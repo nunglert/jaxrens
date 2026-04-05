@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jaxrens"
+version = "0.1.0"
+description = "JAX-based nested sampling for atomistic systems"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Nico Unglert" },
+]
+dependencies = [
+    "jax>=0.9.0",
+    "jaxlib>=0.9.0",
+    "numpy>=1.26",
+    "h5py>=3.10",
+    "ase>=3.22",
+]
+
+[project.optional-dependencies]
+neuralil = ["neuralil"]
+mace = ["mace-jax"]
+dev = [
+    "pytest>=8.0",
+    "pytest-xdist>=3.5",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "heavy: marks tests as heavy/slow (deselect with '-m \"not heavy\"')",
+    "gpu: marks tests requiring GPU",
+    "multi_gpu: marks tests requiring multiple GPUs",
+]
