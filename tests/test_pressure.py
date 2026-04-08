@@ -36,7 +36,7 @@ from jaxrens.utils.cell import get_volume
 def _make_periodic_setup(n_walkers=20, n_atoms=2, box_size=5.0, seed=0):
     """Create a periodic harmonic system with boxes."""
     energy_fn, params = create_harmonic(k=1.0)
-    step_fn = rw_build_kernel(energy_fn, params)
+    step_fn = jax.jit(rw_build_kernel(energy_fn, params))
 
     key = jax.random.key(seed)
     key, init_key = jax.random.split(key)

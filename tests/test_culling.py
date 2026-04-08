@@ -20,6 +20,7 @@ from jaxrens.sampling.nested_sampling import (
     _find_worst_walkers,
     init_ns,
     ns_step,
+    ns_step_multi_cull,
     run_ns,
 )
 
@@ -71,9 +72,9 @@ class TestNsStepMultiCull:
             params, positions, types
         )
         ns_state = init_ns(positions, types, energies, None, jax.random.key(1))
-        step_fn = random_walk.build_kernel(energy_fn, params)
+        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
 
-        new_state, info, _ = ns_step(ns_state, step_fn, n_mcmc_steps=5, n_cull=1)
+        new_state, info, _ = ns_step(ns_state, step_fn, n_mcmc_steps=5)
         assert new_state["n_dead"] == 1
         assert new_state["iteration"] == 1
 
@@ -88,9 +89,9 @@ class TestNsStepMultiCull:
             params, positions, types
         )
         ns_state = init_ns(positions, types, energies, None, jax.random.key(11))
-        step_fn = random_walk.build_kernel(energy_fn, params)
+        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
 
-        new_state, info, _ = ns_step(ns_state, step_fn, n_mcmc_steps=5, n_cull=3)
+        new_state, info, _ = ns_step_multi_cull(ns_state, step_fn, n_cull=3, n_mcmc_steps=5)
         assert new_state["n_dead"] == 3
         assert new_state["iteration"] == 3
 
@@ -110,8 +111,8 @@ class TestNsStepMultiCull:
         worst_3 = set(int(i) for i in sorted_indices[:3])
 
         ns_state = init_ns(positions, types, energies, None, jax.random.key(21))
-        step_fn = random_walk.build_kernel(energy_fn, params)
-        new_state, info, _ = ns_step(ns_state, step_fn, n_mcmc_steps=10, n_cull=3)
+        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
+        new_state, info, _ = ns_step_multi_cull(ns_state, step_fn, n_cull=3, n_mcmc_steps=10)
 
         # The worst walkers' energies should have changed
         for w_idx in worst_3:
@@ -128,9 +129,9 @@ class TestNsStepMultiCull:
             params, positions, types
         )
         ns_state = init_ns(positions, types, energies, None, jax.random.key(31))
-        step_fn = random_walk.build_kernel(energy_fn, params)
+        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
 
-        new_state, info, _ = ns_step(ns_state, step_fn, n_mcmc_steps=5, n_cull=3)
+        new_state, info, _ = ns_step_multi_cull(ns_state, step_fn, n_cull=3, n_mcmc_steps=5)
         dead_e = new_state["dead_energies"][:3]
         # First dead point should have highest energy
         assert float(dead_e[0]) >= float(dead_e[1]) >= float(dead_e[2])
@@ -147,7 +148,7 @@ class TestRunNsMultiCull:
         energies = jax.vmap(energy_fn, in_axes=(None, 0, None))(
             params, positions, types
         )
-        step_fn = random_walk.build_kernel(energy_fn, params)
+        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
 
         result = run_ns(
             positions, types, energies, None,
@@ -171,7 +172,7 @@ class TestRunNsMultiCull:
         energies = jax.vmap(energy_fn, in_axes=(None, 0, None))(
             params, positions, types
         )
-        step_fn = random_walk.build_kernel(energy_fn, params)
+        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
 
         result = run_ns(
             positions, types, energies, None,
@@ -196,7 +197,7 @@ class TestRunNsMultiCull:
         energies = jax.vmap(energy_fn, in_axes=(None, 0, None))(
             params, positions, types
         )
-        step_fn = random_walk.build_kernel(energy_fn, params)
+        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
 
         result = run_ns(
             positions, types, energies, None,

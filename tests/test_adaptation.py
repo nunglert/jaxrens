@@ -79,7 +79,7 @@ class TestAdaptationConvergence:
         adapt_state = init_adaptation(initial_step_size=0.1, target_acceptance=target_acc)
 
         # Warmup: 200 steps with adaptation
-        step_fn = rw_build_kernel(energy_fn, params)
+        step_fn = jax.jit(rw_build_kernel(energy_fn, params))
         rw_state = rw_init(positions, types, energy=0.25, step_size=0.1)
         key = jax.random.key(42)
 

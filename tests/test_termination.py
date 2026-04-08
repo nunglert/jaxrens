@@ -388,7 +388,7 @@ class TestTempTerminationIntegration:
         from jaxrens.sampling.nested_sampling import run_ns
 
         energy_fn, params = create_harmonic(k=1.0)
-        step_fn = rw_build_kernel(energy_fn, params)
+        step_fn = jax.jit(rw_build_kernel(energy_fn, params))
 
         n_walkers = 50
         key = jax.random.key(99)
@@ -432,7 +432,7 @@ class TestTempTerminationIntegration:
         from jaxrens.sampling.nested_sampling import run_ns
 
         energy_fn, params = create_harmonic(k=1.0)
-        step_fn = rw_build_kernel(energy_fn, params)
+        step_fn = jax.jit(rw_build_kernel(energy_fn, params))
 
         n_walkers = 50
         key = jax.random.key(77)

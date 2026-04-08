@@ -21,7 +21,7 @@ from jaxrens.sampling.adaptation.step_size import init_adaptation
 def harmonic_setup():
     """Set up a harmonic oscillator NS problem."""
     energy_fn, params = create_harmonic(k=1.0)
-    step_fn = rw_build_kernel(energy_fn, params)
+    step_fn = jax.jit(rw_build_kernel(energy_fn, params))
 
     n_walkers = 50
     n_atoms = 1
@@ -156,7 +156,7 @@ class TestRunNS:
         exp(-E) over the prior volume.
         """
         energy_fn, params = create_harmonic(k=1.0)
-        step_fn = rw_build_kernel(energy_fn, params)
+        step_fn = jax.jit(rw_build_kernel(energy_fn, params))
 
         n_walkers = 100
         L = 5.0

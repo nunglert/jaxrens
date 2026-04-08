@@ -176,12 +176,11 @@ def ns_step(
     adapt_state: AdaptationState | None = None,
     target_acceptance: float = 0.5,
     pressure: float | None = None,
-    n_cull: int = 1,
 ) -> tuple[dict, dict, AdaptationState | None]:
-    """One NS iteration: replace the worst walker(s).
+    """One NS iteration: replace the single worst walker.
 
-    When n_cull > 1, removes the n_cull worst walkers simultaneously,
-    records all as dead points, clones survivors, and runs MCMC on each.
+    JIT-compatible (the inner MCMC chain runs via lax.scan).
+    For multi-walker culling, use ns_step_multi_cull() instead.
 
     Args:
         ns_state: Current NS state dict.
@@ -190,7 +189,6 @@ def ns_step(
         adapt_state: Optional adaptation state for step size tuning.
         target_acceptance: Target acceptance rate for adaptation.
         pressure: Pressure for NPT ensemble. None or 0 = NVT (energy only).
-        n_cull: Number of walkers to replace per iteration (default 1).
 
     Returns:
         (updated_ns_state, iteration_info, updated_adapt_state)
@@ -213,235 +211,272 @@ def ns_step(
         get_step_size(adapt_state) if adapt_state is not None else jnp.array(0.1)
     )
 
-    if n_cull == 1:
-        # --- Fast path: single walker culling (original logic) ---
+    # 1. Find worst walker
+    key, key_worst = jax.random.split(key)
+    worst_idx, hmax = _find_worst_walker(
+        comparison_values, rng_key=key_worst, n_atoms=n_atoms
+    )
 
-        # 1. Find worst walker
-        key, key_worst = jax.random.split(key)
-        worst_idx, hmax = _find_worst_walker(
-            comparison_values, rng_key=key_worst, n_atoms=n_atoms
+    # 2. Record dead point
+    emax = energies[worst_idx]
+    n_dead = ns_state["n_dead"]
+    dead_energies = ns_state["dead_energies"].at[n_dead].set(hmax)
+    dead_positions = ns_state["dead_positions"].at[n_dead].set(
+        positions[worst_idx]
+    )
+
+    dead_volumes = ns_state["dead_volumes"]
+    if dead_volumes is not None and boxes is not None:
+        dead_volumes = dead_volumes.at[n_dead].set(get_volume(boxes[worst_idx]))
+
+    # 3. Update evidence estimate
+    log_weight = -iteration / n_walkers + jnp.log(1.0 / n_walkers)
+    log_likelihood = -hmax
+    log_evidence_contribution = log_weight + log_likelihood
+    log_evidence = jnp.logaddexp(
+        ns_state["log_evidence"], log_evidence_contribution
+    )
+
+    # 4. Clone a random survivor
+    key, key_clone, key_mcmc = jax.random.split(key, 3)
+    clone_idx = jax.random.randint(key_clone, (), 0, n_walkers - 1)
+    clone_idx = jnp.where(clone_idx >= worst_idx, clone_idx + 1, clone_idx)
+
+    clone_state = RandomWalkState(
+        positions=positions[clone_idx],
+        types=types[clone_idx],
+        energy=energies[clone_idx],
+        box=boxes[clone_idx] if boxes is not None else None,
+        step_size=step_size,
+    )
+
+    # 5. Run MCMC chain via lax.scan
+    mcmc_keys = jax.random.split(key_mcmc, n_mcmc_steps)
+
+    def scan_step(state, step_key):
+        new_state, info = step_fn(step_key, state, hmax)
+        return new_state, info.accepted
+
+    final_state, accepted_arr = jax.lax.scan(scan_step, clone_state, mcmc_keys)
+    n_accepted = jnp.sum(accepted_arr)
+
+    # 6. Replace worst walker with MCMC result
+    new_positions = positions.at[worst_idx].set(final_state.positions)
+    new_energies = energies.at[worst_idx].set(final_state.energy)
+    new_types = types
+    new_boxes = boxes
+    if boxes is not None:
+        new_boxes = boxes.at[worst_idx].set(
+            final_state.box if final_state.box is not None else boxes[worst_idx]
         )
 
-        # 2. Record dead point
-        emax = energies[worst_idx]
-        n_dead = ns_state["n_dead"]
-        dead_energies = ns_state["dead_energies"].at[n_dead].set(hmax)
-        dead_positions = ns_state["dead_positions"].at[n_dead].set(
-            positions[worst_idx]
+    # 7. Update adaptation
+    acc_rate = n_accepted / n_mcmc_steps
+    if adapt_state is not None:
+        adapt_state = dual_averaging_update(
+            adapt_state,
+            accepted=jnp.array(acc_rate > target_acceptance),
+            target_acceptance=target_acceptance,
         )
 
-        dead_volumes = ns_state["dead_volumes"]
+    new_ns_state = {
+        **ns_state,
+        "positions": new_positions,
+        "types": new_types,
+        "energies": new_energies,
+        "boxes": new_boxes,
+        "dead_energies": dead_energies,
+        "dead_positions": dead_positions,
+        "dead_volumes": dead_volumes,
+        "log_evidence": log_evidence,
+        "iteration": iteration + 1,
+        "n_dead": n_dead + 1,
+        "rng_key": key,
+    }
+
+    info = {
+        "emax": emax,
+        "hmax": hmax,
+        "worst_idx": worst_idx,
+        "clone_idx": clone_idx,
+        "n_accepted": n_accepted,
+        "acceptance_rate": acc_rate,
+        "log_evidence": log_evidence,
+        "step_size": step_size,
+    }
+
+    return new_ns_state, info, adapt_state
+
+
+def ns_step_multi_cull(
+    ns_state: dict,
+    step_fn: Callable,
+    n_cull: int,
+    n_mcmc_steps: int = 20,
+    adapt_state: AdaptationState | None = None,
+    target_acceptance: float = 0.5,
+    pressure: float | None = None,
+) -> tuple[dict, dict, AdaptationState | None]:
+    """One NS iteration removing n_cull worst walkers simultaneously.
+
+    Not fully JIT-compatible (uses Python loop over culled walkers).
+    Designed to be called from the outer Python loop in run_ns().
+
+    Args:
+        ns_state: Current NS state dict.
+        step_fn: MCMC step function (key, state, Emax) -> (state, info).
+        n_cull: Number of walkers to replace (must be >= 2).
+        n_mcmc_steps: Number of MCMC steps per replacement.
+        adapt_state: Optional adaptation state for step size tuning.
+        target_acceptance: Target acceptance rate for adaptation.
+        pressure: Pressure for NPT ensemble. None or 0 = NVT (energy only).
+
+    Returns:
+        (updated_ns_state, iteration_info, updated_adapt_state)
+    """
+    positions = ns_state["positions"]
+    types = ns_state["types"]
+    energies = ns_state["energies"]
+    boxes = ns_state["boxes"]
+    n_walkers = ns_state["n_walkers"]
+    iteration = ns_state["iteration"]
+    key = ns_state["rng_key"]
+
+    comparison_values = _compute_enthalpies(energies, boxes, pressure)
+    n_atoms = positions.shape[1] if positions.ndim >= 2 else None
+
+    from jaxrens.sampling.moves.random_walk import RandomWalkState
+
+    step_size = (
+        get_step_size(adapt_state) if adapt_state is not None else jnp.array(0.1)
+    )
+
+    # 1. Find n_cull worst walkers
+    key, key_worst = jax.random.split(key)
+    worst_indices, worst_hvals = _find_worst_walkers(
+        comparison_values, n_cull, rng_key=key_worst, n_atoms=n_atoms
+    )
+
+    # hmax = the highest enthalpy among the culled walkers (the NS constraint)
+    hmax = worst_hvals[0]  # sorted descending
+
+    # 2. Record all dead points
+    n_dead = ns_state["n_dead"]
+    dead_energies = ns_state["dead_energies"]
+    dead_positions = ns_state["dead_positions"]
+    dead_volumes = ns_state["dead_volumes"]
+
+    for j in range(n_cull):
+        w_idx = worst_indices[j]
+        dead_energies = dead_energies.at[n_dead + j].set(worst_hvals[j])
+        dead_positions = dead_positions.at[n_dead + j].set(positions[w_idx])
         if dead_volumes is not None and boxes is not None:
-            dead_volumes = dead_volumes.at[n_dead].set(get_volume(boxes[worst_idx]))
+            dead_volumes = dead_volumes.at[n_dead + j].set(
+                get_volume(boxes[w_idx])
+            )
 
-        # 3. Update evidence estimate
-        log_weight = -iteration / n_walkers + jnp.log(1.0 / n_walkers)
-        log_likelihood = -hmax
-        log_evidence_contribution = log_weight + log_likelihood
+    # 3. Update evidence: one contribution per dead point
+    log_evidence = ns_state["log_evidence"]
+    for j in range(n_cull):
+        iter_j = iteration + j
+        log_weight = -iter_j / n_walkers + jnp.log(1.0 / n_walkers)
+        log_likelihood = -worst_hvals[j]
         log_evidence = jnp.logaddexp(
-            ns_state["log_evidence"], log_evidence_contribution
+            log_evidence, log_weight + log_likelihood
         )
 
-        # 4. Clone a random survivor
-        key, key_clone, key_mcmc = jax.random.split(key, 3)
-        clone_idx = jax.random.randint(key_clone, (), 0, n_walkers - 1)
-        clone_idx = jnp.where(clone_idx >= worst_idx, clone_idx + 1, clone_idx)
+    # 4 & 5. For each culled walker: clone a survivor, run MCMC
+    worst_set = set()
+    for j in range(n_cull):
+        worst_set.add(int(worst_indices[j]))
+
+    survivor_mask = jnp.array(
+        [i not in worst_set for i in range(n_walkers)], dtype=jnp.bool_
+    )
+    survivor_indices = jnp.where(survivor_mask, size=n_walkers - n_cull)[0]
+
+    new_positions = positions
+    new_energies = energies
+    new_types = types
+    new_boxes = boxes
+    total_accepted = 0
+    total_mcmc = 0
+
+    key, *cull_keys = jax.random.split(key, 1 + 2 * n_cull)
+    clone_indices = []
+
+    for j in range(n_cull):
+        w_idx = worst_indices[j]
+        key_clone = cull_keys[2 * j]
+        key_mcmc = cull_keys[2 * j + 1]
+
+        # Clone random survivor
+        n_survivors = n_walkers - n_cull
+        clone_pick = jax.random.randint(key_clone, (), 0, n_survivors)
+        clone_idx = survivor_indices[clone_pick]
+        clone_indices.append(clone_idx)
 
         clone_state = RandomWalkState(
-            positions=positions[clone_idx],
-            types=types[clone_idx],
-            energy=energies[clone_idx],
-            box=boxes[clone_idx] if boxes is not None else None,
+            positions=new_positions[clone_idx],
+            types=new_types[clone_idx],
+            energy=new_energies[clone_idx],
+            box=new_boxes[clone_idx] if new_boxes is not None else None,
             step_size=step_size,
         )
 
-        # 5. Run MCMC chain via lax.scan
         mcmc_keys = jax.random.split(key_mcmc, n_mcmc_steps)
 
-        def scan_step(state, step_key):
-            new_state, info = step_fn(step_key, state, hmax)
-            return new_state, info.accepted
+        def scan_step(state, step_key, _hmax=hmax):
+            new_state, move_info = step_fn(step_key, state, _hmax)
+            return new_state, move_info.accepted
 
-        final_state, accepted_arr = jax.lax.scan(scan_step, clone_state, mcmc_keys)
-        n_accepted = jnp.sum(accepted_arr)
+        final_state, accepted_arr = jax.lax.scan(
+            scan_step, clone_state, mcmc_keys
+        )
+        total_accepted += int(jnp.sum(accepted_arr))
+        total_mcmc += n_mcmc_steps
 
-        # 6. Replace worst walker with MCMC result
-        new_positions = positions.at[worst_idx].set(final_state.positions)
-        new_energies = energies.at[worst_idx].set(final_state.energy)
-        new_types = types
-        new_boxes = boxes
-        if boxes is not None:
-            new_boxes = boxes.at[worst_idx].set(
-                final_state.box if final_state.box is not None else boxes[worst_idx]
+        new_positions = new_positions.at[w_idx].set(final_state.positions)
+        new_energies = new_energies.at[w_idx].set(final_state.energy)
+        if new_boxes is not None:
+            new_boxes = new_boxes.at[w_idx].set(
+                final_state.box if final_state.box is not None else new_boxes[w_idx]
             )
 
-        # 7. Update adaptation
-        acc_rate = n_accepted / n_mcmc_steps
-        if adapt_state is not None:
-            adapt_state = dual_averaging_update(
-                adapt_state,
-                accepted=jnp.array(acc_rate > target_acceptance),
-                target_acceptance=target_acceptance,
-            )
-
-        new_ns_state = {
-            **ns_state,
-            "positions": new_positions,
-            "types": new_types,
-            "energies": new_energies,
-            "boxes": new_boxes,
-            "dead_energies": dead_energies,
-            "dead_positions": dead_positions,
-            "dead_volumes": dead_volumes,
-            "log_evidence": log_evidence,
-            "iteration": iteration + 1,
-            "n_dead": n_dead + 1,
-            "rng_key": key,
-        }
-
-        info = {
-            "emax": emax,
-            "hmax": hmax,
-            "worst_idx": worst_idx,
-            "clone_idx": clone_idx,
-            "n_accepted": n_accepted,
-            "acceptance_rate": acc_rate,
-            "log_evidence": log_evidence,
-            "step_size": step_size,
-        }
-
-    else:
-        # --- Multi-cull path: remove n_cull worst walkers simultaneously ---
-
-        # 1. Find n_cull worst walkers
-        key, key_worst = jax.random.split(key)
-        worst_indices, worst_hvals = _find_worst_walkers(
-            comparison_values, n_cull, rng_key=key_worst, n_atoms=n_atoms
+    # 6. Update adaptation (average acceptance over all culled walkers)
+    acc_rate = total_accepted / max(total_mcmc, 1)
+    if adapt_state is not None:
+        adapt_state = dual_averaging_update(
+            adapt_state,
+            accepted=jnp.array(acc_rate > target_acceptance),
+            target_acceptance=target_acceptance,
         )
 
-        # hmax = the highest enthalpy among the culled walkers (the NS constraint)
-        hmax = worst_hvals[0]  # sorted descending
+    new_ns_state = {
+        **ns_state,
+        "positions": new_positions,
+        "types": new_types,
+        "energies": new_energies,
+        "boxes": new_boxes,
+        "dead_energies": dead_energies,
+        "dead_positions": dead_positions,
+        "dead_volumes": dead_volumes,
+        "log_evidence": log_evidence,
+        "iteration": iteration + n_cull,
+        "n_dead": n_dead + n_cull,
+        "rng_key": key,
+    }
 
-        # 2. Record all dead points
-        n_dead = ns_state["n_dead"]
-        dead_energies = ns_state["dead_energies"]
-        dead_positions = ns_state["dead_positions"]
-        dead_volumes = ns_state["dead_volumes"]
-
-        for j in range(n_cull):
-            w_idx = worst_indices[j]
-            dead_energies = dead_energies.at[n_dead + j].set(worst_hvals[j])
-            dead_positions = dead_positions.at[n_dead + j].set(positions[w_idx])
-            if dead_volumes is not None and boxes is not None:
-                dead_volumes = dead_volumes.at[n_dead + j].set(
-                    get_volume(boxes[w_idx])
-                )
-
-        # 3. Update evidence: one contribution per dead point
-        log_evidence = ns_state["log_evidence"]
-        for j in range(n_cull):
-            iter_j = iteration + j
-            log_weight = -iter_j / n_walkers + jnp.log(1.0 / n_walkers)
-            log_likelihood = -worst_hvals[j]
-            log_evidence = jnp.logaddexp(
-                log_evidence, log_weight + log_likelihood
-            )
-
-        # 4 & 5. For each culled walker: clone a survivor, run MCMC
-        # Build mask of survivor indices
-        worst_set = set()
-        for j in range(n_cull):
-            worst_set.add(int(worst_indices[j]))
-
-        survivor_mask = jnp.array(
-            [i not in worst_set for i in range(n_walkers)], dtype=jnp.bool_
-        )
-        survivor_indices = jnp.where(survivor_mask, size=n_walkers - n_cull)[0]
-
-        new_positions = positions
-        new_energies = energies
-        new_types = types
-        new_boxes = boxes
-        total_accepted = 0
-        total_mcmc = 0
-
-        key, *cull_keys = jax.random.split(key, 1 + 2 * n_cull)
-        clone_indices = []
-
-        for j in range(n_cull):
-            w_idx = worst_indices[j]
-            key_clone = cull_keys[2 * j]
-            key_mcmc = cull_keys[2 * j + 1]
-
-            # Clone random survivor
-            n_survivors = n_walkers - n_cull
-            clone_pick = jax.random.randint(key_clone, (), 0, n_survivors)
-            clone_idx = survivor_indices[clone_pick]
-            clone_indices.append(clone_idx)
-
-            clone_state = RandomWalkState(
-                positions=new_positions[clone_idx],
-                types=new_types[clone_idx],
-                energy=new_energies[clone_idx],
-                box=new_boxes[clone_idx] if new_boxes is not None else None,
-                step_size=step_size,
-            )
-
-            # Run MCMC with the overall worst enthalpy as constraint
-            mcmc_keys = jax.random.split(key_mcmc, n_mcmc_steps)
-
-            def scan_step(state, step_key, _hmax=hmax):
-                new_state, move_info = step_fn(step_key, state, _hmax)
-                return new_state, move_info.accepted
-
-            final_state, accepted_arr = jax.lax.scan(
-                scan_step, clone_state, mcmc_keys
-            )
-            total_accepted += int(jnp.sum(accepted_arr))
-            total_mcmc += n_mcmc_steps
-
-            # Replace culled walker
-            new_positions = new_positions.at[w_idx].set(final_state.positions)
-            new_energies = new_energies.at[w_idx].set(final_state.energy)
-            if new_boxes is not None:
-                new_boxes = new_boxes.at[w_idx].set(
-                    final_state.box if final_state.box is not None else new_boxes[w_idx]
-                )
-
-        # 7. Update adaptation (average acceptance over all culled walkers)
-        acc_rate = total_accepted / max(total_mcmc, 1)
-        if adapt_state is not None:
-            adapt_state = dual_averaging_update(
-                adapt_state,
-                accepted=jnp.array(acc_rate > target_acceptance),
-                target_acceptance=target_acceptance,
-            )
-
-        new_ns_state = {
-            **ns_state,
-            "positions": new_positions,
-            "types": new_types,
-            "energies": new_energies,
-            "boxes": new_boxes,
-            "dead_energies": dead_energies,
-            "dead_positions": dead_positions,
-            "dead_volumes": dead_volumes,
-            "log_evidence": log_evidence,
-            "iteration": iteration + n_cull,
-            "n_dead": n_dead + n_cull,
-            "rng_key": key,
-        }
-
-        info = {
-            "emax": energies[worst_indices[0]],
-            "hmax": hmax,
-            "worst_idx": worst_indices,
-            "clone_idx": jnp.array(clone_indices),
-            "n_accepted": total_accepted,
-            "acceptance_rate": acc_rate,
-            "log_evidence": log_evidence,
-            "step_size": step_size,
-        }
+    info = {
+        "emax": energies[worst_indices[0]],
+        "hmax": hmax,
+        "worst_idx": worst_indices,
+        "clone_idx": jnp.array(clone_indices),
+        "n_accepted": total_accepted,
+        "acceptance_rate": acc_rate,
+        "log_evidence": log_evidence,
+        "step_size": step_size,
+    }
 
     return new_ns_state, info, adapt_state
 
@@ -520,15 +555,25 @@ def run_ns(
         # Use adaptation during warmup, fixed after
         current_adapt = adapt_state if i < adapt_warmup else None
 
-        ns_state, info, adapt_state_new = ns_step(
-            ns_state,
-            step_fn,
-            n_mcmc_steps=n_mcmc_steps,
-            adapt_state=adapt_state,
-            target_acceptance=target_acceptance,
-            pressure=pressure,
-            n_cull=n_cull,
-        )
+        if n_cull == 1:
+            ns_state, info, adapt_state_new = ns_step(
+                ns_state,
+                step_fn,
+                n_mcmc_steps=n_mcmc_steps,
+                adapt_state=adapt_state,
+                target_acceptance=target_acceptance,
+                pressure=pressure,
+            )
+        else:
+            ns_state, info, adapt_state_new = ns_step_multi_cull(
+                ns_state,
+                step_fn,
+                n_cull=n_cull,
+                n_mcmc_steps=n_mcmc_steps,
+                adapt_state=adapt_state,
+                target_acceptance=target_acceptance,
+                pressure=pressure,
+            )
         adapt_state = adapt_state_new
 
         # Callbacks

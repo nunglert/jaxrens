@@ -74,7 +74,7 @@ class TestHMC:
         energy_fn, params = harmonic
         energy = energy_fn(params, positions_1atom, types_1)
         state = hmc.init(positions_1atom, types_1, energy, step_size=0.01)
-        step_fn = hmc.build_kernel(energy_fn, params, n_leapfrog=5)
+        step_fn = jax.jit(hmc.build_kernel(energy_fn, params, n_leapfrog=5))
 
         key = jax.random.key(0)
         new_state, info = step_fn(key, state, 100.0)  # generous constraint
@@ -103,7 +103,7 @@ class TestHMC:
         states = jax.vmap(hmc.init, in_axes=(0, None, 0, None, None))(
             positions, types_1, energies, None, 0.01
         )
-        step_fn = hmc.build_kernel(energy_fn, params, n_leapfrog=5)
+        step_fn = jax.jit(hmc.build_kernel(energy_fn, params, n_leapfrog=5))
         keys = jax.random.split(jax.random.key(3), n_walkers)
         constraints = 100.0 * jnp.ones(n_walkers)
 
@@ -114,7 +114,7 @@ class TestHMC:
         energy_fn, params = harmonic
         energy = energy_fn(params, positions_1atom, types_1)
         state = hmc.init(positions_1atom, types_1, energy, step_size=0.01)
-        step_fn = hmc.build_kernel(energy_fn, params, n_leapfrog=5)
+        step_fn = jax.jit(hmc.build_kernel(energy_fn, params, n_leapfrog=5))
 
         def scan_step(state, key):
             new_state, info = step_fn(key, state, 100.0)
@@ -167,7 +167,7 @@ class TestSingleAtomMove:
         energy_fn, params = harmonic
         energy = energy_fn(params, positions_4atom, types_4)
         state = single_atom.init(positions_4atom, types_4, energy, step_size=0.1)
-        step_fn = single_atom.build_kernel(energy_fn, params)
+        step_fn = jax.jit(single_atom.build_kernel(energy_fn, params))
 
         key = jax.random.key(10)
         new_state, info = step_fn(key, state, 100.0)
@@ -192,7 +192,7 @@ class TestSingleAtomMove:
         states = jax.vmap(single_atom.init, in_axes=(0, None, 0, None, None))(
             positions, types_1, energies, None, 0.1
         )
-        step_fn = single_atom.build_kernel(energy_fn, params)
+        step_fn = jax.jit(single_atom.build_kernel(energy_fn, params))
         keys = jax.random.split(jax.random.key(13), n_walkers)
         constraints = 100.0 * jnp.ones(n_walkers)
 
@@ -203,7 +203,7 @@ class TestSingleAtomMove:
         energy_fn, params = harmonic
         energy = energy_fn(params, positions_4atom, types_4)
         state = single_atom.init(positions_4atom, types_4, energy, step_size=0.1)
-        step_fn = single_atom.build_kernel(energy_fn, params)
+        step_fn = jax.jit(single_atom.build_kernel(energy_fn, params))
 
         def scan_step(state, key):
             new_state, info = step_fn(key, state, 100.0)
@@ -218,7 +218,7 @@ class TestSingleAtomMove:
         energy_fn, params = harmonic
         energy = energy_fn(params, positions_4atom, types_4)
         state = single_atom.init(positions_4atom, types_4, energy, step_size=0.1)
-        step_fn = single_atom.build_kernel(energy_fn, params)
+        step_fn = jax.jit(single_atom.build_kernel(energy_fn, params))
 
         key = jax.random.key(15)
         new_state, info = step_fn(key, state, 100.0)
@@ -245,7 +245,7 @@ class TestSingleAtomSweep:
         energy_fn, params = harmonic
         energy = energy_fn(params, positions_4atom, types_4)
         state = single_atom.init(positions_4atom, types_4, energy, step_size=0.1)
-        step_fn = single_atom.build_sweep_kernel(energy_fn, params, n_atoms=4)
+        step_fn = jax.jit(single_atom.build_sweep_kernel(energy_fn, params, n_atoms=4))
 
         key = jax.random.key(20)
         new_state, info = step_fn(key, state, 100.0)
@@ -278,7 +278,7 @@ class TestSingleAtomSwap:
         energy_fn, params = harmonic
         energy = energy_fn(params, positions_4atom, types_4)
         state = single_atom.init(positions_4atom, types_4, energy)
-        step_fn = single_atom.build_swap_kernel(energy_fn, params)
+        step_fn = jax.jit(single_atom.build_swap_kernel(energy_fn, params))
 
         key = jax.random.key(30)
         new_state, info = step_fn(key, state, 100.0)
@@ -345,7 +345,7 @@ class TestAtomMorph:
         energy_fn, params = harmonic
         energy = energy_fn(params, positions_4atom, types_4)
         state = alchemical.init(positions_4atom, types_4, energy)
-        step_fn = alchemical.build_morph_kernel(energy_fn, params, n_species=2)
+        step_fn = jax.jit(alchemical.build_morph_kernel(energy_fn, params, n_species=2))
 
         key = jax.random.key(50)
         new_state, info = step_fn(key, state, 100.0)
@@ -411,7 +411,7 @@ class TestRandomShift:
         energy_fn, params = harmonic
         energy = energy_fn(params, positions_4atom, types_4)
         state = alchemical.init(positions_4atom, types_4, energy, step_size=0.1)
-        step_fn = alchemical.build_shift_kernel(energy_fn, params)
+        step_fn = jax.jit(alchemical.build_shift_kernel(energy_fn, params))
 
         key = jax.random.key(70)
         new_state, info = step_fn(key, state, 100.0)
@@ -431,7 +431,7 @@ class TestRandomShift:
         energy_fn, params = harmonic
         energy = energy_fn(params, positions_4atom, types_4)
         state = alchemical.init(positions_4atom, types_4, energy, step_size=0.5)
-        step_fn = alchemical.build_shift_kernel(energy_fn, params)
+        step_fn = jax.jit(alchemical.build_shift_kernel(energy_fn, params))
 
         key = jax.random.key(72)
         new_state, info = step_fn(key, state, 1000.0)  # very generous constraint
@@ -453,7 +453,7 @@ class TestRandomShift:
         states = jax.vmap(alchemical.init, in_axes=(0, None, 0, None, None))(
             positions, types_4, energies, None, 0.1
         )
-        step_fn = alchemical.build_shift_kernel(energy_fn, params)
+        step_fn = jax.jit(alchemical.build_shift_kernel(energy_fn, params))
         keys = jax.random.split(jax.random.key(74), n_walkers)
         constraints = 100.0 * jnp.ones(n_walkers)
 
@@ -464,7 +464,7 @@ class TestRandomShift:
         energy_fn, params = harmonic
         energy = energy_fn(params, positions_4atom, types_4)
         state = alchemical.init(positions_4atom, types_4, energy, step_size=0.1)
-        step_fn = alchemical.build_shift_kernel(energy_fn, params)
+        step_fn = jax.jit(alchemical.build_shift_kernel(energy_fn, params))
 
         def scan_step(state, key):
             new_state, info = step_fn(key, state, 100.0)
