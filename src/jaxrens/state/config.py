@@ -21,6 +21,10 @@ class NSConfig:
     n_cull: int = 1
     seed: int = 42
 
+    # Ensemble
+    pressure: float | None = None  # pressure for NPT ensemble (None = NVT)
+    chemical_potential: float | None = None  # for future sGC support
+
     # Multi-GPU
     platform: str = "gpu"  # "gpu" | "multi-gpu" | "cpu"
     n_runs: int = 1

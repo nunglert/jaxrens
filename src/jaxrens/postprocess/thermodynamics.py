@@ -27,7 +27,7 @@ def calc_log_weights(n_dead: int | jnp.ndarray, n_live: int | jnp.ndarray, n_cul
     Returns:
         Array of log weights, shape (n_dead,).
     """
-    n_live = jnp.asarray(n_live, dtype=jnp.float64 if jax.x64_is_enabled() else jnp.float32)
+    n_live = jnp.asarray(n_live, dtype=jnp.float64 if jax.config.x64_enabled else jnp.float32)
     n_cull = jnp.asarray(n_cull, dtype=n_live.dtype)
 
     log_t = jnp.log(n_live - n_cull) - jnp.log(n_live + 1.0 - n_cull)
@@ -56,7 +56,7 @@ def calc_log_weights_live(n_dead: int | jnp.ndarray, n_live: int | jnp.ndarray, 
     Returns:
         Scalar log weight for each live walker.
     """
-    n_live = jnp.asarray(n_live, dtype=jnp.float64 if jax.x64_is_enabled() else jnp.float32)
+    n_live = jnp.asarray(n_live, dtype=jnp.float64 if jax.config.x64_enabled else jnp.float32)
     n_cull = jnp.asarray(n_cull, dtype=n_live.dtype)
     n_dead = jnp.asarray(n_dead, dtype=n_live.dtype)
 

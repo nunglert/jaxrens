@@ -60,6 +60,9 @@ def raw_to_configs(
     Returns:
         (NSConfig, MoveConfig, BackendConfig, OutputConfig) tuple.
     """
+    pressure_str = raw.get("pressure", None)
+    pressure = float(pressure_str) if pressure_str is not None else None
+
     ns = NSConfig(
         n_live=int(raw.get("n_walkers", "500")),
         max_iterations=int(raw.get("max_iterations", "50000")),
@@ -69,6 +72,7 @@ def raw_to_configs(
         seed=int(raw.get("seed", "42")),
         platform=raw.get("platform", "gpu"),
         n_runs=int(raw.get("n_runs", raw.get("n_calc_batch", "1"))),
+        pressure=pressure,
     )
 
     move = MoveConfig(

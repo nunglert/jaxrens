@@ -47,6 +47,16 @@ def save_checkpoint(
             "dead_positions",
             data=np.asarray(ns_state["dead_positions"][: ns_state["n_dead"]]),
         )
+        if ns_state.get("dead_volumes") is not None:
+            f.create_dataset(
+                "dead_volumes",
+                data=np.asarray(ns_state["dead_volumes"][: ns_state["n_dead"]]),
+            )
+        if ns_state.get("live_volumes") is not None:
+            f.create_dataset(
+                "live_volumes",
+                data=np.asarray(ns_state["live_volumes"]),
+            )
         f.attrs["log_evidence"] = float(ns_state["log_evidence"])
         f.attrs["iteration"] = int(ns_state["iteration"])
         f.attrs["n_dead"] = int(ns_state["n_dead"])
@@ -95,6 +105,15 @@ def load_checkpoint(
     dead_positions = jnp.zeros((max_dead, *positions.shape[1:]))
     dead_positions = dead_positions.at[:n_dead].set(dead_positions_data)
 
+    with h5py.File(path, "r") as f:
+        if "dead_volumes" in f:
+            dead_volumes_data = jnp.array(f["dead_volumes"][:])
+            dead_volumes = jnp.zeros(max_dead)
+            dead_volumes = dead_volumes.at[:n_dead].set(dead_volumes_data)
+        else:
+            dead_volumes = None
+        live_volumes = jnp.array(f["live_volumes"][:]) if "live_volumes" in f else None
+
     logger.info("Checkpoint loaded from %s (iteration %d)", path, iteration)
 
     return {
@@ -104,6 +123,8 @@ def load_checkpoint(
         "boxes": boxes,
         "dead_energies": dead_energies,
         "dead_positions": dead_positions,
+        "dead_volumes": dead_volumes,
+        "live_volumes": live_volumes,
         "log_evidence": log_evidence,
         "iteration": iteration,
         "n_dead": n_dead,

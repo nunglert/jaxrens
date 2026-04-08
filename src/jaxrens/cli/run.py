@@ -151,6 +151,7 @@ def run_from_config(
         target_acceptance=move_config.target_acceptance,
         adapt_warmup=move_config.adaptation_warmup,
         callbacks=callbacks,
+        pressure=ns_config.pressure,
     )
 
     return result
