@@ -31,6 +31,8 @@ def _make_state(positions, types, energy, box=None, step_size=0.1):
         step_sizes=jnp.array([step_size]),
         n_accepted=jnp.zeros(1, dtype=jnp.int32),
         n_proposed=jnp.zeros(1, dtype=jnp.int32),
+        max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
+        overflow=jnp.asarray(False),
     )
 
 
@@ -47,6 +49,8 @@ def _make_gmc_state(positions, types, energy, box=None, step_size=0.1):
         step_sizes=jnp.array([step_size]),
         n_accepted=jnp.zeros(1, dtype=jnp.int32),
         n_proposed=jnp.zeros(1, dtype=jnp.int32),
+        max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
+        overflow=jnp.asarray(False),
         direction=jnp.zeros_like(positions),
     )
 
@@ -131,6 +135,8 @@ class TestRandomWalkStep:
             step_sizes=jnp.full((4, 1), 0.1),
             n_accepted=jnp.zeros((4, 1), dtype=jnp.int32),
             n_proposed=jnp.zeros((4, 1), dtype=jnp.int32),
+            max_neighbor_count=jnp.zeros(4, dtype=jnp.int32),
+            overflow=jnp.full(4, False),
         )
 
         keys = jax.random.split(jax.random.key(0), 4)
@@ -234,6 +240,8 @@ class TestGalileanStep:
             step_sizes=jnp.full((4, 1), 0.05),
             n_accepted=jnp.zeros((4, 1), dtype=jnp.int32),
             n_proposed=jnp.zeros((4, 1), dtype=jnp.int32),
+            max_neighbor_count=jnp.zeros(4, dtype=jnp.int32),
+            overflow=jnp.full(4, False),
             direction=batch_dir,
         )
 

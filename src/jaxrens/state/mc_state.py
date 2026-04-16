@@ -104,6 +104,8 @@ def make_mc_state_class(extra_fields: dict[str, type] | None = None) -> type:
         ("step_sizes", jnp.ndarray),
         ("n_accepted", jnp.ndarray),
         ("n_proposed", jnp.ndarray),
+        ("max_neighbor_count", jnp.ndarray),  # actual max neighbors observed
+        ("overflow", jnp.ndarray),            # bool — any overflow detected
     ]
 
     # Move-specific fields

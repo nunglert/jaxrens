@@ -38,6 +38,8 @@ def _make_cell_state(positions, types, energy, box, step_size=0.1):
         step_sizes=jnp.array([step_size]),
         n_accepted=jnp.zeros(1, dtype=jnp.int32),
         n_proposed=jnp.zeros(1, dtype=jnp.int32),
+        max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
+        overflow=jnp.asarray(False),
     )
 
 
@@ -187,6 +189,8 @@ class TestVolumeMoveStep:
             step_sizes=jnp.full((4, 1), 0.1),
             n_accepted=jnp.zeros((4, 1), dtype=jnp.int32),
             n_proposed=jnp.zeros((4, 1), dtype=jnp.int32),
+            max_neighbor_count=jnp.zeros(4, dtype=jnp.int32),
+            overflow=jnp.full(4, False),
         )
 
         keys = jax.random.split(jax.random.key(0), 4)
@@ -294,6 +298,8 @@ class TestShearMoveStep:
             step_sizes=jnp.full((4, 1), 0.1),
             n_accepted=jnp.zeros((4, 1), dtype=jnp.int32),
             n_proposed=jnp.zeros((4, 1), dtype=jnp.int32),
+            max_neighbor_count=jnp.zeros(4, dtype=jnp.int32),
+            overflow=jnp.full(4, False),
         )
 
         keys = jax.random.split(jax.random.key(0), 4)
@@ -398,6 +404,8 @@ class TestStretchMoveStep:
             step_sizes=jnp.full((4, 1), 0.1),
             n_accepted=jnp.zeros((4, 1), dtype=jnp.int32),
             n_proposed=jnp.zeros((4, 1), dtype=jnp.int32),
+            max_neighbor_count=jnp.zeros(4, dtype=jnp.int32),
+            overflow=jnp.full(4, False),
         )
 
         keys = jax.random.split(jax.random.key(0), 4)

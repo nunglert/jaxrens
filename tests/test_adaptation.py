@@ -84,6 +84,8 @@ class TestAdaptationConvergence:
             step_sizes=jnp.array([0.1]),
             n_accepted=jnp.zeros(1, dtype=jnp.int32),
             n_proposed=jnp.zeros(1, dtype=jnp.int32),
+            max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
+            overflow=jnp.asarray(False),
         )
         key = jax.random.key(42)
 

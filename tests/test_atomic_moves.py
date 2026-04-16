@@ -35,6 +35,8 @@ def _make_state(positions, types, energy, box=None, step_size=0.1):
         step_sizes=jnp.array([step_size]),
         n_accepted=jnp.zeros(1, dtype=jnp.int32),
         n_proposed=jnp.zeros(1, dtype=jnp.int32),
+        max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
+        overflow=jnp.asarray(False),
     )
 
 
@@ -50,6 +52,8 @@ def _make_batch_state(positions, types, energies, step_size=0.1):
         step_sizes=jnp.full((n, 1), step_size),
         n_accepted=jnp.zeros((n, 1), dtype=jnp.int32),
         n_proposed=jnp.zeros((n, 1), dtype=jnp.int32),
+        max_neighbor_count=jnp.zeros(n, dtype=jnp.int32),
+        overflow=jnp.full(n, False),
     )
 
 

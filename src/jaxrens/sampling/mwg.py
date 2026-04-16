@@ -140,6 +140,8 @@ def build_mwg(
             step_sizes=jnp.asarray(step_sizes),
             n_accepted=jnp.zeros(n_moves, dtype=jnp.int32),
             n_proposed=jnp.zeros(n_moves, dtype=jnp.int32),
+            max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
+            overflow=jnp.asarray(False),
         )
 
         # Initialize move-specific fields
