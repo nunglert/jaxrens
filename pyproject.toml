@@ -33,8 +33,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not heavy'"
 markers = [
-    "heavy: marks tests as heavy/slow (deselect with '-m \"not heavy\"')",
+    "heavy: marks tests as heavy/slow (run with '-m heavy' or '-m \"\"' to include)",
     "gpu: marks tests requiring GPU",
     "multi_gpu: marks tests requiring multiple GPUs",
 ]

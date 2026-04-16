@@ -17,7 +17,9 @@ import jax.numpy as jnp
 import pytest
 
 from jaxrens.backends.toy import create_harmonic
-from jaxrens.sampling.moves.random_walk import build_kernel as rw_build_kernel
+from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.moves import random_walk
+from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import (
     _compute_enthalpies,
     init_ns,
@@ -36,7 +38,9 @@ from jaxrens.utils.cell import get_volume
 def _make_periodic_setup(n_walkers=20, n_atoms=2, box_size=5.0, seed=0):
     """Create a periodic harmonic system with boxes."""
     energy_fn, params = create_harmonic(k=1.0)
-    step_fn = jax.jit(rw_build_kernel(energy_fn, params))
+    init_fn, step_fn = build_mwg(energy_fn, params, [
+        MoveDescriptor("random_walk", random_walk.build_kernel),
+    ])
 
     key = jax.random.key(seed)
     key, init_key = jax.random.split(key)
@@ -51,6 +55,7 @@ def _make_periodic_setup(n_walkers=20, n_atoms=2, box_size=5.0, seed=0):
     return {
         "energy_fn": energy_fn,
         "params": params,
+        "init_fn": init_fn,
         "step_fn": step_fn,
         "positions": positions,
         "types": types,
@@ -153,7 +158,7 @@ class TestNSStepPressure:
         adapt = init_adaptation(initial_step_size=0.3)
 
         new_state, info, _ = ns_step(
-            state, s["step_fn"], n_mcmc_steps=5,
+            state, s["init_fn"], s["step_fn"], n_mcmc_steps=5,
             adapt_state=adapt, pressure=0.01,
         )
 
@@ -173,7 +178,7 @@ class TestNSStepPressure:
         adapt = init_adaptation(initial_step_size=0.3)
 
         _, info, _ = ns_step(
-            state, s["step_fn"], n_mcmc_steps=5,
+            state, s["init_fn"], s["step_fn"], n_mcmc_steps=5,
             adapt_state=adapt, pressure=0.01,
         )
 
@@ -189,7 +194,7 @@ class TestNSStepPressure:
         adapt = init_adaptation(initial_step_size=0.3)
 
         _, info, _ = ns_step(
-            state, s["step_fn"], n_mcmc_steps=5,
+            state, s["init_fn"], s["step_fn"], n_mcmc_steps=5,
             adapt_state=adapt, pressure=None,
         )
 
@@ -200,13 +205,14 @@ class TestNSStepPressure:
 # run_ns with pressure
 # ---------------------------------------------------------------------------
 
+@pytest.mark.heavy
 class TestRunNSPressure:
     def test_nvt_no_volumes(self, periodic_setup):
         """NVT run (no pressure) should have no dead_volumes or live_volumes."""
         s = periodic_setup
         result = run_ns(
             s["positions"], s["types"], s["energies"],
-            boxes=s["boxes"], step_fn=s["step_fn"],
+            boxes=s["boxes"], init_fn=s["init_fn"], step_fn=s["step_fn"],
             rng_key=s["key"], max_iterations=30,
             n_mcmc_steps=5, initial_step_size=0.3,
         )
@@ -218,7 +224,7 @@ class TestRunNSPressure:
         s = periodic_setup
         result = run_ns(
             s["positions"], s["types"], s["energies"],
-            boxes=s["boxes"], step_fn=s["step_fn"],
+            boxes=s["boxes"], init_fn=s["init_fn"], step_fn=s["step_fn"],
             rng_key=s["key"], max_iterations=30,
             n_mcmc_steps=5, initial_step_size=0.3,
             pressure=0.01,
@@ -238,7 +244,7 @@ class TestRunNSPressure:
         s = periodic_setup
         result = run_ns(
             s["positions"], s["types"], s["energies"],
-            boxes=s["boxes"], step_fn=s["step_fn"],
+            boxes=s["boxes"], init_fn=s["init_fn"], step_fn=s["step_fn"],
             rng_key=s["key"], max_iterations=100,
             n_mcmc_steps=5, initial_step_size=0.3,
             pressure=0.01,
@@ -299,7 +305,7 @@ class TestCheckpointPressure:
         s = periodic_setup
         result = run_ns(
             s["positions"], s["types"], s["energies"],
-            boxes=s["boxes"], step_fn=s["step_fn"],
+            boxes=s["boxes"], init_fn=s["init_fn"], step_fn=s["step_fn"],
             rng_key=s["key"], max_iterations=30,
             n_mcmc_steps=5, initial_step_size=0.3,
             pressure=0.01,
@@ -331,7 +337,7 @@ class TestCheckpointPressure:
         s = periodic_setup
         result = run_ns(
             s["positions"], s["types"], s["energies"],
-            boxes=s["boxes"], step_fn=s["step_fn"],
+            boxes=s["boxes"], init_fn=s["init_fn"], step_fn=s["step_fn"],
             rng_key=s["key"], max_iterations=30,
             n_mcmc_steps=5, initial_step_size=0.3,
         )

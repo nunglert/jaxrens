@@ -380,15 +380,20 @@ class TestFallbackTermination:
 # ── Integration: TempTermination with run_ns ───────────────────────────
 
 
+@pytest.mark.heavy
 class TestTempTerminationIntegration:
     def test_run_ns_with_temp_termination(self):
         """TempTermination terminates a real NS run before max_iterations."""
         from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.moves.random_walk import build_kernel as rw_build_kernel
+        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        from jaxrens.sampling.moves import random_walk
+        from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import run_ns
 
         energy_fn, params = create_harmonic(k=1.0)
-        step_fn = jax.jit(rw_build_kernel(energy_fn, params))
+        init_fn, step_fn = build_mwg(energy_fn, params, [
+            MoveDescriptor("random_walk", random_walk.build_kernel),
+        ])
 
         n_walkers = 50
         key = jax.random.key(99)
@@ -411,6 +416,7 @@ class TestTempTerminationIntegration:
         result = run_ns(
             positions, types, energies,
             boxes=None,
+            init_fn=init_fn,
             step_fn=step_fn,
             rng_key=key,
             max_iterations=max_iters,
@@ -428,11 +434,15 @@ class TestTempTerminationIntegration:
     def test_energy_termination_with_run_ns(self):
         """EnergyTermination stops run_ns when emax drops below target."""
         from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.moves.random_walk import build_kernel as rw_build_kernel
+        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        from jaxrens.sampling.moves import random_walk
+        from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import run_ns
 
         energy_fn, params = create_harmonic(k=1.0)
-        step_fn = jax.jit(rw_build_kernel(energy_fn, params))
+        init_fn, step_fn = build_mwg(energy_fn, params, [
+            MoveDescriptor("random_walk", random_walk.build_kernel),
+        ])
 
         n_walkers = 50
         key = jax.random.key(77)
@@ -453,6 +463,7 @@ class TestTempTerminationIntegration:
         result = run_ns(
             positions, types, energies,
             boxes=None,
+            init_fn=init_fn,
             step_fn=step_fn,
             rng_key=key,
             max_iterations=max_iters,

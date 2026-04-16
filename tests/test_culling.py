@@ -15,7 +15,9 @@ import jax.numpy as jnp
 import pytest
 
 from jaxrens.backends.toy import create_harmonic
+from jaxrens.sampling.move_descriptor import MoveDescriptor
 from jaxrens.sampling.moves import random_walk
+from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import (
     _find_worst_walkers,
     init_ns,
@@ -23,6 +25,13 @@ from jaxrens.sampling.nested_sampling import (
     ns_step_multi_cull,
     run_ns,
 )
+
+
+def _make_mwg(energy_fn, params):
+    """Helper: build MWG init_fn/step_fn for random walk."""
+    return build_mwg(energy_fn, params, [
+        MoveDescriptor("random_walk", random_walk.build_kernel),
+    ])
 
 
 @pytest.fixture
@@ -72,9 +81,9 @@ class TestNsStepMultiCull:
             params, positions, types
         )
         ns_state = init_ns(positions, types, energies, None, jax.random.key(1))
-        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
+        init_fn, step_fn = _make_mwg(energy_fn, params)
 
-        new_state, info, _ = ns_step(ns_state, step_fn, n_mcmc_steps=5)
+        new_state, info, _ = ns_step(ns_state, init_fn, step_fn, n_mcmc_steps=5)
         assert new_state["n_dead"] == 1
         assert new_state["iteration"] == 1
 
@@ -89,9 +98,9 @@ class TestNsStepMultiCull:
             params, positions, types
         )
         ns_state = init_ns(positions, types, energies, None, jax.random.key(11))
-        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
+        init_fn, step_fn = _make_mwg(energy_fn, params)
 
-        new_state, info, _ = ns_step_multi_cull(ns_state, step_fn, n_cull=3, n_mcmc_steps=5)
+        new_state, info, _ = ns_step_multi_cull(ns_state, init_fn, step_fn, n_cull=3, n_mcmc_steps=5)
         assert new_state["n_dead"] == 3
         assert new_state["iteration"] == 3
 
@@ -111,8 +120,8 @@ class TestNsStepMultiCull:
         worst_3 = set(int(i) for i in sorted_indices[:3])
 
         ns_state = init_ns(positions, types, energies, None, jax.random.key(21))
-        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
-        new_state, info, _ = ns_step_multi_cull(ns_state, step_fn, n_cull=3, n_mcmc_steps=10)
+        init_fn, step_fn = _make_mwg(energy_fn, params)
+        new_state, info, _ = ns_step_multi_cull(ns_state, init_fn, step_fn, n_cull=3, n_mcmc_steps=10)
 
         # The worst walkers' energies should have changed
         for w_idx in worst_3:
@@ -129,14 +138,15 @@ class TestNsStepMultiCull:
             params, positions, types
         )
         ns_state = init_ns(positions, types, energies, None, jax.random.key(31))
-        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
+        init_fn, step_fn = _make_mwg(energy_fn, params)
 
-        new_state, info, _ = ns_step_multi_cull(ns_state, step_fn, n_cull=3, n_mcmc_steps=5)
+        new_state, info, _ = ns_step_multi_cull(ns_state, init_fn, step_fn, n_cull=3, n_mcmc_steps=5)
         dead_e = new_state["dead_energies"][:3]
         # First dead point should have highest energy
         assert float(dead_e[0]) >= float(dead_e[1]) >= float(dead_e[2])
 
 
+@pytest.mark.heavy
 class TestRunNsMultiCull:
     def test_run_ns_n_cull_1_baseline(self, harmonic):
         """run_ns with n_cull=1 should work and produce dead points."""
@@ -148,11 +158,11 @@ class TestRunNsMultiCull:
         energies = jax.vmap(energy_fn, in_axes=(None, 0, None))(
             params, positions, types
         )
-        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
+        init_fn, step_fn = _make_mwg(energy_fn, params)
 
         result = run_ns(
             positions, types, energies, None,
-            step_fn, jax.random.key(101),
+            init_fn, step_fn, jax.random.key(101),
             max_iterations=50,
             n_mcmc_steps=5,
             n_cull=1,
@@ -172,11 +182,11 @@ class TestRunNsMultiCull:
         energies = jax.vmap(energy_fn, in_axes=(None, 0, None))(
             params, positions, types
         )
-        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
+        init_fn, step_fn = _make_mwg(energy_fn, params)
 
         result = run_ns(
             positions, types, energies, None,
-            step_fn, jax.random.key(111),
+            init_fn, step_fn, jax.random.key(111),
             max_iterations=30,
             n_mcmc_steps=5,
             n_cull=2,
@@ -197,11 +207,11 @@ class TestRunNsMultiCull:
         energies = jax.vmap(energy_fn, in_axes=(None, 0, None))(
             params, positions, types
         )
-        step_fn = jax.jit(random_walk.build_kernel(energy_fn, params))
+        init_fn, step_fn = _make_mwg(energy_fn, params)
 
         result = run_ns(
             positions, types, energies, None,
-            step_fn, jax.random.key(121),
+            init_fn, step_fn, jax.random.key(121),
             max_iterations=200,
             n_mcmc_steps=10,
             n_cull=2,

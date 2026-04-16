@@ -11,7 +11,7 @@ from jaxrens.cli.parser import (
     dict_to_input_str,
     load_config,
 )
-from jaxrens.cli.run import setup_move_kernel, run_from_config
+from jaxrens.cli.run import setup_mwg, run_from_config
 from jaxrens.state.config import NSConfig, MoveConfig, BackendConfig, OutputConfig
 
 
@@ -80,26 +80,28 @@ class TestParser:
 
 
 class TestRun:
-    def test_setup_move_kernel_random_walk(self):
+    def test_setup_mwg_random_walk(self):
         from jaxrens.backends.toy import create_harmonic
 
         energy_fn, params = create_harmonic()
         move_config = MoveConfig(move_type="random_walk")
-        step_fn = setup_move_kernel(move_config, energy_fn, params)
+        init_fn, step_fn = setup_mwg(move_config, energy_fn, params)
+        assert callable(init_fn)
         assert callable(step_fn)
 
-    def test_setup_move_kernel_galilean(self):
+    def test_setup_mwg_galilean(self):
         from jaxrens.backends.toy import create_harmonic
 
         energy_fn, params = create_harmonic()
         move_config = MoveConfig(move_type="galilean")
-        step_fn = setup_move_kernel(move_config, energy_fn, params)
+        init_fn, step_fn = setup_mwg(move_config, energy_fn, params)
+        assert callable(init_fn)
         assert callable(step_fn)
 
-    def test_setup_move_kernel_unknown_raises(self):
+    def test_setup_mwg_unknown_raises(self):
         move_config = MoveConfig(move_type="nonexistent")
         with pytest.raises(ValueError, match="Unknown move type"):
-            setup_move_kernel(move_config, lambda *a, **k: 0, None)
+            setup_mwg(move_config, lambda *a, **k: 0, None)
 
     def test_run_from_config_toy(self, tmp_path):
         """End-to-end: run NS on harmonic with config objects."""

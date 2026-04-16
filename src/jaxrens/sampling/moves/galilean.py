@@ -18,49 +18,14 @@ Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 
-from jaxrens.base import MoveInfo, MoveKernel
-from jaxrens.types import Box, Params, Positions, Types
-
-
-class GalileanState(NamedTuple):
-    """State for the Galilean Monte Carlo move."""
-
-    positions: jnp.ndarray  # (n_atoms, 3)
-    types: jnp.ndarray  # (n_atoms,)
-    energy: jnp.ndarray  # scalar
-    box: jnp.ndarray | None  # (3, 3) or None
-    direction: jnp.ndarray  # (n_atoms, 3) — unit velocity direction
-    step_size: jnp.ndarray  # scalar
-
-
-def init(
-    positions: Positions,
-    types: Types,
-    energy: float,
-    box: Box | None = None,
-    step_size: float = 0.1,
-    direction: jnp.ndarray | None = None,
-) -> GalileanState:
-    """Create initial Galilean state.
-
-    If direction is None, it will be initialized to zeros and randomized
-    on the first step.
-    """
-    if direction is None:
-        direction = jnp.zeros_like(positions)
-    return GalileanState(
-        positions=positions,
-        types=types,
-        energy=jnp.asarray(energy),
-        box=box,
-        direction=direction,
-        step_size=jnp.asarray(step_size),
-    )
+from jaxrens.base import MoveInfo
+from jaxrens.state.mc_state import MCState
+from jaxrens.types import Params
 
 
 def _random_direction(key: jax.Array, shape: tuple) -> jnp.ndarray:
@@ -112,9 +77,9 @@ def build_kernel(
 
     def step(
         rng_key: jax.Array,
-        state: GalileanState,
+        state: MCState,
         likelihood_constraint: float,
-    ) -> tuple[GalileanState, MoveInfo]:
+    ) -> tuple[MCState, MoveInfo]:
         key_init, key_perturb, key_reflect = jax.random.split(rng_key, 3)
 
         # Initialize direction if zero (first call), otherwise perturb
@@ -169,40 +134,18 @@ def build_kernel(
         accepted = final_energy < likelihood_constraint
 
         # If rejected: revert to initial positions, flip direction
-        out_positions = jnp.where(accepted, final_pos, state.positions)
-        out_energy = jnp.where(accepted, final_energy, state.energy)
-        out_direction = jnp.where(accepted, final_dir, -state.direction)
-
-        new_state = GalileanState(
-            positions=out_positions,
-            types=state.types,
-            energy=out_energy,
-            box=state.box,
-            direction=out_direction,
-            step_size=state.step_size,
+        new_state = state.set(
+            positions=jnp.where(accepted, final_pos, state.positions),
+            energy=jnp.where(accepted, final_energy, state.energy),
+            direction=jnp.where(accepted, final_dir, -state.direction),
         )
 
         info = MoveInfo(
             accepted=accepted,
-            log_likelihood=-out_energy,
+            log_likelihood=-new_state.energy,
             n_evaluations=n_evals,
         )
 
         return new_state, info
 
     return step
-
-
-def as_top_level_api(
-    energy_fn: Any,
-    params: Params,
-    step_size: float = 0.1,
-    n_reflect: int = 5,
-    **kwargs: Any,
-) -> MoveKernel:
-    """Convenient top-level API."""
-    kernel = build_kernel(energy_fn, params, n_reflect=n_reflect, **kwargs)
-    init_fn = lambda pos, types, energy, box=None: init(
-        pos, types, energy, box, step_size
-    )
-    return MoveKernel(init=init_fn, step=kernel)

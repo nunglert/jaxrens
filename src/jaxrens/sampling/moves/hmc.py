@@ -12,40 +12,14 @@ Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 
-from jaxrens.base import MoveInfo, MoveKernel
-from jaxrens.types import Box, Params, Positions, Types
-
-
-class HMCState(NamedTuple):
-    """State for the HMC move."""
-
-    positions: jnp.ndarray  # (n_atoms, 3)
-    types: jnp.ndarray  # (n_atoms,)
-    energy: jnp.ndarray  # scalar
-    box: jnp.ndarray | None  # (3, 3) or None
-    step_size: jnp.ndarray  # scalar
-
-
-def init(
-    positions: Positions,
-    types: Types,
-    energy: float,
-    box: Box | None = None,
-    step_size: float = 0.01,
-) -> HMCState:
-    """Create initial HMC state."""
-    return HMCState(
-        positions=positions,
-        types=types,
-        energy=jnp.asarray(energy),
-        box=box,
-        step_size=jnp.asarray(step_size),
-    )
+from jaxrens.base import MoveInfo
+from jaxrens.state.mc_state import MCState
+from jaxrens.types import Params
 
 
 def build_kernel(
@@ -68,9 +42,9 @@ def build_kernel(
 
     def step(
         rng_key: jax.Array,
-        state: HMCState,
+        state: MCState,
         likelihood_constraint: float,
-    ) -> tuple[HMCState, MoveInfo]:
+    ) -> tuple[MCState, MoveInfo]:
         # Sample random momentum
         momentum = jax.random.normal(rng_key, shape=state.positions.shape)
 
@@ -111,37 +85,17 @@ def build_kernel(
         ns_ok = new_energy < likelihood_constraint
         accepted = ns_ok & hamiltonian_ok
 
-        out_positions = jnp.where(accepted, new_positions, state.positions)
-        out_energy = jnp.where(accepted, new_energy, state.energy)
-
-        new_state = HMCState(
-            positions=out_positions,
-            types=state.types,
-            energy=out_energy,
-            box=state.box,
-            step_size=state.step_size,
+        new_state = state.set(
+            positions=jnp.where(accepted, new_positions, state.positions),
+            energy=jnp.where(accepted, new_energy, state.energy),
         )
 
         info = MoveInfo(
             accepted=accepted,
-            log_likelihood=-out_energy,
+            log_likelihood=-new_state.energy,
             n_evaluations=2 * n_leapfrog,  # 2 grad evals per leapfrog step
         )
 
         return new_state, info
 
     return step
-
-
-def as_top_level_api(
-    energy_fn: Any,
-    params: Params,
-    step_size: float = 0.01,
-    n_leapfrog: int = 10,
-) -> MoveKernel:
-    """Convenient top-level API."""
-    kernel = build_kernel(energy_fn, params, n_leapfrog=n_leapfrog)
-    init_fn = lambda pos, types, energy, box=None: init(
-        pos, types, energy, box, step_size
-    )
-    return MoveKernel(init=init_fn, step=kernel)

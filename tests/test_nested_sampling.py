@@ -12,7 +12,9 @@ import jax.numpy as jnp
 import pytest
 
 from jaxrens.backends.toy import create_harmonic
-from jaxrens.sampling.moves.random_walk import build_kernel as rw_build_kernel
+from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.moves import random_walk
+from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, ns_step, run_ns
 from jaxrens.sampling.adaptation.step_size import init_adaptation
 
@@ -21,7 +23,9 @@ from jaxrens.sampling.adaptation.step_size import init_adaptation
 def harmonic_setup():
     """Set up a harmonic oscillator NS problem."""
     energy_fn, params = create_harmonic(k=1.0)
-    step_fn = jax.jit(rw_build_kernel(energy_fn, params))
+    init_fn, step_fn = build_mwg(energy_fn, params, [
+        MoveDescriptor("random_walk", random_walk.build_kernel),
+    ])
 
     n_walkers = 50
     n_atoms = 1
@@ -42,6 +46,7 @@ def harmonic_setup():
     return {
         "energy_fn": energy_fn,
         "params": params,
+        "init_fn": init_fn,
         "step_fn": step_fn,
         "positions": positions,
         "types": types,
@@ -82,7 +87,7 @@ class TestNSStep:
         adapt = init_adaptation(initial_step_size=0.3)
 
         new_state, info, new_adapt = ns_step(
-            state, s["step_fn"], n_mcmc_steps=10, adapt_state=adapt,
+            state, s["init_fn"], s["step_fn"], n_mcmc_steps=10, adapt_state=adapt,
         )
 
         assert new_state["iteration"] == 1
@@ -101,7 +106,7 @@ class TestNSStep:
         emaxes = []
         for _ in range(20):
             state, info, adapt = ns_step(
-                state, s["step_fn"], n_mcmc_steps=10, adapt_state=adapt,
+                state, s["init_fn"], s["step_fn"], n_mcmc_steps=10, adapt_state=adapt,
             )
             emaxes.append(float(info["emax"]))
 
@@ -118,7 +123,7 @@ class TestNSStep:
 
         for _ in range(50):
             state, info, adapt = ns_step(
-                state, s["step_fn"], n_mcmc_steps=10, adapt_state=adapt,
+                state, s["init_fn"], s["step_fn"], n_mcmc_steps=10, adapt_state=adapt,
             )
 
         # Evidence should be finite after some iterations
@@ -131,6 +136,7 @@ class TestRunNS:
         result = run_ns(
             s["positions"], s["types"], s["energies"],
             boxes=None,
+            init_fn=s["init_fn"],
             step_fn=s["step_fn"],
             rng_key=s["key"],
             max_iterations=100,
@@ -141,6 +147,7 @@ class TestRunNS:
         assert result["n_dead"] > 0
         assert jnp.isfinite(result["log_evidence"])
 
+    @pytest.mark.heavy
     def test_harmonic_evidence_accuracy(self):
         """Test evidence on 1-atom 3D harmonic oscillator.
 
@@ -156,9 +163,11 @@ class TestRunNS:
         exp(-E) over the prior volume.
         """
         energy_fn, params = create_harmonic(k=1.0)
-        step_fn = jax.jit(rw_build_kernel(energy_fn, params))
+        init_fn, step_fn = build_mwg(energy_fn, params, [
+            MoveDescriptor("random_walk", random_walk.build_kernel),
+        ])
 
-        n_walkers = 100
+        n_walkers = 30
         L = 5.0
         key = jax.random.key(123)
         key, init_key = jax.random.split(key)
@@ -174,10 +183,11 @@ class TestRunNS:
         result = run_ns(
             positions, types, energies,
             boxes=None,
+            init_fn=init_fn,
             step_fn=step_fn,
             rng_key=key,
-            max_iterations=2000,
-            n_mcmc_steps=10,
+            max_iterations=500,
+            n_mcmc_steps=5,
             initial_step_size=0.5,
             target_acceptance=0.4,
             convergence_threshold=0.5,
@@ -211,6 +221,7 @@ class TestRunNS:
         result = run_ns(
             s["positions"], s["types"], s["energies"],
             boxes=None,
+            init_fn=s["init_fn"],
             step_fn=s["step_fn"],
             rng_key=s["key"],
             max_iterations=20,

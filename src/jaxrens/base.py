@@ -13,7 +13,7 @@ from jaxrens.types import Box, Params, Positions, Types
 
 
 # ---------------------------------------------------------------------------
-# Move kernel protocol (BlackJAX-inspired init/step pattern)
+# Move kernel protocol
 # ---------------------------------------------------------------------------
 
 
@@ -23,19 +23,6 @@ class MoveInfo(NamedTuple):
     accepted: jnp.ndarray  # bool scalar
     log_likelihood: jnp.ndarray  # float scalar
     n_evaluations: int
-
-
-class MoveKernel(NamedTuple):
-    """Every NS move exposes this interface."""
-
-    init: "InitFn"
-    step: "StepFn"
-
-
-class InitFn(Protocol):
-    def __call__(self, positions: Positions, energy: float) -> Any:
-        """Create initial move state from walker position and energy."""
-        ...
 
 
 class StepFn(Protocol):

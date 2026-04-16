@@ -15,11 +15,8 @@ from jaxrens.sampling.adaptation.step_size import (
     get_step_size,
 )
 from jaxrens.backends.toy import create_harmonic
-from jaxrens.sampling.moves.random_walk import (
-    init as rw_init,
-    build_kernel as rw_build_kernel,
-    RandomWalkState,
-)
+from jaxrens.sampling.moves.random_walk import build_kernel as rw_build_kernel
+from jaxrens.state.mc_state import MCState
 
 
 class TestAdaptationState:
@@ -80,14 +77,21 @@ class TestAdaptationConvergence:
 
         # Warmup: 200 steps with adaptation
         step_fn = jax.jit(rw_build_kernel(energy_fn, params))
-        rw_state = rw_init(positions, types, energy=0.25, step_size=0.1)
+        rw_state = MCState(
+            positions=positions, types=types,
+            energy=jnp.asarray(0.25), box=jnp.zeros((3, 3)),
+            step_size=jnp.asarray(0.1),
+            step_sizes=jnp.array([0.1]),
+            n_accepted=jnp.zeros(1, dtype=jnp.int32),
+            n_proposed=jnp.zeros(1, dtype=jnp.int32),
+        )
         key = jax.random.key(42)
 
         for i in range(200):
             key, subkey = jax.random.split(key)
             # Set step size from adaptation
             current_ss = get_step_size(adapt_state)
-            rw_state = rw_state._replace(step_size=current_ss)
+            rw_state = rw_state.set(step_size=current_ss)
             rw_state, info = step_fn(subkey, rw_state, likelihood_constraint=3.0)
             adapt_state = dual_averaging_update(
                 adapt_state, info.accepted, target_acceptance=target_acc
@@ -95,7 +99,7 @@ class TestAdaptationConvergence:
 
         # Production: 200 steps with fixed step size, measure acceptance
         final_ss = get_step_size(adapt_state, use_averaged=True)
-        rw_state = rw_state._replace(step_size=final_ss)
+        rw_state = rw_state.set(step_size=final_ss)
 
         n_accepted = 0
         n_steps = 200

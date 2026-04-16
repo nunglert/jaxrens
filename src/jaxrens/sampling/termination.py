@@ -83,7 +83,13 @@ class PriorMassTermination:
         if iteration <= self.n_live:
             return False
         log_remaining = -iteration / self.n_live
-        return log_remaining < float(self._log_evidence) - self.threshold
+        converged = log_remaining < float(self._log_evidence) - self.threshold
+        if converged:
+            logger.debug(
+                "PriorMassTermination: log_remaining=%.4f < log_Z=%.4f - %.2f",
+                log_remaining, float(self._log_evidence), self.threshold,
+            )
+        return converged
 
     def message(self) -> str:
         return "Prior mass negligible compared to evidence"
@@ -153,6 +159,13 @@ class TempTermination:
         # Converged when last term is threshold orders of magnitude below max
         if self._log_Z_term_max > -math.inf:
             self._fulfilled = log_Z_term < (self._log_Z_term_max - self.threshold)
+
+        if self._fulfilled:
+            logger.debug(
+                "TempTermination: T=%.1fK, log_Z_term=%.4f, max=%.4f, gap=%.1f > %.1f",
+                self.target_temp, log_Z_term, self._log_Z_term_max,
+                self._log_Z_term_max - log_Z_term, self.threshold,
+            )
 
         return self._fulfilled
 

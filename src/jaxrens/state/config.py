@@ -37,6 +37,7 @@ class MoveConfig:
     move_type: str = "galilean"
     step_size: float = 0.1
     n_steps: int = 10
+    weight: float = 1.0  # relative probability for MWG dispatch
     adaptation_enabled: bool = True
     adaptation_warmup: int = 100
     target_acceptance: float = 0.5

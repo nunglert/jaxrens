@@ -17,13 +17,13 @@ def test_import_types():
 
 def test_import_base():
     from jaxrens.base import (
-        MoveKernel,
         MoveInfo,
+        StepFn,
         EnergyFn,
         TrajectoryWriter,
         NSCallback,
     )
-    assert MoveKernel is not None
+    assert MoveInfo is not None
 
 
 def test_import_state():

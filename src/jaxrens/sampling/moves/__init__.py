@@ -1,7 +1,8 @@
-"""One module per move type. Each exposes init, build_kernel, as_top_level_api."""
+"""One module per move type. Each exposes build_kernel (and variants)."""
 
 from jaxrens.sampling.moves import (
     alchemical,
+    galilean,
     hmc,
     random_walk,
     shear,

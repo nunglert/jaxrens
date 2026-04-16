@@ -80,6 +80,10 @@ def init_ns(
         "n_walkers": n_walkers,
         "rng_key": rng_key,
     }
+    logger.debug(
+        "NS state initialized: %d walkers, energy range [%.4g, %.4g], max_dead=%d",
+        n_walkers, float(jnp.min(energies)), float(jnp.max(energies)), max_dead,
+    )
     return state
 
 
@@ -171,6 +175,7 @@ def _find_worst_walkers(
 
 def ns_step(
     ns_state: dict,
+    init_fn: Callable,
     step_fn: Callable,
     n_mcmc_steps: int = 20,
     adapt_state: AdaptationState | None = None,
@@ -184,6 +189,7 @@ def ns_step(
 
     Args:
         ns_state: Current NS state dict.
+        init_fn: MCState constructor (positions, types, energy, box, step_size) -> MCState.
         step_fn: MCMC step function (key, state, Emax) -> (state, info).
         n_mcmc_steps: Number of MCMC steps per dead-point replacement.
         adapt_state: Optional adaptation state for step size tuning.
@@ -204,8 +210,6 @@ def ns_step(
     # Use enthalpy if pressure is set
     comparison_values = _compute_enthalpies(energies, boxes, pressure)
     n_atoms = positions.shape[1] if positions.ndim >= 2 else None
-
-    from jaxrens.sampling.moves.random_walk import RandomWalkState
 
     step_size = (
         get_step_size(adapt_state) if adapt_state is not None else jnp.array(0.1)
@@ -242,7 +246,7 @@ def ns_step(
     clone_idx = jax.random.randint(key_clone, (), 0, n_walkers - 1)
     clone_idx = jnp.where(clone_idx >= worst_idx, clone_idx + 1, clone_idx)
 
-    clone_state = RandomWalkState(
+    clone_state = init_fn(
         positions=positions[clone_idx],
         types=types[clone_idx],
         energy=energies[clone_idx],
@@ -305,11 +309,19 @@ def ns_step(
         "step_size": step_size,
     }
 
+    logger.debug(
+        "iter=%d  worst=%d  Emax=%.6g  clone=%d  acc=%d/%d (%.2f)  ss=%.4g  log_Z=%.4f",
+        iteration, int(worst_idx), float(emax), int(clone_idx),
+        int(n_accepted), n_mcmc_steps, float(acc_rate),
+        float(step_size), float(log_evidence),
+    )
+
     return new_ns_state, info, adapt_state
 
 
 def ns_step_multi_cull(
     ns_state: dict,
+    init_fn: Callable,
     step_fn: Callable,
     n_cull: int,
     n_mcmc_steps: int = 20,
@@ -324,6 +336,7 @@ def ns_step_multi_cull(
 
     Args:
         ns_state: Current NS state dict.
+        init_fn: MCState constructor (positions, types, energy, box, step_size) -> MCState.
         step_fn: MCMC step function (key, state, Emax) -> (state, info).
         n_cull: Number of walkers to replace (must be >= 2).
         n_mcmc_steps: Number of MCMC steps per replacement.
@@ -344,8 +357,6 @@ def ns_step_multi_cull(
 
     comparison_values = _compute_enthalpies(energies, boxes, pressure)
     n_atoms = positions.shape[1] if positions.ndim >= 2 else None
-
-    from jaxrens.sampling.moves.random_walk import RandomWalkState
 
     step_size = (
         get_step_size(adapt_state) if adapt_state is not None else jnp.array(0.1)
@@ -416,7 +427,7 @@ def ns_step_multi_cull(
         clone_idx = survivor_indices[clone_pick]
         clone_indices.append(clone_idx)
 
-        clone_state = RandomWalkState(
+        clone_state = init_fn(
             positions=new_positions[clone_idx],
             types=new_types[clone_idx],
             energy=new_energies[clone_idx],
@@ -478,6 +489,16 @@ def ns_step_multi_cull(
         "step_size": step_size,
     }
 
+    logger.debug(
+        "iter=%d  culled=%s  Emax=%.6g  clones=%s  acc=%d/%d (%.2f)  ss=%.4g  log_Z=%.4f",
+        iteration,
+        [int(i) for i in worst_indices],
+        float(energies[worst_indices[0]]),
+        [int(i) for i in clone_indices],
+        total_accepted, total_mcmc, acc_rate,
+        float(step_size), float(log_evidence),
+    )
+
     return new_ns_state, info, adapt_state
 
 
@@ -486,6 +507,7 @@ def run_ns(
     types: jnp.ndarray,
     energies: jnp.ndarray,
     boxes: jnp.ndarray | None,
+    init_fn: Callable,
     step_fn: Callable,
     rng_key: jax.Array,
     n_walkers: int | None = None,
@@ -509,7 +531,8 @@ def run_ns(
         types: Atom types, shape (n_atoms,).
         energies: Initial walker energies, shape (n_walkers,).
         boxes: Unit cells, shape (n_walkers, 3, 3) or None.
-        step_fn: MCMC step function from build_kernel().
+        init_fn: MCState constructor from build_mwg().
+        step_fn: MCMC step function from build_mwg().
         rng_key: JAX PRNG key.
         n_walkers: Number of live walkers (inferred from positions if None).
         max_iterations: Maximum number of NS iterations.
@@ -550,6 +573,17 @@ def run_ns(
         target_acceptance=target_acceptance,
     )
 
+    n_atoms = positions.shape[1] if positions.ndim >= 2 else None
+    ensemble = "NPT" if pressure else "NVT"
+    logger.info(
+        "Starting NS run: %d walkers, %s atoms, %s ensemble, "
+        "n_cull=%d, max_iter=%d, n_mcmc=%d",
+        n_walkers, n_atoms, ensemble, n_cull, max_iterations, n_mcmc_steps,
+    )
+
+    # Determine INFO log interval: ~20 messages for the full run
+    info_interval = max(1, max_iterations // 20)
+
     # Outer loop
     for i in range(max_iterations):
         # Use adaptation during warmup, fixed after
@@ -558,6 +592,7 @@ def run_ns(
         if n_cull == 1:
             ns_state, info, adapt_state_new = ns_step(
                 ns_state,
+                init_fn,
                 step_fn,
                 n_mcmc_steps=n_mcmc_steps,
                 adapt_state=adapt_state,
@@ -567,6 +602,7 @@ def run_ns(
         else:
             ns_state, info, adapt_state_new = ns_step_multi_cull(
                 ns_state,
+                init_fn,
                 step_fn,
                 n_cull=n_cull,
                 n_mcmc_steps=n_mcmc_steps,
@@ -575,6 +611,17 @@ def run_ns(
                 pressure=pressure,
             )
         adapt_state = adapt_state_new
+
+        # Periodic INFO log
+        if i % info_interval == 0 or i == max_iterations - 1:
+            logger.info(
+                "iter=%d  Emax=%.6g  log_Z=%.4f  acc=%.2f  ss=%.4g",
+                ns_state["iteration"],
+                float(info["emax"]),
+                float(info["log_evidence"]),
+                float(info["acceptance_rate"]),
+                float(info["step_size"]),
+            )
 
         # Callbacks
         for cb in callbacks:
@@ -613,6 +660,11 @@ def run_ns(
         ns_state["live_volumes"] = jax.vmap(get_volume)(ns_state["boxes"])
     else:
         ns_state["live_volumes"] = None
+
+    logger.info(
+        "NS complete: %d dead points, log_Z=%.4f",
+        ns_state["n_dead"], float(ns_state["log_evidence"]),
+    )
 
     # Callbacks: on_finish
     for cb in callbacks:

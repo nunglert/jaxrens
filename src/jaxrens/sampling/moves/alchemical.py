@@ -1,48 +1,22 @@
 """Alchemical move kernels for nested sampling.
 
-- AtomMorphKernel: gradually morph an atom's type between species
+- build_morph_kernel: gradually morph an atom's type between species
   (interpolate between species for semi-grand-canonical sampling)
-- RandomShiftKernel: random translation of all atoms (rigid shift)
+- build_shift_kernel: random translation of all atoms (rigid shift)
 
 Single-walker functions, designed for pmap(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 
-from jaxrens.base import MoveInfo, MoveKernel
-from jaxrens.types import Box, Params, Positions, Types
-
-
-class AlchemicalState(NamedTuple):
-    """State for alchemical moves."""
-
-    positions: jnp.ndarray  # (n_atoms, 3)
-    types: jnp.ndarray  # (n_atoms,)
-    energy: jnp.ndarray  # scalar
-    box: jnp.ndarray | None  # (3, 3) or None
-    step_size: jnp.ndarray  # scalar
-
-
-def init(
-    positions: Positions,
-    types: Types,
-    energy: float,
-    box: Box | None = None,
-    step_size: float = 0.1,
-) -> AlchemicalState:
-    """Create initial alchemical state."""
-    return AlchemicalState(
-        positions=positions,
-        types=types,
-        energy=jnp.asarray(energy),
-        box=box,
-        step_size=jnp.asarray(step_size),
-    )
+from jaxrens.base import MoveInfo
+from jaxrens.state.mc_state import MCState
+from jaxrens.types import Params
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +46,9 @@ def build_morph_kernel(
 
     def step(
         rng_key: jax.Array,
-        state: AlchemicalState,
+        state: MCState,
         likelihood_constraint: float,
-    ) -> tuple[AlchemicalState, MoveInfo]:
+    ) -> tuple[MCState, MoveInfo]:
         key_atom, key_species = jax.random.split(rng_key)
 
         n_atoms = state.positions.shape[0]
@@ -91,20 +65,14 @@ def build_morph_kernel(
 
         accepted = new_energy < likelihood_constraint
 
-        out_types = jnp.where(accepted, new_types, state.types)
-        out_energy = jnp.where(accepted, new_energy, state.energy)
-
-        new_state = AlchemicalState(
-            positions=state.positions,
-            types=out_types,
-            energy=out_energy,
-            box=state.box,
-            step_size=state.step_size,
+        new_state = state.set(
+            types=jnp.where(accepted, new_types, state.types),
+            energy=jnp.where(accepted, new_energy, state.energy),
         )
 
         info = MoveInfo(
             accepted=accepted,
-            log_likelihood=-out_energy,
+            log_likelihood=-new_state.energy,
             n_evaluations=1,
         )
 
@@ -138,9 +106,9 @@ def build_shift_kernel(
 
     def step(
         rng_key: jax.Array,
-        state: AlchemicalState,
+        state: MCState,
         likelihood_constraint: float,
-    ) -> tuple[AlchemicalState, MoveInfo]:
+    ) -> tuple[MCState, MoveInfo]:
         # Random 3D translation, same for all atoms
         shift = state.step_size * jax.random.normal(rng_key, (3,))
         new_positions = state.positions + shift[None, :]
@@ -148,55 +116,17 @@ def build_shift_kernel(
         new_energy = energy_fn(params, new_positions, state.types, box=state.box)
         accepted = new_energy < likelihood_constraint
 
-        out_positions = jnp.where(accepted, new_positions, state.positions)
-        out_energy = jnp.where(accepted, new_energy, state.energy)
-
-        new_state = AlchemicalState(
-            positions=out_positions,
-            types=state.types,
-            energy=out_energy,
-            box=state.box,
-            step_size=state.step_size,
+        new_state = state.set(
+            positions=jnp.where(accepted, new_positions, state.positions),
+            energy=jnp.where(accepted, new_energy, state.energy),
         )
 
         info = MoveInfo(
             accepted=accepted,
-            log_likelihood=-out_energy,
+            log_likelihood=-new_state.energy,
             n_evaluations=1,
         )
 
         return new_state, info
 
     return step
-
-
-# ---------------------------------------------------------------------------
-# Top-level APIs
-# ---------------------------------------------------------------------------
-
-
-def as_morph_api(
-    energy_fn: Any,
-    params: Params,
-    n_species: int,
-    step_size: float = 0.1,
-) -> MoveKernel:
-    """Top-level API for atom morph move."""
-    kernel = build_morph_kernel(energy_fn, params, n_species)
-    init_fn = lambda pos, types, energy, box=None: init(
-        pos, types, energy, box, step_size
-    )
-    return MoveKernel(init=init_fn, step=kernel)
-
-
-def as_shift_api(
-    energy_fn: Any,
-    params: Params,
-    step_size: float = 0.1,
-) -> MoveKernel:
-    """Top-level API for random shift move."""
-    kernel = build_shift_kernel(energy_fn, params)
-    init_fn = lambda pos, types, energy, box=None: init(
-        pos, types, energy, box, step_size
-    )
-    return MoveKernel(init=init_fn, step=kernel)

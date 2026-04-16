@@ -3,49 +3,23 @@
 Moves that perturb one atom at a time, efficient for large systems where
 displacing all atoms simultaneously has low acceptance.
 
-- SingleAtomMoveKernel: move one random atom per step
-- SingleAtomSweepKernel: sweep through all atoms sequentially via lax.scan
-- SingleAtomSwapKernel: swap species of two random atoms (multi-component)
+- build_kernel: move one random atom per step
+- build_sweep_kernel: sweep through all atoms sequentially via lax.scan
+- build_swap_kernel: swap species of two random atoms (multi-component)
 
 Single-walker functions, designed for pmap(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 
-from jaxrens.base import MoveInfo, MoveKernel
-from jaxrens.types import Box, Params, Positions, Types
-
-
-class SingleAtomState(NamedTuple):
-    """State for single-atom moves."""
-
-    positions: jnp.ndarray  # (n_atoms, 3)
-    types: jnp.ndarray  # (n_atoms,)
-    energy: jnp.ndarray  # scalar
-    box: jnp.ndarray | None  # (3, 3) or None
-    step_size: jnp.ndarray  # scalar
-
-
-def init(
-    positions: Positions,
-    types: Types,
-    energy: float,
-    box: Box | None = None,
-    step_size: float = 0.1,
-) -> SingleAtomState:
-    """Create initial single-atom move state."""
-    return SingleAtomState(
-        positions=positions,
-        types=types,
-        energy=jnp.asarray(energy),
-        box=box,
-        step_size=jnp.asarray(step_size),
-    )
+from jaxrens.base import MoveInfo
+from jaxrens.state.mc_state import MCState
+from jaxrens.types import Params
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +46,9 @@ def build_kernel(
 
     def step(
         rng_key: jax.Array,
-        state: SingleAtomState,
+        state: MCState,
         likelihood_constraint: float,
-    ) -> tuple[SingleAtomState, MoveInfo]:
+    ) -> tuple[MCState, MoveInfo]:
         key_atom, key_disp = jax.random.split(rng_key)
 
         n_atoms = state.positions.shape[0]
@@ -87,20 +61,14 @@ def build_kernel(
         new_energy = energy_fn(params, new_positions, state.types, box=state.box)
         accepted = new_energy < likelihood_constraint
 
-        out_positions = jnp.where(accepted, new_positions, state.positions)
-        out_energy = jnp.where(accepted, new_energy, state.energy)
-
-        new_state = SingleAtomState(
-            positions=out_positions,
-            types=state.types,
-            energy=out_energy,
-            box=state.box,
-            step_size=state.step_size,
+        new_state = state.set(
+            positions=jnp.where(accepted, new_positions, state.positions),
+            energy=jnp.where(accepted, new_energy, state.energy),
         )
 
         info = MoveInfo(
             accepted=accepted,
-            log_likelihood=-out_energy,
+            log_likelihood=-new_state.energy,
             n_evaluations=1,
         )
 
@@ -135,9 +103,9 @@ def build_sweep_kernel(
 
     def step(
         rng_key: jax.Array,
-        state: SingleAtomState,
+        state: MCState,
         likelihood_constraint: float,
-    ) -> tuple[SingleAtomState, MoveInfo]:
+    ) -> tuple[MCState, MoveInfo]:
         keys = jax.random.split(rng_key, n_atoms)
 
         def sweep_one(carry, key_and_idx):
@@ -161,17 +129,14 @@ def build_sweep_kernel(
             sweep_one, init_carry, (keys, atom_indices)
         )
 
-        new_state = SingleAtomState(
+        new_state = state.set(
             positions=final_positions,
-            types=state.types,
             energy=final_energy,
-            box=state.box,
-            step_size=state.step_size,
         )
 
         info = MoveInfo(
             accepted=n_accepted > 0,  # at least one atom accepted
-            log_likelihood=-final_energy,
+            log_likelihood=-new_state.energy,
             n_evaluations=n_atoms,
         )
 
@@ -204,9 +169,9 @@ def build_swap_kernel(
 
     def step(
         rng_key: jax.Array,
-        state: SingleAtomState,
+        state: MCState,
         likelihood_constraint: float,
-    ) -> tuple[SingleAtomState, MoveInfo]:
+    ) -> tuple[MCState, MoveInfo]:
         key_a, key_b = jax.random.split(rng_key)
 
         n_atoms = state.positions.shape[0]
@@ -224,68 +189,17 @@ def build_swap_kernel(
         different_species = type_a != type_b
         accepted = (new_energy < likelihood_constraint) & different_species
 
-        out_types = jnp.where(accepted, new_types, state.types)
-        out_energy = jnp.where(accepted, new_energy, state.energy)
-
-        new_state = SingleAtomState(
-            positions=state.positions,
-            types=out_types,
-            energy=out_energy,
-            box=state.box,
-            step_size=state.step_size,
+        new_state = state.set(
+            types=jnp.where(accepted, new_types, state.types),
+            energy=jnp.where(accepted, new_energy, state.energy),
         )
 
         info = MoveInfo(
             accepted=accepted,
-            log_likelihood=-out_energy,
+            log_likelihood=-new_state.energy,
             n_evaluations=1,
         )
 
         return new_state, info
 
     return step
-
-
-# ---------------------------------------------------------------------------
-# Top-level APIs
-# ---------------------------------------------------------------------------
-
-
-def as_top_level_api(
-    energy_fn: Any,
-    params: Params,
-    step_size: float = 0.1,
-) -> MoveKernel:
-    """Top-level API for single-atom random displacement."""
-    kernel = build_kernel(energy_fn, params)
-    init_fn = lambda pos, types, energy, box=None: init(
-        pos, types, energy, box, step_size
-    )
-    return MoveKernel(init=init_fn, step=kernel)
-
-
-def as_sweep_api(
-    energy_fn: Any,
-    params: Params,
-    n_atoms: int,
-    step_size: float = 0.1,
-) -> MoveKernel:
-    """Top-level API for single-atom sweep."""
-    kernel = build_sweep_kernel(energy_fn, params, n_atoms)
-    init_fn = lambda pos, types, energy, box=None: init(
-        pos, types, energy, box, step_size
-    )
-    return MoveKernel(init=init_fn, step=kernel)
-
-
-def as_swap_api(
-    energy_fn: Any,
-    params: Params,
-    step_size: float = 0.1,
-) -> MoveKernel:
-    """Top-level API for single-atom species swap."""
-    kernel = build_swap_kernel(energy_fn, params)
-    init_fn = lambda pos, types, energy, box=None: init(
-        pos, types, energy, box, step_size
-    )
-    return MoveKernel(init=init_fn, step=kernel)

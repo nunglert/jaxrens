@@ -23,35 +23,99 @@ from jaxrens.cli.monitor import (
 from jaxrens.cli.parser import load_config
 from jaxrens.io.energy_log import EnergyLogger
 from jaxrens.io.trajectory import create_trajectory_writer
-from jaxrens.sampling.moves.galilean import build_kernel as gmc_build_kernel
-from jaxrens.sampling.moves.random_walk import build_kernel as rw_build_kernel
+from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.moves import galilean, hmc, random_walk, single_atom, volume, shear, stretch
+from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import run_ns
 from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
 
 logger = logging.getLogger(__name__)
 
+# Map move type names to build_kernel functions
+_MOVE_REGISTRY: dict[str, Any] = {
+    "random_walk": random_walk.build_kernel,
+    "galilean": galilean.build_kernel,
+    "gmc": galilean.build_kernel,
+    "hmc": hmc.build_kernel,
+    "single_atom": single_atom.build_kernel,
+    "single_atom_sweep": single_atom.build_sweep_kernel,
+    "single_atom_swap": single_atom.build_swap_kernel,
+    "volume": volume.build_kernel,
+    "shear": shear.build_kernel,
+    "stretch": stretch.build_kernel,
+}
 
-def setup_move_kernel(
-    move_config: MoveConfig,
+
+def _build_kernel_kwargs(move_config: MoveConfig) -> dict[str, Any]:
+    """Extract kernel_kwargs from a MoveConfig based on move type."""
+    kwargs: dict[str, Any] = {}
+    match move_config.move_type:
+        case "galilean" | "gmc":
+            kwargs["n_reflect"] = move_config.n_steps
+        case "hmc":
+            kwargs["n_leapfrog"] = move_config.n_steps
+        case "volume" | "shear" | "stretch":
+            # n_atoms is passed via kernel_kwargs; caller must set it
+            pass
+    return kwargs
+
+
+def _extra_state_fields(move_type: str) -> dict[str, tuple[type, Any]]:
+    """Return extra MCState fields required by a move type."""
+    if move_type in ("galilean", "gmc"):
+        return {
+            "direction": (
+                jnp.ndarray,
+                lambda positions, types: jnp.zeros_like(positions),
+            ),
+        }
+    return {}
+
+
+def setup_mwg(
+    move_configs: list[MoveConfig] | MoveConfig,
     energy_fn: Any,
     params: Any,
 ):
-    """Create the MCMC step function based on move config."""
-    match move_config.move_type:
-        case "random_walk":
-            return rw_build_kernel(energy_fn, params)
-        case "galilean" | "gmc":
-            return gmc_build_kernel(
-                energy_fn, params,
-                n_reflect=move_config.n_steps,
+    """Create MWG init_fn and step_fn from move config(s).
+
+    Args:
+        move_configs: Single MoveConfig or list of MoveConfigs.
+            A single config is treated as a list of length 1.
+        energy_fn: Callable conforming to EnergyFn protocol.
+        params: Opaque pytree of backend parameters.
+
+    Returns:
+        (init_fn, step_fn) from build_mwg.
+    """
+    if isinstance(move_configs, MoveConfig):
+        move_configs = [move_configs]
+
+    descriptors = []
+    for mc in move_configs:
+        build_fn = _MOVE_REGISTRY.get(mc.move_type)
+        if build_fn is None:
+            raise ValueError(
+                f"Unknown move type: {mc.move_type!r}. "
+                f"Available: {list(_MOVE_REGISTRY)}"
             )
-        case _:
-            raise ValueError(f"Unknown move type: {move_config.move_type!r}")
+        descriptors.append(
+            MoveDescriptor(
+                name=mc.move_type,
+                build_kernel=build_fn,
+                kernel_kwargs=_build_kernel_kwargs(mc),
+                weight=mc.weight,
+                step_size=mc.step_size,
+                extra_state_fields=_extra_state_fields(mc.move_type),
+            )
+        )
+
+    return build_mwg(energy_fn, params, descriptors)
 
 
 def run_from_config(
     ns_config: NSConfig,
-    move_config: MoveConfig,
+    move_config: MoveConfig | list[MoveConfig],
     backend_config: BackendConfig,
     output_config: OutputConfig,
     initial_positions: jnp.ndarray,
@@ -66,7 +130,7 @@ def run_from_config(
 
     Args:
         ns_config: NS run parameters.
-        move_config: Move type and parameters.
+        move_config: Move type and parameters (single or list for MWG).
         backend_config: Energy backend parameters.
         output_config: I/O and output parameters.
         initial_positions: Starting walker positions (n_walkers, n_atoms, 3).
@@ -96,8 +160,8 @@ def run_from_config(
             params, initial_positions, initial_types
         )
 
-    # Build move kernel
-    step_fn = setup_move_kernel(move_config, energy_fn, params)
+    # Build MWG sampler
+    init_fn, step_fn = setup_mwg(move_config, energy_fn, params)
 
     # Set up callbacks
     callbacks = [
@@ -135,6 +199,9 @@ def run_from_config(
         )
     )
 
+    # Determine step_size for adaptation from first move config
+    first_mc = move_config[0] if isinstance(move_config, list) else move_config
+
     # Run
     key = jax.random.key(ns_config.seed)
     result = run_ns(
@@ -142,14 +209,15 @@ def run_from_config(
         types=initial_types,
         energies=initial_energies,
         boxes=initial_boxes,
+        init_fn=init_fn,
         step_fn=step_fn,
         rng_key=key,
         max_iterations=ns_config.max_iterations,
         n_mcmc_steps=ns_config.n_mcmc_steps,
         convergence_threshold=ns_config.convergence_threshold,
-        initial_step_size=move_config.step_size,
-        target_acceptance=move_config.target_acceptance,
-        adapt_warmup=move_config.adaptation_warmup,
+        initial_step_size=first_mc.step_size,
+        target_acceptance=first_mc.target_acceptance,
+        adapt_warmup=first_mc.adaptation_warmup,
         callbacks=callbacks,
         pressure=ns_config.pressure,
     )
