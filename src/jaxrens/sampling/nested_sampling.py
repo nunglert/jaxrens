@@ -123,6 +123,7 @@ def init_ns(
     max_dead: int = 50000,
     step_sizes: jnp.ndarray | None = None,
     ensemble_params: dict | None = None,
+    restart_state=None,
 ) -> NSState:
     """Initialize NSState from walker data.
 
@@ -142,6 +143,10 @@ def init_ns(
         max_dead: Maximum number of dead points to collect.
         step_sizes: Per-move step size array. None = use descriptor defaults.
         ensemble_params: Ensemble parameters dict for MCState.
+        restart_state: Optional RestartBundle from load_restart(). When
+            provided, seeds NSState dead-point history and bookkeeping
+            scalars from the checkpoint instead of zero-initializing.
+            The live-walker side is always taken from positions/energies.
 
     Returns:
         Initialized NSState with batched MCState population.
@@ -169,14 +174,45 @@ def init_ns(
         walkers.append(w)
     population = jax.tree.map(lambda *xs: jnp.stack(xs), *walkers)
 
+    if restart_state is None:
+        dead_energies = jnp.full(max_dead, jnp.inf)
+        dead_positions = jnp.zeros((max_dead, n_atoms, 3))
+        dead_volumes = jnp.zeros(max_dead)
+        log_evidence = jnp.array(-jnp.inf)
+        iteration = jnp.array(0, dtype=jnp.int32)
+        n_dead = jnp.array(0, dtype=jnp.int32)
+    else:
+        rs = restart_state
+        nd = rs.n_dead
+
+        dead_energies = jnp.full(max_dead, jnp.inf)
+        dead_energies = dead_energies.at[:nd].set(jnp.asarray(rs.dead_energies[:nd]))
+
+        dead_positions = jnp.zeros((max_dead, n_atoms, 3))
+        dead_positions = dead_positions.at[:nd].set(
+            jnp.asarray(rs.dead_positions[:nd])
+        )
+
+        if rs.dead_volumes is not None:
+            dead_volumes = jnp.zeros(max_dead)
+            dead_volumes = dead_volumes.at[:nd].set(
+                jnp.asarray(rs.dead_volumes[:nd])
+            )
+        else:
+            dead_volumes = jnp.zeros(max_dead)
+
+        log_evidence = jnp.array(rs.log_evidence)
+        iteration = jnp.array(rs.iteration, dtype=jnp.int32)
+        n_dead = jnp.array(nd, dtype=jnp.int32)
+
     state = NSState(
         population=population,
-        dead_energies=jnp.full(max_dead, jnp.inf),
-        dead_positions=jnp.zeros((max_dead, n_atoms, 3)),
-        dead_volumes=jnp.zeros(max_dead),
-        log_evidence=jnp.array(-jnp.inf),
-        iteration=jnp.array(0, dtype=jnp.int32),
-        n_dead=jnp.array(0, dtype=jnp.int32),
+        dead_energies=dead_energies,
+        dead_positions=dead_positions,
+        dead_volumes=dead_volumes,
+        log_evidence=log_evidence,
+        iteration=iteration,
+        n_dead=n_dead,
         rng_key=rng_key,
         n_walkers=n_walkers,
         n_atoms=n_atoms,
@@ -184,8 +220,9 @@ def init_ns(
     )
 
     logger.debug(
-        "NS state initialized: %d walkers, energy range [%.4g, %.4g], max_dead=%d",
+        "NS state initialized: %d walkers, energy range [%.4g, %.4g], max_dead=%d%s",
         n_walkers, float(jnp.min(energies)), float(jnp.max(energies)), max_dead,
+        f" (restart from iteration {restart_state.iteration})" if restart_state is not None else "",
     )
     return state
 
@@ -373,6 +410,7 @@ def run_ns(
     adjust_n_samples: int = 50,
     adjust_max_rounds: int = 15,
     adjust_factor: float = 1.5,
+    restart_state=None,
 ) -> dict:
     """Run a full nested sampling calculation.
 
@@ -399,6 +437,7 @@ def run_ns(
         max_dead=max_iterations,
         step_sizes=jnp.full(1, initial_step_size),
         ensemble_params=ensemble_params,
+        restart_state=restart_state,
     )
 
     adapt_state = init_adaptation(

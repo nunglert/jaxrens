@@ -120,6 +120,7 @@ def run_from_config(
     initial_cells: jnp.ndarray | None = None,
     symbol_map: dict[int, str] | None = None,
     termination_criteria: list | None = None,
+    restart_state=None,
 ) -> dict:
     """Run NS from typed config objects."""
     if symbol_map is None:
@@ -142,8 +143,11 @@ def run_from_config(
     else:
         backend = base_backend
 
-    # Compute initial energies if not provided
     if initial_energies is None:
+        logger.debug(
+            "initial_energies missing from ResolvedInit; computing in run_from_config. "
+            "Prefer populating ResolvedInit.initial_energies via the resolver."
+        )
         def eval_one(pos):
             e, _, _ = backend(pos, initial_types,
                              initial_cells[0] if initial_cells is not None else jnp.zeros((3, 3)),
@@ -208,6 +212,7 @@ def run_from_config(
         callbacks=callbacks,
         ensemble_params=ensemble_params,
         termination_criteria=termination_criteria,
+        restart_state=restart_state,
     )
 
     return result

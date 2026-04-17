@@ -22,6 +22,12 @@ from jaxrens.cli.schema.cell import CellConfig
 from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
 from jaxrens.cli.schema.init import InitConfig
 from jaxrens.cli.schema.root import RootConfig
+from jaxrens.init.cells import cell_shape_walk, sample_initial_volume
+from jaxrens.init.positions import grid_positions_in_cell, uniform_positions_in_cell
+from jaxrens.init.rejection import rejection_sample_positions
+from jaxrens.init.restart import RestartBundle, load_restart
+from jaxrens.init.structure import load_structure
+from jaxrens.init.walker_set import load_walker_set
 from jaxrens.sampling.move_descriptor import MoveDescriptor
 from jaxrens.sampling.termination import (
     IterationTermination,
@@ -29,6 +35,7 @@ from jaxrens.sampling.termination import (
     TerminationCriterion,
 )
 from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
+from jaxrens.utils.cell import check_cell_shape
 
 logger = logging.getLogger(__name__)
 
@@ -60,78 +67,389 @@ class ResolvedInit:
     initial_types: Any       # shape: (n_atoms,) dtype int32 or None
     initial_cells: Any       # shape: (n_live, 3, 3) or None
     initial_energies: Any    # shape: (n_live,) or None — None until evaluated
+    symbol_map: dict[int, str] | None = None
+    restart_state: RestartBundle | None = None
 
 
-def _resolve_init(init: InitConfig, n_live: int, seed: int) -> ResolvedInit:
+def _build_cells(
+    init: InitConfig,
+    n_live: int,
+    shape_key: jax.Array,
+    base_cell: jnp.ndarray,
+    n_atoms: int,
+    cell_cfg: CellConfig,
+) -> jnp.ndarray:
+    """Produce (n_live, 3, 3) cells from a base cell.
+
+    If ``init.random_initialise_cell``, run cell_shape_walk per walker;
+    otherwise broadcast ``base_cell`` across all walkers.
+    """
+    _CELL_SHAPE_EQUIL_STEPS = 50
+
+    if init.random_initialise_cell:
+        walker_shape_keys = jax.random.split(shape_key, n_live)
+
+        def _walk_one(k):
+            cell, _ = cell_shape_walk(
+                key=k,
+                cell=base_cell,
+                n_steps=_CELL_SHAPE_EQUIL_STEPS,
+                step_size_shear=0.05,
+                step_size_stretch=0.05,
+                min_aspect_ratio_val=cell_cfg.min_aspect_ratio,
+                n_atoms=n_atoms,
+                max_volume_per_atom=cell_cfg.max_volume_per_atom,
+                min_volume_per_atom=cell_cfg.min_volume_per_atom,
+            )
+            return cell
+
+        return jax.vmap(_walk_one)(walker_shape_keys)
+    else:
+        return jnp.broadcast_to(base_cell[None], (n_live, 3, 3))
+
+
+def _validate_cells(
+    cells: jnp.ndarray,
+    n_atoms: int,
+    cell_cfg: CellConfig,
+) -> None:
+    """Raise ``RuntimeError`` if any walker cell fails check_cell_shape."""
+    n_live = cells.shape[0]
+    for wi in range(n_live):
+        cell_valid = bool(
+            check_cell_shape(
+                cells[wi],
+                n_atoms=n_atoms,
+                max_vol_per_atom=cell_cfg.max_volume_per_atom,
+                min_vol_per_atom=cell_cfg.min_volume_per_atom,
+                min_aspect=cell_cfg.min_aspect_ratio,
+            )
+        )
+        if not cell_valid:
+            raise RuntimeError(
+                f"Walker {wi} produced an invalid cell (failed check_cell_shape). "
+                f"Cell:\n{cells[wi]}"
+            )
+
+
+def _sample_per_walker_positions(
+    init: InitConfig,
+    n_live: int,
+    pos_key: jax.Array,
+    initial_cells: jnp.ndarray,
+    initial_types: jnp.ndarray,
+    n_atoms: int,
+    energy_backend: EnergyBackend | None,
+) -> tuple[jnp.ndarray, list | None]:
+    """Sample per-walker positions (and optionally energies) via grid or rejection.
+
+    Returns:
+        (initial_positions, energies_list):
+          - initial_positions: (n_live, n_atoms, 3)
+          - energies_list: list of n_live energy scalars if energy_backend is
+            not None; otherwise None.
+    """
+    start_energy_ceiling = init.start_energy_ceiling_per_atom * n_atoms
+    walker_pos_keys = jax.random.split(pos_key, n_live)
+    positions_list = []
+    energies_list: list | None = [] if energy_backend is not None else None
+
+    for wi in range(n_live):
+        w_cell = initial_cells[wi]
+
+        if init.pos_randomization_mode == "grid":
+            pos = grid_positions_in_cell(
+                walker_pos_keys[wi], w_cell, n_atoms, init.grid_distance
+            )
+            positions_list.append(pos)
+            if energy_backend is not None:
+                e, _, _ = energy_backend(pos, initial_types, w_cell, 0)
+                energies_list.append(e)
+        else:
+            pos, e = rejection_sample_positions(
+                walker_pos_keys[wi],
+                cell=w_cell,
+                types=initial_types,
+                n_atoms=n_atoms,
+                energy_fn=energy_backend if energy_backend is not None else _null_energy_fn,
+                start_energy_ceiling=start_energy_ceiling,
+                min_distance=init.init_distance_criterion,
+                max_tries=init.random_init_max_n_tries,
+                mode="uniform",
+                grid_distance=init.grid_distance,
+            )
+            positions_list.append(pos)
+            if energy_backend is not None:
+                energies_list.append(e)
+
+    return jnp.stack(positions_list, axis=0), energies_list
+
+
+def _resolve_init_walker_set(
+    init: InitConfig,
+    cell_cfg: CellConfig,
+    n_live: int,
+    energy_backend: EnergyBackend | None,
+) -> ResolvedInit:
+    """Mode C: load a pre-computed set of N walker configurations from disk."""
+    if init.random_initialise_pos or init.random_initialise_cell:
+        logger.warning(
+            "start_walker_set: ignoring random_initialise_pos/cell=True. "
+            "Walker-set files are taken verbatim; no randomization applied."
+        )
+
+    walker_set = load_walker_set(Path(init.start_walker_set), n_live)
+    n_atoms = walker_set.types.shape[1]
+
+    _validate_cells(walker_set.cells, n_atoms, cell_cfg)
+
+    if energy_backend is not None:
+        energies = jax.vmap(
+            lambda pos, typs, cel: energy_backend(pos, typs, cel, 0)[0]
+        )(walker_set.positions, walker_set.types, walker_set.cells)
+    else:
+        energies = None
+
+    return ResolvedInit(
+        initial_positions=walker_set.positions,
+        initial_types=walker_set.types,
+        initial_cells=walker_set.cells,
+        initial_energies=energies,
+        symbol_map=walker_set.symbol_map,
+    )
+
+
+def _resolve_init_restart(
+    init: InitConfig,
+    cell_cfg: CellConfig,
+    n_live: int,
+    energy_backend: EnergyBackend | None,
+) -> ResolvedInit:
+    """Mode D: resume an NS run from a checkpoint file (restart_file)."""
+    if init.random_initialise_pos or init.random_initialise_cell:
+        logger.warning(
+            "restart_file: ignoring random_initialise_pos/cell=True. "
+            "Checkpoint files are taken verbatim; no randomization applied."
+        )
+
+    walker_set, restart_bundle = load_restart(Path(init.restart_file))
+    n_atoms = walker_set.types.shape[1]
+
+    _validate_cells(walker_set.cells, n_atoms, cell_cfg)
+
+    if energy_backend is not None:
+        energies = jax.vmap(
+            lambda pos, typs, cel: energy_backend(pos, typs, cel, 0)[0]
+        )(walker_set.positions, walker_set.types, walker_set.cells)
+    else:
+        energies = None
+
+    return ResolvedInit(
+        initial_positions=walker_set.positions,
+        initial_types=walker_set.types,
+        initial_cells=walker_set.cells,
+        initial_energies=energies,
+        symbol_map=walker_set.symbol_map,
+        restart_state=restart_bundle,
+    )
+
+
+def _resolve_init(
+    init: InitConfig,
+    n_live: int,
+    seed: int,
+    energy_backend: EnergyBackend | None = None,
+    cell_cfg: CellConfig | None = None,
+) -> ResolvedInit:
     """Resolve an ``InitConfig`` into concrete initial-state arrays.
 
-    Only ``start_species`` is fully supported today.  All other source types
-    raise ``NotImplementedError`` with a clear message.
+    Supports ``start_species`` (Mode A), ``start_config_file`` (Mode B),
+    ``start_walker_set`` (Mode C), and ``restart_file`` (Mode D).
 
     Args:
         init: Validated ``InitConfig``.
         n_live: Number of live walkers (from ``NSConfig.n_live``).
         seed: PRNG seed.
+        energy_backend: Backend used to compute initial energies.  When
+            ``None``, ``initial_energies`` is left as ``None``.
+        cell_cfg: ``CellConfig`` carrying cell-geometry constraints.  When
+            ``None`` a default ``CellConfig()`` is used.
 
     Returns:
-        ``ResolvedInit`` with arrays for the ``start_species`` path, or raises.
-
-    Raises:
-        NotImplementedError: For ``start_config_file``, ``start_walker_set``,
-            and ``restart_file`` — no structure reader / walker loader exists
-            in jaxrens today.
+        ``ResolvedInit`` with arrays populated for the chosen mode.
     """
-    if init.start_config_file is not None:
-        raise NotImplementedError(
-            "start_config_file is not yet supported: jaxrens has no structure "
-            "file reader (e.g. ase.io.read).  Adding one is tracked as a "
-            "separate task.  Use start_species instead."
-        )
+    if cell_cfg is None:
+        cell_cfg = CellConfig()
 
     if init.start_walker_set is not None:
-        raise NotImplementedError(
-            "start_walker_set is not yet supported: no walker-set loader "
-            "exists in jaxrens today.  Use start_species instead."
-        )
+        return _resolve_init_walker_set(init, cell_cfg, n_live, energy_backend)
 
     if init.restart_file is not None:
-        raise NotImplementedError(
-            "restart_file is not yet supported: checkpoint-based restart is "
-            "not yet wired into the CLI resolver.  Use start_species instead."
-        )
+        return _resolve_init_restart(init, cell_cfg, n_live, energy_backend)
 
-    # start_species path — synthesize random initial positions
+    if init.start_config_file is not None:
+        return _resolve_init_config_file(init, n_live, seed, energy_backend, cell_cfg)
+
     assert init.start_species is not None
+    return _resolve_init_species(init, n_live, seed, energy_backend, cell_cfg)
+
+
+def _resolve_init_species(
+    init: InitConfig,
+    n_live: int,
+    seed: int,
+    energy_backend: EnergyBackend | None,
+    cell_cfg: CellConfig,
+) -> ResolvedInit:
+    """Mode A: initialise from a species string (start_species)."""
     species_counts = init.parsed_species()
     assert species_counts is not None
 
-    # Derive n_atoms and types array from species_counts
     types_list: list[int] = []
     for z, count in sorted(species_counts.items()):
         types_list.extend([z] * count)
     n_atoms = len(types_list)
 
-    # Map atomic numbers to contiguous 0-based integer indices
     unique_z = sorted(set(types_list))
     z_to_idx = {z: i for i, z in enumerate(unique_z)}
     type_indices = [z_to_idx[z] for z in types_list]
     initial_types = jnp.array(type_indices, dtype=jnp.int32)
 
+    # Build a symbol_map from atomic numbers for Mode A.
+    from ase.data import chemical_symbols
+    symbol_map: dict[int, str] = {
+        idx: chemical_symbols[z] for idx, z in enumerate(unique_z)
+    }
+
     key = jax.random.key(seed)
-    key, key_pos = jax.random.split(key)
-    initial_positions = jax.random.uniform(
-        key_pos,
-        shape=(n_live, n_atoms, 3),
-        minval=-3.0,
-        maxval=3.0,
+    key, vol_key, shape_key, pos_key = jax.random.split(key, 4)
+
+    lc = float(
+        sample_initial_volume(
+            vol_key,
+            n_atoms=n_atoms,
+            max_volume_per_atom=cell_cfg.max_volume_per_atom,
+            flat_V_prior=cell_cfg.flat_V_prior,
+        )
     )
+    cubic_cell = jnp.eye(3, dtype=jnp.float32) * lc
+
+    initial_cells = _build_cells(init, n_live, shape_key, cubic_cell, n_atoms, cell_cfg)
+    _validate_cells(initial_cells, n_atoms, cell_cfg)
+
+    if init.pos_autoscale_cells:
+        logger.warning(
+            "pos_autoscale_cells=True is set but not yet implemented in step 2. "
+            "The cell will not be scaled to guarantee minimum atom distances. "
+            "Rejection sampling may fail if the cell is too small."
+        )
+
+    if not init.random_initialise_pos:
+        logger.warning(
+            "random_initialise_pos=False: all %d walkers start from identical "
+            "positions.  This introduces strong correlations across walkers and "
+            "may degrade nested sampling evidence accuracy.",
+            n_live,
+        )
+        single_key, _ = jax.random.split(pos_key)
+        single_cell = initial_cells[0]
+        if init.pos_randomization_mode == "grid":
+            single_pos = grid_positions_in_cell(
+                single_key, single_cell, n_atoms, init.grid_distance
+            )
+        else:
+            single_pos = uniform_positions_in_cell(single_key, single_cell, n_atoms)
+        initial_positions = jnp.broadcast_to(
+            single_pos[None], (n_live, n_atoms, 3)
+        )
+        energies_list = None
+    else:
+        initial_positions, energies_list = _sample_per_walker_positions(
+            init, n_live, pos_key, initial_cells, initial_types, n_atoms, energy_backend
+        )
+
+    if energies_list is not None:
+        initial_energies = jnp.stack(energies_list, axis=0)
+    elif energy_backend is not None and not init.random_initialise_pos:
+        e_list = []
+        for wi in range(n_live):
+            e, _, _ = energy_backend(initial_positions[wi], initial_types, initial_cells[wi], 0)
+            e_list.append(e)
+        initial_energies = jnp.stack(e_list, axis=0)
+    else:
+        initial_energies = None
 
     return ResolvedInit(
         initial_positions=initial_positions,
         initial_types=initial_types,
-        initial_cells=None,
-        initial_energies=None,
+        initial_cells=initial_cells,
+        initial_energies=initial_energies,
+        symbol_map=symbol_map,
     )
+
+
+def _resolve_init_config_file(
+    init: InitConfig,
+    n_live: int,
+    seed: int,
+    energy_backend: EnergyBackend | None,
+    cell_cfg: CellConfig,
+) -> ResolvedInit:
+    """Mode B: initialise from a founder structure file (start_config_file)."""
+    positions_single, types_single, cell_single, symbol_map = load_structure(
+        init.start_config_file
+    )
+    n_atoms = positions_single.shape[0]
+
+    key = jax.random.key(seed)
+    key, shape_key, pos_key = jax.random.split(key, 3)
+
+    initial_cells = _build_cells(init, n_live, shape_key, cell_single, n_atoms, cell_cfg)
+    _validate_cells(initial_cells, n_atoms, cell_cfg)
+
+    if not init.random_initialise_pos:
+        logger.warning(
+            "start_config_file with random_initialise_pos=False: all %d walkers "
+            "start with identical positions. They are fully correlated; enable "
+            "burn-in (InitialWalkConfig.n_walks > 0) or set random_initialise_pos=True.",
+            n_live,
+        )
+        initial_positions = jnp.broadcast_to(
+            positions_single[None], (n_live, n_atoms, 3)
+        )
+        if energy_backend is not None:
+            e_list = []
+            for wi in range(n_live):
+                e, _, _ = energy_backend(
+                    initial_positions[wi], types_single, initial_cells[wi], 0
+                )
+                e_list.append(e)
+            initial_energies: jnp.ndarray | None = jnp.stack(e_list, axis=0)
+        else:
+            initial_energies = None
+    else:
+        initial_positions, energies_list = _sample_per_walker_positions(
+            init, n_live, pos_key, initial_cells, types_single, n_atoms, energy_backend
+        )
+        initial_energies = jnp.stack(energies_list, axis=0) if energies_list is not None else None
+
+    return ResolvedInit(
+        initial_positions=initial_positions,
+        initial_types=types_single,
+        initial_cells=initial_cells,
+        initial_energies=initial_energies,
+        symbol_map=symbol_map,
+    )
+
+
+def _null_energy_fn(
+    positions: jnp.ndarray,
+    types: jnp.ndarray,
+    cell: jnp.ndarray,
+    max_neighbors: int,
+) -> tuple[jnp.ndarray, int, bool]:
+    """Placeholder energy function returning zero, for grid-mode without a backend."""
+    return jnp.float32(0.0), 0, False
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +580,13 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
         for m in root.moves
     )
 
-    resolved_init = _resolve_init(root.init, n_live=ns.n_live, seed=seed)
+    resolved_init = _resolve_init(
+        root.init,
+        n_live=ns.n_live,
+        seed=seed,
+        energy_backend=energy_backend,
+        cell_cfg=root.cell,
+    )
 
     return ResolvedConfig(
         ns=ns,
@@ -302,6 +626,13 @@ def expand_cohort(root: RootConfig) -> list[ResolvedConfig]:
         is always non-empty; single-element cohorts are the common case.
     """
     n = _cohort_size(root)
+
+    if root.init.restart_file is not None and n > 1:
+        raise ValueError(
+            "restart_file is only supported for single NS runs; cohort size is "
+            f"{n}. Remove ensemble.pressure list / run.seed list, or "
+            "remove restart_file."
+        )
 
     if n == 1:
         return [_resolve_one(root, cohort_index=0)]

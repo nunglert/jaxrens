@@ -1696,25 +1696,25 @@ class TestInitConfigResolver:
         result = _resolve_init(cfg, n_live=4, seed=0)
         assert result.initial_positions.shape[1] == 5
 
-    def test_start_config_file_raises_not_implemented(self):
+    def test_start_config_file_nonexistent_raises(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(start_config_file=Path("/tmp/fake.xyz"))
-        with pytest.raises(NotImplementedError, match="start_config_file"):
+        cfg = InitConfig(start_config_file=tmp_path / "does_not_exist.xyz")
+        with pytest.raises(FileNotFoundError):
             _resolve_init(cfg, n_live=4, seed=0)
 
-    def test_start_walker_set_raises_not_implemented(self):
+    def test_start_walker_set_nonexistent_raises_file_not_found(self):
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(start_walker_set=Path("/tmp/walkers.npz"))
-        with pytest.raises(NotImplementedError, match="start_walker_set"):
+        cfg = InitConfig(start_walker_set=Path("/tmp/does_not_exist_walker.extxyz"))
+        with pytest.raises(FileNotFoundError):
             _resolve_init(cfg, n_live=4, seed=0)
 
-    def test_restart_file_raises_not_implemented(self):
+    def test_restart_file_nonexistent_raises_file_not_found(self):
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(restart_file=Path("/tmp/checkpoint.npz"))
-        with pytest.raises(NotImplementedError, match="restart_file"):
+        cfg = InitConfig(restart_file=Path("/tmp/does_not_exist_checkpoint.h5"))
+        with pytest.raises(FileNotFoundError):
             _resolve_init(cfg, n_live=4, seed=0)
 
     def test_resolved_config_has_init_field(self):
@@ -1983,3 +1983,1006 @@ class TestFullConfigFixture:
         new_state, _ = jit_ns_step(ns_state, step_fn, n_mcmc_steps=3)
 
         assert jnp.isfinite(new_state.log_evidence) or new_state.n_dead == 0
+
+
+# ---------------------------------------------------------------------------
+# 28. start_species resolver: ResolvedInit is fully populated
+# ---------------------------------------------------------------------------
+
+def _species_dict(n_atoms: int = 4, n_live: int = 8, mode: str = "grid") -> dict:
+    """Return a minimal RootConfig dict with start_species and harmonic backend."""
+    return {
+        "run": {
+            "n_live": n_live,
+            "max_iterations": 5,
+            "n_mcmc_steps": 3,
+            "seed": 0,
+        },
+        "moves": [{"move_type": "random_walk", "step_size": 0.3}],
+        "backend": {
+            "backend_type": "harmonic",
+            "n_atoms": n_atoms,
+        },
+        "output": {
+            "format": "none",
+            "working_dir": ".",
+            "info_interval": 999,
+        },
+        "init": {
+            "start_species": " ".join(["1"] * n_atoms),
+            "random_initialise_pos": True,
+            "random_initialise_cell": False,
+            "pos_randomization_mode": mode,
+            "grid_distance": 1.5,
+            "init_distance_criterion": 0.5,
+            "random_init_max_n_tries": 50,
+            "start_energy_ceiling_per_atom": 1e6,
+            "pos_autoscale_cells": False,
+        },
+    }
+
+
+class TestInitConfigResolver:
+    def test_start_species_cells_shape(self):
+        root = RootConfig.model_validate(_species_dict(n_atoms=2, n_live=6))
+        resolved = resolve(root)
+        assert resolved.init.initial_cells is not None
+        assert resolved.init.initial_cells.shape == (6, 3, 3)
+
+    def test_start_species_positions_shape(self):
+        root = RootConfig.model_validate(_species_dict(n_atoms=2, n_live=6))
+        resolved = resolve(root)
+        assert resolved.init.initial_positions is not None
+        assert resolved.init.initial_positions.shape == (6, 2, 3)
+
+    def test_start_species_initial_energies_populated(self):
+        import jax.numpy as jnp
+        root = RootConfig.model_validate(_species_dict(n_atoms=2, n_live=4))
+        resolved = resolve(root)
+        assert resolved.init.initial_energies is not None
+        assert resolved.init.initial_energies.shape == (4,)
+        assert jnp.all(jnp.isfinite(resolved.init.initial_energies))
+
+    def test_random_initialise_cell_true_produces_diverse_cells(self):
+        import jax.numpy as jnp
+        d = _species_dict(n_atoms=2, n_live=8)
+        d["init"]["random_initialise_cell"] = True
+        root = RootConfig.model_validate(d)
+        resolved = resolve(root)
+        cells = resolved.init.initial_cells
+        assert cells is not None
+        assert cells.shape == (8, 3, 3)
+        # At least some cells should differ from one another
+        diffs = jnp.abs(cells[1:] - cells[:-1])
+        assert jnp.any(diffs > 1e-5)
+
+    def test_grid_mode_pairwise_distances(self):
+        import jax.numpy as jnp
+        root = RootConfig.model_validate(_species_dict(n_atoms=2, n_live=4, mode="grid"))
+        resolved = resolve(root)
+        positions = resolved.init.initial_positions
+        grid_dist = 1.5
+        for wi in range(4):
+            p = positions[wi]
+            d = float(jnp.linalg.norm(p[0] - p[1]))
+            assert d >= grid_dist - 1e-4, f"Walker {wi}: pairwise dist {d} < {grid_dist}"
+
+    def test_uniform_mode_energies_below_ceiling(self):
+        import jax.numpy as jnp
+        n_atoms = 2
+        ceiling_per_atom = 1e6
+        d = _species_dict(n_atoms=n_atoms, n_live=4, mode="uniform")
+        d["init"]["start_energy_ceiling_per_atom"] = ceiling_per_atom
+        root = RootConfig.model_validate(d)
+        resolved = resolve(root)
+        energies = resolved.init.initial_energies
+        assert energies is not None
+        ceiling_total = ceiling_per_atom * n_atoms
+        assert jnp.all(energies <= ceiling_total + 1e-3)
+
+    def test_random_initialise_pos_false_emits_warning(self, caplog):
+        import logging
+        d = _species_dict(n_atoms=2, n_live=4)
+        d["init"]["random_initialise_pos"] = False
+        root = RootConfig.model_validate(d)
+        with caplog.at_level(logging.WARNING):
+            resolve(root)
+        assert any("correlation" in rec.message.lower() for rec in caplog.records)
+
+    def test_start_species_e2e_run_ns(self, tmp_path):
+        """Resolver output feeds directly into run_from_config without error."""
+        import jax
+        import jax.numpy as jnp
+        from jaxrens.cli.run import run_from_config
+
+        d = _species_dict(n_atoms=2, n_live=6, mode="grid")
+        d["output"]["working_dir"] = str(tmp_path)
+        root = RootConfig.model_validate(d)
+        resolved = resolve(root)
+
+        result = run_from_config(
+            resolved.ns,
+            list(resolved.moves),
+            resolved.backend,
+            resolved.output,
+            initial_positions=resolved.init.initial_positions,
+            initial_types=resolved.init.initial_types,
+            initial_energies=resolved.init.initial_energies,
+            initial_cells=resolved.init.initial_cells,
+        )
+        assert result["iteration"] > 0
+        assert jnp.isfinite(result["log_evidence"])
+
+    def test_start_species_symbol_map_populated(self):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        cfg = InitConfig(start_species="14 8")
+        result = _resolve_init(cfg, n_live=4, seed=0)
+        assert result.symbol_map is not None
+        assert isinstance(result.symbol_map, dict)
+
+    # -----------------------------------------------------------------
+    # Mode B: start_config_file
+    # -----------------------------------------------------------------
+
+    def _make_founder(self, tmp_path, symbols=("Si", "Si"), cell_size=6.0):
+        """Write a minimal single-frame extxyz and return its path."""
+        import ase, ase.io
+        import numpy as _np
+        pos = _np.zeros((len(symbols), 3), dtype=_np.float32)
+        for i in range(len(symbols)):
+            pos[i, 0] = i * (cell_size / (len(symbols) + 1))
+        cell = _np.eye(3) * cell_size
+        atoms = ase.Atoms(symbols=list(symbols), positions=pos, cell=cell, pbc=True)
+        p = tmp_path / "founder.extxyz"
+        ase.io.write(str(p), atoms)
+        return p
+
+    def test_mode_b_random_pos_true_positions_shape(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.cell import CellConfig
+        p = self._make_founder(tmp_path, symbols=["Si", "Si"], cell_size=6.0)
+        cfg = InitConfig(
+            start_config_file=p,
+            random_initialise_pos=True,
+            random_initialise_cell=False,
+            pos_randomization_mode="uniform",
+        )
+        cell_cfg = CellConfig(
+            max_volume_per_atom=1000.0,
+            min_volume_per_atom=0.1,
+            min_aspect_ratio=0.01,
+        )
+        result = _resolve_init(cfg, n_live=5, seed=0, cell_cfg=cell_cfg)
+        assert result.initial_positions.shape == (5, 2, 3)
+
+    def test_mode_b_random_pos_false_identical_positions(self, tmp_path, caplog):
+        import numpy as np
+        import logging
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.cell import CellConfig
+        p = self._make_founder(tmp_path, symbols=["Si", "O"], cell_size=6.0)
+        cfg = InitConfig(
+            start_config_file=p,
+            random_initialise_pos=False,
+            random_initialise_cell=False,
+        )
+        cell_cfg = CellConfig(
+            max_volume_per_atom=1000.0,
+            min_volume_per_atom=0.1,
+            min_aspect_ratio=0.01,
+        )
+        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+            result = _resolve_init(cfg, n_live=4, seed=0, cell_cfg=cell_cfg)
+        for wi in range(1, 4):
+            np.testing.assert_allclose(
+                np.array(result.initial_positions[wi]),
+                np.array(result.initial_positions[0]),
+            )
+        assert any("correlated" in r.message.lower() or "identical" in r.message.lower()
+                   for r in caplog.records)
+
+    def test_mode_b_random_pos_false_warning_mentions_burn_in(self, tmp_path, caplog):
+        import logging
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.cell import CellConfig
+        p = self._make_founder(tmp_path, symbols=["Si"], cell_size=5.0)
+        cfg = InitConfig(
+            start_config_file=p,
+            random_initialise_pos=False,
+            random_initialise_cell=False,
+        )
+        cell_cfg = CellConfig(
+            max_volume_per_atom=1000.0,
+            min_volume_per_atom=0.1,
+            min_aspect_ratio=0.01,
+        )
+        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+            _resolve_init(cfg, n_live=3, seed=0, cell_cfg=cell_cfg)
+        assert any("burn-in" in r.message for r in caplog.records)
+
+    def test_mode_b_random_cell_true_cells_diverge(self, tmp_path):
+        import numpy as np
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.cell import CellConfig
+        p = self._make_founder(tmp_path, symbols=["Si", "Si"], cell_size=8.0)
+        cfg = InitConfig(
+            start_config_file=p,
+            random_initialise_pos=True,
+            random_initialise_cell=True,
+            pos_randomization_mode="uniform",
+        )
+        cell_cfg = CellConfig(
+            max_volume_per_atom=1000.0,
+            min_volume_per_atom=0.1,
+            min_aspect_ratio=0.01,
+        )
+        result = _resolve_init(cfg, n_live=4, seed=7, cell_cfg=cell_cfg)
+        cells = np.array(result.initial_cells)
+        all_same = all(np.allclose(cells[0], cells[wi]) for wi in range(1, 4))
+        assert not all_same
+
+    def test_mode_b_random_cell_false_cells_identical(self, tmp_path):
+        import numpy as np
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.cell import CellConfig
+        p = self._make_founder(tmp_path, symbols=["Si", "Si"], cell_size=6.0)
+        cfg = InitConfig(
+            start_config_file=p,
+            random_initialise_pos=True,
+            random_initialise_cell=False,
+            pos_randomization_mode="uniform",
+        )
+        cell_cfg = CellConfig(
+            max_volume_per_atom=1000.0,
+            min_volume_per_atom=0.1,
+            min_aspect_ratio=0.01,
+        )
+        result = _resolve_init(cfg, n_live=4, seed=0, cell_cfg=cell_cfg)
+        cells = np.array(result.initial_cells)
+        for wi in range(1, 4):
+            np.testing.assert_allclose(cells[0], cells[wi])
+
+    def test_mode_b_symbol_map_from_file(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.cell import CellConfig
+        p = self._make_founder(tmp_path, symbols=["Si", "O"], cell_size=6.0)
+        cfg = InitConfig(
+            start_config_file=p,
+            random_initialise_pos=True,
+            random_initialise_cell=False,
+            pos_randomization_mode="uniform",
+        )
+        cell_cfg = CellConfig(
+            max_volume_per_atom=1000.0,
+            min_volume_per_atom=0.1,
+            min_aspect_ratio=0.01,
+        )
+        result = _resolve_init(cfg, n_live=3, seed=0, cell_cfg=cell_cfg)
+        assert result.symbol_map == {0: "Si", 1: "O"}
+
+    def test_mode_b_positions_are_finite(self, tmp_path):
+        import jax.numpy as jnp
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.cell import CellConfig
+        p = self._make_founder(tmp_path, symbols=["Si", "Si"], cell_size=6.0)
+        cfg = InitConfig(
+            start_config_file=p,
+            random_initialise_pos=True,
+            random_initialise_cell=False,
+            pos_randomization_mode="uniform",
+        )
+        cell_cfg = CellConfig(
+            max_volume_per_atom=1000.0,
+            min_volume_per_atom=0.1,
+            min_aspect_ratio=0.01,
+        )
+        result = _resolve_init(cfg, n_live=4, seed=0, cell_cfg=cell_cfg)
+        assert jnp.all(jnp.isfinite(result.initial_positions))
+
+    def test_mode_b_energies_computed_with_backend(self, tmp_path):
+        import jax.numpy as jnp
+        from jaxrens.backends.toy import create_harmonic
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.cell import CellConfig
+        p = self._make_founder(tmp_path, symbols=["Si"], cell_size=5.0)
+        cfg = InitConfig(
+            start_config_file=p,
+            random_initialise_pos=True,
+            random_initialise_cell=False,
+            pos_randomization_mode="uniform",
+        )
+        cell_cfg = CellConfig(
+            max_volume_per_atom=1000.0,
+            min_volume_per_atom=0.1,
+            min_aspect_ratio=0.01,
+        )
+        backend = create_harmonic()
+        result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=backend, cell_cfg=cell_cfg)
+        assert result.initial_energies is not None
+        assert result.initial_energies.shape == (3,)
+        assert jnp.all(jnp.isfinite(result.initial_energies))
+
+    def test_mode_b_end_to_end_jit(self, tmp_path):
+        """Mode B resolver -> run_ns -> ns_step under JIT."""
+        import ase, ase.io
+        import numpy as np
+        import jax
+        import jax.numpy as jnp
+        from jaxrens.backends.toy import create_harmonic
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.cell import CellConfig
+        from jaxrens.sampling.mwg import build_mwg
+        from jaxrens.sampling.nested_sampling import init_ns, ns_step
+        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        import jaxrens.sampling.moves.random_walk as rw_mod
+
+        pos = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+        cell = np.eye(3, dtype=np.float32) * 5.0
+        atoms = ase.Atoms(["Si"], positions=pos, cell=cell, pbc=True)
+        p = tmp_path / "founder_jit.extxyz"
+        ase.io.write(str(p), atoms)
+
+        cfg = InitConfig(
+            start_config_file=p,
+            random_initialise_pos=True,
+            random_initialise_cell=False,
+            pos_randomization_mode="uniform",
+        )
+        cell_cfg = CellConfig(
+            max_volume_per_atom=1000.0,
+            min_volume_per_atom=0.1,
+            min_aspect_ratio=0.01,
+        )
+        backend = create_harmonic()
+        result = _resolve_init(cfg, n_live=6, seed=0, energy_backend=backend, cell_cfg=cell_cfg)
+
+        desc = MoveDescriptor(
+            name="random_walk",
+            build_kernel=rw_mod.build_kernel,
+            step_size=0.3,
+            weight=1.0,
+            kernel_kwargs={},
+            extra_state_fields={},
+        )
+        init_fn, step_fn, _ = build_mwg(backend, [desc])
+
+        key = jax.random.key(42)
+        ns_state = init_ns(
+            init_fn,
+            result.initial_positions,
+            result.initial_types,
+            result.initial_energies,
+            cells=result.initial_cells,
+            rng_key=key,
+        )
+
+        jit_ns_step = jax.jit(ns_step, static_argnames=("step_fn", "n_mcmc_steps"))
+        new_state, _ = jit_ns_step(ns_state, step_fn, n_mcmc_steps=2)
+        assert jnp.isfinite(new_state.log_evidence) or new_state.n_dead == 0
+
+
+# ---------------------------------------------------------------------------
+# 32. Mode C: start_walker_set resolver
+# ---------------------------------------------------------------------------
+
+def _make_walker_set_extxyz(
+    tmp_path: Path,
+    n_live: int = 4,
+    symbols: list[str] | None = None,
+    cell_size: float = 6.0,
+    name: str = "walkers.extxyz",
+) -> Path:
+    """Write a minimal multi-frame extxyz file for Mode C resolver tests."""
+    import ase, ase.io
+    import numpy as _np
+
+    if symbols is None:
+        symbols = ["Si"]
+    n_atoms = len(symbols)
+    cell = _np.eye(3) * cell_size
+    rng = _np.random.default_rng(42)
+    frames = []
+    for _ in range(n_live):
+        pos = rng.uniform(0.5, cell_size - 0.5, (n_atoms, 3)).astype(_np.float32)
+        frames.append(ase.Atoms(list(symbols), positions=pos, cell=cell, pbc=True))
+    p = tmp_path / name
+    ase.io.write(str(p), frames, format="extxyz")
+    return p
+
+
+def _make_walker_set_hdf5(
+    tmp_path: Path,
+    n_live: int = 4,
+    n_atoms: int = 1,
+    cell_size: float = 6.0,
+    symbol_map: dict | None = None,
+    name: str = "walkers.h5",
+) -> Path:
+    import json as _json
+    import numpy as _np
+
+    if symbol_map is None:
+        symbol_map = {0: "Si"}
+    rng = _np.random.default_rng(7)
+    positions = rng.uniform(0.5, cell_size - 0.5, (n_live, n_atoms, 3)).astype(_np.float32)
+    types = _np.zeros((n_live, n_atoms), dtype=_np.int32)
+    cells = _np.stack([_np.eye(3) * cell_size] * n_live).astype(_np.float32)
+    p = tmp_path / name
+    with __import__("h5py").File(p, "w") as f:
+        f.create_dataset("positions", data=positions)
+        f.create_dataset("types", data=types)
+        f.create_dataset("cells", data=cells)
+        f.attrs["symbol_map"] = _json.dumps({str(k): v for k, v in symbol_map.items()})
+    return p
+
+
+def _cell_cfg_permissive():
+    from jaxrens.cli.schema.cell import CellConfig
+    return CellConfig(
+        max_volume_per_atom=10000.0,
+        min_volume_per_atom=0.01,
+        min_aspect_ratio=0.001,
+    )
+
+
+class TestInitConfigResolverModeC:
+    """Mode C resolver tests: start_walker_set."""
+
+    def test_extxyz_resolved_init_type(self, tmp_path):
+        from jaxrens.cli.resolve import ResolvedInit, _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_walker_set_extxyz(tmp_path, n_live=4, symbols=["Si"])
+        cfg = InitConfig(start_walker_set=p)
+        result = _resolve_init(cfg, n_live=4, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        assert isinstance(result, ResolvedInit)
+
+    def test_extxyz_positions_shape(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_walker_set_extxyz(tmp_path, n_live=4, symbols=["Si", "Si"])
+        cfg = InitConfig(start_walker_set=p)
+        result = _resolve_init(cfg, n_live=4, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        assert result.initial_positions.shape == (4, 2, 3)
+
+    def test_extxyz_types_shape(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_walker_set_extxyz(tmp_path, n_live=4, symbols=["Si", "Si"])
+        cfg = InitConfig(start_walker_set=p)
+        result = _resolve_init(cfg, n_live=4, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        assert result.initial_types.shape == (4, 2)
+
+    def test_extxyz_symbol_map_correct(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si", "O", "O"])
+        cfg = InitConfig(start_walker_set=p)
+        result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        assert result.symbol_map == {0: "Si", 1: "O"}
+
+    def test_extxyz_energies_recomputed_not_from_file(self, tmp_path):
+        """Energies in the extxyz are stale; resolver must recompute with the backend."""
+        import jax.numpy as jnp
+        import ase, ase.io
+        import numpy as _np
+        from jaxrens.backends.toy import create_harmonic
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+
+        cell = _np.eye(3, dtype=_np.float32) * 6.0
+        rng = _np.random.default_rng(0)
+        frames = []
+        for _ in range(3):
+            pos = rng.uniform(0.5, 5.5, (1, 3)).astype(_np.float32)
+            atoms = ase.Atoms(["Si"], positions=pos, cell=cell, pbc=True)
+            atoms.info["energy"] = -9999.0
+            frames.append(atoms)
+        p = tmp_path / "stale.extxyz"
+        ase.io.write(str(p), frames, format="extxyz")
+
+        cfg = InitConfig(start_walker_set=p)
+        backend = create_harmonic()
+        result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=backend, cell_cfg=_cell_cfg_permissive())
+        assert result.initial_energies is not None
+        assert not jnp.any(jnp.isclose(result.initial_energies, jnp.float32(-9999.0)))
+
+    def test_hdf5_positions_shape(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_walker_set_hdf5(tmp_path, n_live=5, n_atoms=2)
+        cfg = InitConfig(start_walker_set=p)
+        result = _resolve_init(cfg, n_live=5, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        assert result.initial_positions.shape == (5, 2, 3)
+
+    def test_hdf5_symbol_map_correct(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_walker_set_hdf5(tmp_path, n_live=3, n_atoms=1, symbol_map={0: "O"})
+        cfg = InitConfig(start_walker_set=p)
+        result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        assert result.symbol_map == {0: "O"}
+
+    def test_hdf5_energies_recomputed(self, tmp_path):
+        """Resolver must recompute energies regardless of what is stored in the file."""
+        import jax.numpy as jnp
+        import json as _json
+        import numpy as _np
+        from jaxrens.backends.toy import create_harmonic
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+
+        rng = _np.random.default_rng(5)
+        positions = rng.uniform(0, 5, (4, 1, 3)).astype(_np.float32)
+        types = _np.zeros((4, 1), dtype=_np.int32)
+        cells = _np.stack([_np.eye(3) * 6.0] * 4).astype(_np.float32)
+        p = tmp_path / "stale.h5"
+        with __import__("h5py").File(p, "w") as f:
+            f.create_dataset("positions", data=positions)
+            f.create_dataset("types", data=types)
+            f.create_dataset("cells", data=cells)
+            f.create_dataset("energies", data=_np.full(4, -9999.0, dtype=_np.float32))
+            f.attrs["symbol_map"] = _json.dumps({"0": "Si"})
+
+        cfg = InitConfig(start_walker_set=p)
+        backend = create_harmonic()
+        result = _resolve_init(cfg, n_live=4, seed=0, energy_backend=backend, cell_cfg=_cell_cfg_permissive())
+        assert result.initial_energies is not None
+        assert not jnp.any(jnp.isclose(result.initial_energies, jnp.float32(-9999.0)))
+
+    def test_random_initialise_pos_true_warning(self, tmp_path, caplog):
+        import logging
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si"])
+        cfg = InitConfig(start_walker_set=p, random_initialise_pos=True)
+        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+            _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        assert any("random_initialise_pos" in r.message or "randomiz" in r.message.lower()
+                   for r in caplog.records)
+
+    def test_random_initialise_pos_true_positions_verbatim(self, tmp_path, caplog):
+        """With random_initialise_pos=True, positions must still come from the file."""
+        import logging
+        import numpy as _np
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.init.walker_set import load_walker_set
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si"])
+        cfg = InitConfig(start_walker_set=p, random_initialise_pos=True)
+        ws = load_walker_set(p, n_live_expected=3)
+        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+            result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        _np.testing.assert_allclose(
+            _np.array(result.initial_positions),
+            _np.array(ws.positions),
+            atol=1e-5,
+        )
+
+    def test_random_initialise_cell_true_warning(self, tmp_path, caplog):
+        import logging
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si"])
+        cfg = InitConfig(start_walker_set=p, random_initialise_cell=True)
+        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+            _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        assert any("random_initialise_cell" in r.message or "randomiz" in r.message.lower()
+                   for r in caplog.records)
+
+    def test_random_initialise_cell_true_cells_verbatim(self, tmp_path, caplog):
+        """With random_initialise_cell=True, cells must still come from the file."""
+        import logging
+        import numpy as _np
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.init.walker_set import load_walker_set
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si"])
+        cfg = InitConfig(start_walker_set=p, random_initialise_cell=True)
+        ws = load_walker_set(p, n_live_expected=3)
+        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+            result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        _np.testing.assert_allclose(
+            _np.array(result.initial_cells),
+            _np.array(ws.cells),
+            atol=1e-5,
+        )
+
+    def test_cell_config_violation_raises(self, tmp_path):
+        """A walker cell that violates CellConfig bounds must raise RuntimeError."""
+        import ase, ase.io
+        import numpy as _np
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.cell import CellConfig
+
+        cell = _np.eye(3, dtype=_np.float32) * 6.0
+        atoms = ase.Atoms(["Si"], positions=[[3.0, 3.0, 3.0]], cell=cell, pbc=True)
+        p = tmp_path / "toosmall.extxyz"
+        ase.io.write(str(p), [atoms], format="extxyz")
+
+        strict_cfg = CellConfig(
+            max_volume_per_atom=1.0,
+            min_volume_per_atom=0.0001,
+            min_aspect_ratio=0.001,
+        )
+        cfg = InitConfig(start_walker_set=p)
+        with pytest.raises(RuntimeError):
+            _resolve_init(cfg, n_live=1, seed=0, cell_cfg=strict_cfg)
+
+    def test_mode_c_end_to_end_jit(self, tmp_path):
+        """Mode C resolver -> run_ns -> ns_step under JIT."""
+        import jax
+        import jax.numpy as jnp
+        from jaxrens.backends.toy import create_harmonic
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.sampling.mwg import build_mwg
+        from jaxrens.sampling.nested_sampling import init_ns, ns_step
+        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        import jaxrens.sampling.moves.random_walk as rw_mod
+
+        p = _make_walker_set_extxyz(tmp_path, n_live=6, symbols=["Si"])
+        cfg = InitConfig(start_walker_set=p)
+        backend = create_harmonic()
+        result = _resolve_init(
+            cfg,
+            n_live=6,
+            seed=0,
+            energy_backend=backend,
+            cell_cfg=_cell_cfg_permissive(),
+        )
+
+        desc = MoveDescriptor(
+            name="random_walk",
+            build_kernel=rw_mod.build_kernel,
+            step_size=0.3,
+            weight=1.0,
+            kernel_kwargs={},
+            extra_state_fields={},
+        )
+        init_fn, step_fn, _ = build_mwg(backend, [desc])
+
+        key = jax.random.key(77)
+        ns_state = init_ns(
+            init_fn,
+            result.initial_positions,
+            result.initial_types,
+            result.initial_energies,
+            cells=result.initial_cells,
+            rng_key=key,
+        )
+
+        jit_ns_step = jax.jit(ns_step, static_argnames=("step_fn", "n_mcmc_steps"))
+        new_state, _ = jit_ns_step(ns_state, step_fn, n_mcmc_steps=2)
+        assert jnp.isfinite(new_state.log_evidence) or new_state.n_dead == 0
+
+
+# ---------------------------------------------------------------------------
+# 35. Mode D: restart_file resolver
+# ---------------------------------------------------------------------------
+
+def _make_ns_checkpoint(
+    tmp_path: Path,
+    n_walkers: int = 4,
+    n_atoms: int = 1,
+    n_dead: int = 5,
+    name: str = "ns.checkpoint.h5",
+) -> Path:
+    """Write a minimal NS checkpoint and return the path."""
+    import jax as _jax
+    import numpy as _np
+    from jaxrens.io.checkpoint import save_checkpoint
+
+    rng = _np.random.default_rng(0)
+    positions = rng.uniform(-2, 2, (n_walkers, n_atoms, 3)).astype(_np.float32)
+    types = _np.zeros((n_walkers, n_atoms), dtype=_np.int32)
+    energies = rng.uniform(1, 10, n_walkers).astype(_np.float32)
+    cells = _np.stack([_np.eye(3, dtype=_np.float32) * 6.0] * n_walkers)
+    dead_energies = rng.uniform(10, 20, n_dead).astype(_np.float32)
+    dead_positions = rng.uniform(-2, 2, (n_dead, n_atoms, 3)).astype(_np.float32)
+
+    state = {
+        "positions": positions,
+        "types": types,
+        "energies": energies,
+        "cells": cells,
+        "dead_energies": dead_energies,
+        "dead_positions": dead_positions,
+        "dead_volumes": None,
+        "live_volumes": None,
+        "log_evidence": -7.3,
+        "iteration": n_dead,
+        "n_dead": n_dead,
+        "n_walkers": n_walkers,
+        "rng_key": _jax.random.key(1),
+    }
+    p = tmp_path / name
+    save_checkpoint(p, state, symbol_map={0: "Si"})
+    return p
+
+
+class TestInitConfigResolverModeD:
+    """Mode D resolver tests: restart_file."""
+
+    def test_mode_d_returns_resolved_init(self, tmp_path):
+        from jaxrens.cli.resolve import ResolvedInit, _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_ns_checkpoint(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        cfg = InitConfig(restart_file=p)
+        result = _resolve_init(
+            cfg, n_live=4, seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_cell_cfg_permissive(),
+        )
+        assert isinstance(result, ResolvedInit)
+
+    def test_mode_d_restart_state_populated(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.init.restart import RestartBundle
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_ns_checkpoint(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        cfg = InitConfig(restart_file=p)
+        result = _resolve_init(
+            cfg, n_live=4, seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_cell_cfg_permissive(),
+        )
+        assert result.restart_state is not None
+        assert isinstance(result.restart_state, RestartBundle)
+
+    def test_mode_d_restart_state_n_dead(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_ns_checkpoint(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        cfg = InitConfig(restart_file=p)
+        result = _resolve_init(
+            cfg, n_live=4, seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_cell_cfg_permissive(),
+        )
+        assert result.restart_state.n_dead == 5
+
+    def test_mode_d_restart_state_iteration(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_ns_checkpoint(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        cfg = InitConfig(restart_file=p)
+        result = _resolve_init(
+            cfg, n_live=4, seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_cell_cfg_permissive(),
+        )
+        assert result.restart_state.iteration == 5
+
+    def test_mode_d_symbol_map_populated(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_ns_checkpoint(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        cfg = InitConfig(restart_file=p)
+        result = _resolve_init(
+            cfg, n_live=4, seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_cell_cfg_permissive(),
+        )
+        assert result.symbol_map == {0: "Si"}
+
+    def test_mode_d_energies_recomputed(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_ns_checkpoint(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        cfg = InitConfig(restart_file=p)
+        result = _resolve_init(
+            cfg, n_live=4, seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_cell_cfg_permissive(),
+        )
+        import jax.numpy as jnp
+        assert result.initial_energies is not None
+        assert result.initial_energies.shape == (4,)
+        assert jnp.all(jnp.isfinite(result.initial_energies))
+
+    def test_mode_d_random_initialise_pos_true_warns(self, tmp_path, caplog):
+        import logging
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.backends.toy import create_harmonic
+
+        p = _make_ns_checkpoint(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        cfg = InitConfig(restart_file=p, random_initialise_pos=True)
+        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+            _resolve_init(
+                cfg, n_live=4, seed=0,
+                energy_backend=create_harmonic(),
+                cell_cfg=_cell_cfg_permissive(),
+            )
+        assert any(
+            "restart_file" in r.message.lower() or "verbatim" in r.message.lower()
+            for r in caplog.records
+        )
+
+    def test_cohort_gt_1_with_restart_file_raises(self, tmp_path):
+        from jaxrens.cli.resolve import expand_cohort
+        p = _make_ns_checkpoint(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        d = {
+            "run": {"n_live": 4, "max_iterations": 5, "n_mcmc_steps": 2, "seed": 0},
+            "moves": [{"type": "random_walk", "step_size": 0.3}],
+            "backend": {"type": "harmonic", "n_atoms": 1},
+            "output": {"format": "none", "working_dir": ".", "info_interval": 999},
+            "ensemble": {"type": "npt", "pressure": [0.01, 0.02]},
+            "init": {"restart_file": str(p)},
+        }
+        root = RootConfig.model_validate(d)
+        with pytest.raises(ValueError, match="restart_file"):
+            expand_cohort(root)
+
+    def test_cohort_gt_1_restart_error_message_contains_cohort_size(self, tmp_path):
+        from jaxrens.cli.resolve import expand_cohort
+        p = _make_ns_checkpoint(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        d = {
+            "run": {"n_live": 4, "max_iterations": 5, "n_mcmc_steps": 2, "seed": 0},
+            "moves": [{"type": "random_walk", "step_size": 0.3}],
+            "backend": {"type": "harmonic", "n_atoms": 1},
+            "output": {"format": "none", "working_dir": ".", "info_interval": 999},
+            "ensemble": {"type": "npt", "pressure": [0.01, 0.02, 0.03]},
+            "init": {"restart_file": str(p)},
+        }
+        root = RootConfig.model_validate(d)
+        with pytest.raises(ValueError, match="3"):
+            expand_cohort(root)
+
+    def test_mode_d_end_to_end_jit(self, tmp_path):
+        """Mode D: load checkpoint, init_ns with restart_state, run ns_step under JIT.
+
+        Asserts that NSState starts from checkpoint iteration, increments correctly.
+        """
+        import numpy as _np
+        from jaxrens.backends.toy import create_harmonic
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.sampling.mwg import build_mwg
+        from jaxrens.sampling.nested_sampling import init_ns, ns_step
+        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        import jaxrens.sampling.moves.random_walk as rw_mod
+
+        n_dead_checkpoint = 5
+        p = _make_ns_checkpoint(tmp_path, n_walkers=4, n_atoms=1, n_dead=n_dead_checkpoint)
+
+        cfg = InitConfig(restart_file=p)
+        backend = create_harmonic()
+        result = _resolve_init(
+            cfg, n_live=4, seed=0,
+            energy_backend=backend,
+            cell_cfg=_cell_cfg_permissive(),
+        )
+
+        desc = MoveDescriptor(
+            name="random_walk",
+            build_kernel=rw_mod.build_kernel,
+            step_size=0.3,
+            weight=1.0,
+            kernel_kwargs={},
+            extra_state_fields={},
+        )
+        init_fn, step_fn, _ = build_mwg(backend, [desc])
+
+        import jax
+        import jax.numpy as jnp
+        key = jax.random.key(11)
+        ns_state = init_ns(
+            init_fn,
+            result.initial_positions,
+            result.initial_types,
+            result.initial_energies,
+            cells=result.initial_cells,
+            rng_key=key,
+            max_dead=200,
+            restart_state=result.restart_state,
+        )
+
+        assert int(ns_state.n_dead) == n_dead_checkpoint
+        assert int(ns_state.iteration) == n_dead_checkpoint
+
+        jit_ns_step = jax.jit(ns_step, static_argnames=("step_fn", "n_mcmc_steps"))
+        new_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps=3)
+
+        assert int(new_state.n_dead) == n_dead_checkpoint + 1
+        assert int(new_state.iteration) == n_dead_checkpoint + 1
+        assert jnp.isfinite(info["emax"])
+
+    def test_mode_d_continued_run_n_dead_increments(self, tmp_path):
+        """After restart, run_ns for N more steps: n_dead >= checkpoint + N."""
+        import numpy as _np
+        from jaxrens.backends.toy import create_harmonic
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.sampling.mwg import build_mwg
+        from jaxrens.sampling.nested_sampling import init_ns, run_ns
+        from jaxrens.sampling.termination import IterationTermination
+        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        import jaxrens.sampling.moves.random_walk as rw_mod
+
+        n_dead_checkpoint = 5
+        n_extra_iters = 5
+        p = _make_ns_checkpoint(tmp_path, n_walkers=4, n_atoms=1, n_dead=n_dead_checkpoint)
+
+        cfg = InitConfig(restart_file=p)
+        backend = create_harmonic()
+        result = _resolve_init(
+            cfg, n_live=4, seed=0,
+            energy_backend=backend,
+            cell_cfg=_cell_cfg_permissive(),
+        )
+
+        desc = MoveDescriptor(
+            name="random_walk",
+            build_kernel=rw_mod.build_kernel,
+            step_size=0.3,
+            weight=1.0,
+            kernel_kwargs={},
+            extra_state_fields={},
+        )
+        init_fn, step_fn, _ = build_mwg(backend, [desc])
+
+        import jax
+        import jax.numpy as jnp
+        key = jax.random.key(11)
+        termination = [IterationTermination(n_extra_iters)]
+
+        out = run_ns(
+            positions=result.initial_positions,
+            types=result.initial_types,
+            energies=result.initial_energies,
+            cells=result.initial_cells,
+            init_fn=init_fn,
+            step_fn=step_fn,
+            rng_key=key,
+            max_iterations=n_extra_iters,
+            n_mcmc_steps=3,
+            termination_criteria=termination,
+            restart_state=result.restart_state,
+        )
+
+        assert out["n_dead"] >= n_dead_checkpoint
+        assert jnp.isfinite(out["log_evidence"])
