@@ -180,20 +180,20 @@ def _make_re_data(n_runs, n_walkers, n_atoms=2):
     energies = jax.random.uniform(
         jax.random.key(1), (n_runs, n_walkers), minval=-5.0, maxval=0.0
     )
-    boxes = jnp.broadcast_to(
+    cells = jnp.broadcast_to(
         5.0 * jnp.eye(3), (n_runs, n_walkers, 3, 3)
     ).copy()
-    return positions, types, energies, boxes
+    return positions, types, energies, cells
 
 
 class TestReplicaExchangeStep:
     def test_single_run_no_swap(self):
         """With 1 run, nothing should change."""
-        pos, types, ene, boxes = _make_re_data(1, 4)
+        pos, types, ene, cells = _make_re_data(1, 4)
         emax = jnp.array([0.0])
         key = jax.random.key(99)
-        new_pos, new_types, new_ene, new_boxes, info = replica_exchange_step(
-            key, pos, types, ene, boxes, emax
+        new_pos, new_types, new_ene, new_cells, info = replica_exchange_step(
+            key, pos, types, ene, cells, emax
         )
         assert jnp.array_equal(new_pos, pos)
         assert jnp.array_equal(new_ene, ene)
@@ -203,12 +203,12 @@ class TestReplicaExchangeStep:
     def test_two_runs_guaranteed_swap(self):
         """With very high Emax, all swaps should be accepted."""
         n_runs, n_walkers = 2, 1
-        pos, types, ene, boxes = _make_re_data(n_runs, n_walkers)
+        pos, types, ene, cells = _make_re_data(n_runs, n_walkers)
         # Very high Emax so both energies are always below both constraints
         emax = jnp.array([100.0, 100.0])
         key = jax.random.key(7)
-        new_pos, new_types, new_ene, new_boxes, info = replica_exchange_step(
-            key, pos, types, ene, boxes, emax
+        new_pos, new_types, new_ene, new_cells, info = replica_exchange_step(
+            key, pos, types, ene, cells, emax
         )
         # With 1 cycle, even phase has 1 pair, odd phase has 0 pairs for 2 runs
         assert int(info["n_attempted"]) == 1
@@ -220,12 +220,12 @@ class TestReplicaExchangeStep:
     def test_two_runs_guaranteed_reject(self):
         """With very low Emax, no swaps should be accepted."""
         n_runs, n_walkers = 2, 1
-        pos, types, ene, boxes = _make_re_data(n_runs, n_walkers)
+        pos, types, ene, cells = _make_re_data(n_runs, n_walkers)
         # Emax very low -- energies are in [-5, 0], setting emax to -10 rejects
         emax = jnp.array([-10.0, -10.0])
         key = jax.random.key(7)
-        new_pos, new_types, new_ene, new_boxes, info = replica_exchange_step(
-            key, pos, types, ene, boxes, emax
+        new_pos, new_types, new_ene, new_cells, info = replica_exchange_step(
+            key, pos, types, ene, cells, emax
         )
         assert int(info["n_attempted"]) == 1
         assert int(info["n_accepted"]) == 0
@@ -235,36 +235,36 @@ class TestReplicaExchangeStep:
 
     def test_returns_correct_shapes(self):
         n_runs, n_walkers, n_atoms = 4, 3, 2
-        pos, types, ene, boxes = _make_re_data(n_runs, n_walkers, n_atoms)
+        pos, types, ene, cells = _make_re_data(n_runs, n_walkers, n_atoms)
         emax = jnp.array([0.0, 0.0, 0.0, 0.0])
         key = jax.random.key(0)
-        new_pos, new_types, new_ene, new_boxes, info = replica_exchange_step(
-            key, pos, types, ene, boxes, emax
+        new_pos, new_types, new_ene, new_cells, info = replica_exchange_step(
+            key, pos, types, ene, cells, emax
         )
         assert new_pos.shape == (n_runs, n_walkers, n_atoms, 3)
         assert new_types.shape == types.shape
         assert new_ene.shape == (n_runs, n_walkers)
-        assert new_boxes.shape == (n_runs, n_walkers, 3, 3)
+        assert new_cells.shape == (n_runs, n_walkers, 3, 3)
 
-    def test_no_box(self):
-        """Works when boxes are None."""
+    def test_no_cell(self):
+        """Works when cells are None."""
         n_runs, n_walkers = 3, 2
         pos, types, ene, _ = _make_re_data(n_runs, n_walkers)
         emax = jnp.array([100.0, 100.0, 100.0])
         key = jax.random.key(5)
-        new_pos, new_types, new_ene, new_boxes, info = replica_exchange_step(
+        new_pos, new_types, new_ene, new_cells, info = replica_exchange_step(
             key, pos, types, ene, None, emax
         )
-        assert new_boxes is None
+        assert new_cells is None
         assert new_pos.shape == pos.shape
 
     def test_multiple_swap_cycles(self):
         n_runs, n_walkers = 3, 2
-        pos, types, ene, boxes = _make_re_data(n_runs, n_walkers)
+        pos, types, ene, cells = _make_re_data(n_runs, n_walkers)
         emax = jnp.array([100.0, 100.0, 100.0])
         key = jax.random.key(13)
         _, _, _, _, info = replica_exchange_step(
-            key, pos, types, ene, boxes, emax, n_swap_cycles=3
+            key, pos, types, ene, cells, emax, n_swap_cycles=3
         )
         # 3 runs: even pairs=1, odd pairs=1 => 2 attempts per cycle, 3 cycles = 6
         assert int(info["n_attempted"]) == 6
@@ -272,11 +272,11 @@ class TestReplicaExchangeStep:
     def test_energy_conservation(self):
         """Total energy across all walkers is conserved (swaps only move energy)."""
         n_runs, n_walkers = 4, 3
-        pos, types, ene, boxes = _make_re_data(n_runs, n_walkers)
+        pos, types, ene, cells = _make_re_data(n_runs, n_walkers)
         emax = jnp.array([100.0, 100.0, 100.0, 100.0])
         key = jax.random.key(42)
         _, _, new_ene, _, _ = replica_exchange_step(
-            key, pos, types, ene, boxes, emax, n_swap_cycles=5
+            key, pos, types, ene, cells, emax, n_swap_cycles=5
         )
         # Total energy should be preserved (just rearranged)
         assert jnp.allclose(jnp.sort(ene.ravel()), jnp.sort(new_ene.ravel()))
@@ -284,12 +284,12 @@ class TestReplicaExchangeStep:
     def test_types_per_run_not_per_walker(self):
         """When types has shape (P, n_atoms) instead of (P, K, n_atoms)."""
         n_runs, n_walkers, n_atoms = 3, 2, 2
-        pos, _, ene, boxes = _make_re_data(n_runs, n_walkers, n_atoms)
+        pos, _, ene, cells = _make_re_data(n_runs, n_walkers, n_atoms)
         types_shared = jnp.zeros((n_runs, n_atoms), dtype=jnp.int32)
         emax = jnp.array([100.0, 100.0, 100.0])
         key = jax.random.key(0)
         _, new_types, _, _, _ = replica_exchange_step(
-            key, pos, types_shared, ene, boxes, emax
+            key, pos, types_shared, ene, cells, emax
         )
         # Types should remain unchanged when not per-walker
         assert jnp.array_equal(new_types, types_shared)
@@ -304,12 +304,12 @@ class TestReplicaExchangeStepPressure:
     def test_pressure_re_runs(self):
         """replica_exchange_step with pressures should run without error."""
         n_runs, n_walkers = 3, 2
-        pos, types, ene, boxes = _make_re_data(n_runs, n_walkers)
+        pos, types, ene, cells = _make_re_data(n_runs, n_walkers)
         emax = jnp.array([100.0, 100.0, 100.0])
         pressures = jnp.array([0.0, 1.0, 2.0])
         key = jax.random.key(0)
-        new_pos, new_types, new_ene, new_boxes, info = replica_exchange_step(
-            key, pos, types, ene, boxes, emax, pressures=pressures
+        new_pos, new_types, new_ene, new_cells, info = replica_exchange_step(
+            key, pos, types, ene, cells, emax, pressures=pressures
         )
         assert new_pos.shape == pos.shape
         assert int(info["n_attempted"]) > 0
@@ -317,13 +317,13 @@ class TestReplicaExchangeStepPressure:
     def test_high_pressure_rejects_swaps(self):
         """Very high pressure makes enthalpies exceed Emax, rejecting swaps."""
         n_runs, n_walkers = 2, 1
-        pos, types, ene, boxes = _make_re_data(n_runs, n_walkers)
+        pos, types, ene, cells = _make_re_data(n_runs, n_walkers)
         # Set tight emax and very high pressure so enthalpy = E + P*V >> emax
         emax = jnp.array([0.0, 0.0])
         pressures = jnp.array([1e6, 1e6])
         key = jax.random.key(0)
         _, _, new_ene, _, info = replica_exchange_step(
-            key, pos, types, ene, boxes, emax, pressures=pressures
+            key, pos, types, ene, cells, emax, pressures=pressures
         )
         assert int(info["n_accepted"]) == 0
 
@@ -355,12 +355,12 @@ class TestJITCompatibility:
 
     def test_replica_exchange_step_jit(self):
         n_runs, n_walkers = 3, 2
-        pos, types, ene, boxes = _make_re_data(n_runs, n_walkers)
+        pos, types, ene, cells = _make_re_data(n_runs, n_walkers)
         emax = jnp.array([100.0, 100.0, 100.0])
         key = jax.random.key(0)
         jitted = jax.jit(replica_exchange_step, static_argnames=("n_swap_cycles",))
         new_pos, _, new_ene, _, info = jitted(
-            key, pos, types, ene, boxes, emax, n_swap_cycles=1
+            key, pos, types, ene, cells, emax, n_swap_cycles=1
         )
         assert new_pos.shape == pos.shape
         assert int(info["n_attempted"]) > 0

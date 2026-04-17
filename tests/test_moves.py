@@ -18,15 +18,15 @@ from jaxrens.state.mc_state import MCState, make_mc_state_class
 _GalileanMCState = make_mc_state_class({"direction": jnp.ndarray})
 
 
-def _make_state(positions, types, energy, box=None, step_size=0.1):
+def _make_state(positions, types, energy, cell=None, step_size=0.1):
     """Helper: create MCState for non-galilean tests."""
-    if box is None:
-        box = jnp.zeros((3, 3))
+    if cell is None:
+        cell = jnp.zeros((3, 3))
     return MCState(
         positions=jnp.asarray(positions),
         types=jnp.asarray(types),
         energy=jnp.asarray(energy),
-        box=jnp.asarray(box),
+        cell=jnp.asarray(cell),
         step_size=jnp.asarray(step_size),
         step_sizes=jnp.array([step_size]),
         n_accepted=jnp.zeros(1, dtype=jnp.int32),
@@ -37,15 +37,15 @@ def _make_state(positions, types, energy, box=None, step_size=0.1):
     )
 
 
-def _make_gmc_state(positions, types, energy, box=None, step_size=0.1):
+def _make_gmc_state(positions, types, energy, cell=None, step_size=0.1):
     """Helper: create MCState with direction for galilean tests."""
-    if box is None:
-        box = jnp.zeros((3, 3))
+    if cell is None:
+        cell = jnp.zeros((3, 3))
     return _GalileanMCState(
         positions=jnp.asarray(positions),
         types=jnp.asarray(types),
         energy=jnp.asarray(energy),
-        box=jnp.asarray(box),
+        cell=jnp.asarray(cell),
         step_size=jnp.asarray(step_size),
         step_sizes=jnp.array([step_size]),
         n_accepted=jnp.zeros(1, dtype=jnp.int32),
@@ -132,7 +132,7 @@ class TestRandomWalkStep:
             positions=batch_pos,
             types=batch_types,
             energy=batch_energy,
-            box=jnp.zeros((4, 3, 3)),
+            cell=jnp.zeros((4, 3, 3)),
             step_size=batch_step_size,
             step_sizes=jnp.full((4, 1), 0.1),
             n_accepted=jnp.zeros((4, 1), dtype=jnp.int32),
@@ -238,7 +238,7 @@ class TestGalileanStep:
             positions=batch_pos,
             types=batch_types,
             energy=batch_energy,
-            box=jnp.zeros((4, 3, 3)),
+            cell=jnp.zeros((4, 3, 3)),
             step_size=batch_step_size,
             step_sizes=jnp.full((4, 1), 0.05),
             n_accepted=jnp.zeros((4, 1), dtype=jnp.int32),

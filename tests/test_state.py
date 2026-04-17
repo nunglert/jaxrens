@@ -58,13 +58,13 @@ class TestWalkerStatePytree:
         batch_positions = jnp.stack([dummy_walker.positions] * 4)
         batch_types = jnp.stack([dummy_walker.types] * 4)
         batch_energies = jnp.array([-1.0, -2.0, -3.0, -4.0])
-        batch_boxes = jnp.stack([dummy_walker.box] * 4)
+        batch_cells = jnp.stack([dummy_walker.cell] * 4)
 
         batch = WalkerState(
             positions=batch_positions,
             types=batch_types,
             energy=batch_energies,
-            box=batch_boxes,
+            cell=batch_cells,
             n_atoms=3,
         )
 
@@ -84,14 +84,14 @@ class TestWalkerStatePytree:
         """Static fields should not appear in pytree leaves."""
         leaves = jax.tree_util.tree_leaves(dummy_walker)
         # n_atoms is static, should not be in leaves
-        # Leaves: positions, types, energy, box = 4 leaves
+        # Leaves: positions, types, energy, cell = 4 leaves
         assert len(leaves) == 4
 
     def test_nonperiodic_walker(self, dummy_walker_nonperiodic):
-        """Walker with box=None should work as pytree."""
+        """Walker with cell=None should work as pytree."""
         leaves, treedef = jax.tree_util.tree_flatten(dummy_walker_nonperiodic)
         reconstructed = treedef.unflatten(leaves)
-        assert reconstructed.box is None
+        assert reconstructed.cell is None
         assert jnp.array_equal(reconstructed.positions, dummy_walker_nonperiodic.positions)
 
 
@@ -106,7 +106,7 @@ class TestNSStatePytree:
             positions=jnp.zeros((n_walkers, 3, 3)),
             types=jnp.zeros((n_walkers, 3), dtype=jnp.int32),
             energy=jnp.zeros(n_walkers),
-            box=jnp.tile(5.0 * jnp.eye(3), (n_walkers, 1, 1)),
+            cell=jnp.tile(5.0 * jnp.eye(3), (n_walkers, 1, 1)),
             step_size=jnp.zeros(n_walkers),
             step_sizes=jnp.full((n_walkers, n_moves), 0.1),
             n_accepted=jnp.zeros((n_walkers, n_moves), dtype=jnp.int32),

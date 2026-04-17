@@ -79,7 +79,7 @@ class TestAdaptationConvergence:
         step_fn = jax.jit(rw_build_kernel(backend))
         rw_state = MCState(
             positions=positions, types=types,
-            energy=jnp.asarray(0.25), box=jnp.zeros((3, 3)),
+            energy=jnp.asarray(0.25), cell=jnp.zeros((3, 3)),
             step_size=jnp.asarray(0.1),
             step_sizes=jnp.array([0.1]),
             n_accepted=jnp.zeros(1, dtype=jnp.int32),

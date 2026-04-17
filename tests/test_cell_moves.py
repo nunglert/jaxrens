@@ -60,7 +60,7 @@ def types():
 
 
 @pytest.fixture
-def box():
+def cell():
     return 5.0 * jnp.eye(3)
 
 
@@ -87,27 +87,27 @@ N_ATOMS = 2
 
 
 class TestCellUtils:
-    def test_get_volume_cubic(self, box):
-        vol = get_volume(box)
+    def test_get_volume_cubic(self, cell):
+        vol = get_volume(cell)
         assert jnp.allclose(vol, 125.0)
 
-    def test_min_aspect_ratio_cubic(self, box):
-        vol = get_volume(box)
-        ratio = min_aspect_ratio(box, vol)
+    def test_min_aspect_ratio_cubic(self, cell):
+        vol = get_volume(cell)
+        ratio = min_aspect_ratio(cell, vol)
         assert jnp.allclose(ratio, 1.0, atol=1e-5)
 
-    def test_check_cell_shape_valid(self, box):
-        valid = check_cell_shape(box, N_ATOMS, max_vol_per_atom=100.0,
+    def test_check_cell_shape_valid(self, cell):
+        valid = check_cell_shape(cell, N_ATOMS, max_vol_per_atom=100.0,
                                  min_vol_per_atom=1.0, min_aspect=0.5)
         assert valid
 
-    def test_check_cell_shape_too_large(self, box):
-        valid = check_cell_shape(box, N_ATOMS, max_vol_per_atom=10.0,
+    def test_check_cell_shape_too_large(self, cell):
+        valid = check_cell_shape(cell, N_ATOMS, max_vol_per_atom=10.0,
                                  min_vol_per_atom=1.0, min_aspect=0.5)
         assert not valid
 
-    def test_check_cell_shape_too_small(self, box):
-        valid = check_cell_shape(box, N_ATOMS, max_vol_per_atom=200.0,
+    def test_check_cell_shape_too_small(self, cell):
+        valid = check_cell_shape(cell, N_ATOMS, max_vol_per_atom=200.0,
                                  min_vol_per_atom=100.0, min_aspect=0.5)
         assert not valid
 
@@ -119,13 +119,13 @@ class TestCellUtils:
                                  min_vol_per_atom=0.001, min_aspect=0.5)
         assert not valid
 
-    def test_transform_positions_identity(self, positions, box):
-        new_pos = transform_positions(positions, box, box)
+    def test_transform_positions_identity(self, positions, cell):
+        new_pos = transform_positions(positions, cell, cell)
         assert jnp.allclose(new_pos, positions, atol=1e-6)
 
-    def test_transform_positions_scaling(self, positions, box):
-        new_box = 2.0 * box
-        new_pos = transform_positions(positions, box, new_box)
+    def test_transform_positions_scaling(self, positions, cell):
+        new_cell = 2.0 * cell
+        new_pos = transform_positions(positions, cell, new_cell)
         assert jnp.allclose(new_pos, 2.0 * positions, atol=1e-6)
 
 
@@ -135,8 +135,8 @@ class TestCellUtils:
 
 
 class TestVolumeMoveStep:
-    def test_step_returns_state_and_info(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.1)
+    def test_step_returns_state_and_info(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.1)
         step = jax.jit(vol_build_kernel(cell_energy_backend, N_ATOMS))
 
         key = jax.random.key(0)
@@ -146,16 +146,16 @@ class TestVolumeMoveStep:
         assert hasattr(info, "accepted")
         assert hasattr(info, "n_evaluations")
 
-    def test_accepts_below_constraint(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.01)
+    def test_accepts_below_constraint(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.01)
         step = jax.jit(vol_build_kernel(cell_energy_backend, N_ATOMS))
 
         key = jax.random.key(42)
         new_state, info = step(key, state, likelihood_constraint=1000.0)
         assert info.accepted
 
-    def test_rejects_above_constraint(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.01)
+    def test_rejects_above_constraint(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.01)
         step = jax.jit(vol_build_kernel(cell_energy_backend, N_ATOMS))
 
         key = jax.random.key(0)
@@ -163,19 +163,19 @@ class TestVolumeMoveStep:
         assert not info.accepted
         assert jnp.array_equal(new_state.positions, state.positions)
 
-    def test_volume_changes_on_accept(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.5)
+    def test_volume_changes_on_accept(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.5)
         step = jax.jit(vol_build_kernel(cell_energy_backend, N_ATOMS))
 
         key = jax.random.key(42)
         new_state, info = step(key, state, likelihood_constraint=1000.0)
         if info.accepted:
-            old_vol = get_volume(state.box)
-            new_vol = get_volume(new_state.box)
+            old_vol = get_volume(state.cell)
+            new_vol = get_volume(new_state.cell)
             assert not jnp.allclose(old_vol, new_vol, atol=1e-8)
 
-    def test_jit(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.1)
+    def test_jit(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.1)
         step = vol_build_kernel(cell_energy_backend, N_ATOMS)
 
         jitted_step = jax.jit(step)
@@ -183,18 +183,18 @@ class TestVolumeMoveStep:
         new_state, info = jitted_step(key, state, 100.0)
         assert new_state.energy.shape == ()
 
-    def test_vmap(self, positions, types, box):
+    def test_vmap(self, positions, types, cell):
         step = jax.jit(vol_build_kernel(cell_energy_backend, N_ATOMS))
 
         batch_pos = jnp.stack([positions] * 4)
         batch_types = jnp.stack([types] * 4)
         batch_energy = jnp.array([0.5, 1.0, 1.5, 2.0])
         batch_step_size = jnp.full(4, 0.1)
-        batch_box = jnp.stack([box] * 4)
+        batch_cell = jnp.stack([cell] * 4)
 
         batch_state = MCState(
             positions=batch_pos, types=batch_types,
-            energy=batch_energy, box=batch_box,
+            energy=batch_energy, cell=batch_cell,
             step_size=batch_step_size,
             step_sizes=jnp.full((4, 1), 0.1),
             n_accepted=jnp.zeros((4, 1), dtype=jnp.int32),
@@ -211,8 +211,8 @@ class TestVolumeMoveStep:
         assert new_states.energy.shape == (4,)
         assert infos.accepted.shape == (4,)
 
-    def test_scan_compatible(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.1)
+    def test_scan_compatible(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.1)
         step = jax.jit(vol_build_kernel(cell_energy_backend, N_ATOMS))
 
         def scan_step(carry, key):
@@ -223,8 +223,8 @@ class TestVolumeMoveStep:
         final_state, accepted = jax.lax.scan(scan_step, state, keys)
         assert accepted.shape == (10,)
 
-    def test_cell_shape_constraint_enforced(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=10.0)
+    def test_cell_shape_constraint_enforced(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=10.0)
         step = jax.jit(vol_build_kernel(
             cell_energy_backend, N_ATOMS,
             max_vol_per_atom=63.0,
@@ -248,8 +248,8 @@ class TestVolumeMoveStep:
 
 
 class TestShearMoveStep:
-    def test_step_returns_state_and_info(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.1)
+    def test_step_returns_state_and_info(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.1)
         step = jax.jit(shear_build_kernel(cell_energy_backend, N_ATOMS))
 
         key = jax.random.key(0)
@@ -258,34 +258,34 @@ class TestShearMoveStep:
         assert isinstance(new_state, MCState)
         assert hasattr(info, "accepted")
 
-    def test_accepts_below_constraint(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.01)
+    def test_accepts_below_constraint(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.01)
         step = jax.jit(shear_build_kernel(cell_energy_backend, N_ATOMS))
 
         key = jax.random.key(42)
         new_state, info = step(key, state, likelihood_constraint=1000.0)
         assert info.accepted
 
-    def test_rejects_above_constraint(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.01)
+    def test_rejects_above_constraint(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.01)
         step = jax.jit(shear_build_kernel(cell_energy_backend, N_ATOMS))
 
         key = jax.random.key(0)
         new_state, info = step(key, state, likelihood_constraint=0.0)
         assert not info.accepted
 
-    def test_volume_preserved(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.5)
+    def test_volume_preserved(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.5)
         step = jax.jit(shear_build_kernel(cell_energy_backend, N_ATOMS))
 
-        old_vol = get_volume(state.box)
+        old_vol = get_volume(state.cell)
         key = jax.random.key(42)
         new_state, info = step(key, state, likelihood_constraint=1000.0)
-        new_vol = get_volume(new_state.box)
+        new_vol = get_volume(new_state.cell)
         assert jnp.allclose(old_vol, new_vol, atol=1e-4)
 
-    def test_jit(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.1)
+    def test_jit(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.1)
         step = shear_build_kernel(cell_energy_backend, N_ATOMS)
 
         jitted_step = jax.jit(step)
@@ -293,18 +293,18 @@ class TestShearMoveStep:
         new_state, info = jitted_step(key, state, 100.0)
         assert new_state.energy.shape == ()
 
-    def test_vmap(self, positions, types, box):
+    def test_vmap(self, positions, types, cell):
         step = jax.jit(shear_build_kernel(cell_energy_backend, N_ATOMS))
 
         batch_pos = jnp.stack([positions] * 4)
         batch_types = jnp.stack([types] * 4)
         batch_energy = jnp.array([0.5, 1.0, 1.5, 2.0])
         batch_step_size = jnp.full(4, 0.1)
-        batch_box = jnp.stack([box] * 4)
+        batch_cell = jnp.stack([cell] * 4)
 
         batch_state = MCState(
             positions=batch_pos, types=batch_types,
-            energy=batch_energy, box=batch_box,
+            energy=batch_energy, cell=batch_cell,
             step_size=batch_step_size,
             step_sizes=jnp.full((4, 1), 0.1),
             n_accepted=jnp.zeros((4, 1), dtype=jnp.int32),
@@ -321,8 +321,8 @@ class TestShearMoveStep:
         assert new_states.energy.shape == (4,)
         assert infos.accepted.shape == (4,)
 
-    def test_scan_compatible(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.1)
+    def test_scan_compatible(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.1)
         step = jax.jit(shear_build_kernel(cell_energy_backend, N_ATOMS))
 
         def scan_step(carry, key):
@@ -333,8 +333,8 @@ class TestShearMoveStep:
         final_state, accepted = jax.lax.scan(scan_step, state, keys)
         assert accepted.shape == (10,)
 
-    def test_cell_shape_constraint_enforced(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=10.0)
+    def test_cell_shape_constraint_enforced(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=10.0)
         step = jax.jit(shear_build_kernel(
             cell_energy_backend, N_ATOMS, min_aspect=0.99,
         ))
@@ -355,8 +355,8 @@ class TestShearMoveStep:
 
 
 class TestStretchMoveStep:
-    def test_step_returns_state_and_info(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.1)
+    def test_step_returns_state_and_info(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.1)
         step = jax.jit(stretch_build_kernel(cell_energy_backend, N_ATOMS))
 
         key = jax.random.key(0)
@@ -365,34 +365,34 @@ class TestStretchMoveStep:
         assert isinstance(new_state, MCState)
         assert hasattr(info, "accepted")
 
-    def test_accepts_below_constraint(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.01)
+    def test_accepts_below_constraint(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.01)
         step = jax.jit(stretch_build_kernel(cell_energy_backend, N_ATOMS))
 
         key = jax.random.key(42)
         new_state, info = step(key, state, likelihood_constraint=1000.0)
         assert info.accepted
 
-    def test_rejects_above_constraint(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.01)
+    def test_rejects_above_constraint(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.01)
         step = jax.jit(stretch_build_kernel(cell_energy_backend, N_ATOMS))
 
         key = jax.random.key(0)
         new_state, info = step(key, state, likelihood_constraint=0.0)
         assert not info.accepted
 
-    def test_volume_preserved(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.5)
+    def test_volume_preserved(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.5)
         step = jax.jit(stretch_build_kernel(cell_energy_backend, N_ATOMS))
 
-        old_vol = get_volume(state.box)
+        old_vol = get_volume(state.cell)
         key = jax.random.key(42)
         new_state, info = step(key, state, likelihood_constraint=1000.0)
-        new_vol = get_volume(new_state.box)
+        new_vol = get_volume(new_state.cell)
         assert jnp.allclose(old_vol, new_vol, atol=1e-4)
 
-    def test_jit(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.1)
+    def test_jit(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.1)
         step = stretch_build_kernel(cell_energy_backend, N_ATOMS)
 
         jitted_step = jax.jit(step)
@@ -400,18 +400,18 @@ class TestStretchMoveStep:
         new_state, info = jitted_step(key, state, 100.0)
         assert new_state.energy.shape == ()
 
-    def test_vmap(self, positions, types, box):
+    def test_vmap(self, positions, types, cell):
         step = jax.jit(stretch_build_kernel(cell_energy_backend, N_ATOMS))
 
         batch_pos = jnp.stack([positions] * 4)
         batch_types = jnp.stack([types] * 4)
         batch_energy = jnp.array([0.5, 1.0, 1.5, 2.0])
         batch_step_size = jnp.full(4, 0.1)
-        batch_box = jnp.stack([box] * 4)
+        batch_cell = jnp.stack([cell] * 4)
 
         batch_state = MCState(
             positions=batch_pos, types=batch_types,
-            energy=batch_energy, box=batch_box,
+            energy=batch_energy, cell=batch_cell,
             step_size=batch_step_size,
             step_sizes=jnp.full((4, 1), 0.1),
             n_accepted=jnp.zeros((4, 1), dtype=jnp.int32),
@@ -428,8 +428,8 @@ class TestStretchMoveStep:
         assert new_states.energy.shape == (4,)
         assert infos.accepted.shape == (4,)
 
-    def test_scan_compatible(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=0.1)
+    def test_scan_compatible(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=0.1)
         step = jax.jit(stretch_build_kernel(cell_energy_backend, N_ATOMS))
 
         def scan_step(carry, key):
@@ -440,8 +440,8 @@ class TestStretchMoveStep:
         final_state, accepted = jax.lax.scan(scan_step, state, keys)
         assert accepted.shape == (10,)
 
-    def test_cell_shape_constraint_enforced(self, positions, types, box):
-        state = _make_cell_state(positions, types, energy=0.5, box=box, step_size=10.0)
+    def test_cell_shape_constraint_enforced(self, positions, types, cell):
+        state = _make_cell_state(positions, types, energy=0.5, cell=cell, step_size=10.0)
         step = jax.jit(stretch_build_kernel(
             cell_energy_backend, N_ATOMS, min_aspect=0.99,
         ))
@@ -467,7 +467,7 @@ class TestLJIntegration:
         backend = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5)
         n_atoms = 4
 
-        box = 5.0 * jnp.eye(3)
+        cell = 5.0 * jnp.eye(3)
         positions = jnp.array([
             [0.5, 0.5, 0.5],
             [2.0, 0.5, 0.5],
@@ -476,8 +476,8 @@ class TestLJIntegration:
         ])
         types = jnp.zeros(n_atoms, dtype=jnp.int32)
 
-        init_energy = backend(positions, types, box, 0)[0]
-        state = _make_cell_state(positions, types, energy=init_energy, box=box, step_size=0.5)
+        init_energy = backend(positions, types, cell, 0)[0]
+        state = _make_cell_state(positions, types, energy=init_energy, cell=cell, step_size=0.5)
         step = jax.jit(vol_build_kernel(
             backend, n_atoms,
             max_vol_per_atom=100.0,
@@ -495,7 +495,7 @@ class TestLJIntegration:
             state, info = step(subkey, state, likelihood_constraint=1e6)
             if info.accepted:
                 n_accepted += 1
-            volumes.append(float(get_volume(state.box)))
+            volumes.append(float(get_volume(state.cell)))
 
         volumes = jnp.array(volumes)
 

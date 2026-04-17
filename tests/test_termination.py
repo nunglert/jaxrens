@@ -416,7 +416,7 @@ class TestTempTerminationIntegration:
 
         result = run_ns(
             positions, types, energies,
-            boxes=None,
+            cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
             rng_key=key,
@@ -464,7 +464,7 @@ class TestTempTerminationIntegration:
 
         result = run_ns(
             positions, types, energies,
-            boxes=None,
+            cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
             rng_key=key,

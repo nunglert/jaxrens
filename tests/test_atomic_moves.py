@@ -22,15 +22,15 @@ from jaxrens.base import MoveInfo
 from jaxrens.state.mc_state import MCState
 
 
-def _make_state(positions, types, energy, box=None, step_size=0.1):
+def _make_state(positions, types, energy, cell=None, step_size=0.1):
     """Helper: create MCState for tests."""
-    if box is None:
-        box = jnp.zeros((3, 3))
+    if cell is None:
+        cell = jnp.zeros((3, 3))
     return MCState(
         positions=jnp.asarray(positions),
         types=jnp.asarray(types),
         energy=jnp.asarray(energy),
-        box=jnp.asarray(box),
+        cell=jnp.asarray(cell),
         step_size=jnp.asarray(step_size),
         step_sizes=jnp.array([step_size]),
         n_accepted=jnp.zeros(1, dtype=jnp.int32),
@@ -48,7 +48,7 @@ def _make_batch_state(positions, types, energies, step_size=0.1):
         positions=positions,
         types=jnp.broadcast_to(types, (n, *types.shape)) if types.ndim == 1 else types,
         energy=energies,
-        box=jnp.zeros((n, 3, 3)),
+        cell=jnp.zeros((n, 3, 3)),
         step_size=jnp.full(n, step_size),
         step_sizes=jnp.full((n, 1), step_size),
         n_accepted=jnp.zeros((n, 1), dtype=jnp.int32),
@@ -128,8 +128,8 @@ class TestHMC:
         n_walkers = 8
         key = jax.random.key(2)
         positions = jax.random.normal(key, (n_walkers, 1, 3))
-        box = jnp.zeros((3, 3))
-        energies = jax.vmap(lambda pos: backend(pos, types_1, box, 0)[0])(positions)
+        cell = jnp.zeros((3, 3))
+        energies = jax.vmap(lambda pos: backend(pos, types_1, cell, 0)[0])(positions)
         states = _make_batch_state(positions, types_1, energies, step_size=0.01)
         step_fn = jax.jit(hmc.build_kernel(backend, n_leapfrog=5))
         keys = jax.random.split(jax.random.key(3), n_walkers)
@@ -199,8 +199,8 @@ class TestSingleAtomMove:
         backend = harmonic
         n_walkers = 4
         positions = jax.random.normal(jax.random.key(12), (n_walkers, 1, 3))
-        box = jnp.zeros((3, 3))
-        energies = jax.vmap(lambda pos: backend(pos, types_1, box, 0)[0])(positions)
+        cell = jnp.zeros((3, 3))
+        energies = jax.vmap(lambda pos: backend(pos, types_1, cell, 0)[0])(positions)
         states = _make_batch_state(positions, types_1, energies, step_size=0.1)
         step_fn = jax.jit(single_atom.build_kernel(backend))
         keys = jax.random.split(jax.random.key(13), n_walkers)

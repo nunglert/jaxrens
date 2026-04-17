@@ -36,19 +36,19 @@ def dummy_types_3():
 
 
 @pytest.fixture
-def dummy_box():
-    """Cubic box with side length 5.0."""
+def dummy_cell():
+    """Cubic cell with side length 5.0."""
     return 5.0 * jnp.eye(3)
 
 
 @pytest.fixture
-def dummy_walker(dummy_positions_3, dummy_types_3, dummy_box):
-    """Single WalkerState with 3 atoms in a box."""
+def dummy_walker(dummy_positions_3, dummy_types_3, dummy_cell):
+    """Single WalkerState with 3 atoms in a cell."""
     return WalkerState(
         positions=dummy_positions_3,
         types=dummy_types_3,
         energy=jnp.array(-1.5),
-        box=dummy_box,
+        cell=dummy_cell,
         n_atoms=3,
     )
 
@@ -60,7 +60,7 @@ def dummy_walker_nonperiodic(dummy_positions_3, dummy_types_3):
         positions=dummy_positions_3,
         types=dummy_types_3,
         energy=jnp.array(-1.5),
-        box=None,
+        cell=None,
         n_atoms=3,
     )
 
@@ -78,7 +78,7 @@ def harmonic_energy_fn():
     log Z = N * 3/2 * log(2*pi) - 3*N*log(L)  (approximate, large L)
     """
 
-    def energy_fn(params, positions, types, box=None, **kwargs):
+    def energy_fn(params, positions, types, cell=None, **kwargs):
         return 0.5 * jnp.sum(positions**2)
 
     return energy_fn
@@ -92,7 +92,7 @@ def lj_pair_energy_fn():
     with epsilon=1, sigma=1.
     """
 
-    def energy_fn(params, positions, types, box=None, **kwargs):
+    def energy_fn(params, positions, types, cell=None, **kwargs):
         n_atoms = positions.shape[0]
         energy = jnp.array(0.0)
         for i in range(n_atoms):

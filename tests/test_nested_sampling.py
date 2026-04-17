@@ -59,7 +59,7 @@ class TestInitNS:
         state = init_ns(
             s["init_fn"],
             s["positions"], s["types"], s["energies"],
-            boxes=None, rng_key=s["key"],
+            cells=None, rng_key=s["key"],
         )
         assert state.population.positions.shape == s["positions"].shape
         assert state.population.energy.shape == (s["n_walkers"],)
@@ -71,7 +71,7 @@ class TestInitNS:
         state = init_ns(
             s["init_fn"],
             s["positions"], s["types"], s["energies"],
-            boxes=None, rng_key=s["key"], max_dead=100,
+            cells=None, rng_key=s["key"], max_dead=100,
         )
         assert state.dead_energies.shape == (100,)
 
@@ -80,7 +80,7 @@ class TestInitNS:
         state = init_ns(
             s["init_fn"],
             s["positions"], s["types"], s["energies"],
-            boxes=None, rng_key=s["key"],
+            cells=None, rng_key=s["key"],
         )
         pop = state.population
         assert pop.positions.shape[0] == s["n_walkers"]
@@ -94,7 +94,7 @@ class TestNSStep:
         state = init_ns(
             s["init_fn"],
             s["positions"], s["types"], s["energies"],
-            boxes=None, rng_key=s["key"],
+            cells=None, rng_key=s["key"],
         )
 
         new_state, info = ns_step(state, s["step_fn"], n_mcmc_steps=10)
@@ -108,7 +108,7 @@ class TestNSStep:
         state = init_ns(
             s["init_fn"],
             s["positions"], s["types"], s["energies"],
-            boxes=None, rng_key=s["key"],
+            cells=None, rng_key=s["key"],
         )
 
         emaxes = []
@@ -123,7 +123,7 @@ class TestNSStep:
         state = init_ns(
             s["init_fn"],
             s["positions"], s["types"], s["energies"],
-            boxes=None, rng_key=s["key"],
+            cells=None, rng_key=s["key"],
         )
 
         for _ in range(50):
@@ -136,7 +136,7 @@ class TestNSStep:
         state = init_ns(
             s["init_fn"],
             s["positions"], s["types"], s["energies"],
-            boxes=None, rng_key=s["key"],
+            cells=None, rng_key=s["key"],
         )
 
         jit_step = jax.jit(ns_step, static_argnums=(1, 2, 3))
@@ -150,7 +150,7 @@ class TestNSStep:
         state = init_ns(
             s["init_fn"],
             s["positions"], s["types"], s["energies"],
-            boxes=None, rng_key=s["key"],
+            cells=None, rng_key=s["key"],
         )
 
         new_state, info = ns_step(state, s["step_fn"], n_mcmc_steps=10, n_extra=5)
@@ -164,7 +164,7 @@ class TestNSStep:
         state = init_ns(
             s["init_fn"],
             s["positions"], s["types"], s["energies"],
-            boxes=None, rng_key=s["key"],
+            cells=None, rng_key=s["key"],
         )
 
         emaxes = []
@@ -180,7 +180,7 @@ class TestRunNS:
         s = harmonic_setup
         result = run_ns(
             s["positions"], s["types"], s["energies"],
-            boxes=None,
+            cells=None,
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
             rng_key=s["key"],
@@ -214,7 +214,7 @@ class TestRunNS:
 
         result = run_ns(
             positions, types, energies,
-            boxes=None,
+            cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
             rng_key=key,
@@ -248,7 +248,7 @@ class TestRunNS:
 
         result = run_ns(
             s["positions"], s["types"], s["energies"],
-            boxes=None,
+            cells=None,
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
             rng_key=s["key"],

@@ -33,7 +33,7 @@ def types_3():
 
 
 @pytest.fixture
-def box_5():
+def cell_5():
     return 5.0 * jnp.eye(3)
 
 
@@ -170,12 +170,12 @@ class TestLJ:
 
     def test_periodic_minimum_image(self):
         backend = create_lj(epsilon=1.0, sigma=1.0)
-        box = 3.0 * jnp.eye(3)
-        # Two atoms: one at (0,0,0), one at (2.8,0,0) in a 3.0 box
+        cell = 3.0 * jnp.eye(3)
+        # Two atoms: one at (0,0,0), one at (2.8,0,0) in a 3.0 cell
         # Minimum image distance = 0.2 (wraps around)
         pos = jnp.array([[0.0, 0.0, 0.0], [2.8, 0.0, 0.0]])
         types = jnp.array([0, 0])
-        e_pbc = backend(pos, types, box, 0)[0]
+        e_pbc = backend(pos, types, cell, 0)[0]
         e_no_pbc = backend(pos, types, jnp.zeros((3, 3)), 0)[0]
         # With PBC, distance is 0.2 -> very repulsive
         # Without PBC, distance is 2.8 -> weakly attractive

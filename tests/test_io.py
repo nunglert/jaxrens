@@ -33,7 +33,7 @@ def walker():
         positions=jnp.array([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]),
         types=jnp.array([0, 1]),
         energy=jnp.array(-1.5),
-        box=5.0 * jnp.eye(3),
+        cell=5.0 * jnp.eye(3),
         n_atoms=2,
     )
 
@@ -44,7 +44,7 @@ def ns_state():
         "positions": jnp.zeros((10, 2, 3)),
         "types": jnp.zeros((10, 2), dtype=jnp.int32),
         "energies": jnp.arange(10, dtype=jnp.float32),
-        "boxes": None,
+        "cells": None,
         "dead_energies": jnp.array([5.0, 4.0, 3.0, jnp.inf, jnp.inf]),
         "dead_positions": jnp.zeros((5, 2, 3)),
         "log_evidence": jnp.array(-2.5),
@@ -87,7 +87,7 @@ class TestFormats:
         assert jnp.allclose(loaded.positions, walker.positions)
         assert jnp.array_equal(loaded.types, walker.types)
         assert jnp.allclose(loaded.energy, walker.energy)
-        assert loaded.box is not None
+        assert loaded.cell is not None
 
     def test_dict_walker_to_ase(self, symbol_map):
         w = {
@@ -119,11 +119,11 @@ class TestCheckpoint:
             loaded["dead_energies"][:3], ns_state["dead_energies"][:3]
         )
 
-    def test_save_without_boxes(self, ns_state, tmp_path):
-        path = tmp_path / "no_boxes.h5"
+    def test_save_without_cells(self, ns_state, tmp_path):
+        path = tmp_path / "no_cells.h5"
         save_checkpoint(path, ns_state)
         loaded = load_checkpoint(path)
-        assert loaded["boxes"] is None
+        assert loaded["cells"] is None
 
 
 # ---------------------------------------------------------------------------

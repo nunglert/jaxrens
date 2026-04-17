@@ -33,8 +33,8 @@ from jaxrens.utils.cell import get_volume
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _make_periodic_setup(n_walkers=20, n_atoms=2, box_size=5.0, seed=0, pressure=None):
-    """Create a periodic harmonic system with boxes."""
+def _make_periodic_setup(n_walkers=20, n_atoms=2, cell_size=5.0, seed=0, pressure=None):
+    """Create a periodic harmonic system with cells."""
     base_backend = create_harmonic(k=1.0)
     if pressure:
         backend = EnsembleBackend(base_backend, pressure=pressure)
@@ -51,12 +51,12 @@ def _make_periodic_setup(n_walkers=20, n_atoms=2, box_size=5.0, seed=0, pressure
         init_key, (n_walkers, n_atoms, 3), minval=-1.0, maxval=1.0
     )
     types = jnp.zeros((n_atoms,), dtype=jnp.int32)
-    boxes = jnp.tile(box_size * jnp.eye(3), (n_walkers, 1, 1))
+    cells = jnp.tile(cell_size * jnp.eye(3), (n_walkers, 1, 1))
 
     # Compute energies through the backend (includes PV if NPT)
     energies = jax.vmap(
-        lambda pos, box: backend(pos, types, box, 0)[0]
-    )(positions, boxes)
+        lambda pos, cell: backend(pos, types, cell, 0)[0]
+    )(positions, cells)
 
     return {
         "backend": backend,
@@ -65,7 +65,7 @@ def _make_periodic_setup(n_walkers=20, n_atoms=2, box_size=5.0, seed=0, pressure
         "positions": positions,
         "types": types,
         "energies": energies,
-        "boxes": boxes,
+        "cells": cells,
         "key": key,
         "n_walkers": n_walkers,
     }
@@ -130,7 +130,7 @@ class TestNSStepPressure:
         state = init_ns(
             s["init_fn"],
             s["positions"], s["types"], s["energies"],
-            boxes=s["boxes"], rng_key=s["key"], max_dead=100,
+            cells=s["cells"], rng_key=s["key"], max_dead=100,
         )
 
         new_state, info = ns_step(state, s["step_fn"], n_mcmc_steps=5)
@@ -150,7 +150,7 @@ class TestRunNSPressure:
         s = periodic_setup
         result = run_ns(
             s["positions"], s["types"], s["energies"],
-            boxes=s["boxes"], init_fn=s["init_fn"], step_fn=s["step_fn"],
+            cells=s["cells"], init_fn=s["init_fn"], step_fn=s["step_fn"],
             rng_key=s["key"], max_iterations=30,
             n_mcmc_steps=5, initial_step_size=0.3,
         )
@@ -162,7 +162,7 @@ class TestRunNSPressure:
         from jaxrens.backends.ensemble import make_ensemble_params
         result = run_ns(
             s["positions"], s["types"], s["energies"],
-            boxes=s["boxes"], init_fn=s["init_fn"], step_fn=s["step_fn"],
+            cells=s["cells"], init_fn=s["init_fn"], step_fn=s["step_fn"],
             rng_key=s["key"], max_iterations=100,
             n_mcmc_steps=5, initial_step_size=0.3,
             ensemble_params=make_ensemble_params(pressure=0.01),
