@@ -1,1 +1,2 @@
 - [CLI modernization plan](project_cli_modernization.md) — 8-step plan; steps 1–7 complete as of 2026-04-17
+- [Walker init package](project_init_package.md) — 7-step init build-out; step 1 complete (jaxrens.init.cells)
