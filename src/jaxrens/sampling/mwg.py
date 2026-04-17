@@ -6,7 +6,7 @@ descriptors — only fields needed by the active moves are included.
 
 Usage:
     backend = HarmonicBackend(k=1.0)
-    init_fn, step_fn = build_mwg(backend, [
+    init_fn, step_fn, per_move_fns = build_mwg(backend, [
         MoveDescriptor("random_walk", random_walk.build_kernel, weight=7),
         MoveDescriptor("volume", volume.build_kernel,
                        kernel_kwargs={"n_atoms": 64}, weight=2),
@@ -17,6 +17,7 @@ Usage:
     ])
     state = init_fn(positions, types, energy, cell)
     state, info = step_fn(rng_key, state, likelihood_constraint)
+    # per_move_fns[i](state, key, constraint) runs move i directly
 """
 
 from __future__ import annotations
@@ -173,4 +174,4 @@ def build_mwg(
 
         return new_state, info
 
-    return init_fn, step_fn
+    return init_fn, step_fn, wrapped_fns

@@ -23,7 +23,7 @@ from jaxrens.sampling.nested_sampling import init_ns, ns_step, run_ns
 def harmonic_setup():
     """Set up a harmonic oscillator NS problem."""
     backend = create_harmonic(k=1.0)
-    init_fn, step_fn = build_mwg(backend, [
+    init_fn, step_fn, _ = build_mwg(backend, [
         MoveDescriptor("random_walk", random_walk.build_kernel),
     ])
 
@@ -195,7 +195,7 @@ class TestRunNS:
     @pytest.mark.heavy
     def test_harmonic_evidence_accuracy(self):
         backend = create_harmonic(k=1.0)
-        init_fn, step_fn = build_mwg(backend, [
+        init_fn, step_fn, _ = build_mwg(backend, [
             MoveDescriptor("random_walk", random_walk.build_kernel),
         ])
 

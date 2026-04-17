@@ -41,7 +41,7 @@ def _make_periodic_setup(n_walkers=20, n_atoms=2, cell_size=5.0, seed=0, pressur
     else:
         backend = base_backend
 
-    init_fn, step_fn = build_mwg(backend, [
+    init_fn, step_fn, _ = build_mwg(backend, [
         MoveDescriptor("random_walk", random_walk.build_kernel),
     ])
 

@@ -41,4 +41,7 @@ class MoveDescriptor:
     kernel_kwargs: dict[str, Any] = field(default_factory=dict)
     weight: float = 1.0
     step_size: float = 0.1
+    step_size_max: float = 10.0
+    min_rate: float = 0.25
+    max_rate: float = 0.65
     extra_state_fields: dict[str, tuple[type, Callable]] = field(default_factory=dict)

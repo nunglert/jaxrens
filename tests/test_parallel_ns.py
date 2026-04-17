@@ -29,7 +29,7 @@ from jaxrens.sampling.nested_sampling import (
 def parallel_setup():
     """Set up 2-run parallel NS on harmonic oscillator."""
     backend = create_harmonic(k=1.0)
-    init_fn, step_fn = build_mwg(backend, [
+    init_fn, step_fn, _ = build_mwg(backend, [
         MoveDescriptor("random_walk", random_walk.build_kernel),
     ])
 
@@ -132,7 +132,7 @@ class TestVmapDifferentPressures:
         backend_p1 = EnsembleBackend(base_backend, pressure=0.1)
 
         # Use same init_fn for both (pressure correction applied by backend)
-        init_fn_p0, step_fn_p0 = build_mwg(backend_p0, [
+        init_fn_p0, step_fn_p0, _ = build_mwg(backend_p0, [
             MoveDescriptor("random_walk", random_walk.build_kernel),
         ])
 

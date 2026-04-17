@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from jaxrens.base import NSCallback
 from jaxrens.sampling.adaptation.step_size import (
@@ -366,6 +367,12 @@ def run_ns(
     callbacks: list[Any] | None = None,
     termination_criteria: list[TerminationCriterion] | None = None,
     ensemble_params: dict | None = None,
+    per_move_fns: list[Callable] | None = None,
+    move_descriptors: list | None = None,
+    adjust_interval: int = 0,
+    adjust_n_samples: int = 50,
+    adjust_max_rounds: int = 15,
+    adjust_factor: float = 1.5,
 ) -> dict:
     """Run a full nested sampling calculation.
 
@@ -410,9 +417,47 @@ def run_ns(
     # JIT-compile ns_step with step_fn, n_mcmc_steps, n_extra as static args
     jit_ns_step = jax.jit(ns_step, static_argnums=(1, 2, 3))
 
+    # Determine adaptation mode
+    use_full_auto = (
+        per_move_fns is not None
+        and move_descriptors is not None
+        and adjust_interval > 0
+    )
+
+    # Track per-move step sizes
+    pop = ns_state.population
+    current_step_sizes = pop.step_sizes[0]  # (n_move_types,) — same for all walkers
+
     for i in range(max_iterations):
-        # Adaptation: update step_sizes on population before step
-        if i < adapt_warmup:
+        # Step size adaptation
+        if use_full_auto and i > 0 and i % adjust_interval == 0:
+            # Full-auto: per-move trial-based adjustment
+            from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
+
+            pop = ns_state.population
+            emax = jnp.max(pop.energy)
+            for move_idx, desc in enumerate(move_descriptors):
+                rng_key, key_adjust = jax.random.split(rng_key)
+                new_ss, rate = jax.jit(
+                    adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10)
+                )(
+                    pop, per_move_fns[move_idx],
+                    current_step_sizes[move_idx], emax, key_adjust,
+                    adjust_n_samples, desc.min_rate, desc.max_rate,
+                    adjust_factor, desc.step_size_max, adjust_max_rounds,
+                )
+                current_step_sizes = current_step_sizes.at[move_idx].set(new_ss)
+                logger.info(
+                    "Adjusted %s: ss=%.4g rate=%.3f",
+                    desc.name, float(new_ss), float(rate),
+                )
+            # Broadcast to all walkers
+            new_ss_pop = jnp.broadcast_to(
+                current_step_sizes, (n_walkers, current_step_sizes.shape[0]),
+            )
+            ns_state = ns_state.set(population=pop.set(step_sizes=new_ss_pop))
+        elif not use_full_auto and i < adapt_warmup:
+            # Fallback: simple dual averaging (single scalar for all moves)
             step_size = get_step_size(adapt_state)
             pop = ns_state.population
             n_move_types = pop.step_sizes.shape[-1]
@@ -441,8 +486,8 @@ def run_ns(
 
         ns_state = new_ns_state
 
-        # Adaptation update (outside JIT)
-        if i < adapt_warmup:
+        # Dual averaging update (fallback, outside JIT)
+        if not use_full_auto and i < adapt_warmup:
             adapt_state = dual_averaging_update(
                 adapt_state,
                 accepted=jnp.array(info["acceptance_rate"] > target_acceptance),
@@ -452,11 +497,11 @@ def run_ns(
         # Periodic INFO log
         if i % info_interval == 0 or i == max_iterations - 1:
             logger.info(
-                "iter=%d  Emax=%.6g  log_Z=%.4f  acc=%.2f  ss=%.4g",
+                "iter=%d  Emax=%.6g  log_Z=%.4f  acc=%.2f  ss=%s",
                 int(ns_state.iteration),
                 float(info["emax"]),
                 float(info["acceptance_rate"]),
-                float(get_step_size(adapt_state)),
+                str(np.array(current_step_sizes).round(4)) if use_full_auto else f"{float(get_step_size(adapt_state)):.4g}",
                 float(ns_state.log_evidence),
             )
 

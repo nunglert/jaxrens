@@ -391,7 +391,7 @@ class TestTempTerminationIntegration:
         from jaxrens.sampling.nested_sampling import run_ns
 
         backend = create_harmonic(k=1.0)
-        init_fn, step_fn = build_mwg(backend, [
+        init_fn, step_fn, _ = build_mwg(backend, [
             MoveDescriptor("random_walk", random_walk.build_kernel),
         ])
 
@@ -441,7 +441,7 @@ class TestTempTerminationIntegration:
         from jaxrens.sampling.nested_sampling import run_ns
 
         backend = create_harmonic(k=1.0)
-        init_fn, step_fn = build_mwg(backend, [
+        init_fn, step_fn, _ = build_mwg(backend, [
             MoveDescriptor("random_walk", random_walk.build_kernel),
         ])
 

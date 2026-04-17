@@ -85,7 +85,7 @@ class TestRun:
 
         backend = create_harmonic()
         move_config = MoveConfig(move_type="random_walk")
-        init_fn, step_fn = setup_mwg(move_config, backend)
+        init_fn, step_fn, _ = setup_mwg(move_config, backend)
         assert callable(init_fn)
         assert callable(step_fn)
 
@@ -94,7 +94,7 @@ class TestRun:
 
         backend = create_harmonic()
         move_config = MoveConfig(move_type="galilean")
-        init_fn, step_fn = setup_mwg(move_config, backend)
+        init_fn, step_fn, _ = setup_mwg(move_config, backend)
         assert callable(init_fn)
         assert callable(step_fn)
 

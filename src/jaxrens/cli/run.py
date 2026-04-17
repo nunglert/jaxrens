@@ -153,7 +153,7 @@ def run_from_config(
         initial_energies = jax.vmap(eval_one)(initial_positions)
 
     # Build MWG sampler
-    init_fn, step_fn = setup_mwg(move_config, backend)
+    init_fn, step_fn, per_move_fns = setup_mwg(move_config, backend)
 
     # Set up callbacks
     callbacks = [
