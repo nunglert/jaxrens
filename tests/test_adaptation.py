@@ -68,7 +68,7 @@ class TestAdaptationConvergence:
 
         After warmup, the acceptance rate should be near the target.
         """
-        energy_fn, params = create_harmonic(k=1.0)
+        backend = create_harmonic(k=1.0)
         positions = jnp.array([[0.5, 0.0, 0.0], [0.0, 0.5, 0.0]])
         types = jnp.array([0, 0])
 
@@ -76,7 +76,7 @@ class TestAdaptationConvergence:
         adapt_state = init_adaptation(initial_step_size=0.1, target_acceptance=target_acc)
 
         # Warmup: 200 steps with adaptation
-        step_fn = jax.jit(rw_build_kernel(energy_fn, params))
+        step_fn = jax.jit(rw_build_kernel(backend))
         rw_state = MCState(
             positions=positions, types=types,
             energy=jnp.asarray(0.25), box=jnp.zeros((3, 3)),
@@ -86,6 +86,7 @@ class TestAdaptationConvergence:
             n_proposed=jnp.zeros(1, dtype=jnp.int32),
             max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
             overflow=jnp.asarray(False),
+            ensemble_params={},
         )
         key = jax.random.key(42)
 

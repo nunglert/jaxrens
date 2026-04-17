@@ -157,15 +157,14 @@ def _make_energy_fn(
         params: Params,
         positions: Positions,
         types: Types,
-        box: Box | None = None,
+        cell: Box | None = None,
         **unused_kwargs: Any,
     ) -> jnp.ndarray:
         """Compute potential energy via NeuralIL ensemble mean.
 
-        The `box` argument maps to NeuralIL's `cell` parameter.
-        If box is None, a large dummy cell is used (non-periodic).
+        If cell is None, a large dummy cell is used (non-periodic).
         """
-        cell = box if box is not None else 1000.0 * jnp.eye(3)
+        cell = cell if cell is not None else 1000.0 * jnp.eye(3)
 
         energy_ensemble = dynamics_model.apply(
             model_params,

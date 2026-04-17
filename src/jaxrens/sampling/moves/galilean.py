@@ -24,8 +24,6 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.base import MoveInfo
-from jaxrens.state.mc_state import MCState
-from jaxrens.types import Params
 
 
 def _random_direction(key: jax.Array, shape: tuple) -> jnp.ndarray:
@@ -40,11 +38,7 @@ def _perturb_direction(
     direction: jnp.ndarray,
     perturb_angle: float = 0.1,
 ) -> jnp.ndarray:
-    """Perturb a direction vector by a small random angle.
-
-    Adds a random component and renormalizes. The perturb_angle controls
-    the magnitude of the random perturbation relative to the original direction.
-    """
+    """Perturb a direction vector by a small random angle."""
     noise = perturb_angle * jax.random.normal(key, direction.shape)
     new_dir = direction + noise
     norm = jnp.sqrt(jnp.sum(new_dir**2))
@@ -52,8 +46,7 @@ def _perturb_direction(
 
 
 def build_kernel(
-    energy_fn: Any,
-    params: Params,
+    backend: Any,
     n_reflect: int = 5,
     perturb_angle: float = 0.1,
     use_forces: bool = True,
@@ -61,8 +54,7 @@ def build_kernel(
     """Build a Galilean Monte Carlo move kernel.
 
     Args:
-        energy_fn: Callable conforming to EnergyFn protocol.
-        params: Opaque pytree of backend parameters.
+        backend: EnergyBackend instance.
         n_reflect: Number of trajectory steps (with reflections).
         perturb_angle: Angle (radians) to perturb direction between moves.
         use_forces: If True, reflect using gradient (forces). If False,
@@ -72,14 +64,7 @@ def build_kernel(
         step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
     """
 
-    if use_forces:
-        grad_energy = jax.grad(energy_fn, argnums=1)
-
-    def step(
-        rng_key: jax.Array,
-        state: MCState,
-        likelihood_constraint: float,
-    ) -> tuple[MCState, MoveInfo]:
+    def step(rng_key, state, likelihood_constraint):
         key_init, key_perturb, key_reflect = jax.random.split(rng_key, 3)
 
         # Initialize direction if zero (first call), otherwise perturb
@@ -91,43 +76,62 @@ def build_kernel(
             _perturb_direction(key_perturb, state.direction, perturb_angle),
         )
 
+        max_neighbors = state.max_neighbors
+        ensemble_params = state.ensemble_params
+
         # Reflection loop via lax.scan
         def reflect_step(carry, step_key):
-            pos, direction, energy, n_evals = carry
+            pos, direction, energy, acc_count, acc_overflow = carry
 
             # Propose step
             new_pos = pos + state.step_size * direction
 
-            # Evaluate energy
-            new_energy = energy_fn(params, new_pos, state.types, box=state.box)
+            if use_forces:
+                # Energy + forces via autodiff through backend
+                def energy_fn(p):
+                    e, count, overflow = backend(
+                        p, state.types, state.cell, max_neighbors,
+                        ensemble_params=ensemble_params,
+                    )
+                    return e, (count, overflow)
+
+                (new_energy, (count, overflow)), grad = jax.value_and_grad(
+                    energy_fn, has_aux=True
+                )(new_pos)
+            else:
+                new_energy, count, overflow = backend(
+                    new_pos, state.types, state.cell, max_neighbors,
+                    ensemble_params=ensemble_params,
+                )
+                grad = None
+
+            # Accumulate overflow tracking
+            acc_count = jnp.maximum(acc_count, count)
+            acc_overflow = acc_overflow | overflow
 
             # Check if constraint is violated
             violated = new_energy >= likelihood_constraint
 
             if use_forces:
-                # Reflect using gradient of energy (force direction)
-                grad = grad_energy(params, new_pos, state.types, box=state.box)
                 grad_norm = jnp.sqrt(jnp.sum(grad**2))
                 f_hat = grad / jnp.maximum(grad_norm, 1e-10)
-                # Elastic reflection: d_new = d - 2*(F.d)*F
                 reflected_dir = direction - 2.0 * jnp.sum(f_hat * direction) * f_hat
             else:
-                # Random reflection (fallback)
                 reflected_dir = _random_direction(step_key, direction.shape)
 
-            # Apply reflection only if violated
             direction_out = jnp.where(violated, reflected_dir, direction)
-
-            # Keep position: if violated, stay at old pos; if not, advance
             pos_out = jnp.where(violated, pos, new_pos)
             energy_out = jnp.where(violated, energy, new_energy)
 
-            return (pos_out, direction_out, energy_out, n_evals + 1), None
+            return (pos_out, direction_out, energy_out, acc_count, acc_overflow), None
 
         reflect_keys = jax.random.split(key_reflect, n_reflect)
-        init_carry = (state.positions, direction, state.energy, 0)
-        (final_pos, final_dir, final_energy, n_evals), _ = jax.lax.scan(
-            reflect_step, init_carry, reflect_keys
+        init_carry = (
+            state.positions, direction, state.energy,
+            state.max_neighbor_count, state.overflow,
+        )
+        (final_pos, final_dir, final_energy, acc_count, acc_overflow), _ = (
+            jax.lax.scan(reflect_step, init_carry, reflect_keys)
         )
 
         # Accept if final energy < Emax
@@ -138,12 +142,14 @@ def build_kernel(
             positions=jnp.where(accepted, final_pos, state.positions),
             energy=jnp.where(accepted, final_energy, state.energy),
             direction=jnp.where(accepted, final_dir, -state.direction),
+            max_neighbor_count=acc_count,
+            overflow=acc_overflow,
         )
 
         info = MoveInfo(
             accepted=accepted,
             log_likelihood=-new_state.energy,
-            n_evaluations=n_evals,
+            n_evaluations=n_reflect,
         )
 
         return new_state, info

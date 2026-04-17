@@ -14,32 +14,22 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.base import MoveInfo
-from jaxrens.state.mc_state import MCState
-from jaxrens.types import Params
 
 
-def build_kernel(
-    energy_fn: Any,
-    params: Params,
-):
+def build_kernel(backend: Any):
     """Build a random walk move kernel.
 
     The returned step function operates on a SINGLE walker.
-    Energy function and params are captured via closure.
+    Backend is captured via closure.
 
     Args:
-        energy_fn: Callable conforming to EnergyFn protocol.
-        params: Opaque pytree of backend parameters.
+        backend: EnergyBackend instance.
 
     Returns:
         step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
     """
 
-    def step(
-        rng_key: jax.Array,
-        state: MCState,
-        likelihood_constraint: float,
-    ) -> tuple[MCState, MoveInfo]:
+    def step(rng_key, state, likelihood_constraint):
         # Propose: random Gaussian displacement
         dpos = state.step_size * jax.random.normal(
             rng_key, shape=state.positions.shape
@@ -47,8 +37,9 @@ def build_kernel(
         new_positions = state.positions + dpos
 
         # Evaluate energy at proposed position
-        new_energy = energy_fn(
-            params, new_positions, state.types, box=state.box
+        new_energy, count, overflow = backend(
+            new_positions, state.types, state.cell, state.max_neighbors,
+            ensemble_params=state.ensemble_params,
         )
 
         # Accept if energy below constraint (NS rejection sampling)
@@ -58,6 +49,8 @@ def build_kernel(
         new_state = state.set(
             positions=jnp.where(accepted, new_positions, state.positions),
             energy=jnp.where(accepted, new_energy, state.energy),
+            max_neighbor_count=jnp.maximum(state.max_neighbor_count, count),
+            overflow=state.overflow | overflow,
         )
 
         info = MoveInfo(

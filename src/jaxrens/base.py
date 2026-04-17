@@ -64,7 +64,7 @@ class EnergyFn(Protocol):
         params: Params,
         positions: Positions,
         types: Types,
-        box: Box | None = None,
+        cell: Box | None = None,
         **unused_kwargs: Any,
     ) -> float: ...
 

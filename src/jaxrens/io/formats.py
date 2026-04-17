@@ -34,7 +34,7 @@ def walker_to_ase_atoms(
         positions = np.asarray(walker.positions)
         types = np.asarray(walker.types)
         energy = float(walker.energy)
-        box = walker.box
+        box = walker.cell
 
     symbols = [symbol_map[int(t)] for t in types]
     atoms = Atoms(symbols=symbols, positions=positions)
@@ -63,13 +63,13 @@ def ase_atoms_to_walker(
     positions = jnp.array(atoms.get_positions())
     types = jnp.array([symbol_map[s] for s in atoms.get_chemical_symbols()])
     energy = jnp.array(atoms.info.get("ns_energy", 0.0))
-    box = jnp.array(atoms.get_cell()[:]) if any(atoms.get_pbc()) else None
+    cell = jnp.array(atoms.get_cell()[:]) if any(atoms.get_pbc()) else None
 
     return WalkerState(
         positions=positions,
         types=types,
         energy=energy,
-        box=box,
+        cell=cell,
         n_atoms=len(atoms),
     )
 
@@ -91,8 +91,8 @@ def walker_to_h5_group(group: Any, walker: WalkerState | dict) -> None:
         group.create_dataset("positions", data=np.asarray(walker.positions))
         group.create_dataset("types", data=np.asarray(walker.types))
         group.create_dataset("energy", data=float(walker.energy))
-        if walker.box is not None:
-            group.create_dataset("box", data=np.asarray(walker.box))
+        if walker.cell is not None:
+            group.create_dataset("box", data=np.asarray(walker.cell))
 
 
 def h5_group_to_walker(group: Any) -> WalkerState:
@@ -113,6 +113,6 @@ def h5_group_to_walker(group: Any) -> WalkerState:
         positions=positions,
         types=types,
         energy=energy,
-        box=box,
+        cell=box,
         n_atoms=positions.shape[0],
     )

@@ -57,8 +57,8 @@ class ExtxyzTrajectoryWriter:
         atoms_list = []
         for i in range(positions.shape[0]):
             w = {"positions": positions[i], "types": types[i], "energy": energies[i]}
-            if walkers.get("boxes") is not None:
-                w["box"] = np.asarray(walkers["boxes"])[i]
+            if walkers.get("cells") is not None:
+                w["box"] = np.asarray(walkers["cells"])[i]
             atoms = walker_to_ase_atoms(w, self.symbol_map)
             atoms.info["iter"] = iteration
             atoms.info["walker_idx"] = i

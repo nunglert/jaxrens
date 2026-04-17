@@ -1,7 +1,7 @@
 """Dynamic MCState factory for Monte Carlo moves.
 
 MCState is built at runtime by the MWG factory based on the active move
-set. Core fields (positions, types, energy, box, step_size, step_sizes,
+set. Core fields (positions, types, energy, cell, step_size, step_sizes,
 n_accepted, n_proposed) are always present. Move-specific fields (e.g.
 direction for Galilean) are added only when the corresponding move is
 in the MWG descriptor list.
@@ -99,13 +99,14 @@ def make_mc_state_class(extra_fields: dict[str, type] | None = None) -> type:
         ("positions", jnp.ndarray),
         ("types", jnp.ndarray),
         ("energy", jnp.ndarray),
-        ("box", jnp.ndarray),
+        ("cell", jnp.ndarray),
         ("step_size", jnp.ndarray),
         ("step_sizes", jnp.ndarray),
         ("n_accepted", jnp.ndarray),
         ("n_proposed", jnp.ndarray),
         ("max_neighbor_count", jnp.ndarray),  # actual max neighbors observed
         ("overflow", jnp.ndarray),            # bool — any overflow detected
+        ("ensemble_params", dict),            # e.g. {"pressure": scalar, "mu": (n_species,)}
     ]
 
     # Move-specific fields

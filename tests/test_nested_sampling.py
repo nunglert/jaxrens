@@ -5,6 +5,7 @@ Verifies:
 - Evidence accuracy on harmonic oscillator (known answer)
 - lax.scan inner loop produces correct results
 - Callbacks are invoked
+- ns_step is JIT-compatible
 """
 
 import jax
@@ -16,14 +17,13 @@ from jaxrens.sampling.move_descriptor import MoveDescriptor
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, ns_step, run_ns
-from jaxrens.sampling.adaptation.step_size import init_adaptation
 
 
 @pytest.fixture
 def harmonic_setup():
     """Set up a harmonic oscillator NS problem."""
-    energy_fn, params = create_harmonic(k=1.0)
-    init_fn, step_fn = build_mwg(energy_fn, params, [
+    backend = create_harmonic(k=1.0)
+    init_fn, step_fn = build_mwg(backend, [
         MoveDescriptor("random_walk", random_walk.build_kernel),
     ])
 
@@ -31,21 +31,18 @@ def harmonic_setup():
     n_atoms = 1
     key = jax.random.key(42)
 
-    # Initialize walkers uniformly in [-3, 3]^3
     key, init_key = jax.random.split(key)
     positions = jax.random.uniform(
         init_key, (n_walkers, n_atoms, 3), minval=-3.0, maxval=3.0
     )
     types = jnp.zeros((n_atoms,), dtype=jnp.int32)
 
-    # Compute initial energies
-    energies = jax.vmap(energy_fn, in_axes=(None, 0, None))(
-        params, positions, types
-    )
+    energies = jax.vmap(
+        lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
+    )(positions)
 
     return {
-        "energy_fn": energy_fn,
-        "params": params,
+        "backend": backend,
         "init_fn": init_fn,
         "step_fn": step_fn,
         "positions": positions,
@@ -60,74 +57,122 @@ class TestInitNS:
     def test_init_creates_state(self, harmonic_setup):
         s = harmonic_setup
         state = init_ns(
+            s["init_fn"],
             s["positions"], s["types"], s["energies"],
             boxes=None, rng_key=s["key"],
         )
-        assert state["positions"].shape == s["positions"].shape
-        assert state["energies"].shape == (s["n_walkers"],)
-        assert state["iteration"] == 0
-        assert state["n_dead"] == 0
+        assert state.population.positions.shape == s["positions"].shape
+        assert state.population.energy.shape == (s["n_walkers"],)
+        assert state.iteration == 0
+        assert state.n_dead == 0
 
     def test_init_dead_points_buffer(self, harmonic_setup):
         s = harmonic_setup
         state = init_ns(
+            s["init_fn"],
             s["positions"], s["types"], s["energies"],
             boxes=None, rng_key=s["key"], max_dead=100,
         )
-        assert state["dead_energies"].shape == (100,)
+        assert state.dead_energies.shape == (100,)
+
+    def test_init_population_is_batched_mcstate(self, harmonic_setup):
+        s = harmonic_setup
+        state = init_ns(
+            s["init_fn"],
+            s["positions"], s["types"], s["energies"],
+            boxes=None, rng_key=s["key"],
+        )
+        pop = state.population
+        assert pop.positions.shape[0] == s["n_walkers"]
+        assert pop.energy.shape == (s["n_walkers"],)
+        assert pop.step_sizes.ndim == 2
 
 
 class TestNSStep:
     def test_single_step(self, harmonic_setup):
         s = harmonic_setup
         state = init_ns(
+            s["init_fn"],
             s["positions"], s["types"], s["energies"],
             boxes=None, rng_key=s["key"],
         )
-        adapt = init_adaptation(initial_step_size=0.3)
 
-        new_state, info, new_adapt = ns_step(
-            state, s["init_fn"], s["step_fn"], n_mcmc_steps=10, adapt_state=adapt,
-        )
+        new_state, info = ns_step(state, s["step_fn"], n_mcmc_steps=10)
 
-        assert new_state["iteration"] == 1
-        assert new_state["n_dead"] == 1
-        assert info["emax"] == jnp.max(s["energies"])
+        assert new_state.iteration == 1
+        assert new_state.n_dead == 1
         assert 0 <= info["acceptance_rate"] <= 1.0
 
     def test_multiple_steps_reduce_emax(self, harmonic_setup):
         s = harmonic_setup
         state = init_ns(
+            s["init_fn"],
             s["positions"], s["types"], s["energies"],
             boxes=None, rng_key=s["key"],
         )
-        adapt = init_adaptation(initial_step_size=0.3)
 
         emaxes = []
         for _ in range(20):
-            state, info, adapt = ns_step(
-                state, s["init_fn"], s["step_fn"], n_mcmc_steps=10, adapt_state=adapt,
-            )
+            state, info = ns_step(state, s["step_fn"], n_mcmc_steps=10)
             emaxes.append(float(info["emax"]))
 
-        # Emax should generally decrease over iterations
         assert emaxes[-1] < emaxes[0], "Emax should decrease during NS"
 
     def test_evidence_increases(self, harmonic_setup):
         s = harmonic_setup
         state = init_ns(
+            s["init_fn"],
             s["positions"], s["types"], s["energies"],
             boxes=None, rng_key=s["key"],
         )
-        adapt = init_adaptation(initial_step_size=0.3)
 
         for _ in range(50):
-            state, info, adapt = ns_step(
-                state, s["init_fn"], s["step_fn"], n_mcmc_steps=10, adapt_state=adapt,
-            )
+            state, info = ns_step(state, s["step_fn"], n_mcmc_steps=10)
 
-        # Evidence should be finite after some iterations
-        assert jnp.isfinite(state["log_evidence"])
+        assert jnp.isfinite(state.log_evidence)
+
+    def test_jit_compatible(self, harmonic_setup):
+        s = harmonic_setup
+        state = init_ns(
+            s["init_fn"],
+            s["positions"], s["types"], s["energies"],
+            boxes=None, rng_key=s["key"],
+        )
+
+        jit_step = jax.jit(ns_step, static_argnums=(1, 2, 3))
+        new_state, info = jit_step(state, s["step_fn"], 10, 0)
+
+        assert new_state.iteration == 1
+        assert jnp.isfinite(info["emax"])
+
+    def test_n_extra_walks(self, harmonic_setup):
+        s = harmonic_setup
+        state = init_ns(
+            s["init_fn"],
+            s["positions"], s["types"], s["energies"],
+            boxes=None, rng_key=s["key"],
+        )
+
+        new_state, info = ns_step(state, s["step_fn"], n_mcmc_steps=10, n_extra=5)
+
+        assert new_state.iteration == 1
+        assert new_state.n_dead == 1
+        assert 0 <= info["acceptance_rate"] <= 1.0
+
+    def test_n_extra_reduces_emax(self, harmonic_setup):
+        s = harmonic_setup
+        state = init_ns(
+            s["init_fn"],
+            s["positions"], s["types"], s["energies"],
+            boxes=None, rng_key=s["key"],
+        )
+
+        emaxes = []
+        for _ in range(20):
+            state, info = ns_step(state, s["step_fn"], n_mcmc_steps=10, n_extra=3)
+            emaxes.append(float(info["emax"]))
+
+        assert emaxes[-1] < emaxes[0], "Emax should decrease during NS with n_extra"
 
 
 class TestRunNS:
@@ -149,21 +194,8 @@ class TestRunNS:
 
     @pytest.mark.heavy
     def test_harmonic_evidence_accuracy(self):
-        """Test evidence on 1-atom 3D harmonic oscillator.
-
-        For E = 0.5 * k * sum(x^2) with k=1, prior box [-L, L]^3:
-        Z = integral exp(-E) dx = (2*pi)^(3/2) for the Gaussian part
-        Prior volume = (2*L)^3
-        log Z = 3/2 * log(2*pi) - 3*log(2*L) = 3/2*log(2*pi) - log(V)
-
-        With walkers initialized in [-L, L]^3, the NS evidence estimate
-        should approximate log(Z/V) = 3/2*log(2*pi) - log(V)
-
-        Actually for NS: log_Z_ns ~ log(Z) since we're integrating
-        exp(-E) over the prior volume.
-        """
-        energy_fn, params = create_harmonic(k=1.0)
-        init_fn, step_fn = build_mwg(energy_fn, params, [
+        backend = create_harmonic(k=1.0)
+        init_fn, step_fn = build_mwg(backend, [
             MoveDescriptor("random_walk", random_walk.build_kernel),
         ])
 
@@ -176,9 +208,9 @@ class TestRunNS:
             init_key, (n_walkers, 1, 3), minval=-L, maxval=L
         )
         types = jnp.zeros((1,), dtype=jnp.int32)
-        energies = jax.vmap(energy_fn, in_axes=(None, 0, None))(
-            params, positions, types
-        )
+        energies = jax.vmap(
+            lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
+        )(positions)
 
         result = run_ns(
             positions, types, energies,
@@ -195,13 +227,9 @@ class TestRunNS:
 
         log_evidence = float(result["log_evidence"])
 
-        # Analytical: log Z = 3/2 * log(2*pi) - log((2L)^3)
-        # = 3/2 * log(2*pi) - 3*log(2L)
         log_prior_volume = 3.0 * jnp.log(2.0 * L)
         log_Z_analytical = 1.5 * jnp.log(2.0 * jnp.pi) - log_prior_volume
 
-        # NS evidence should be within ~1 nat of analytical
-        # (generous tolerance for a stochastic test with small n_walkers)
         assert abs(log_evidence - float(log_Z_analytical)) < 1.5, (
             f"log_evidence={log_evidence:.3f} vs analytical={float(log_Z_analytical):.3f}"
         )

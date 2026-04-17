@@ -3,6 +3,8 @@
 __version__ = "0.1.0"
 
 # High-level API
+from jaxrens.backends.base import EnergyBackend
+from jaxrens.backends.ensemble import EnsembleBackend, make_ensemble_params
 from jaxrens.backends.loader import load_backend
 from jaxrens.cli.run import run_from_config, run_from_file
 from jaxrens.sampling.move_descriptor import MoveDescriptor
@@ -20,6 +22,9 @@ from jaxrens.postprocess.thermodynamics import (
 )
 
 __all__ = [
+    "EnergyBackend",
+    "EnsembleBackend",
+    "make_ensemble_params",
     "load_backend",
     "build_mwg",
     "MCState",

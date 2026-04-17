@@ -5,7 +5,8 @@ via lax.switch. The MCState class is built dynamically from the move
 descriptors — only fields needed by the active moves are included.
 
 Usage:
-    init_fn, step_fn = build_mwg(energy_fn, params, [
+    backend = HarmonicBackend(k=1.0)
+    init_fn, step_fn = build_mwg(backend, [
         MoveDescriptor("random_walk", random_walk.build_kernel, weight=7),
         MoveDescriptor("volume", volume.build_kernel,
                        kernel_kwargs={"n_atoms": 64}, weight=2),
@@ -14,7 +15,7 @@ Usage:
                        extra_state_fields={"direction": (jnp.ndarray,
                            lambda pos, types: jnp.zeros_like(pos))}),
     ])
-    state = init_fn(positions, types, energy, box)
+    state = init_fn(positions, types, energy, cell)
     state, info = step_fn(rng_key, state, likelihood_constraint)
 """
 
@@ -28,12 +29,10 @@ import jax.numpy as jnp
 from jaxrens.base import MoveInfo
 from jaxrens.sampling.move_descriptor import MoveDescriptor
 from jaxrens.state.mc_state import make_mc_state_class
-from jaxrens.types import Params
 
 
 def build_mwg(
-    energy_fn: Any,
-    params: Params,
+    backend: Any,
     move_descriptors: list[MoveDescriptor],
 ) -> tuple[Callable, Callable]:
     """Build a Metropolis-within-Gibbs sampler from move descriptors.
@@ -43,15 +42,14 @@ def build_mwg(
     as a per-move array for independent per-replica adaptation.
 
     Args:
-        energy_fn: Callable conforming to EnergyFn protocol.
-        params: Opaque pytree of backend parameters.
+        backend: EnergyBackend instance. Captured in move closures.
         move_descriptors: List of MoveDescriptor, each specifying a move
             type with its build_kernel, kwargs, weight, step_size, and
             optional extra_state_fields.
 
     Returns:
         (init_fn, step_fn) where:
-        - init_fn(positions, types, energy, box, step_sizes) -> MCState
+        - init_fn(positions, types, energy, cell, step_sizes) -> MCState
         - step_fn(rng_key, state, likelihood_constraint) -> (MCState, MoveInfo)
     """
     n_moves = len(move_descriptors)
@@ -79,7 +77,7 @@ def build_mwg(
 
     # --- Build per-move step functions ---
     raw_step_fns = [
-        desc.build_kernel(energy_fn, params, **desc.kernel_kwargs)
+        desc.build_kernel(backend, **desc.kernel_kwargs)
         for desc in move_descriptors
     ]
 
@@ -110,9 +108,10 @@ def build_mwg(
         positions: jnp.ndarray,
         types: jnp.ndarray,
         energy: float,
-        box: jnp.ndarray | None = None,
+        cell: jnp.ndarray | None = None,
         step_sizes: jnp.ndarray | None = None,
         step_size: float | None = None,
+        ensemble_params: dict | None = None,
     ) -> Any:  # returns MCStateClass instance
         """Create initial MCState from walker data.
 
@@ -120,28 +119,31 @@ def build_mwg(
             step_sizes: Per-move step size array, shape (n_move_types,).
                 If None, uses defaults from descriptors.
             step_size: Scalar step size — broadcast to all moves.
-                Convenience for single-move setups and adaptation.
-                Overridden by step_sizes if both are given.
+            ensemble_params: Ensemble parameters dict (e.g. {"pressure": 0.01}).
+                Stored on the MCState for use by EnsembleBackend.
         """
-        if box is None:
-            box = jnp.zeros((3, 3))
+        if cell is None:
+            cell = jnp.zeros((3, 3))
         if step_sizes is None:
             if step_size is not None:
                 step_sizes = jnp.full(n_moves, step_size)
             else:
                 step_sizes = default_step_sizes
+        if ensemble_params is None:
+            ensemble_params = {}
 
         kwargs = dict(
             positions=jnp.asarray(positions),
             types=jnp.asarray(types),
             energy=jnp.asarray(energy),
-            box=jnp.asarray(box),
+            cell=jnp.asarray(cell),
             step_size=jnp.asarray(0.0),  # ephemeral — set by wrapper
             step_sizes=jnp.asarray(step_sizes),
             n_accepted=jnp.zeros(n_moves, dtype=jnp.int32),
             n_proposed=jnp.zeros(n_moves, dtype=jnp.int32),
             max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
             overflow=jnp.asarray(False),
+            ensemble_params=ensemble_params,
         )
 
         # Initialize move-specific fields

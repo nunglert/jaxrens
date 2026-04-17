@@ -33,6 +33,7 @@ def _make_state(positions, types, energy, box=None, step_size=0.1):
         n_proposed=jnp.zeros(1, dtype=jnp.int32),
         max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
         overflow=jnp.asarray(False),
+        ensemble_params={},
     )
 
 
@@ -51,6 +52,7 @@ def _make_gmc_state(positions, types, energy, box=None, step_size=0.1):
         n_proposed=jnp.zeros(1, dtype=jnp.int32),
         max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
         overflow=jnp.asarray(False),
+        ensemble_params={},
         direction=jnp.zeros_like(positions),
     )
 
@@ -77,9 +79,9 @@ def types():
 
 class TestRandomWalkStep:
     def test_step_returns_state_and_info(self, harmonic, positions, types):
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_state(positions, types, energy=1.0, step_size=0.05)
-        step = jax.jit(rw_build_kernel(energy_fn, params))
+        step = jax.jit(rw_build_kernel(backend))
 
         key = jax.random.key(0)
         new_state, info = step(key, state, likelihood_constraint=10.0)
@@ -89,18 +91,18 @@ class TestRandomWalkStep:
         assert hasattr(info, "n_evaluations")
 
     def test_accepts_below_constraint(self, harmonic, positions, types):
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_state(positions, types, energy=0.25, step_size=0.01)
-        step = jax.jit(rw_build_kernel(energy_fn, params))
+        step = jax.jit(rw_build_kernel(backend))
 
         key = jax.random.key(42)
         new_state, info = step(key, state, likelihood_constraint=100.0)
         assert info.accepted
 
     def test_rejects_above_constraint(self, harmonic, positions, types):
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_state(positions, types, energy=0.001, step_size=100.0)
-        step = jax.jit(rw_build_kernel(energy_fn, params))
+        step = jax.jit(rw_build_kernel(backend))
 
         key = jax.random.key(0)
         new_state, info = step(key, state, likelihood_constraint=0.002)
@@ -108,9 +110,9 @@ class TestRandomWalkStep:
         assert jnp.array_equal(new_state.positions, state.positions)
 
     def test_jit(self, harmonic, positions, types):
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_state(positions, types, energy=1.0, step_size=0.1)
-        step = rw_build_kernel(energy_fn, params)
+        step = rw_build_kernel(backend)
 
         jitted_step = jax.jit(step)
         key = jax.random.key(0)
@@ -118,8 +120,8 @@ class TestRandomWalkStep:
         assert new_state.energy.shape == ()
 
     def test_vmap(self, harmonic, positions, types):
-        energy_fn, params = harmonic
-        step = jax.jit(rw_build_kernel(energy_fn, params))
+        backend = harmonic
+        step = jax.jit(rw_build_kernel(backend))
 
         batch_pos = jnp.stack([positions] * 4)
         batch_types = jnp.stack([types] * 4)
@@ -137,6 +139,7 @@ class TestRandomWalkStep:
             n_proposed=jnp.zeros((4, 1), dtype=jnp.int32),
             max_neighbor_count=jnp.zeros(4, dtype=jnp.int32),
             overflow=jnp.full(4, False),
+            ensemble_params={},
         )
 
         keys = jax.random.split(jax.random.key(0), 4)
@@ -148,9 +151,9 @@ class TestRandomWalkStep:
 
     def test_acceptance_rate_reasonable(self, harmonic, positions, types):
         """Run 200 steps, expect reasonable acceptance rate on easy problem."""
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_state(positions, types, energy=0.25, step_size=0.05)
-        step = jax.jit(rw_build_kernel(energy_fn, params))
+        step = jax.jit(rw_build_kernel(backend))
 
         n_steps = 200
         n_accepted = 0
@@ -166,9 +169,9 @@ class TestRandomWalkStep:
 
     def test_scan_compatible(self, harmonic, positions, types):
         """lax.scan should work with random walk step."""
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_state(positions, types, energy=0.25, step_size=0.05)
-        step = jax.jit(rw_build_kernel(energy_fn, params))
+        step = jax.jit(rw_build_kernel(backend))
 
         def scan_step(carry, key):
             state = carry
@@ -187,9 +190,9 @@ class TestRandomWalkStep:
 
 class TestGalileanStep:
     def test_step_returns_state_and_info(self, harmonic, positions, types):
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
-        step = jax.jit(gmc_build_kernel(energy_fn, params, n_reflect=3))
+        step = jax.jit(gmc_build_kernel(backend, n_reflect=3))
 
         key = jax.random.key(0)
         new_state, info = step(key, state, likelihood_constraint=10.0)
@@ -200,11 +203,11 @@ class TestGalileanStep:
 
     def test_direction_initialized_on_first_call(self, harmonic, positions, types):
         """Direction should be randomized if initially zero."""
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
         assert jnp.allclose(state.direction, 0.0)
 
-        step = jax.jit(gmc_build_kernel(energy_fn, params, n_reflect=3))
+        step = jax.jit(gmc_build_kernel(backend, n_reflect=3))
         key = jax.random.key(0)
         new_state, _ = step(key, state, likelihood_constraint=10.0)
 
@@ -212,9 +215,9 @@ class TestGalileanStep:
         assert dir_norm > 0.1
 
     def test_jit(self, harmonic, positions, types):
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
-        step = gmc_build_kernel(energy_fn, params, n_reflect=3)
+        step = gmc_build_kernel(backend, n_reflect=3)
 
         jitted_step = jax.jit(step)
         key = jax.random.key(0)
@@ -222,8 +225,8 @@ class TestGalileanStep:
         assert new_state.energy.shape == ()
 
     def test_vmap(self, harmonic, positions, types):
-        energy_fn, params = harmonic
-        step = jax.jit(gmc_build_kernel(energy_fn, params, n_reflect=3))
+        backend = harmonic
+        step = jax.jit(gmc_build_kernel(backend, n_reflect=3))
 
         batch_pos = jnp.stack([positions] * 4)
         batch_types = jnp.stack([types] * 4)
@@ -242,6 +245,7 @@ class TestGalileanStep:
             n_proposed=jnp.zeros((4, 1), dtype=jnp.int32),
             max_neighbor_count=jnp.zeros(4, dtype=jnp.int32),
             overflow=jnp.full(4, False),
+            ensemble_params={},
             direction=batch_dir,
         )
 
@@ -254,9 +258,9 @@ class TestGalileanStep:
 
     def test_reflection_keeps_energy_below_constraint(self, harmonic, positions, types):
         """After GMC step, accepted states should have energy < Emax."""
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
-        step = jax.jit(gmc_build_kernel(energy_fn, params, n_reflect=5))
+        step = jax.jit(gmc_build_kernel(backend, n_reflect=5))
 
         key = jax.random.key(42)
         for i in range(20):
@@ -266,9 +270,9 @@ class TestGalileanStep:
                 assert state.energy < 2.0
 
     def test_acceptance_rate_reasonable(self, harmonic, positions, types):
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
-        step = jax.jit(gmc_build_kernel(energy_fn, params, n_reflect=5))
+        step = jax.jit(gmc_build_kernel(backend, n_reflect=5))
 
         n_steps = 100
         n_accepted = 0
@@ -283,9 +287,9 @@ class TestGalileanStep:
         assert 0.1 < rate <= 1.0, f"Acceptance rate {rate} out of expected range"
 
     def test_scan_compatible(self, harmonic, positions, types):
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
-        step = jax.jit(gmc_build_kernel(energy_fn, params, n_reflect=3))
+        step = jax.jit(gmc_build_kernel(backend, n_reflect=3))
 
         def scan_step(carry, key):
             state = carry
@@ -298,10 +302,10 @@ class TestGalileanStep:
 
     def test_without_forces(self, harmonic, positions, types):
         """use_forces=False should still work (random reflection)."""
-        energy_fn, params = harmonic
+        backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
         step = gmc_build_kernel(
-            energy_fn, params, n_reflect=3, use_forces=False
+            backend, n_reflect=3, use_forces=False
         )
 
         key = jax.random.key(0)

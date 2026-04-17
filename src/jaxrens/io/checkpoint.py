@@ -37,8 +37,8 @@ def save_checkpoint(
         f.create_dataset("positions", data=np.asarray(ns_state["positions"]))
         f.create_dataset("types", data=np.asarray(ns_state["types"]))
         f.create_dataset("energies", data=np.asarray(ns_state["energies"]))
-        if ns_state.get("boxes") is not None:
-            f.create_dataset("boxes", data=np.asarray(ns_state["boxes"]))
+        if ns_state.get("cells") is not None:
+            f.create_dataset("cells", data=np.asarray(ns_state["cells"]))
         f.create_dataset(
             "dead_energies",
             data=np.asarray(ns_state["dead_energies"][: ns_state["n_dead"]]),
@@ -90,7 +90,7 @@ def load_checkpoint(
         positions = jnp.array(f["positions"][:])
         types = jnp.array(f["types"][:])
         energies = jnp.array(f["energies"][:])
-        boxes = jnp.array(f["boxes"][:]) if "boxes" in f else None
+        cells = jnp.array(f["cells"][:]) if "cells" in f else None
         dead_energies_data = jnp.array(f["dead_energies"][:])
         dead_positions_data = jnp.array(f["dead_positions"][:])
         log_evidence = jnp.array(f.attrs["log_evidence"])
@@ -120,7 +120,7 @@ def load_checkpoint(
         "positions": positions,
         "types": types,
         "energies": energies,
-        "boxes": boxes,
+        "cells": cells,
         "dead_energies": dead_energies,
         "dead_positions": dead_positions,
         "dead_volumes": dead_volumes,

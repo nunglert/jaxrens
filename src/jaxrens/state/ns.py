@@ -1,7 +1,12 @@
 """NSState: full state of a nested sampling run.
 
-Carries the live walker population, dead-point accumulator, evidence estimate,
-and RNG state. Registered as a JAX pytree for compatibility with JIT/vmap.
+Carries the live walker population (as a batched MCState), dead-point
+accumulator, evidence estimate, and RNG state. Registered as a JAX pytree
+for compatibility with JIT/vmap.
+
+NSState is ensemble-agnostic — it doesn't know about pressure, chemical
+potentials, or ensemble type. The full ensemble potential is stored in
+MCState.energy (via EnsembleBackend), and ns_step reads it directly.
 """
 
 from __future__ import annotations
@@ -40,57 +45,41 @@ def _ns_unflatten(aux: dict, leaves: list) -> NSState:
 class NSState:
     """Full state of a nested sampling run.
 
-    The walker arrays have shape (G, P, K, ...) in the multi-GPU case,
-    where G=n_gpu_parallel, P=n_runs_per_gpu, K=n_walkers.
+    Ensemble-agnostic: MCState.energy is the full potential (U, H, Ω, ...),
+    computed by the backend (possibly wrapped in EnsembleBackend).
 
     Attributes:
-        positions: Walker positions, shape (..., n_atoms, 3).
-        types: Walker atom types, shape (..., n_atoms).
-        energies: Walker energies, shape (...,).
-        boxes: Walker unit cells, shape (..., 3, 3) or None.
-        dead_energies: Collected dead-point energies, shape (max_dead,).
+        population: Batched MCState with shape (n_walkers, ...) on every field.
+        dead_energies: Collected dead-point potentials, shape (max_dead,).
+        dead_positions: Collected dead-point positions, shape (max_dead, n_atoms, 3).
+        dead_volumes: Collected dead-point volumes, shape (max_dead,).
         log_evidence: Running log-evidence estimate (scalar).
         iteration: Current iteration count (scalar).
         n_dead: Number of dead points collected so far (scalar).
         rng_key: JAX PRNG key.
-        move_state: Opaque move-specific state (e.g., step sizes, velocities).
-        n_live: Number of live walkers per run (compile-time constant).
+        n_walkers: Number of live walkers (compile-time constant).
         n_atoms: Number of atoms (compile-time constant).
+        max_dead: Maximum dead points to store (compile-time constant).
     """
 
-    # Walker population (dynamic, batched)
-    positions: jnp.ndarray
-    types: jnp.ndarray
-    energies: jnp.ndarray
-    boxes: jnp.ndarray | None = None
+    # Walker population — batched MCState, (n_walkers, ...) on every field
+    population: Any  # MCState instance (dynamic pytree)
 
     # Dead-point accumulator
-    dead_energies: jnp.ndarray = dataclasses.field(
-        default_factory=lambda: jnp.array([])
-    )
-    log_evidence: jnp.ndarray = dataclasses.field(
-        default_factory=lambda: jnp.array(-jnp.inf)
-    )
+    dead_energies: jnp.ndarray
+    dead_positions: jnp.ndarray
+    dead_volumes: jnp.ndarray  # zeros if no cell / NVT
 
-    # Loop counters
-    iteration: jnp.ndarray = dataclasses.field(
-        default_factory=lambda: jnp.array(0, dtype=jnp.int32)
-    )
-    n_dead: jnp.ndarray = dataclasses.field(
-        default_factory=lambda: jnp.array(0, dtype=jnp.int32)
-    )
-
-    # RNG
-    rng_key: jax.Array = dataclasses.field(
-        default_factory=lambda: jax.random.key(0)
-    )
-
-    # Move state (opaque pytree)
-    move_state: Any = None
+    # NS bookkeeping
+    log_evidence: jnp.ndarray
+    iteration: jnp.ndarray
+    n_dead: jnp.ndarray
+    rng_key: jax.Array
 
     # Compile-time constants
-    n_live: int = static_field(default=0)
+    n_walkers: int = static_field(default=0)
     n_atoms: int = static_field(default=0)
+    max_dead: int = static_field(default=0)
 
     def set(self, **kwargs: Any) -> NSState:
         return dataclasses.replace(self, **kwargs)

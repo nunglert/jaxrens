@@ -12,14 +12,11 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.base import MoveInfo
-from jaxrens.state.mc_state import MCState
-from jaxrens.types import Params
 from jaxrens.utils.cell import check_cell_shape, get_volume
 
 
 def build_kernel(
-    energy_fn: Any,
-    params: Params,
+    backend: Any,
     n_atoms: int,
     max_vol_per_atom: float = 100.0,
     min_vol_per_atom: float = 1.0,
@@ -29,8 +26,7 @@ def build_kernel(
     """Build a volume move kernel.
 
     Args:
-        energy_fn: Callable conforming to EnergyFn protocol.
-        params: Opaque pytree of backend parameters.
+        backend: EnergyBackend instance.
         n_atoms: Number of atoms.
         max_vol_per_atom: Upper bound on volume per atom.
         min_vol_per_atom: Lower bound on volume per atom.
@@ -41,14 +37,10 @@ def build_kernel(
         step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
     """
 
-    def step(
-        rng_key: jax.Array,
-        state: MCState,
-        likelihood_constraint: float,
-    ) -> tuple[MCState, MoveInfo]:
+    def step(rng_key, state, likelihood_constraint):
         k1, k2 = jax.random.split(rng_key)
 
-        old_V = get_volume(state.box)
+        old_V = get_volume(state.cell)
 
         # Propose volume change
         dV = state.step_size * n_atoms * jax.random.normal(k1)
@@ -59,15 +51,18 @@ def build_kernel(
         scale = vol_ratio ** (1.0 / 3.0)
         transform = jnp.eye(3) * scale
 
-        new_box = state.box @ transform
+        new_cell = state.cell @ transform
         new_positions = state.positions @ transform
 
         # Evaluate energy
-        new_energy = energy_fn(params, new_positions, state.types, box=new_box)
+        new_energy, count, overflow = backend(
+            new_positions, state.types, new_cell, state.max_neighbors,
+            ensemble_params=state.ensemble_params,
+        )
 
         # Check cell shape validity
         cell_valid = check_cell_shape(
-            new_box, n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect
+            new_cell, n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect
         )
 
         # Volume prior acceptance
@@ -85,7 +80,9 @@ def build_kernel(
         new_state = state.set(
             positions=jnp.where(accepted, new_positions, state.positions),
             energy=jnp.where(accepted, new_energy, state.energy),
-            box=jnp.where(accepted, new_box, state.box),
+            cell=jnp.where(accepted, new_cell, state.cell),
+            max_neighbor_count=jnp.maximum(state.max_neighbor_count, count),
+            overflow=state.overflow | overflow,
         )
 
         info = MoveInfo(

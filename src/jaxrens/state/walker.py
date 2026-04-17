@@ -59,14 +59,14 @@ class WalkerState:
         positions: Cartesian coordinates, shape (n_atoms, 3).
         types: Integer atom type codes, shape (n_atoms,).
         energy: Current potential energy (scalar).
-        box: Unit cell matrix (3, 3) or None for non-periodic systems.
+        cell: Unit cell matrix (3, 3) or None for non-periodic systems.
         n_atoms: Number of atoms (compile-time constant).
     """
 
     positions: jnp.ndarray
     types: jnp.ndarray
     energy: jnp.ndarray
-    box: jnp.ndarray | None = None
+    cell: jnp.ndarray | None = None
     n_atoms: int = static_field(default=0)
 
     def set(self, **kwargs: Any) -> WalkerState:

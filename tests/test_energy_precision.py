@@ -18,9 +18,10 @@ from jaxrens.sampling.nested_sampling import _find_worst_walker
 
 class TestFindWorstWalker:
     def test_basic_argmax(self):
-        """Without extras, behaves like argmax."""
+        """With a key, finds the maximum."""
         energies = jnp.array([1.0, 5.0, 3.0, 2.0])
-        idx, val = _find_worst_walker(energies)
+        key = jax.random.key(0)
+        idx, val = _find_worst_walker(energies, rng_key=key)
         assert idx == 1
         assert val == pytest.approx(5.0)
 
@@ -61,12 +62,13 @@ class TestFindWorstWalker:
 
         assert len(selections) == 4
 
-    def test_deterministic_without_key(self):
-        """Without rng_key, uses deterministic argmax."""
+    def test_deterministic_with_same_key(self):
+        """Same rng_key gives same result."""
         energies = jnp.array([3.0, 5.0, 5.0])
-        idx1, _ = _find_worst_walker(energies)
-        idx2, _ = _find_worst_walker(energies)
-        assert idx1 == idx2  # deterministic
+        key = jax.random.key(42)
+        idx1, _ = _find_worst_walker(energies, rng_key=key)
+        idx2, _ = _find_worst_walker(energies, rng_key=key)
+        assert idx1 == idx2  # deterministic with same key
 
     def test_per_atom_large_system(self):
         """Per-atom normalization keeps values in a good float32 range."""

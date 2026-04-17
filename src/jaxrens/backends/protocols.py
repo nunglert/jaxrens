@@ -32,7 +32,7 @@ class EnergyFn(Protocol):
         params: Params,
         positions: Positions,
         types: Types,
-        box: Box | None = None,
+        cell: Box | None = None,
         **unused_kwargs: Any,
     ) -> jnp.ndarray:
         """Compute total potential energy.
@@ -41,7 +41,7 @@ class EnergyFn(Protocol):
             params: Opaque pytree of backend-specific parameters.
             positions: Atomic positions, shape (n_atoms, 3).
             types: Integer atom type codes, shape (n_atoms,).
-            box: Unit cell matrix (3, 3) or None for non-periodic.
+            cell: Unit cell matrix (3, 3) or None for non-periodic.
             **unused_kwargs: Forward-compatibility for future args
                 (e.g., temperature for NS-SMC).
 

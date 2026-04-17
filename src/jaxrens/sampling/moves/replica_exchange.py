@@ -78,9 +78,9 @@ def perform_swap(
     return accepted
 
 
-def _get_volume(box: jnp.ndarray) -> jnp.ndarray:
-    """Compute volume from box matrix. box shape: (3, 3)."""
-    return jnp.abs(jnp.linalg.det(box))
+def _get_volume(cell: jnp.ndarray) -> jnp.ndarray:
+    """Compute volume from cell matrix. cell shape: (3, 3)."""
+    return jnp.abs(jnp.linalg.det(cell))
 
 
 def replica_exchange_step(
@@ -88,7 +88,7 @@ def replica_exchange_step(
     all_positions: jnp.ndarray,
     all_types: jnp.ndarray,
     all_energies: jnp.ndarray,
-    all_boxes: jnp.ndarray | None,
+    all_cells: jnp.ndarray | None,
     all_emax: jnp.ndarray,
     pressures: jnp.ndarray | None = None,
     n_swap_cycles: int = 1,
@@ -107,13 +107,13 @@ def replica_exchange_step(
         all_positions: (P, K, n_atoms, 3) positions for all runs.
         all_energies: (P, K) energies for all runs.
         all_types: (P, K, n_atoms) or (P, n_atoms) types.
-        all_boxes: (P, K, 3, 3) or None.
+        all_cells: (P, K, 3, 3) or None.
         all_emax: (P,) current Emax for each run.
         pressures: (P,) or None.
         n_swap_cycles: number of even+odd phase cycles.
 
     Returns:
-        (new_positions, new_types, new_energies, new_boxes, swap_info)
+        (new_positions, new_types, new_energies, new_cells, swap_info)
         where swap_info is a dict with 'n_accepted', 'n_attempted'.
     """
     n_runs = all_positions.shape[0]
@@ -137,7 +137,7 @@ def replica_exchange_step(
             all_positions,
             all_types,
             all_energies,
-            all_boxes,
+            all_cells,
             {"n_accepted": jnp.array(0), "n_attempted": jnp.array(0)},
         )
 
@@ -162,7 +162,7 @@ def replica_exchange_step(
 
     def _do_one_phase(carry, phase_input):
         """Process one phase (even or odd) of swap attempts."""
-        positions, types, energies, boxes, n_acc, n_att, key = carry
+        positions, types, energies, cells, n_acc, n_att, key = carry
         pairs, mask, phase_key = phase_input
 
         # Generate random walker indices for all pairs
@@ -187,7 +187,7 @@ def replica_exchange_step(
             emax_pair = jnp.array([all_emax[run_i], all_emax[run_j]])
 
             # Volumes and pressures for pressure RE
-            if boxes is not None and pressures is not None:
+            if cells is not None and pressures is not None:
                 v_i = _get_volume(bxs[run_i, wi])
                 v_j = _get_volume(bxs[run_j, wj])
                 volumes_pair = jnp.array([v_i, v_j])
@@ -222,8 +222,8 @@ def replica_exchange_step(
             else:
                 new_typ = typ
 
-            # Swap boxes if present
-            if boxes is not None:
+            # Swap cells if present
+            if cells is not None:
                 b_i = bxs[run_i, wi]
                 b_j = bxs[run_j, wj]
                 new_bxs = bxs.at[run_i, wi].set(jnp.where(do_swap, b_j, b_i))
@@ -236,43 +236,43 @@ def replica_exchange_step(
             return (new_pos, new_typ, new_ene, new_bxs, new_acc), None
 
         scan_inputs = (pairs, mask, pair_keys)
-        (positions, types, energies, boxes, n_acc), _ = jax.lax.scan(
+        (positions, types, energies, cells, n_acc), _ = jax.lax.scan(
             _attempt_one_swap,
-            (positions, types, energies, boxes, n_acc),
+            (positions, types, energies, cells, n_acc),
             scan_inputs,
         )
         n_att = n_att + jnp.sum(mask.astype(jnp.int32))
 
-        return (positions, types, energies, boxes, n_acc, n_att, key), None
+        return (positions, types, energies, cells, n_acc, n_att, key), None
 
     # Run n_swap_cycles, each with even + odd phase
     def _do_one_cycle(carry, cycle_key):
-        positions, types, energies, boxes, n_acc, n_att = carry
+        positions, types, energies, cells, n_acc, n_att = carry
         even_key, odd_key = jax.random.split(cycle_key)
 
         # Even phase
-        (positions, types, energies, boxes, n_acc, n_att, _), _ = _do_one_phase(
-            (positions, types, energies, boxes, n_acc, n_att, even_key),
+        (positions, types, energies, cells, n_acc, n_att, _), _ = _do_one_phase(
+            (positions, types, energies, cells, n_acc, n_att, even_key),
             (all_pairs[0], all_masks[0], even_key),
         )
         # Odd phase
-        (positions, types, energies, boxes, n_acc, n_att, _), _ = _do_one_phase(
-            (positions, types, energies, boxes, n_acc, n_att, odd_key),
+        (positions, types, energies, cells, n_acc, n_att, _), _ = _do_one_phase(
+            (positions, types, energies, cells, n_acc, n_att, odd_key),
             (all_pairs[1], all_masks[1], odd_key),
         )
 
-        return (positions, types, energies, boxes, n_acc, n_att), None
+        return (positions, types, energies, cells, n_acc, n_att), None
 
     cycle_keys = jax.random.split(rng_key, n_swap_cycles)
     init_carry = (
         all_positions,
         types_broadcastable,
         all_energies,
-        all_boxes,
+        all_cells,
         jnp.array(0, dtype=jnp.int32),
         jnp.array(0, dtype=jnp.int32),
     )
-    (new_pos, new_types, new_ene, new_boxes, total_acc, total_att), _ = jax.lax.scan(
+    (new_pos, new_types, new_ene, new_cells, total_acc, total_att), _ = jax.lax.scan(
         _do_one_cycle, init_carry, cycle_keys
     )
 
@@ -281,4 +281,4 @@ def replica_exchange_step(
         "n_attempted": total_att,
     }
 
-    return new_pos, new_types, new_ene, new_boxes, swap_info
+    return new_pos, new_types, new_ene, new_cells, swap_info

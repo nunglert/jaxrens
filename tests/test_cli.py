@@ -83,25 +83,28 @@ class TestRun:
     def test_setup_mwg_random_walk(self):
         from jaxrens.backends.toy import create_harmonic
 
-        energy_fn, params = create_harmonic()
+        backend = create_harmonic()
         move_config = MoveConfig(move_type="random_walk")
-        init_fn, step_fn = setup_mwg(move_config, energy_fn, params)
+        init_fn, step_fn = setup_mwg(move_config, backend)
         assert callable(init_fn)
         assert callable(step_fn)
 
     def test_setup_mwg_galilean(self):
         from jaxrens.backends.toy import create_harmonic
 
-        energy_fn, params = create_harmonic()
+        backend = create_harmonic()
         move_config = MoveConfig(move_type="galilean")
-        init_fn, step_fn = setup_mwg(move_config, energy_fn, params)
+        init_fn, step_fn = setup_mwg(move_config, backend)
         assert callable(init_fn)
         assert callable(step_fn)
 
     def test_setup_mwg_unknown_raises(self):
+        from jaxrens.backends.toy import create_harmonic
+
+        backend = create_harmonic()
         move_config = MoveConfig(move_type="nonexistent")
         with pytest.raises(ValueError, match="Unknown move type"):
-            setup_mwg(move_config, lambda *a, **k: 0, None)
+            setup_mwg(move_config, backend)
 
     def test_run_from_config_toy(self, tmp_path):
         """End-to-end: run NS on harmonic with config objects."""

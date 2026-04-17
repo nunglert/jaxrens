@@ -390,8 +390,8 @@ class TestTempTerminationIntegration:
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import run_ns
 
-        energy_fn, params = create_harmonic(k=1.0)
-        init_fn, step_fn = build_mwg(energy_fn, params, [
+        backend = create_harmonic(k=1.0)
+        init_fn, step_fn = build_mwg(backend, [
             MoveDescriptor("random_walk", random_walk.build_kernel),
         ])
 
@@ -403,9 +403,10 @@ class TestTempTerminationIntegration:
             init_key, (n_walkers, 1, 3), minval=-3.0, maxval=3.0
         )
         types = jnp.zeros((1,), dtype=jnp.int32)
-        energies = jax.vmap(energy_fn, in_axes=(None, 0, None))(
-            params, positions, types
-        )
+        cell = jnp.zeros((3, 3))
+        energies = jax.vmap(
+            lambda pos: backend(pos, types, cell, 0)[0]
+        )(positions)
 
         max_iters = 5000
         temp_crit = TempTermination(
@@ -439,8 +440,8 @@ class TestTempTerminationIntegration:
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import run_ns
 
-        energy_fn, params = create_harmonic(k=1.0)
-        init_fn, step_fn = build_mwg(energy_fn, params, [
+        backend = create_harmonic(k=1.0)
+        init_fn, step_fn = build_mwg(backend, [
             MoveDescriptor("random_walk", random_walk.build_kernel),
         ])
 
@@ -452,9 +453,10 @@ class TestTempTerminationIntegration:
             init_key, (n_walkers, 1, 3), minval=-3.0, maxval=3.0
         )
         types = jnp.zeros((1,), dtype=jnp.int32)
-        energies = jax.vmap(energy_fn, in_axes=(None, 0, None))(
-            params, positions, types
-        )
+        cell = jnp.zeros((3, 3))
+        energies = jax.vmap(
+            lambda pos: backend(pos, types, cell, 0)[0]
+        )(positions)
 
         # Set energy target that should be reached well before 5000 iters
         energy_target = 1.0  # harmonic energies start ~5-10, decrease during NS

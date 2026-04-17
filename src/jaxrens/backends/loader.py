@@ -1,23 +1,22 @@
 """Unified backend loader.
 
-load_backend(backend_type, **kwargs) -> (energy_fn, params)
+load_backend(backend_type, **kwargs) -> EnergyBackend
 
 Single entry point for all energy backends.
 """
 
+from __future__ import annotations
+
 from typing import Any
 
-from jaxrens.backends.protocols import EnergyFn
-from jaxrens.types import Params
+from jaxrens.backends.base import EnergyBackend
 
 
 def load_backend(
     backend_type: str,
     **kwargs: Any,
-) -> tuple[EnergyFn, Params]:
+) -> EnergyBackend:
     """Load any energy backend through a single interface.
-
-    Returns (energy_fn, params) where params is an opaque pytree.
 
     Args:
         backend_type: One of "harmonic", "double_well", "gaussian_mixture",
@@ -25,7 +24,7 @@ def load_backend(
         **kwargs: Backend-specific keyword arguments.
 
     Returns:
-        (energy_fn, params) tuple.
+        An EnergyBackend instance.
 
     Raises:
         ValueError: If backend_type is unknown.

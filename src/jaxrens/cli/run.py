@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.backends.loader import load_backend
+from jaxrens.backends.ensemble import EnsembleBackend, make_ensemble_params
 from jaxrens.cli.monitor import (
     CheckpointCallback,
     EnergyCheckCallback,
@@ -55,7 +56,6 @@ def _build_kernel_kwargs(move_config: MoveConfig) -> dict[str, Any]:
         case "hmc":
             kwargs["n_leapfrog"] = move_config.n_steps
         case "volume" | "shear" | "stretch":
-            # n_atoms is passed via kernel_kwargs; caller must set it
             pass
     return kwargs
 
@@ -74,16 +74,13 @@ def _extra_state_fields(move_type: str) -> dict[str, tuple[type, Any]]:
 
 def setup_mwg(
     move_configs: list[MoveConfig] | MoveConfig,
-    energy_fn: Any,
-    params: Any,
+    backend: Any,
 ):
     """Create MWG init_fn and step_fn from move config(s).
 
     Args:
         move_configs: Single MoveConfig or list of MoveConfigs.
-            A single config is treated as a list of length 1.
-        energy_fn: Callable conforming to EnergyFn protocol.
-        params: Opaque pytree of backend parameters.
+        backend: EnergyBackend instance.
 
     Returns:
         (init_fn, step_fn) from build_mwg.
@@ -110,7 +107,7 @@ def setup_mwg(
             )
         )
 
-    return build_mwg(energy_fn, params, descriptors)
+    return build_mwg(backend, descriptors)
 
 
 def run_from_config(
@@ -121,27 +118,10 @@ def run_from_config(
     initial_positions: jnp.ndarray,
     initial_types: jnp.ndarray,
     initial_energies: jnp.ndarray | None = None,
-    initial_boxes: jnp.ndarray | None = None,
+    initial_cells: jnp.ndarray | None = None,
     symbol_map: dict[int, str] | None = None,
 ) -> dict:
-    """Run NS from typed config objects.
-
-    This is the main programmatic entry point.
-
-    Args:
-        ns_config: NS run parameters.
-        move_config: Move type and parameters (single or list for MWG).
-        backend_config: Energy backend parameters.
-        output_config: I/O and output parameters.
-        initial_positions: Starting walker positions (n_walkers, n_atoms, 3).
-        initial_types: Atom types (n_atoms,).
-        initial_energies: Starting energies (n_walkers,). Computed if None.
-        initial_boxes: Unit cells (n_walkers, 3, 3) or None.
-        symbol_map: Atom type -> element symbol mapping.
-
-    Returns:
-        Final NS state dict.
-    """
+    """Run NS from typed config objects."""
     if symbol_map is None:
         symbol_map = {0: "X"}
 
@@ -152,16 +132,28 @@ def run_from_config(
     if backend_config.cutoff is not None:
         backend_kwargs["cutoff"] = backend_config.cutoff
 
-    energy_fn, params = load_backend(backend_config.backend_type, **backend_kwargs)
+    base_backend = load_backend(backend_config.backend_type, **backend_kwargs)
+
+    # Wrap with ensemble corrections if needed
+    ensemble_params = None
+    if ns_config.pressure:
+        backend = EnsembleBackend(base_backend, pressure=ns_config.pressure)
+        ensemble_params = make_ensemble_params(pressure=ns_config.pressure)
+    else:
+        backend = base_backend
 
     # Compute initial energies if not provided
     if initial_energies is None:
-        initial_energies = jax.vmap(energy_fn, in_axes=(None, 0, None))(
-            params, initial_positions, initial_types
-        )
+        # Use backend to get initial energies (includes ensemble correction)
+        def eval_one(pos):
+            e, _, _ = backend(pos, initial_types,
+                             initial_cells[0] if initial_cells is not None else jnp.zeros((3, 3)),
+                             0)
+            return e
+        initial_energies = jax.vmap(eval_one)(initial_positions)
 
     # Build MWG sampler
-    init_fn, step_fn = setup_mwg(move_config, energy_fn, params)
+    init_fn, step_fn = setup_mwg(move_config, backend)
 
     # Set up callbacks
     callbacks = [
@@ -172,7 +164,6 @@ def run_from_config(
     working_dir = output_config.working_dir
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    # Checkpoint callback
     callbacks.append(
         CheckpointCallback(
             working_dir=working_dir,
@@ -182,7 +173,6 @@ def run_from_config(
         )
     )
 
-    # Trajectory callback
     traj_path = working_dir / f"{output_config.out_file_prefix}.traj.{output_config.format}"
     writer = create_trajectory_writer(output_config.format, traj_path, symbol_map)
     energy_logger = EnergyLogger(
@@ -199,16 +189,14 @@ def run_from_config(
         )
     )
 
-    # Determine step_size for adaptation from first move config
     first_mc = move_config[0] if isinstance(move_config, list) else move_config
 
-    # Run
     key = jax.random.key(ns_config.seed)
     result = run_ns(
         positions=initial_positions,
         types=initial_types,
         energies=initial_energies,
-        boxes=initial_boxes,
+        cells=initial_cells,
         init_fn=init_fn,
         step_fn=step_fn,
         rng_key=key,
@@ -219,7 +207,7 @@ def run_from_config(
         target_acceptance=first_mc.target_acceptance,
         adapt_warmup=first_mc.adaptation_warmup,
         callbacks=callbacks,
-        pressure=ns_config.pressure,
+        ensemble_params=ensemble_params,
     )
 
     return result
@@ -231,17 +219,7 @@ def run_from_file(
     initial_types: jnp.ndarray,
     **kwargs: Any,
 ) -> dict:
-    """Run NS from an ns.inp config file.
-
-    Args:
-        config_path: Path to configuration file.
-        initial_positions: Starting walker positions.
-        initial_types: Atom types.
-        **kwargs: Additional overrides passed to run_from_config.
-
-    Returns:
-        Final NS state dict.
-    """
+    """Run NS from an ns.inp config file."""
     ns_config, move_config, backend_config, output_config = load_config(config_path)
     return run_from_config(
         ns_config, move_config, backend_config, output_config,

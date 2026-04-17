@@ -10,6 +10,7 @@ import pytest
 
 from jaxrens.state.walker import WalkerState
 from jaxrens.state.ns import NSState
+from jaxrens.state.mc_state import make_mc_state_class
 
 
 class TestWalkerStatePytree:
@@ -98,26 +99,44 @@ class TestNSStatePytree:
     """NSState must be a valid JAX pytree."""
 
     def _make_ns_state(self):
+        MCState = make_mc_state_class()
+        n_walkers = 10
+        n_moves = 1
+        population = MCState(
+            positions=jnp.zeros((n_walkers, 3, 3)),
+            types=jnp.zeros((n_walkers, 3), dtype=jnp.int32),
+            energy=jnp.zeros(n_walkers),
+            box=jnp.tile(5.0 * jnp.eye(3), (n_walkers, 1, 1)),
+            step_size=jnp.zeros(n_walkers),
+            step_sizes=jnp.full((n_walkers, n_moves), 0.1),
+            n_accepted=jnp.zeros((n_walkers, n_moves), dtype=jnp.int32),
+            n_proposed=jnp.zeros((n_walkers, n_moves), dtype=jnp.int32),
+            max_neighbor_count=jnp.zeros(n_walkers, dtype=jnp.int32),
+            overflow=jnp.zeros(n_walkers, dtype=jnp.bool_),
+            ensemble_params={},
+        )
         return NSState(
-            positions=jnp.zeros((10, 3, 3)),  # 10 walkers, 3 atoms, 3D
-            types=jnp.zeros((10, 3), dtype=jnp.int32),
-            energies=jnp.zeros(10),
-            boxes=jnp.eye(3)[None].repeat(10, axis=0) * 5.0,
+            population=population,
             dead_energies=jnp.full(1000, jnp.inf),
+            dead_positions=jnp.zeros((1000, 3, 3)),
+            dead_volumes=jnp.zeros(1000),
             log_evidence=jnp.array(-jnp.inf),
             iteration=jnp.array(0, dtype=jnp.int32),
             n_dead=jnp.array(0, dtype=jnp.int32),
             rng_key=jax.random.key(0),
-            n_live=10,
+            n_walkers=10,
             n_atoms=3,
+            max_dead=1000,
         )
 
     def test_tree_flatten_unflatten(self):
         state = self._make_ns_state()
         leaves, treedef = jax.tree_util.tree_flatten(state)
         reconstructed = treedef.unflatten(leaves)
-        assert jnp.array_equal(reconstructed.positions, state.positions)
-        assert reconstructed.n_live == state.n_live
+        assert jnp.array_equal(
+            reconstructed.population.positions, state.population.positions
+        )
+        assert reconstructed.n_walkers == state.n_walkers
         assert reconstructed.n_atoms == state.n_atoms
 
     def test_jit_passthrough(self):
