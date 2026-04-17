@@ -1,0 +1,23 @@
+run:
+  n_live: 8
+  max_iterations: 10
+  n_mcmc_steps: 3
+  seed: 7
+
+moves:
+  - type: random_walk
+    step_size: 0.3
+
+backend:
+  type: harmonic
+  n_atoms: 1
+
+output:
+  format: none
+  working_dir: "."
+  info_interval: 999
+
+ensemble:
+  type: npt
+  pressure: 0.01
+  pressure_units: eva3

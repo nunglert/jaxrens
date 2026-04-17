@@ -1,0 +1,1 @@
+- [CLI modernization plan](project_cli_modernization.md) — 8-step plan; steps 1–7 complete as of 2026-04-17

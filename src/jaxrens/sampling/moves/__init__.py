@@ -5,6 +5,7 @@ from jaxrens.sampling.moves import (
     galilean,
     hmc,
     random_walk,
+    replica_exchange,
     shear,
     single_atom,
     stretch,

@@ -424,6 +424,17 @@ def run_ns(
         and adjust_interval > 0
     )
 
+    # Pre-compile per-move adjustment functions (once, before the loop)
+    if use_full_auto:
+        from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
+
+        jit_adjust_fns = []
+        for move_idx, desc in enumerate(move_descriptors):
+            # Each move gets its own JIT'd function with its static config baked in
+            jit_adjust_fns.append(
+                jax.jit(adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10))
+            )
+
     # Track per-move step sizes
     pop = ns_state.population
     current_step_sizes = pop.step_sizes[0]  # (n_move_types,) — same for all walkers
@@ -431,16 +442,11 @@ def run_ns(
     for i in range(max_iterations):
         # Step size adaptation
         if use_full_auto and i > 0 and i % adjust_interval == 0:
-            # Full-auto: per-move trial-based adjustment
-            from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
-
             pop = ns_state.population
             emax = jnp.max(pop.energy)
             for move_idx, desc in enumerate(move_descriptors):
                 rng_key, key_adjust = jax.random.split(rng_key)
-                new_ss, rate = jax.jit(
-                    adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10)
-                )(
+                new_ss, rate = jit_adjust_fns[move_idx](
                     pop, per_move_fns[move_idx],
                     current_step_sizes[move_idx], emax, key_adjust,
                     adjust_n_samples, desc.min_rate, desc.max_rate,

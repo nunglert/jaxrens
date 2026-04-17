@@ -34,8 +34,8 @@ class StepFn(Protocol):
     ) -> tuple[Any, MoveInfo]:
         """Propose a new state satisfying the likelihood constraint.
 
-        Operates on a SINGLE walker. Designed to be wrapped in
-        pmap(vmap(vmap(...))) by the batch_wrapper layer.
+        Operates on a SINGLE walker. Batched via vmap/pmap by the
+        MWG wrapper layer.
 
         Returns (new_state, info).
         """
@@ -55,8 +55,8 @@ class EnergyFn(Protocol):
 
     NeuralIL-style backends compute neighbors internally during descriptor
     calculation -- no neighbor_list argument. The max_neighbors parameter
-    is a compile-time constant baked into the descriptor generator, handled
-    by the CompiledKernelSet dispatch layer.
+    is a compile-time constant; JAX's compilation cache handles retrace
+    when the value changes.
     """
 
     def __call__(

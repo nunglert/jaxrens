@@ -1,4 +1,4 @@
-"""Test energy backends: toy potentials, LJ, loader, kernel dispatch.
+"""Test energy backends: toy potentials, LJ, loader.
 
 Part of Step 2: backend protocol and implementations.
 """
@@ -10,11 +10,6 @@ import pytest
 from jaxrens.backends.toy import create_harmonic, create_double_well, create_gaussian_mixture
 from jaxrens.backends.lj import create_lj
 from jaxrens.backends.loader import load_backend
-from jaxrens.backends.kernel_dispatch import (
-    find_closest_higher_number,
-    CompiledKernelSet,
-    SingleKernelSet,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -242,106 +237,3 @@ class TestLoader:
         with pytest.raises(ValueError, match="Unknown backend"):
             load_backend("nonexistent_backend")
 
-
-# ---------------------------------------------------------------------------
-# Kernel dispatch
-# ---------------------------------------------------------------------------
-
-
-class TestFindClosestHigherNumber:
-    def test_exact_match(self):
-        assert find_closest_higher_number(15, [4, 6, 8, 10, 15, 20]) == 15
-
-    def test_between_values(self):
-        assert find_closest_higher_number(12, [4, 6, 8, 10, 15, 20]) == 15
-
-    def test_extra_offset(self):
-        assert find_closest_higher_number(12, [4, 6, 8, 10, 15, 20], extra_offset=1) == 20
-
-    def test_at_minimum(self):
-        assert find_closest_higher_number(1, [10, 20, 30]) == 10
-
-    def test_at_maximum(self):
-        assert find_closest_higher_number(30, [10, 20, 30]) == 30
-
-    def test_exceeds_all(self):
-        with pytest.raises(ValueError, match="No bucket large enough"):
-            find_closest_higher_number(100, [10, 20, 30])
-
-    def test_extra_offset_clamps_to_end(self):
-        # extra_offset=10 but only 3 elements after match
-        assert find_closest_higher_number(5, [10, 20, 30], extra_offset=10) == 30
-
-
-class TestCompiledKernelSet:
-    def test_select_basic(self):
-        factory = lambda n: f"kernel_{n}"
-        ks = CompiledKernelSet(factory, [10, 20, 30, 40, 50], max_neighbors_offset=5)
-
-        # current=12 + offset=5 = 17 -> bucket 20
-        kernel = ks.select(12)
-        assert kernel == "kernel_20"
-
-    def test_select_with_escalation(self):
-        factory = lambda n: f"kernel_{n}"
-        ks = CompiledKernelSet(factory, [10, 20, 30, 40, 50], max_neighbors_offset=5)
-
-        # current=12 + offset=5 = 17 -> bucket 20, then escalate by 1 -> 30
-        kernel = ks.select(12, extra_offset=1)
-        assert kernel == "kernel_30"
-
-    def test_adjust_and_run_no_violation(self):
-        factory = lambda n: f"kernel_{n}"
-        ks = CompiledKernelSet(factory, [10, 20, 30], max_neighbors_offset=0)
-
-        result, info = ks.adjust_and_run(
-            walkers="walkers",
-            get_neighbor_count=lambda w: 15,
-            run_fn=lambda kernel, w: (f"result_{kernel}", "info"),
-            check_violation=lambda r: False,
-        )
-        assert result == "result_kernel_20"
-
-    def test_adjust_and_run_with_retry(self):
-        call_count = 0
-
-        def run_fn(kernel, walkers):
-            nonlocal call_count
-            call_count += 1
-            return f"result_{kernel}_{call_count}", "info"
-
-        def check_violation(result):
-            # First call violates, second succeeds
-            return "1" in result
-
-        factory = lambda n: f"kernel_{n}"
-        ks = CompiledKernelSet(factory, [10, 20, 30], max_neighbors_offset=0)
-
-        result, info = ks.adjust_and_run(
-            walkers="walkers",
-            get_neighbor_count=lambda w: 15,
-            run_fn=run_fn,
-            check_violation=check_violation,
-        )
-        assert call_count == 2
-        assert "kernel_30" in result  # Escalated to next bucket
-
-    def test_adjust_and_run_max_retries_exceeded(self):
-        factory = lambda n: f"kernel_{n}"
-        ks = CompiledKernelSet(factory, [10, 20, 30], max_neighbors_offset=0)
-
-        with pytest.raises(ValueError, match="violations persisted"):
-            ks.adjust_and_run(
-                walkers="walkers",
-                get_neighbor_count=lambda w: 15,
-                run_fn=lambda k, w: ("result", "info"),
-                check_violation=lambda r: True,  # Always violates
-                max_retries=2,
-            )
-
-
-class TestSingleKernelSet:
-    def test_select_returns_kernel(self):
-        ks = SingleKernelSet("my_kernel")
-        assert ks.select() == "my_kernel"
-        assert ks.select(42, extra_offset=3) == "my_kernel"

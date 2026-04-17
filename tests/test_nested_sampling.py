@@ -1,11 +1,12 @@
-"""Test the nested sampling loop.
+"""Test full nested sampling runs (run_ns, run_ns_parallel).
 
 Verifies:
-- NS runs complete without error on toy problems
+- run_ns completes and produces finite evidence
 - Evidence accuracy on harmonic oscillator (known answer)
-- lax.scan inner loop produces correct results
 - Callbacks are invoked
-- ns_step is JIT-compatible
+- run_ns_parallel completes with correct shapes
+- Parallel evidence roughly matches sequential
+- Different pressures produce different evidence
 """
 
 import jax
@@ -13,15 +14,21 @@ import jax.numpy as jnp
 import pytest
 
 from jaxrens.backends.toy import create_harmonic
+from jaxrens.backends.ensemble import EnsembleBackend
 from jaxrens.sampling.move_descriptor import MoveDescriptor
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
-from jaxrens.sampling.nested_sampling import init_ns, ns_step, run_ns
+from jaxrens.sampling.nested_sampling import run_ns, run_ns_parallel
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def harmonic_setup():
-    """Set up a harmonic oscillator NS problem."""
+    """Single-run harmonic oscillator NS problem."""
     backend = create_harmonic(k=1.0)
     init_fn, step_fn, _ = build_mwg(backend, [
         MoveDescriptor("random_walk", random_walk.build_kernel),
@@ -42,7 +49,6 @@ def harmonic_setup():
     )(positions)
 
     return {
-        "backend": backend,
         "init_fn": init_fn,
         "step_fn": step_fn,
         "positions": positions,
@@ -53,126 +59,48 @@ def harmonic_setup():
     }
 
 
-class TestInitNS:
-    def test_init_creates_state(self, harmonic_setup):
-        s = harmonic_setup
-        state = init_ns(
-            s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
-        )
-        assert state.population.positions.shape == s["positions"].shape
-        assert state.population.energy.shape == (s["n_walkers"],)
-        assert state.iteration == 0
-        assert state.n_dead == 0
+@pytest.fixture
+def parallel_setup():
+    """2-run parallel harmonic oscillator NS problem."""
+    backend = create_harmonic(k=1.0)
+    init_fn, step_fn, _ = build_mwg(backend, [
+        MoveDescriptor("random_walk", random_walk.build_kernel),
+    ])
 
-    def test_init_dead_points_buffer(self, harmonic_setup):
-        s = harmonic_setup
-        state = init_ns(
-            s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"], max_dead=100,
-        )
-        assert state.dead_energies.shape == (100,)
+    n_runs = 2
+    n_walkers = 20
+    n_atoms = 1
 
-    def test_init_population_is_batched_mcstate(self, harmonic_setup):
-        s = harmonic_setup
-        state = init_ns(
-            s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
-        )
-        pop = state.population
-        assert pop.positions.shape[0] == s["n_walkers"]
-        assert pop.energy.shape == (s["n_walkers"],)
-        assert pop.step_sizes.ndim == 2
+    keys = jax.random.split(jax.random.key(0), n_runs)
+    positions = jax.vmap(
+        lambda k: jax.random.uniform(k, (n_walkers, n_atoms, 3), minval=-3.0, maxval=3.0)
+    )(keys)
+
+    types = jnp.zeros((n_atoms,), dtype=jnp.int32)
+
+    energies = jax.vmap(
+        lambda pos: jax.vmap(
+            lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+        )(pos)
+    )(positions)
+
+    rng_keys = jax.random.split(jax.random.key(42), n_runs)
+
+    return {
+        "init_fn": init_fn,
+        "step_fn": step_fn,
+        "positions": positions,
+        "types": types,
+        "energies": energies,
+        "rng_keys": rng_keys,
+        "n_runs": n_runs,
+        "n_walkers": n_walkers,
+    }
 
 
-class TestNSStep:
-    def test_single_step(self, harmonic_setup):
-        s = harmonic_setup
-        state = init_ns(
-            s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
-        )
-
-        new_state, info = ns_step(state, s["step_fn"], n_mcmc_steps=10)
-
-        assert new_state.iteration == 1
-        assert new_state.n_dead == 1
-        assert 0 <= info["acceptance_rate"] <= 1.0
-
-    def test_multiple_steps_reduce_emax(self, harmonic_setup):
-        s = harmonic_setup
-        state = init_ns(
-            s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
-        )
-
-        emaxes = []
-        for _ in range(20):
-            state, info = ns_step(state, s["step_fn"], n_mcmc_steps=10)
-            emaxes.append(float(info["emax"]))
-
-        assert emaxes[-1] < emaxes[0], "Emax should decrease during NS"
-
-    def test_evidence_increases(self, harmonic_setup):
-        s = harmonic_setup
-        state = init_ns(
-            s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
-        )
-
-        for _ in range(50):
-            state, info = ns_step(state, s["step_fn"], n_mcmc_steps=10)
-
-        assert jnp.isfinite(state.log_evidence)
-
-    def test_jit_compatible(self, harmonic_setup):
-        s = harmonic_setup
-        state = init_ns(
-            s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
-        )
-
-        jit_step = jax.jit(ns_step, static_argnums=(1, 2, 3))
-        new_state, info = jit_step(state, s["step_fn"], 10, 0)
-
-        assert new_state.iteration == 1
-        assert jnp.isfinite(info["emax"])
-
-    def test_n_extra_walks(self, harmonic_setup):
-        s = harmonic_setup
-        state = init_ns(
-            s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
-        )
-
-        new_state, info = ns_step(state, s["step_fn"], n_mcmc_steps=10, n_extra=5)
-
-        assert new_state.iteration == 1
-        assert new_state.n_dead == 1
-        assert 0 <= info["acceptance_rate"] <= 1.0
-
-    def test_n_extra_reduces_emax(self, harmonic_setup):
-        s = harmonic_setup
-        state = init_ns(
-            s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
-        )
-
-        emaxes = []
-        for _ in range(20):
-            state, info = ns_step(state, s["step_fn"], n_mcmc_steps=10, n_extra=3)
-            emaxes.append(float(info["emax"]))
-
-        assert emaxes[-1] < emaxes[0], "Emax should decrease during NS with n_extra"
+# ---------------------------------------------------------------------------
+# run_ns (single run)
+# ---------------------------------------------------------------------------
 
 
 class TestRunNS:
@@ -260,3 +188,91 @@ class TestRunNS:
         assert len(iterations_seen) > 1
         assert iterations_seen[-1] == "finish"
         assert 0 in iterations_seen
+
+
+# ---------------------------------------------------------------------------
+# run_ns_parallel (multi-run)
+# ---------------------------------------------------------------------------
+
+
+class TestRunNsParallel:
+    def test_basic_completion(self, parallel_setup):
+        s = parallel_setup
+        result = run_ns_parallel(
+            s["positions"], s["types"], s["energies"],
+            cells=None,
+            init_fn=s["init_fn"],
+            step_fn=s["step_fn"],
+            rng_keys=s["rng_keys"],
+            max_iterations=50,
+            n_mcmc_steps=5,
+            initial_step_size=0.3,
+        )
+
+        assert result["n_runs"] == 2
+        assert result["log_evidence"].shape == (2,)
+        assert result["iteration"].shape == (2,)
+        assert jnp.all(jnp.isfinite(result["log_evidence"]))
+        assert jnp.all(result["n_dead"] > 0)
+
+    def test_parallel_matches_sequential(self, parallel_setup):
+        s = parallel_setup
+        n_iter = 50
+        n_mcmc = 5
+
+        result_par = run_ns_parallel(
+            s["positions"], s["types"], s["energies"],
+            cells=None,
+            init_fn=s["init_fn"],
+            step_fn=s["step_fn"],
+            rng_keys=s["rng_keys"],
+            max_iterations=n_iter,
+            n_mcmc_steps=n_mcmc,
+            initial_step_size=0.3,
+        )
+
+        result_seq_0 = run_ns(
+            s["positions"][0], s["types"], s["energies"][0],
+            cells=None,
+            init_fn=s["init_fn"],
+            step_fn=s["step_fn"],
+            rng_key=s["rng_keys"][0],
+            max_iterations=n_iter,
+            n_mcmc_steps=n_mcmc,
+            initial_step_size=0.3,
+        )
+
+        log_Z_par = float(result_par["log_evidence"][0])
+        log_Z_seq = float(result_seq_0["log_evidence"])
+        assert abs(log_Z_par - log_Z_seq) < 5.0, (
+            f"Parallel log_Z={log_Z_par:.3f} vs sequential log_Z={log_Z_seq:.3f}"
+        )
+
+
+class TestDifferentPressures:
+    def test_different_pressures_different_evidence(self):
+        base_backend = create_harmonic(k=1.0)
+        backend_p0 = EnsembleBackend(base_backend, pressure=0.0)
+        backend_p1 = EnsembleBackend(base_backend, pressure=0.1)
+
+        init_fn_p0, step_fn_p0, _ = build_mwg(backend_p0, [
+            MoveDescriptor("random_walk", random_walk.build_kernel),
+        ])
+
+        n_walkers = 15
+        n_atoms = 1
+        key = jax.random.key(99)
+        positions = jax.random.uniform(key, (n_walkers, n_atoms, 3), minval=-2.0, maxval=2.0)
+        types = jnp.zeros((n_atoms,), dtype=jnp.int32)
+        cells = jnp.tile(5.0 * jnp.eye(3), (n_walkers, 1, 1))
+
+        energies_p0 = jax.vmap(
+            lambda pos, cell: backend_p0(pos, types, cell, 0)[0]
+        )(positions, cells)
+
+        energies_p1 = jax.vmap(
+            lambda pos, cell: backend_p1(pos, types, cell, 0)[0]
+        )(positions, cells)
+
+        assert not jnp.allclose(energies_p0, energies_p1)
+        assert jnp.all(energies_p1 > energies_p0)

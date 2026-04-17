@@ -1,0 +1,22 @@
+run:
+  n_live: 20
+  max_iterations: 50
+  n_mcmc_steps: 5
+  seed: 0
+
+moves:
+  - type: random_walk
+    step_size: 0.1
+
+backend:
+  type: lj
+  n_atoms: 4
+  epsilon: 1.0
+  sigma: 1.0
+  cutoff: 3.0
+  periodic: false
+
+output:
+  format: none
+  working_dir: "."
+  info_interval: 999

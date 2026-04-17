@@ -23,11 +23,6 @@ class NSConfig:
 
     # Ensemble
     pressure: float | None = None  # pressure for NPT ensemble (None = NVT)
-    chemical_potential: float | None = None  # for future sGC support
-
-    # Multi-GPU
-    platform: str = "gpu"  # "gpu" | "multi-gpu" | "cpu"
-    n_runs: int = 1
 
 
 @dataclass(frozen=True)
@@ -38,7 +33,6 @@ class MoveConfig:
     step_size: float = 0.1
     n_steps: int = 10
     weight: float = 1.0  # relative probability for MWG dispatch
-    adaptation_enabled: bool = True
     adaptation_warmup: int = 100
     target_acceptance: float = 0.5
 
@@ -65,10 +59,7 @@ class OutputConfig:
     format: str = "extxyz"  # "extxyz" | "h5" | "none"
     traj_interval: int = 1
     snapshot_interval: int = 100
-    snapshot_clean: bool = True
     checkpoint_interval: int = 100
-    checkpoint_keep: int = 3
     info_interval: int = 100
     out_file_prefix: str = "ns"
     working_dir: Path = field(default_factory=lambda: Path("."))
-    write_traj_db: bool = False

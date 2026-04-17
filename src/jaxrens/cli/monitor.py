@@ -24,7 +24,7 @@ def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
     """Convert NSState to a dict suitable for save_checkpoint."""
     pop = ns_state.population
     ep = ns_state.population.ensemble_params if hasattr(ns_state.population, "ensemble_params") else {}
-    is_npt = isinstance(ep, dict) and float(ep.get("pressure", 0.0)) != 0.0
+    is_npt = isinstance(ep, dict) and "pressure" in ep
     result = {
         "positions": pop.positions,
         "types": pop.types,

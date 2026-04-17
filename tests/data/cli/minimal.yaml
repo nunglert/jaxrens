@@ -1,0 +1,18 @@
+run:
+  n_live: 20
+  max_iterations: 50
+  n_mcmc_steps: 5
+  seed: 0
+
+moves:
+  move_type: random_walk
+  step_size: 0.3
+
+backend:
+  backend_type: harmonic
+  n_atoms: 1
+
+output:
+  format: none
+  working_dir: "."
+  info_interval: 999

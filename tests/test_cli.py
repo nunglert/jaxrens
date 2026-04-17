@@ -5,18 +5,13 @@ import jax.numpy as jnp
 import pytest
 from pathlib import Path
 
-from jaxrens.cli.parser import (
-    parse_input_file,
-    raw_to_configs,
-    dict_to_input_str,
-    load_config,
-)
+from jaxrens.cli.parser import parse_input_file
 from jaxrens.cli.run import setup_mwg, run_from_config
 from jaxrens.state.config import NSConfig, MoveConfig, BackendConfig, OutputConfig
 
 
 # ---------------------------------------------------------------------------
-# Parser tests
+# Parser tests (raw-read only; dataclass-construction path removed in step 7)
 # ---------------------------------------------------------------------------
 
 
@@ -37,41 +32,17 @@ class TestParser:
         assert raw["backend"] == "lj"
         assert raw["step_size"] == "0.05"
 
-    def test_raw_to_configs(self):
-        raw = {
-            "n_walkers": "200",
-            "backend": "harmonic",
-            "step_size": "0.05",
-            "move_type": "random_walk",
-        }
-        ns, move, backend, output = raw_to_configs(raw)
+    def test_parse_input_file_inline_comment(self, tmp_path):
+        config = tmp_path / "ns.inp"
+        config.write_text("n_walkers = 50  # inline comment\n")
+        raw = parse_input_file(config)
+        assert raw["n_walkers"] == "50"
 
-        assert isinstance(ns, NSConfig)
-        assert ns.n_live == 200
-        assert isinstance(move, MoveConfig)
-        assert move.move_type == "random_walk"
-        assert move.step_size == 0.05
-        assert isinstance(backend, BackendConfig)
-        assert backend.backend_type == "harmonic"
-        assert isinstance(output, OutputConfig)
-
-    def test_load_config_roundtrip(self, tmp_path):
-        config = tmp_path / "test.inp"
-        config.write_text(
-            "n_walkers = 50\n"
-            "backend = lj\n"
-            "move_type = galilean\n"
-            "max_neighbors_list = 10 20 30\n"
-        )
-        ns, move, backend, output = load_config(config)
-        assert ns.n_live == 50
-        assert move.move_type == "galilean"
-        assert backend.max_neighbors_list == [10, 20, 30]
-
-    def test_dict_to_input_str(self):
-        s = dict_to_input_str({"n_walkers": 100, "backend": "lj"})
-        assert "n_walkers = 100" in s
-        assert "backend = lj" in s
+    def test_parse_input_file_blank_lines(self, tmp_path):
+        config = tmp_path / "ns.inp"
+        config.write_text("\n\nn_walkers = 10\n\n")
+        raw = parse_input_file(config)
+        assert raw == {"n_walkers": "10"}
 
 
 # ---------------------------------------------------------------------------
@@ -158,3 +129,15 @@ class TestPublicAPI:
     def test_backend_imports(self):
         from jaxrens.backends import loader
         assert hasattr(loader, "load_backend")
+
+    def test_parser_public_api(self):
+        """parse_input_file is still importable; raw_to_configs is gone."""
+        from jaxrens.cli.parser import parse_input_file
+        assert callable(parse_input_file)
+
+        with pytest.raises(ImportError):
+            from jaxrens.cli.parser import raw_to_configs  # noqa: F401
+
+    def test_migrate_importable(self):
+        from jaxrens.cli.migrate import migrate_ns_inp
+        assert callable(migrate_ns_inp)

@@ -1,0 +1,31 @@
+run:
+  n_live: 10
+  max_iterations: 100
+  n_mcmc_steps: 5
+  seed: 0
+
+moves:
+  - type: random_walk
+    step_size: 0.3
+    name: rw_main
+  - type: galilean
+    step_size: 0.1
+    name: gal_main
+
+backend:
+  type: harmonic
+  n_atoms: 1
+
+output:
+  format: none
+  working_dir: "."
+  info_interval: 999
+
+adaptation:
+  defaults:
+    min_rate: 0.3
+    max_rate: 0.7
+  per_move:
+    gal_main:
+      min_rate: 0.4
+      step_size_max: 5.0

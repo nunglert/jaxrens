@@ -1,0 +1,21 @@
+# Minimal legacy ns.inp for migration tests
+n_walkers = 200
+n_iter = 5000
+n_cull = 1
+seed = 7
+
+energy_calculator = lj
+n_atoms = 13
+lj_r_cut = 5.0
+lj_sigma = 1.0
+lj_eps = 1.0
+
+n_gmc_steps = 1
+atom_traj_len = 8
+
+start_species = 18
+
+config_file_format = extxyz
+traj_interval = 100
+out_file_prefix = test_run
+working_dir = .

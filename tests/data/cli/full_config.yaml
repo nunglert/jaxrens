@@ -1,0 +1,50 @@
+run:
+  n_live: 20
+  max_iterations: 50
+  n_mcmc_steps: 5
+  seed: 7
+
+moves:
+  - type: random_walk
+    step_size: 0.3
+  - type: galilean
+    n_reflect: 4
+    step_size: 0.1
+
+backend:
+  type: harmonic
+  n_atoms: 2
+
+output:
+  format: none
+  working_dir: "."
+  info_interval: 999
+  traj_interval: 5
+  snapshot_interval: 50
+  checkpoint_interval: 50
+
+termination:
+  - type: iteration
+    max_iterations: 50
+
+adaptation:
+  defaults:
+    min_rate: 0.3
+  per_move:
+    galilean:
+      min_rate: 0.4
+
+ensemble:
+  type: nvt
+
+init:
+  start_species: "1 1"
+  random_initialise_pos: true
+  pos_randomization_mode: grid
+  grid_distance: 1.5
+
+cell:
+  max_volume_per_atom: 500.0
+  min_volume_per_atom: 2.0
+  min_aspect_ratio: 0.75
+  flat_V_prior: false

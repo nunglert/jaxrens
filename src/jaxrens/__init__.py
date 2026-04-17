@@ -6,7 +6,7 @@ __version__ = "0.1.0"
 from jaxrens.backends.base import EnergyBackend
 from jaxrens.backends.ensemble import EnsembleBackend, make_ensemble_params
 from jaxrens.backends.loader import load_backend
-from jaxrens.cli.run import run_from_config, run_from_file
+from jaxrens.cli.run import run_from_config
 from jaxrens.sampling.move_descriptor import MoveDescriptor
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, ns_step, run_ns
@@ -14,6 +14,7 @@ from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConf
 from jaxrens.state.mc_state import MCState, make_mc_state_class
 from jaxrens.postprocess.thermodynamics import (
     calc_log_weights,
+    calc_log_weights_live,
     expectation,
     free_energy,
     heat_capacity,
@@ -34,12 +35,12 @@ __all__ = [
     "init_ns",
     "ns_step",
     "run_from_config",
-    "run_from_file",
     "NSConfig",
     "MoveConfig",
     "BackendConfig",
     "OutputConfig",
     "calc_log_weights",
+    "calc_log_weights_live",
     "expectation",
     "free_energy",
     "heat_capacity",
