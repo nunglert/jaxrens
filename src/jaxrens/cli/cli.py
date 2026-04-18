@@ -110,6 +110,10 @@ def _run_one(resolved, *, cohort_label: str = "") -> None:
         initial_types=resolved.init.initial_types,
         initial_energies=resolved.init.initial_energies,
         initial_cells=resolved.init.initial_cells,
+        restart_state=resolved.init.restart_state,
+        move_descriptors=list(resolved.move_descriptors),
+        initial_walk_config=resolved.initial_walk_config,
+        adaptation_config=resolved.adaptation_cfg,
     )
 
 

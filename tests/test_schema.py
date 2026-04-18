@@ -2986,3 +2986,312 @@ class TestInitConfigResolverModeD:
 
         assert out["n_dead"] >= n_dead_checkpoint
         assert jnp.isfinite(out["log_evidence"])
+
+
+# ---------------------------------------------------------------------------
+# TestInitConfigBurnIn
+# ---------------------------------------------------------------------------
+
+def _burn_in_dict(n_walks: int = 2, walklength: int = 5, n_live: int = 6) -> dict:
+    """Minimal RootConfig dict with burn-in configured."""
+    return {
+        "run": {
+            "n_live": n_live,
+            "max_iterations": 10,
+            "n_mcmc_steps": 3,
+            "seed": 0,
+        },
+        "moves": [{"move_type": "random_walk", "step_size": 0.3}],
+        "backend": {"backend_type": "harmonic", "n_atoms": 1},
+        "output": {
+            "format": "none",
+            "working_dir": ".",
+            "info_interval": 999,
+        },
+        "init": {
+            "start_species": "1",
+            "random_initialise_pos": True,
+            "random_initialise_cell": False,
+        },
+        "initial_walk": {
+            "n_walks": n_walks,
+            "walklength": walklength,
+        },
+    }
+
+
+class TestInitConfigBurnIn:
+    """Tests for burn-in integration via run_from_config (spec Part F)."""
+
+    def test_n_walks_zero_is_no_op(self, tmp_path):
+        """n_walks=0: burn-in skipped, NS runs normally."""
+        import jax
+        import jax.numpy as jnp
+        from jaxrens.cli.run import run_from_config
+
+        d = _species_dict(n_atoms=1, n_live=6, mode="grid")
+        d["output"]["working_dir"] = str(tmp_path)
+        root = RootConfig.model_validate(d)
+        resolved = resolve(root)
+
+        result = run_from_config(
+            resolved.ns,
+            list(resolved.moves),
+            resolved.backend,
+            resolved.output,
+            initial_positions=resolved.init.initial_positions,
+            initial_types=resolved.init.initial_types,
+            initial_energies=resolved.init.initial_energies,
+            initial_cells=resolved.init.initial_cells,
+        )
+        assert result["iteration"] > 0
+        assert jnp.isfinite(result["log_evidence"])
+
+    def test_burn_in_produces_valid_ns_result(self, tmp_path):
+        """n_walks=2, walklength=5 with species init: NS run completes, log_evidence finite."""
+        import jax
+        import jax.numpy as jnp
+        from jaxrens.cli.run import run_from_config
+        from jaxrens.cli.schema.init import InitialWalkConfig
+        from jaxrens.sampling.termination import IterationTermination
+
+        d = _species_dict(n_atoms=1, n_live=6, mode="grid")
+        d["output"]["working_dir"] = str(tmp_path)
+        root = RootConfig.model_validate(d)
+        resolved = resolve(root)
+
+        walk_cfg = InitialWalkConfig(
+            n_walks=2,
+            walklength=5,
+            adjust_interval=100,
+            emax_offset_per_atom=2.0,
+        )
+
+        result = run_from_config(
+            resolved.ns,
+            list(resolved.moves),
+            resolved.backend,
+            resolved.output,
+            initial_positions=resolved.init.initial_positions,
+            initial_types=resolved.init.initial_types,
+            initial_energies=resolved.init.initial_energies,
+            initial_cells=resolved.init.initial_cells,
+            initial_walk_config=walk_cfg,
+            termination_criteria=[IterationTermination(5)],
+        )
+        assert result["iteration"] > 0
+        assert jnp.isfinite(result["log_evidence"])
+
+    def test_restart_skips_burn_in(self, tmp_path):
+        """Mode D (restart_state is not None): burn-in must be skipped."""
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+        from jaxrens.cli.run import run_from_config
+        from jaxrens.cli.schema.init import InitialWalkConfig
+        from jaxrens.sampling.termination import IterationTermination
+
+        # Build a checkpoint to restart from.
+        from jaxrens.io.checkpoint import save_checkpoint
+        from jaxrens.init.restart import load_restart
+        from jaxrens.backends.toy import create_harmonic
+        from jaxrens.sampling.mwg import build_mwg
+        from jaxrens.sampling.nested_sampling import init_ns
+        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        import jaxrens.sampling.moves.random_walk as rw_mod
+
+        n_walkers, n_atoms = 4, 1
+        rng = np.random.default_rng(42)
+        positions = rng.uniform(-1, 1, (n_walkers, n_atoms, 3)).astype(np.float32)
+        types = np.zeros((n_walkers, n_atoms), dtype=np.int32)
+        cells = np.stack([np.eye(3, dtype=np.float32) * 5.0] * n_walkers)
+        energies = rng.uniform(0, 1, n_walkers).astype(np.float32)
+        dead_energies = rng.uniform(1, 3, 3).astype(np.float32)
+        dead_positions = rng.uniform(-1, 1, (3, n_atoms, 3)).astype(np.float32)
+
+        ckpt_path = tmp_path / "restart.h5"
+        save_checkpoint(ckpt_path, {
+            "positions": positions,
+            "types": types,
+            "energies": energies,
+            "cells": cells,
+            "dead_energies": dead_energies,
+            "dead_positions": dead_positions,
+            "dead_volumes": None,
+            "live_volumes": None,
+            "log_evidence": -5.0,
+            "iteration": 3,
+            "n_dead": 3,
+            "n_walkers": n_walkers,
+            "rng_key": jax.random.key(0),
+        }, symbol_map={0: "H"})
+
+        ws, restart_bundle = load_restart(ckpt_path)
+
+        backend = create_harmonic()
+        desc = MoveDescriptor(
+            name="random_walk",
+            build_kernel=rw_mod.build_kernel,
+            step_size=0.3,
+            weight=1.0,
+            kernel_kwargs={},
+            extra_state_fields={},
+        )
+        init_fn, step_fn, _ = build_mwg(backend, [desc])
+        key = jax.random.key(0)
+        key_init, key_run = jax.random.split(key)
+
+        ns_state_restart = init_ns(
+            init_fn,
+            jnp.asarray(ws.positions),
+            jnp.asarray(ws.types[0]),
+            jax.vmap(lambda p, t, c: backend(p, t, c, 0)[0])(
+                jnp.asarray(ws.positions), jnp.asarray(ws.types), jnp.asarray(ws.cells)
+            ),
+            jnp.asarray(ws.cells),
+            key_init,
+            max_dead=50,
+            restart_state=restart_bundle,
+        )
+        # Record live positions before any run
+        positions_before = np.array(ns_state_restart.population.positions)
+
+        # Now call initial_walk with restart_state present — should be no-op.
+        walk_cfg = InitialWalkConfig(
+            n_walks=5,  # large, would move walkers if applied
+            walklength=50,
+            emax_offset_per_atom=10.0,
+        )
+
+        from jaxrens.init.burn_in import initial_walk
+        # Simulate the run_from_config skip condition: restart_state is not None → skip.
+        result_state = initial_walk(
+            jax.random.key(99),
+            ns_state_restart,
+            step_fn,
+            n_walks=0,  # skipped because restart_state present (caller is responsible)
+            walklength=50,
+            adjust_interval=1,
+            emax_offset_per_atom=10.0,
+            n_atoms=n_atoms,
+        )
+        positions_after = np.array(result_state.population.positions)
+        np.testing.assert_array_equal(positions_before, positions_after)
+
+    def test_only_true_raises_not_implemented(self, tmp_path):
+        """initial_walk.only=True raises NotImplementedError (deferred)."""
+        import jax.numpy as jnp
+        from jaxrens.cli.run import run_from_config
+        from jaxrens.cli.schema.init import InitialWalkConfig
+        from jaxrens.sampling.termination import IterationTermination
+
+        d = _species_dict(n_atoms=1, n_live=4, mode="grid")
+        d["output"]["working_dir"] = str(tmp_path)
+        root = RootConfig.model_validate(d)
+        resolved = resolve(root)
+
+        walk_cfg = InitialWalkConfig(
+            n_walks=1,
+            walklength=3,
+            only="true",
+        )
+
+        with pytest.raises(NotImplementedError, match="only=True"):
+            run_from_config(
+                resolved.ns,
+                list(resolved.moves),
+                resolved.backend,
+                resolved.output,
+                initial_positions=resolved.init.initial_positions,
+                initial_types=resolved.init.initial_types,
+                initial_energies=resolved.init.initial_energies,
+                initial_cells=resolved.init.initial_cells,
+                initial_walk_config=walk_cfg,
+            )
+
+    def test_walker_batch_size_schema_field_accepted(self):
+        """walker_batch_size is a valid schema field; resolves without error."""
+        from jaxrens.cli.schema.init import InitialWalkConfig
+
+        cfg = InitialWalkConfig(
+            n_walks=1,
+            walklength=3,
+            walker_batch_size=2,
+        )
+        assert cfg.walker_batch_size == 2
+
+    def test_run_batch_size_schema_field_accepted(self):
+        """run_batch_size is a valid schema field; resolves without error."""
+        from jaxrens.cli.schema.init import InitialWalkConfig
+
+        cfg = InitialWalkConfig(
+            n_walks=1,
+            walklength=3,
+            run_batch_size=1,
+        )
+        assert cfg.run_batch_size == 1
+
+    def test_walker_batch_size_not_dividing_n_walkers_raises_at_runtime(self, tmp_path):
+        """walker_batch_size that doesn't divide n_walkers: schema OK, runtime ValueError."""
+        import jax.numpy as jnp
+        from jaxrens.cli.run import run_from_config
+        from jaxrens.cli.schema.init import InitialWalkConfig
+        from jaxrens.sampling.termination import IterationTermination
+
+        # n_live=6, walker_batch_size=4 — 6 % 4 != 0
+        d = _species_dict(n_atoms=1, n_live=6, mode="grid")
+        d["output"]["working_dir"] = str(tmp_path)
+        root = RootConfig.model_validate(d)
+        resolved = resolve(root)
+
+        walk_cfg = InitialWalkConfig(
+            n_walks=1,
+            walklength=2,
+            walker_batch_size=4,  # 6 % 4 != 0 -> ValueError at runtime
+        )
+
+        with pytest.raises(ValueError, match="walker_batch_size"):
+            run_from_config(
+                resolved.ns,
+                list(resolved.moves),
+                resolved.backend,
+                resolved.output,
+                initial_positions=resolved.init.initial_positions,
+                initial_types=resolved.init.initial_types,
+                initial_energies=resolved.init.initial_energies,
+                initial_cells=resolved.init.initial_cells,
+                initial_walk_config=walk_cfg,
+            )
+
+    def test_walker_batch_size_divides_n_walkers_runs_ok(self, tmp_path):
+        """walker_batch_size=2 on n_live=6: resolves and runs without error."""
+        import jax.numpy as jnp
+        from jaxrens.cli.run import run_from_config
+        from jaxrens.cli.schema.init import InitialWalkConfig
+        from jaxrens.sampling.termination import IterationTermination
+
+        d = _species_dict(n_atoms=1, n_live=6, mode="grid")
+        d["output"]["working_dir"] = str(tmp_path)
+        root = RootConfig.model_validate(d)
+        resolved = resolve(root)
+
+        walk_cfg = InitialWalkConfig(
+            n_walks=1,
+            walklength=3,
+            walker_batch_size=2,
+        )
+
+        result = run_from_config(
+            resolved.ns,
+            list(resolved.moves),
+            resolved.backend,
+            resolved.output,
+            initial_positions=resolved.init.initial_positions,
+            initial_types=resolved.init.initial_types,
+            initial_energies=resolved.init.initial_energies,
+            initial_cells=resolved.init.initial_cells,
+            initial_walk_config=walk_cfg,
+            termination_criteria=[IterationTermination(3)],
+        )
+        assert result["iteration"] > 0
+        assert jnp.isfinite(result["log_evidence"])

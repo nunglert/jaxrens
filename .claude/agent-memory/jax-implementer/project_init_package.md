@@ -51,5 +51,17 @@ Step 5 (`restart.py`, Mode D in `cli/resolve.py`):
 
 Key gotcha (step 5): bare walker-set HDF5 has no `energies` dataset, so `load_checkpoint` crashes with `KeyError` before any validation code runs. Must pre-check required fields by inspecting the HDF5 directly before delegating to `load_checkpoint`.
 
-**Why:** Architect spec step 5 of 7-step walker init plan.
-**How to apply:** Steps 6–7 add burn-in and CellConfig unification on top of this foundation.
+Step 6 (`burn_in.py` rewrite, schema fields, cli wiring):
+- `src/jaxrens/init/burn_in.py` extended with `batched`, `walker_batch_size`, `run_batch_size` params.
+- `_one_walk` private fn handles a single-run NSState: vmap or lax.map over walkers.
+- `_apply_adaptation` handles single-run and batched cases; batched path vmaps `adjust_step_size` over run axis.
+- Top-level `initial_walk` validates divisibility of chunk sizes, computes emax (scalar or (n_runs,)), builds JIT-compiled inner loop, Python outer loop with optional adaptation.
+- `jax.lax.map` accepts `batch_size` kwarg in this environment (confirmed with `inspect.signature`).
+- `InitialWalkConfig` in `cli/schema/init.py` extended with `walker_batch_size` and `run_batch_size` fields (both `int | None = Field(default=None, ...)`).
+- `run_from_config` in `cli/run.py` passes `batched=False`, `walker_batch_size`, `run_batch_size` to `initial_walk`.
+- Tests: `test_init_burn_in.py` extended from 14 to 24 tests (added walker-chunking tests 8–10 and batched tests 11–15). `TestInitConfigBurnIn` in `test_schema.py` extended with 4 new tests (schema field acceptance, runtime ValueError for bad walker_batch_size, successful run with walker_batch_size). Total 436/436 green.
+
+Key gotcha (step 6): `lax.map` with `batch_size` vmaps items in chunks; the lambda must unpack a tuple of (population[i], chain_keys[i]) not the full batch. For batched runs, `_batched_one_walk` must split `key` into `n_runs` run-keys and vmap `one_run(run_key, run_state, run_emax)`.
+
+**Why:** Architect spec step 6 of 7-step walker init plan.
+**How to apply:** Step 7 adds CellConfig unification on top of this foundation.

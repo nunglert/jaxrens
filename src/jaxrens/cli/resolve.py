@@ -502,6 +502,8 @@ class ResolvedConfig:
     cell: CellConfig
     cohort_index: int = 0
     ensemble_params: dict = field(default_factory=dict)
+    initial_walk_config: Any = None
+    adaptation_cfg: Any = None
 
 
 def _cohort_size(root: RootConfig) -> int:
@@ -601,6 +603,8 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
         cell=root.cell,
         cohort_index=cohort_index,
         ensemble_params=ensemble_params,
+        initial_walk_config=root.init.initial_walk,
+        adaptation_cfg=root.adaptation,
     )
 
 

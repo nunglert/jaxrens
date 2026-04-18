@@ -6,10 +6,6 @@ Source-of-atoms rules:
 
 Multi-composition species strings (e.g. ``"1 3: 0 16, 8 8"``) are deferred.
 Only the single-composition form (e.g. ``"1 3"``) is parsed here.
-
-``InitialWalkConfig.n_walks > 0`` is accepted but not yet consumed by the
-runtime — no initial-walk code path exists in jaxrens today.  Setting
-``n_walks > 0`` will not execute any burn-in; a future task must wire this up.
 """
 
 from __future__ import annotations
@@ -26,12 +22,23 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # ---------------------------------------------------------------------------
 
 class InitialWalkConfig(BaseModel):
-    """Parameters for optional burn-in walks before nested sampling.
+    """Parameters for optional fixed-Emax burn-in walks before nested sampling.
 
-    DEFERRED: ``n_walks > 0`` is accepted by the schema but is not consumed
-    by the runtime.  The initial-walk code path does not exist in jaxrens
-    today.  This is a design-surface placeholder — runtime support is planned
-    as a future task.
+    When ``n_walks > 0``, ``run_from_config`` runs ``initial_walk`` between
+    ``init_ns`` and ``run_ns`` to decorrelate the live-walker population from
+    initialization artifacts.  Burn-in is skipped for Mode D (restart) runs.
+
+    Memory-control knobs:
+        ``walker_batch_size``: chunk the per-walker vmap via ``lax.map``.
+            ``None`` = full vmap over all walkers (default; fastest).
+            Must divide ``n_walkers`` evenly or ``initial_walk`` raises.
+        ``run_batch_size``: chunk the per-run vmap when ``batched=True``.
+            ``None`` = full vmap over all runs (default).
+            Must divide ``n_runs`` evenly. Ignored for single-run configs.
+
+    Deferred fields:
+        ``write_initial_walkers``: accepted but not yet consumed by the runtime.
+        ``only``: raises ``NotImplementedError`` at run time.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -42,6 +49,22 @@ class InitialWalkConfig(BaseModel):
     emax_offset_per_atom: float = 0.0
     only: str | None = None
     write_initial_walkers: bool = False
+    walker_batch_size: int | None = Field(
+        default=None,
+        description=(
+            "Chunk walkers during burn-in vmap for memory control. "
+            "None = full vmap over all walkers (max speed). "
+            "Must divide n_walkers evenly."
+        ),
+    )
+    run_batch_size: int | None = Field(
+        default=None,
+        description=(
+            "Chunk runs during batched burn-in. "
+            "None = full vmap over all runs. "
+            "Must divide n_runs evenly."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +137,7 @@ class InitConfig(BaseModel):
     random_init_max_n_tries: int = 100
     pos_autoscale_cells: bool = False
 
-    # -- Burn-in (deferred: see InitialWalkConfig docstring) --
+    # -- Burn-in (active when n_walks > 0; skipped for restart_file) --
     initial_walk: InitialWalkConfig = Field(default_factory=InitialWalkConfig)
 
     @model_validator(mode="after")

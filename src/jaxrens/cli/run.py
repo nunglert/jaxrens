@@ -121,6 +121,9 @@ def run_from_config(
     symbol_map: dict[int, str] | None = None,
     termination_criteria: list | None = None,
     restart_state=None,
+    initial_walk_config=None,
+    adaptation_config=None,
+    move_descriptors=None,
 ) -> dict:
     """Run NS from typed config objects."""
     if symbol_map is None:
@@ -195,6 +198,84 @@ def run_from_config(
     first_mc = move_config[0] if isinstance(move_config, list) else move_config
 
     key = jax.random.key(ns_config.seed)
+
+    # --- Burn-in: fixed-Emax relaxation before NS proper ---
+    # Skip for Mode D (restart) — the checkpoint is already at the right level.
+    burn_in_cfg = initial_walk_config
+    do_burn_in = (
+        burn_in_cfg is not None
+        and burn_in_cfg.n_walks > 0
+        and restart_state is None
+    )
+    if do_burn_in:
+        from jaxrens.init.burn_in import initial_walk
+        from jaxrens.sampling.nested_sampling import init_ns
+
+        logger.info(
+            "Running initial-walk burn-in: %d walks x %d steps/walk",
+            burn_in_cfg.n_walks, burn_in_cfg.walklength,
+        )
+
+        n_atoms = initial_positions.shape[1] if initial_positions.ndim >= 2 else 1
+
+        key, key_init, key_burn = jax.random.split(key, 3)
+        ns_state_burn = init_ns(
+            init_fn,
+            initial_positions,
+            initial_types,
+            initial_energies,
+            initial_cells,
+            key_init,
+            max_dead=ns_config.max_iterations,
+            ensemble_params=ensemble_params,
+        )
+
+        # Build per-move adaptation data if available.
+        burn_per_move_fns = None
+        burn_adaptation_policies = None
+        if adaptation_config is not None and move_descriptors is not None:
+            burn_per_move_fns = per_move_fns
+            burn_adaptation_policies = tuple(
+                adaptation_config.resolve_for(d.name)
+                for d in move_descriptors
+            )
+
+        ns_state_burn = initial_walk(
+            key=key_burn,
+            ns_state=ns_state_burn,
+            step_fn=step_fn,
+            n_walks=burn_in_cfg.n_walks,
+            walklength=burn_in_cfg.walklength,
+            adjust_interval=burn_in_cfg.adjust_interval,
+            emax_offset_per_atom=burn_in_cfg.emax_offset_per_atom,
+            n_atoms=n_atoms,
+            batched=False,
+            walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
+            run_batch_size=getattr(burn_in_cfg, "run_batch_size", None),
+            per_move_fns=burn_per_move_fns,
+            adaptation_policies=burn_adaptation_policies,
+            adjust_n_samples=getattr(adaptation_config, "adjust_n_samples", 50) if adaptation_config is not None else 50,
+            adjust_max_rounds=getattr(adaptation_config, "adjust_max_rounds", 15) if adaptation_config is not None else 15,
+        )
+
+        # Extract burned-in walker arrays to re-seed run_ns.
+        pop = ns_state_burn.population
+        initial_positions = pop.positions
+        initial_energies = pop.energy
+        initial_cells = pop.cell
+
+        if burn_in_cfg.write_initial_walkers:
+            logger.warning(
+                "initial_walk.write_initial_walkers=True is set but not yet "
+                "consumed by the runtime — field is a deferred placeholder."
+            )
+
+        if getattr(burn_in_cfg, "only", None):
+            raise NotImplementedError(
+                "initial_walk.only=True is not yet implemented. "
+                "The run-ns-skip path is deferred."
+            )
+
     result = run_ns(
         positions=initial_positions,
         types=initial_types,
