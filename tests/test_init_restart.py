@@ -10,7 +10,6 @@ Covers:
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import h5py
@@ -596,7 +595,6 @@ class TestInitConfigResolverModeD:
 
     def test_mode_d_end_to_end_jit(self, tmp_path):
         """Mode D: load checkpoint, init_ns with restart_state, run ns_step under JIT."""
-        import numpy as _np
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitConfig
@@ -650,12 +648,11 @@ class TestInitConfigResolverModeD:
 
     def test_mode_d_continued_run_n_dead_increments(self, tmp_path):
         """After restart, run_ns for N more steps: n_dead >= checkpoint + N."""
-        import numpy as _np
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitConfig
         from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import init_ns, run_ns
+        from jaxrens.sampling.nested_sampling import run_ns
         from jaxrens.sampling.termination import IterationTermination
         from jaxrens.sampling.move_kernel import MoveKernel
         import jaxrens.sampling.moves.random_walk as rw_mod

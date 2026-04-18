@@ -17,8 +17,6 @@ from pydantic import ValidationError
 
 from jaxrens.cli.schema import RootConfig
 from jaxrens.cli.schema.backend import (
-    BackendSpec,
-    BaseBackendSpec,
     DoubleWellBackendSpec,
     GaussianMixtureBackendSpec,
     HarmonicBackendSpec,
@@ -27,7 +25,6 @@ from jaxrens.cli.schema.backend import (
     NeuralILBackendSpec,
 )
 from jaxrens.cli.schema.moves import (
-    MoveSpec,
     RandomWalkMoveSpec,
     GalileanMoveSpec,
     GmcMoveSpec,
@@ -43,7 +40,6 @@ from jaxrens.cli.schema.moves import (
 )
 from jaxrens.cli.resolve import resolve, expand_cohort, ResolvedConfig
 from jaxrens.cli.cli import _apply_overrides, _parse_set_override
-from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
 
 _DATA = Path(__file__).parent / "data" / "cli"
 _MINIMAL_YAML = _DATA / "minimal.yaml"
@@ -477,9 +473,9 @@ class TestTerminationDiscriminatedUnion:
 
     @pytest.mark.parametrize("term_dict,expected_cls_name", [
         ({"type": "iteration", "max_iterations": 100}, "IterationTerminationSpec"),
-        ({"type": "prior_mass", "n_live": 20}, "PriorMassTerminationSpec"),
+        ({"type": "prior_mass"}, "PriorMassTerminationSpec"),
         (
-            {"type": "temperature", "n_walkers": 20, "target_temp": 300.0},
+            {"type": "temperature", "target_temp": 300.0},
             "TemperatureTerminationSpec",
         ),
         ({"type": "energy", "min_energy": -10.0}, "EnergyTerminationSpec"),

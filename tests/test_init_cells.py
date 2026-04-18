@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-import pytest
 
 from jaxrens.init.cells import cell_shape_walk, sample_initial_volume
 from jaxrens.utils.cell import get_volume

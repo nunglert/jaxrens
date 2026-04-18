@@ -25,9 +25,21 @@ from jaxrens.sampling.termination import (
 # ---------------------------------------------------------------------------
 
 class BaseTerminationSpec(BaseModel):
+    """Fields shared by every termination criterion.
+
+    ``to_criterion`` takes ``n_live`` and ``n_cull`` from the resolver so
+    criteria that need walker-count information (e.g. prior-mass,
+    temperature) don't redundantly re-declare it in the YAML.
+    """
+
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    def to_criterion(self) -> TerminationCriterion:
+    def to_criterion(
+        self,
+        *,
+        n_live: int | None = None,
+        n_cull: int | None = None,
+    ) -> TerminationCriterion:
         raise NotImplementedError
 
 
@@ -39,31 +51,53 @@ class IterationTerminationSpec(BaseTerminationSpec):
     type: Literal["iteration"] = "iteration"
     max_iterations: int
 
-    def to_criterion(self) -> TerminationCriterion:
+    def to_criterion(
+        self,
+        *,
+        n_live: int | None = None,
+        n_cull: int | None = None,
+    ) -> TerminationCriterion:
         return IterationTermination(max_iterations=self.max_iterations)
 
 
 class PriorMassTerminationSpec(BaseTerminationSpec):
     type: Literal["prior_mass"] = "prior_mass"
-    n_live: int
     threshold: float = 0.1
 
-    def to_criterion(self) -> TerminationCriterion:
-        return PriorMassTermination(n_live=self.n_live, threshold=self.threshold)
+    def to_criterion(
+        self,
+        *,
+        n_live: int | None = None,
+        n_cull: int | None = None,
+    ) -> TerminationCriterion:
+        if n_live is None:
+            raise ValueError(
+                "PriorMassTerminationSpec.to_criterion() requires n_live. "
+                "Call to_criterion(n_live=...) from the resolver with run.n_live."
+            )
+        return PriorMassTermination(n_live=n_live, threshold=self.threshold)
 
 
 class TemperatureTerminationSpec(BaseTerminationSpec):
     type: Literal["temperature"] = "temperature"
-    n_walkers: int
     target_temp: float
-    n_cull: int = 1
     threshold: float = 10.0
 
-    def to_criterion(self) -> TerminationCriterion:
+    def to_criterion(
+        self,
+        *,
+        n_live: int | None = None,
+        n_cull: int | None = None,
+    ) -> TerminationCriterion:
+        if n_live is None or n_cull is None:
+            raise ValueError(
+                "TemperatureTerminationSpec.to_criterion() requires n_live and n_cull. "
+                "Call to_criterion(n_live=..., n_cull=...) from the resolver."
+            )
         return TempTermination(
-            n_walkers=self.n_walkers,
+            n_walkers=n_live,
             target_temp=self.target_temp,
-            n_cull=self.n_cull,
+            n_cull=n_cull,
             threshold=self.threshold,
         )
 
@@ -72,7 +106,12 @@ class EnergyTerminationSpec(BaseTerminationSpec):
     type: Literal["energy"] = "energy"
     min_energy: float
 
-    def to_criterion(self) -> TerminationCriterion:
+    def to_criterion(
+        self,
+        *,
+        n_live: int | None = None,
+        n_cull: int | None = None,
+    ) -> TerminationCriterion:
         return EnergyTermination(min_energy=self.min_energy)
 
 

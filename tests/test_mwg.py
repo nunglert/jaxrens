@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-import pytest
 
 from jaxrens.backends.toy import create_harmonic
 from jaxrens.cli.resolve import resolve

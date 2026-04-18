@@ -362,7 +362,6 @@ class TestAdaptationCallCount:
     def test_adjust_called_correct_number_of_times(self):
         """With n_walks=5 and adjust_interval=2, adaptation fires at walks 2 and 4."""
         from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
-        from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
 
         ns_state, step_fn, per_move_fns, _ = _build_ns_state(n_walkers=4, n_atoms=2)
 

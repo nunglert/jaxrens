@@ -18,6 +18,7 @@ class NSConfig:
     max_iterations: int = 50_000
     convergence_threshold: float = 0.1
     n_mcmc_steps: int = 20
+    n_extra: int = 0
     n_cull: int = 1
     seed: int = 42
 

@@ -3,7 +3,6 @@
 import jax
 import jax.numpy as jnp
 import pytest
-from pathlib import Path
 
 from jaxrens.cli.parser import parse_input_file
 from jaxrens.cli.run import setup_mwg, run_from_config
@@ -110,13 +109,6 @@ class TestPublicAPI:
         from jaxrens import (
             load_backend,
             run_ns,
-            init_ns,
-            ns_step,
-            run_from_config,
-            NSConfig,
-            MoveConfig,
-            BackendConfig,
-            OutputConfig,
         )
         assert callable(load_backend)
         assert callable(run_ns)

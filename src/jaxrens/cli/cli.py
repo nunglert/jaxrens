@@ -114,6 +114,7 @@ def _run_one(resolved, *, cohort_label: str = "") -> None:
         move_descriptors=list(resolved.move_descriptors),
         initial_walk_config=resolved.initial_walk_config,
         adaptation_config=resolved.adaptation_cfg,
+        termination_criteria=list(resolved.termination),
     )
 
 

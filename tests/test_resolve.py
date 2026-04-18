@@ -20,12 +20,9 @@ from pathlib import Path
 
 import pytest
 import yaml
-from pydantic import ValidationError
 
 from jaxrens.cli.schema import RootConfig
 from jaxrens.cli.schema.backend import (
-    BackendSpec,
-    BaseBackendSpec,
     DoubleWellBackendSpec,
     GaussianMixtureBackendSpec,
     HarmonicBackendSpec,
@@ -34,17 +31,12 @@ from jaxrens.cli.schema.backend import (
     NeuralILBackendSpec,
 )
 from jaxrens.cli.schema.moves import (
-    MoveSpec,
     RandomWalkMoveSpec,
     GalileanMoveSpec,
     GmcMoveSpec,
     HMCMoveSpec,
     SingleAtomMoveSpec,
-    SingleAtomSweepMoveSpec,
-    SingleAtomSwapMoveSpec,
     VolumeMoveSpec,
-    ShearMoveSpec,
-    StretchMoveSpec,
     AlchemicalMorphMoveSpec,
     AlchemicalShiftMoveSpec,
 )
@@ -461,17 +453,23 @@ class TestToCriterion:
     def test_to_criterion_prior_mass(self):
         from jaxrens.cli.schema.termination import PriorMassTerminationSpec
         from jaxrens.sampling.termination import PriorMassTermination
-        spec = PriorMassTerminationSpec(n_live=30, threshold=0.05)
-        crit = spec.to_criterion()
+        spec = PriorMassTerminationSpec(threshold=0.05)
+        crit = spec.to_criterion(n_live=30, n_cull=1)
         assert isinstance(crit, PriorMassTermination)
         assert crit.n_live == 30
         assert crit.threshold == pytest.approx(0.05)
 
+    def test_to_criterion_prior_mass_requires_n_live(self):
+        from jaxrens.cli.schema.termination import PriorMassTerminationSpec
+        spec = PriorMassTerminationSpec(threshold=0.05)
+        with pytest.raises(ValueError, match="requires n_live"):
+            spec.to_criterion()
+
     def test_to_criterion_temperature(self):
         from jaxrens.cli.schema.termination import TemperatureTerminationSpec
         from jaxrens.sampling.termination import TempTermination
-        spec = TemperatureTerminationSpec(n_walkers=20, target_temp=500.0, n_cull=2, threshold=8.0)
-        crit = spec.to_criterion()
+        spec = TemperatureTerminationSpec(target_temp=500.0, threshold=8.0)
+        crit = spec.to_criterion(n_live=20, n_cull=2)
         assert isinstance(crit, TempTermination)
         assert crit.target_temp == pytest.approx(500.0)
         assert crit.n_cull == 2
@@ -849,7 +847,6 @@ class TestInitConfigResolverPartA:
         assert isinstance(result, ResolvedInit)
 
     def test_start_species_positions_shape(self):
-        import jax.numpy as jnp
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitConfig
         cfg = InitConfig(start_species="1 3")

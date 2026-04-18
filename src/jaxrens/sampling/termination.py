@@ -65,14 +65,17 @@ class IterationTermination:
 class PriorMassTermination:
     """Terminate when remaining prior mass contributes negligibly to evidence.
 
-    At iteration i with n_live walkers, remaining log prior mass is
-    approximately -i / n_live. Stop when this is much smaller than
-    the current log evidence.
+    Skilling-style check: the upper bound on the remaining contribution
+    to Z is ``X_i * L_max_remaining`` where ``X_i = exp(-i/n_live)`` is the
+    current prior-mass fraction and ``L_max_remaining`` is bounded above
+    by the likelihood of the currently-removed walker (``exp(-emax)``).
+    Convergence: remaining contribution < ``threshold * Z``.
     """
 
-    def __init__(self, n_live: int, threshold: float = 0.1):
+    def __init__(self, n_live: int, threshold: float = 1e-3):
         self.n_live = n_live
         self.threshold = threshold
+        self._log_threshold = math.log(threshold)
         self._log_evidence = -jnp.inf
 
     def update_evidence(self, log_evidence: float) -> None:
@@ -82,12 +85,15 @@ class PriorMassTermination:
     def check(self, iteration: int, emax: float) -> bool:
         if iteration <= self.n_live:
             return False
-        log_remaining = -iteration / self.n_live
-        converged = log_remaining < float(self._log_evidence) - self.threshold
+        log_X = -iteration / self.n_live
+        log_L_upper = -float(emax)
+        log_remaining_contrib = log_X + log_L_upper
+        log_Z = float(self._log_evidence)
+        converged = log_remaining_contrib < log_Z + self._log_threshold
         if converged:
             logger.debug(
-                "PriorMassTermination: log_remaining=%.4f < log_Z=%.4f - %.2f",
-                log_remaining, float(self._log_evidence), self.threshold,
+                "PriorMassTermination: log(X*L_max)=%.4f < log_Z=%.4f + log(%.1e)=%.4f",
+                log_remaining_contrib, log_Z, self.threshold, self._log_threshold,
             )
         return converged
 

@@ -335,6 +335,7 @@ def run_from_config(
         rng_key=key,
         max_iterations=ns_config.max_iterations,
         n_mcmc_steps=ns_config.n_mcmc_steps,
+        n_extra=ns_config.n_extra,
         convergence_threshold=ns_config.convergence_threshold,
         initial_step_size=first_mc.step_size,
         target_acceptance=first_mc.target_acceptance,

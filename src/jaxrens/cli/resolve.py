@@ -534,6 +534,7 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
         max_iterations=root.run.max_iterations,
         convergence_threshold=root.run.convergence_threshold,
         n_mcmc_steps=root.run.n_mcmc_steps,
+        n_extra=root.run.n_extra,
         n_cull=root.run.n_cull,
         seed=seed,
         pressure=pressure,
@@ -556,7 +557,10 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
     _warn_unused_output_fields(root.output)
 
     if root.termination is not None:
-        termination = tuple(spec.to_criterion() for spec in root.termination)
+        termination = tuple(
+            spec.to_criterion(n_live=ns.n_live, n_cull=ns.n_cull)
+            for spec in root.termination
+        )
     else:
         termination = (
             IterationTermination(ns.max_iterations),
