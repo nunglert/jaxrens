@@ -1,4 +1,4 @@
-"""MoveDescriptor: declarative description of an MC move type.
+"""MoveKernel: declarative description of an MC move type.
 
 Used by the MWG factory (build_mwg) to assemble move kernels and
 dispatch weights without the user touching build_kernel directly.
@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 
 @dataclasses.dataclass(frozen=True)
-class MoveDescriptor:
+class MoveKernel:
     """Describes one move type for the MWG sampler.
 
     Attributes:

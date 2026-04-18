@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import pytest
 
 from jaxrens.backends.toy import create_harmonic
-from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, init_ns_parallel, ns_step
@@ -29,7 +29,7 @@ def harmonic_setup():
     """Single-run harmonic oscillator NS problem."""
     backend = create_harmonic(k=1.0)
     init_fn, step_fn, _ = build_mwg(backend, [
-        MoveDescriptor("random_walk", random_walk.build_kernel),
+        MoveKernel("random_walk", random_walk.build_kernel),
     ])
 
     n_walkers = 50
@@ -63,7 +63,7 @@ def parallel_setup():
     """2-run parallel harmonic oscillator NS problem."""
     backend = create_harmonic(k=1.0)
     init_fn, step_fn, _ = build_mwg(backend, [
-        MoveDescriptor("random_walk", random_walk.build_kernel),
+        MoveKernel("random_walk", random_walk.build_kernel),
     ])
 
     n_runs = 2

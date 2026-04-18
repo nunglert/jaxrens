@@ -385,14 +385,14 @@ class TestTempTerminationIntegration:
     def test_run_ns_with_temp_termination(self):
         """TempTermination terminates a real NS run before max_iterations."""
         from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        from jaxrens.sampling.move_kernel import MoveKernel
         from jaxrens.sampling.moves import random_walk
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import run_ns
 
         backend = create_harmonic(k=1.0)
         init_fn, step_fn, _ = build_mwg(backend, [
-            MoveDescriptor("random_walk", random_walk.build_kernel),
+            MoveKernel("random_walk", random_walk.build_kernel),
         ])
 
         n_walkers = 50
@@ -435,14 +435,14 @@ class TestTempTerminationIntegration:
     def test_energy_termination_with_run_ns(self):
         """EnergyTermination stops run_ns when emax drops below target."""
         from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        from jaxrens.sampling.move_kernel import MoveKernel
         from jaxrens.sampling.moves import random_walk
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import run_ns
 
         backend = create_harmonic(k=1.0)
         init_fn, step_fn, _ = build_mwg(backend, [
-            MoveDescriptor("random_walk", random_walk.build_kernel),
+            MoveKernel("random_walk", random_walk.build_kernel),
         ])
 
         n_walkers = 50

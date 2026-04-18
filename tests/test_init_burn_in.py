@@ -27,7 +27,7 @@ import pytest
 
 from jaxrens.backends.toy import create_harmonic
 from jaxrens.init.burn_in import initial_walk
-from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, init_ns_parallel
 import jaxrens.sampling.moves.random_walk as _rw_mod
@@ -37,8 +37,8 @@ import jaxrens.sampling.moves.random_walk as _rw_mod
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _rw_descriptor(step_size: float = 0.3) -> MoveDescriptor:
-    return MoveDescriptor(
+def _rw_descriptor(step_size: float = 0.3) -> MoveKernel:
+    return MoveKernel(
         name="random_walk",
         build_kernel=_rw_mod.build_kernel,
         step_size=step_size,

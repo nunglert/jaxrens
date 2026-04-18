@@ -28,7 +28,7 @@ from jaxrens.init.rejection import rejection_sample_positions
 from jaxrens.init.restart import RestartBundle, load_restart
 from jaxrens.init.structure import load_structure
 from jaxrens.init.walker_set import load_walker_set
-from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.termination import (
     IterationTermination,
     PriorMassTermination,
@@ -492,7 +492,7 @@ class ResolvedConfig:
 
     ns: NSConfig
     moves: tuple[MoveConfig, ...]
-    move_descriptors: tuple[MoveDescriptor, ...]
+    move_descriptors: tuple[MoveKernel, ...]
     backend: BackendConfig
     energy_backend: EnergyBackend
     output: OutputConfig

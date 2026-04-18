@@ -123,7 +123,7 @@ class TestNeuralILNSStep:
         if not fixture_available():
             pytest.skip("NeuralIL fixture not found.")
         from jaxrens.backends.neuralil import create_neuralil
-        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        from jaxrens.sampling.move_kernel import MoveKernel
         from jaxrens.sampling.moves import random_walk
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, ns_step
@@ -137,7 +137,7 @@ class TestNeuralILNSStep:
         )
 
         init_fn, step_fn, _ = build_mwg(backend, [
-            MoveDescriptor("random_walk", random_walk.build_kernel, step_size=0.01),
+            MoveKernel("random_walk", random_walk.build_kernel, step_size=0.01),
         ])
 
         # Use 3 walkers with slightly different positions

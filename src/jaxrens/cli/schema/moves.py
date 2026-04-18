@@ -14,7 +14,7 @@ from typing import Annotated, Any, Callable, Literal, Union
 import jax.numpy as jnp
 from pydantic import BaseModel, ConfigDict, Field
 
-from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import alchemical, galilean, hmc, random_walk, single_atom, volume, shear, stretch
 from jaxrens.state.config import MoveConfig
 
@@ -86,9 +86,9 @@ class BaseMoveSpec(BaseModel):
     def _extra_state_fields(self) -> dict[str, tuple[type, Callable]]:
         return {}
 
-    def to_descriptor(self) -> MoveDescriptor:
-        """Produce the ``MoveDescriptor`` for ``build_mwg``."""
-        return MoveDescriptor(
+    def to_descriptor(self) -> MoveKernel:
+        """Produce the ``MoveKernel`` for ``build_mwg``."""
+        return MoveKernel(
             name=self._effective_name(),
             build_kernel=self._build_kernel(),
             kernel_kwargs=self._kernel_kwargs(),

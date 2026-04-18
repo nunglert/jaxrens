@@ -7,13 +7,13 @@ descriptors — only fields needed by the active moves are included.
 Usage:
     backend = HarmonicBackend(k=1.0)
     init_fn, step_fn, per_move_fns = build_mwg(backend, [
-        MoveDescriptor("random_walk", random_walk.build_kernel, weight=7),
-        MoveDescriptor("volume", volume.build_kernel,
-                       kernel_kwargs={"n_atoms": 64}, weight=2),
-        MoveDescriptor("galilean", galilean.build_kernel,
-                       kernel_kwargs={"n_reflect": 5}, weight=1,
-                       extra_state_fields={"direction": (jnp.ndarray,
-                           lambda pos, types: jnp.zeros_like(pos))}),
+        MoveKernel("random_walk", random_walk.build_kernel, weight=7),
+        MoveKernel("volume", volume.build_kernel,
+                   kernel_kwargs={"n_atoms": 64}, weight=2),
+        MoveKernel("galilean", galilean.build_kernel,
+                   kernel_kwargs={"n_reflect": 5}, weight=1,
+                   extra_state_fields={"direction": (jnp.ndarray,
+                       lambda pos, types: jnp.zeros_like(pos))}),
     ])
     state = init_fn(positions, types, energy, cell)
     state, info = step_fn(rng_key, state, likelihood_constraint)
@@ -28,13 +28,13 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.base import MoveInfo
-from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.state.mc_state import make_mc_state_class
 
 
 def build_mwg(
     backend: Any,
-    move_descriptors: list[MoveDescriptor],
+    move_descriptors: list[MoveKernel],
 ) -> tuple[Callable, Callable]:
     """Build a Metropolis-within-Gibbs sampler from move descriptors.
 
@@ -44,7 +44,7 @@ def build_mwg(
 
     Args:
         backend: EnergyBackend instance. Captured in move closures.
-        move_descriptors: List of MoveDescriptor, each specifying a move
+        move_descriptors: List of MoveKernel, each specifying a move
             type with its build_kernel, kwargs, weight, step_size, and
             optional extra_state_fields.
 

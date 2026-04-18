@@ -7,7 +7,7 @@ from jaxrens.backends.base import EnergyBackend
 from jaxrens.backends.ensemble import EnsembleBackend, make_ensemble_params
 from jaxrens.backends.loader import load_backend
 from jaxrens.cli.run import run_from_config
-from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, ns_step, run_ns
 from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
@@ -30,7 +30,7 @@ __all__ = [
     "build_mwg",
     "MCState",
     "make_mc_state_class",
-    "MoveDescriptor",
+    "MoveKernel",
     "run_ns",
     "init_ns",
     "ns_step",

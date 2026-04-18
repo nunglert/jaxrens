@@ -22,12 +22,12 @@ import pytest
 from jaxrens.init.restart import RestartBundle, load_restart
 from jaxrens.init.walker_set import WalkerSet
 from jaxrens.io.checkpoint import save_checkpoint
-from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.move_kernel import MoveKernel
 import jaxrens.sampling.moves.random_walk as _rw_mod
 
 
 def _rw_descriptor():
-    return MoveDescriptor(
+    return MoveKernel(
         name="random_walk",
         build_kernel=_rw_mod.build_kernel,
         step_size=0.3,

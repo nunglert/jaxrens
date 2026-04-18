@@ -17,7 +17,7 @@ import pytest
 
 from jaxrens.backends.toy import create_harmonic
 from jaxrens.backends.ensemble import EnsembleBackend
-from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import (
@@ -42,7 +42,7 @@ def _make_periodic_setup(n_walkers=20, n_atoms=2, cell_size=5.0, seed=0, pressur
         backend = base_backend
 
     init_fn, step_fn, _ = build_mwg(backend, [
-        MoveDescriptor("random_walk", random_walk.build_kernel),
+        MoveKernel("random_walk", random_walk.build_kernel),
     ])
 
     key = jax.random.key(seed)

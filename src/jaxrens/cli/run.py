@@ -23,7 +23,7 @@ from jaxrens.cli.monitor import (
 )
 from jaxrens.io.energy_log import EnergyLogger
 from jaxrens.io.trajectory import create_trajectory_writer
-from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import run_ns
 from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
@@ -31,8 +31,8 @@ from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConf
 logger = logging.getLogger(__name__)
 
 
-def _move_config_to_descriptor(mc: MoveConfig) -> MoveDescriptor:
-    """Convert a ``MoveConfig`` dataclass to a ``MoveDescriptor``.
+def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
+    """Convert a ``MoveConfig`` dataclass to a ``MoveKernel``.
 
     Delegates to the corresponding ``*MoveSpec`` class so that the spec
     classes remain the single source of truth for kernel kwargs and
@@ -96,7 +96,7 @@ def setup_mwg(
         move_configs: Single ``MoveConfig`` or list of ``MoveConfig`` objects.
             For move types that require ``n_atoms`` or ``n_species``
             (volume, shear, stretch, single_atom_sweep, alchemical_morph)
-            use ``build_mwg`` directly with pre-built ``MoveDescriptor``s.
+            use ``build_mwg`` directly with pre-built ``MoveKernel``s.
         backend: EnergyBackend instance.
 
     Returns:

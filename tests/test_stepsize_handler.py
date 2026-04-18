@@ -16,7 +16,7 @@ from jaxrens.sampling.adaptation.stepsize_handler import (
     adjust_step_size,
     _process_rate_jax,
 )
-from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, ns_step, run_ns
@@ -31,7 +31,7 @@ def harmonic_mwg():
     """
     backend = create_harmonic(k=1.0)
     descriptors = [
-        MoveDescriptor(
+        MoveKernel(
             "random_walk", random_walk.build_kernel,
             step_size=0.1, step_size_max=5.0,
             min_rate=0.2, max_rate=0.7,

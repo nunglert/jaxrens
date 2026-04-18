@@ -15,7 +15,7 @@ import pytest
 
 from jaxrens.backends.toy import create_harmonic
 from jaxrens.backends.ensemble import EnsembleBackend
-from jaxrens.sampling.move_descriptor import MoveDescriptor
+from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import run_ns, run_ns_parallel
@@ -31,7 +31,7 @@ def harmonic_setup():
     """Single-run harmonic oscillator NS problem."""
     backend = create_harmonic(k=1.0)
     init_fn, step_fn, _ = build_mwg(backend, [
-        MoveDescriptor("random_walk", random_walk.build_kernel),
+        MoveKernel("random_walk", random_walk.build_kernel),
     ])
 
     n_walkers = 50
@@ -64,7 +64,7 @@ def parallel_setup():
     """2-run parallel harmonic oscillator NS problem."""
     backend = create_harmonic(k=1.0)
     init_fn, step_fn, _ = build_mwg(backend, [
-        MoveDescriptor("random_walk", random_walk.build_kernel),
+        MoveKernel("random_walk", random_walk.build_kernel),
     ])
 
     n_runs = 2
@@ -124,7 +124,7 @@ class TestRunNS:
     def test_harmonic_evidence_accuracy(self):
         backend = create_harmonic(k=1.0)
         init_fn, step_fn, _ = build_mwg(backend, [
-            MoveDescriptor("random_walk", random_walk.build_kernel),
+            MoveKernel("random_walk", random_walk.build_kernel),
         ])
 
         n_walkers = 30
@@ -256,7 +256,7 @@ class TestDifferentPressures:
         backend_p1 = EnsembleBackend(base_backend, pressure=0.1)
 
         init_fn_p0, step_fn_p0, _ = build_mwg(backend_p0, [
-            MoveDescriptor("random_walk", random_walk.build_kernel),
+            MoveKernel("random_walk", random_walk.build_kernel),
         ])
 
         n_walkers = 15

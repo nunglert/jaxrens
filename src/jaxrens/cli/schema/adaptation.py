@@ -4,7 +4,7 @@
 ``defaults + per_move`` overlay.  ``resolve_for(key)`` returns the effective
 policy for a named move: per-move fields that are None fall through to
 defaults, and defaults fields that are None fall through to the hardcoded
-library values that ``MoveDescriptor`` and ``adjust_step_size`` use today.
+library values that ``MoveKernel`` and ``adjust_step_size`` use today.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 # ---------------------------------------------------------------------------
-# Hardcoded fallbacks — match MoveDescriptor defaults and run_ns defaults
+# Hardcoded fallbacks — match MoveKernel defaults and run_ns defaults
 # ---------------------------------------------------------------------------
 
 _FALLBACK_MIN_RATE: float = 0.25

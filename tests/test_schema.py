@@ -529,12 +529,12 @@ class TestToMoveConfig:
 
 class TestResolvedDescriptors:
     def test_resolve_produces_move_descriptors(self):
-        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        from jaxrens.sampling.move_kernel import MoveKernel
         root = RootConfig.model_validate(_minimal_dict())
         resolved = resolve(root)
         assert hasattr(resolved, "move_descriptors")
         assert isinstance(resolved.move_descriptors, tuple)
-        assert all(isinstance(d, MoveDescriptor) for d in resolved.move_descriptors)
+        assert all(isinstance(d, MoveKernel) for d in resolved.move_descriptors)
         assert len(resolved.move_descriptors) == len(resolved.moves)
 
     def test_resolve_descriptor_matches_move(self):
@@ -2323,7 +2323,7 @@ class TestInitConfigResolver:
         from jaxrens.cli.schema.cell import CellConfig
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, ns_step
-        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        from jaxrens.sampling.move_kernel import MoveKernel
         import jaxrens.sampling.moves.random_walk as rw_mod
 
         pos = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
@@ -2346,7 +2346,7 @@ class TestInitConfigResolver:
         backend = create_harmonic()
         result = _resolve_init(cfg, n_live=6, seed=0, energy_backend=backend, cell_cfg=cell_cfg)
 
-        desc = MoveDescriptor(
+        desc = MoveKernel(
             name="random_walk",
             build_kernel=rw_mod.build_kernel,
             step_size=0.3,
@@ -2648,7 +2648,7 @@ class TestInitConfigResolverModeC:
         from jaxrens.cli.schema.init import InitConfig
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, ns_step
-        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        from jaxrens.sampling.move_kernel import MoveKernel
         import jaxrens.sampling.moves.random_walk as rw_mod
 
         p = _make_walker_set_extxyz(tmp_path, n_live=6, symbols=["Si"])
@@ -2662,7 +2662,7 @@ class TestInitConfigResolverModeC:
             cell_cfg=_cell_cfg_permissive(),
         )
 
-        desc = MoveDescriptor(
+        desc = MoveKernel(
             name="random_walk",
             build_kernel=rw_mod.build_kernel,
             step_size=0.3,
@@ -2883,7 +2883,7 @@ class TestInitConfigResolverModeD:
         from jaxrens.cli.schema.init import InitConfig
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, ns_step
-        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        from jaxrens.sampling.move_kernel import MoveKernel
         import jaxrens.sampling.moves.random_walk as rw_mod
 
         n_dead_checkpoint = 5
@@ -2897,7 +2897,7 @@ class TestInitConfigResolverModeD:
             cell_cfg=_cell_cfg_permissive(),
         )
 
-        desc = MoveDescriptor(
+        desc = MoveKernel(
             name="random_walk",
             build_kernel=rw_mod.build_kernel,
             step_size=0.3,
@@ -2940,7 +2940,7 @@ class TestInitConfigResolverModeD:
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, run_ns
         from jaxrens.sampling.termination import IterationTermination
-        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        from jaxrens.sampling.move_kernel import MoveKernel
         import jaxrens.sampling.moves.random_walk as rw_mod
 
         n_dead_checkpoint = 5
@@ -2955,7 +2955,7 @@ class TestInitConfigResolverModeD:
             cell_cfg=_cell_cfg_permissive(),
         )
 
-        desc = MoveDescriptor(
+        desc = MoveKernel(
             name="random_walk",
             build_kernel=rw_mod.build_kernel,
             step_size=0.3,
@@ -3097,7 +3097,7 @@ class TestInitConfigBurnIn:
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns
-        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        from jaxrens.sampling.move_kernel import MoveKernel
         import jaxrens.sampling.moves.random_walk as rw_mod
 
         n_walkers, n_atoms = 4, 1
@@ -3129,7 +3129,7 @@ class TestInitConfigBurnIn:
         ws, restart_bundle = load_restart(ckpt_path)
 
         backend = create_harmonic()
-        desc = MoveDescriptor(
+        desc = MoveKernel(
             name="random_walk",
             build_kernel=rw_mod.build_kernel,
             step_size=0.3,

@@ -230,7 +230,7 @@ class TestMACENSStep:
         if not fixture_available():
             pytest.skip("MACE fixture not found. Run save_mace_test_fixture.py.")
         from jaxrens.backends.mace import create_mace
-        from jaxrens.sampling.move_descriptor import MoveDescriptor
+        from jaxrens.sampling.move_kernel import MoveKernel
         from jaxrens.sampling.moves import random_walk
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, ns_step
@@ -243,7 +243,7 @@ class TestMACENSStep:
         )
 
         init_fn, step_fn, _ = build_mwg(backend, [
-            MoveDescriptor("random_walk", random_walk.build_kernel, step_size=0.01),
+            MoveKernel("random_walk", random_walk.build_kernel, step_size=0.01),
         ])
 
         n_walkers = 4
