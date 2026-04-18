@@ -220,3 +220,69 @@ class TestLoadStructureErrors:
         ase.io.write(str(p), [atoms, atoms, atoms])
         with pytest.raises(ValueError, match="3"):
             load_structure(p)
+
+
+# ---------------------------------------------------------------------------
+# Mode B E2E test moved from test_schema.py::TestInitConfigResolver (line 2080)
+# ---------------------------------------------------------------------------
+
+class TestModeBEndToEndJit:
+    """test_mode_b_end_to_end_jit moved from second TestInitConfigResolver."""
+
+    def test_mode_b_end_to_end_jit(self, tmp_path):
+        """Mode B resolver -> run_ns -> ns_step under JIT."""
+        import ase, ase.io
+        import jax
+        import jax.numpy as jnp
+        from jaxrens.backends.toy import create_harmonic
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.cell import CellConfig
+        from jaxrens.sampling.mwg import build_mwg
+        from jaxrens.sampling.nested_sampling import init_ns, ns_step
+        from jaxrens.sampling.move_kernel import MoveKernel
+        import jaxrens.sampling.moves.random_walk as rw_mod
+
+        pos = np.zeros((1, 3), dtype=np.float32)
+        cell = np.eye(3, dtype=np.float32) * 5.0
+        atoms = ase.Atoms(["Si"], positions=pos, cell=cell, pbc=True)
+        p = tmp_path / "founder_jit.extxyz"
+        ase.io.write(str(p), atoms)
+
+        cfg = InitConfig(
+            start_config_file=p,
+            random_initialise_pos=True,
+            random_initialise_cell=False,
+            pos_randomization_mode="uniform",
+        )
+        cell_cfg = CellConfig(
+            max_volume_per_atom=1000.0,
+            min_volume_per_atom=0.1,
+            min_aspect_ratio=0.01,
+        )
+        backend = create_harmonic()
+        result = _resolve_init(cfg, n_live=6, seed=0, energy_backend=backend, cell_cfg=cell_cfg)
+
+        desc = MoveKernel(
+            name="random_walk",
+            build_kernel=rw_mod.build_kernel,
+            step_size=0.3,
+            weight=1.0,
+            kernel_kwargs={},
+            extra_state_fields={},
+        )
+        init_fn, step_fn, _ = build_mwg(backend, [desc])
+
+        key = jax.random.key(42)
+        ns_state = init_ns(
+            init_fn,
+            result.initial_positions,
+            result.initial_types,
+            result.initial_energies,
+            cells=result.initial_cells,
+            rng_key=key,
+        )
+
+        jit_ns_step = jax.jit(ns_step, static_argnames=("step_fn", "n_mcmc_steps"))
+        new_state, _ = jit_ns_step(ns_state, step_fn, n_mcmc_steps=2)
+        assert jnp.isfinite(new_state.log_evidence) or new_state.n_dead == 0

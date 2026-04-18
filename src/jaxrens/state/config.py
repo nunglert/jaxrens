@@ -39,11 +39,16 @@ class MoveConfig:
 
 @dataclass(frozen=True)
 class BackendConfig:
-    """Energy backend configuration."""
+    """Energy backend configuration.
+
+    ``n_atoms`` is intentionally absent: it is derived from the initial
+    walker positions (``positions.shape[-2]``) at run time.  Storing it
+    here would duplicate the source of truth and require manual synchronisation
+    with the initialisation configuration.
+    """
 
     backend_type: str = "lj"
     checkpoint_path: str | None = None
-    n_atoms: int = 13
     periodic: bool = False
     cutoff: float | None = None
 
@@ -63,3 +68,4 @@ class OutputConfig:
     info_interval: int = 100
     out_file_prefix: str = "ns"
     working_dir: Path = field(default_factory=lambda: Path("."))
+    log_level: str = "info"  # "info" | "debug"

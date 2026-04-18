@@ -1,15 +1,9 @@
 """Pydantic schema for the [cell] section of a jaxrens YAML config.
 
-``CellConfig`` exposes cell-geometry constraints that the existing volume,
-shear, and stretch move kernels accept individually (``max_vol_per_atom``,
-``min_vol_per_atom``, ``min_aspect``).
-
-DEFERRED: ``CellConfig`` fields are accepted and validated here but are NOT
-yet automatically threaded into move kernels.  Individual move specs
-(``VolumeMoveSpec``, ``ShearMoveSpec``, ``StretchMoveSpec``) carry their own
-per-move copies of these fields; unifying them through ``CellConfig`` is
-planned for a future task.  A resolver warning is emitted when any non-default
-value is set in ``CellConfig`` to ensure users are not silently ignored.
+``CellConfig`` exposes cell-geometry constraints that the volume, shear, and
+stretch move kernels accept.  The resolver threads these values into
+``MoveKernel.kernel_kwargs`` automatically at resolution time via
+``BaseMoveSpec.to_descriptor(cell_cfg=...)``.
 """
 
 from __future__ import annotations
@@ -20,8 +14,10 @@ from pydantic import BaseModel, ConfigDict
 class CellConfig(BaseModel):
     """Cell-geometry constraint parameters.
 
-    DEFERRED: these fields are validated and stored but not yet consumed by
-    move kernels automatically.  See module docstring for details.
+    These values are threaded automatically into the ``kernel_kwargs`` of
+    volume, shear, and stretch move descriptors by the resolver.  They are
+    the single source of truth for cell-geometry bounds; the individual move
+    specs no longer carry copies of these fields.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)

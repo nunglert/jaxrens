@@ -363,7 +363,7 @@ def _ns_state_to_result_dict(ns_state: NSState) -> dict:
     """Convert NSState to backward-compatible result dict."""
     pop = ns_state.population
     ep = pop.ensemble_params if hasattr(pop, "ensemble_params") else {}
-    is_npt = isinstance(ep, dict) and float(ep.get("pressure", 0.0)) != 0.0
+    is_npt = isinstance(ep, dict) and "pressure" in ep
     result = {
         "positions": pop.positions,
         "types": pop.types,
@@ -545,9 +545,9 @@ def run_ns(
                 "iter=%d  Emax=%.6g  log_Z=%.4f  acc=%.2f  ss=%s",
                 int(ns_state.iteration),
                 float(info["emax"]),
+                float(ns_state.log_evidence),
                 float(info["acceptance_rate"]),
                 str(np.array(current_step_sizes).round(4)) if use_full_auto else f"{float(get_step_size(adapt_state)):.4g}",
-                float(ns_state.log_evidence),
             )
 
         # Callbacks

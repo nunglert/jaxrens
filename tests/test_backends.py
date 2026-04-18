@@ -237,3 +237,21 @@ class TestLoader:
         with pytest.raises(ValueError, match="Unknown backend"):
             load_backend("nonexistent_backend")
 
+
+# ---------------------------------------------------------------------------
+# Backend callable test (moved from test_schema.py::TestBuildBackend)
+# ---------------------------------------------------------------------------
+
+class TestHarmonicBackendCallable:
+    """Moved from test_schema.py::TestBuildBackend::test_harmonic_backend_callable."""
+
+    def test_harmonic_backend_callable(self):
+        from jaxrens.cli.schema.backend import HarmonicBackendSpec
+        spec = HarmonicBackendSpec(k=1.0)
+        backend = spec.build_backend()
+        positions = jnp.zeros((1, 3))
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        cell = jnp.zeros((3, 3))
+        energy, _, _ = backend(positions, types, cell, 0)
+        assert jnp.isfinite(energy)
+

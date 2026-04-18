@@ -81,7 +81,7 @@ class TestRun:
         """End-to-end: run NS on harmonic with config objects."""
         ns_config = NSConfig(n_live=20, max_iterations=50, n_mcmc_steps=5, seed=42)
         move_config = MoveConfig(move_type="random_walk", step_size=0.3)
-        backend_config = BackendConfig(backend_type="harmonic", n_atoms=1)
+        backend_config = BackendConfig(backend_type="harmonic")
         output_config = OutputConfig(
             format="none", working_dir=tmp_path, info_interval=999
         )

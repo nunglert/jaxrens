@@ -539,9 +539,6 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
         pressure=pressure,
     )
 
-    moves = tuple(m.to_move_config() for m in root.moves)
-    move_descriptors = tuple(m.to_descriptor() for m in root.moves)
-
     backend = root.backend.to_backend_config()
     energy_backend = root.backend.build_backend()
 
@@ -553,21 +550,10 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
         info_interval=root.output.info_interval,
         out_file_prefix=root.output.out_file_prefix,
         working_dir=Path(root.output.working_dir),
+        log_level=root.output.log_level,
     )
 
     _warn_unused_output_fields(root.output)
-
-    # CellConfig deferred-field warning: emit when non-default values are set
-    cell_defaults = CellConfig()
-    if root.cell != cell_defaults:
-        logger.warning(
-            "cell section contains non-default values %r but CellConfig fields "
-            "are not yet automatically threaded into move kernels.  Per-move "
-            "specs (VolumeMoveSpec, ShearMoveSpec, StretchMoveSpec) carry their "
-            "own copies of these parameters.  Unified CellConfig propagation is "
-            "planned for a future task.",
-            root.cell.model_dump(),
-        )
 
     if root.termination is not None:
         termination = tuple(spec.to_criterion() for spec in root.termination)
@@ -588,6 +574,16 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
         seed=seed,
         energy_backend=energy_backend,
         cell_cfg=root.cell,
+    )
+
+    # Derive n_atoms from the resolved initial positions rather than from a
+    # config field — this is the single canonical source of truth.
+    n_atoms = int(resolved_init.initial_positions.shape[-2])
+
+    moves = tuple(m.to_move_config() for m in root.moves)
+    move_descriptors = tuple(
+        m.to_descriptor(n_atoms=n_atoms, cell_cfg=root.cell)
+        for m in root.moves
     )
 
     return ResolvedConfig(

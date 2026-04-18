@@ -15,6 +15,7 @@ Users who set these will see a ``logging.warning`` from the resolver:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -31,6 +32,7 @@ class OutputSchema(BaseModel):
     info_interval: int = 100
     out_file_prefix: str = "ns"
     working_dir: Path = Path(".")
+    log_level: Literal["info", "debug"] = "info"
 
     # -- Deferred fields (see module docstring) --
     snapshot_time: float | None = None

@@ -31,6 +31,44 @@ from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConf
 logger = logging.getLogger(__name__)
 
 
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+def _configure_file_logging(
+    *,
+    working_dir: Path,
+    prefix: str,
+    level: str,
+) -> None:
+    """Attach file handlers to the ``jaxrens`` logger.
+
+    Always writes INFO+ to ``<working_dir>/<prefix>.log``. If ``level`` is
+    ``debug``, additionally writes DEBUG+ to ``<working_dir>/<prefix>.debug.log``.
+    Idempotent: removes any prior handlers this function attached before
+    re-attaching, so repeated calls (e.g. across cohort runs) stay clean.
+    """
+    root = logging.getLogger("jaxrens")
+    root.setLevel(logging.DEBUG if level == "debug" else logging.INFO)
+
+    for h in list(root.handlers):
+        if getattr(h, "_jaxrens_managed", False):
+            root.removeHandler(h)
+            h.close()
+
+    info_h = logging.FileHandler(working_dir / f"{prefix}.log", mode="w")
+    info_h.setLevel(logging.INFO)
+    info_h.setFormatter(logging.Formatter(_LOG_FORMAT))
+    info_h._jaxrens_managed = True  # type: ignore[attr-defined]
+    root.addHandler(info_h)
+
+    if level == "debug":
+        debug_h = logging.FileHandler(working_dir / f"{prefix}.debug.log", mode="w")
+        debug_h.setLevel(logging.DEBUG)
+        debug_h.setFormatter(logging.Formatter(_LOG_FORMAT))
+        debug_h._jaxrens_managed = True  # type: ignore[attr-defined]
+        root.addHandler(debug_h)
+
+
 def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
     """Convert a ``MoveConfig`` dataclass to a ``MoveKernel``.
 
@@ -158,17 +196,28 @@ def run_from_config(
             return e
         initial_energies = jax.vmap(eval_one)(initial_positions)
 
-    # Build MWG sampler
-    init_fn, step_fn, per_move_fns = setup_mwg(move_config, backend)
+    # Build MWG sampler. Prefer pre-built MoveKernels when available — they
+    # carry n_atoms / n_species that MoveConfig can't express (volume, shear,
+    # stretch, single_atom_sweep, alchemical_morph).
+    if move_descriptors is not None:
+        init_fn, step_fn, per_move_fns = build_mwg(backend, list(move_descriptors))
+    else:
+        init_fn, step_fn, per_move_fns = setup_mwg(move_config, backend)
+
+    working_dir = output_config.working_dir
+    working_dir.mkdir(parents=True, exist_ok=True)
+
+    _configure_file_logging(
+        working_dir=working_dir,
+        prefix=output_config.out_file_prefix,
+        level=output_config.log_level,
+    )
 
     # Set up callbacks
     callbacks = [
         ProgressCallback(info_interval=output_config.info_interval),
         EnergyCheckCallback(),
     ]
-
-    working_dir = output_config.working_dir
-    working_dir.mkdir(parents=True, exist_ok=True)
 
     callbacks.append(
         CheckpointCallback(
@@ -184,7 +233,7 @@ def run_from_config(
     energy_logger = EnergyLogger(
         working_dir / f"{output_config.out_file_prefix}.energies",
         n_walkers=ns_config.n_live,
-        n_atoms=backend_config.n_atoms,
+        n_atoms=initial_positions.shape[-2],
     )
     callbacks.append(
         TrajectoryCallback(

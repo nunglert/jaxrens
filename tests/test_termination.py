@@ -482,3 +482,64 @@ class TestTempTerminationIntegration:
         last_dead_idx = result["n_dead"] - 1
         last_dead_e = float(result["dead_energies"][last_dead_idx])
         assert last_dead_e < energy_target + 1.0  # some tolerance
+
+
+# ---------------------------------------------------------------------------
+# TerminationSpec end-to-end JIT test (moved from test_schema.py)
+# ---------------------------------------------------------------------------
+
+class TestTerminationEndToEndJit:
+    def test_iteration_termination_stops_early_under_jit(self):
+        """IterationTermination(5) causes run_ns to stop at iteration 5.
+
+        run_ns internally JITs ns_step, satisfying the JIT testing policy.
+        Moved verbatim from test_schema.py::TestTerminationEndToEndJit.
+        """
+        from jaxrens.backends.toy import create_harmonic
+        from jaxrens.cli.resolve import resolve
+        from jaxrens.cli.schema import RootConfig
+        from jaxrens.sampling.mwg import build_mwg
+        from jaxrens.sampling.nested_sampling import run_ns
+
+        d = {
+            "run": {
+                "n_live": 10,
+                "max_iterations": 1000,
+                "n_mcmc_steps": 3,
+                "seed": 0,
+            },
+            "moves": [{"move_type": "random_walk", "step_size": 0.3}],
+            "backend": {"backend_type": "harmonic"},
+            "output": {"format": "none", "working_dir": ".", "info_interval": 999},
+            "termination": [{"type": "iteration", "max_iterations": 5}],
+        }
+        root = RootConfig.model_validate(d)
+        resolved = resolve(root)
+
+        backend = create_harmonic()
+        init_fn, step_fn, _ = build_mwg(backend, list(resolved.move_descriptors))
+
+        key = jax.random.key(123)
+        key, key_pos = jax.random.split(key)
+        n_live = 10
+        positions = jax.random.uniform(key_pos, (n_live, 1, 3), minval=-2.0, maxval=2.0)
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        energies = jax.vmap(
+            lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
+        )(positions)
+
+        result = run_ns(
+            positions=positions,
+            types=types,
+            energies=energies,
+            cells=None,
+            init_fn=init_fn,
+            step_fn=step_fn,
+            rng_key=key,
+            max_iterations=1000,
+            n_mcmc_steps=3,
+            termination_criteria=list(resolved.termination),
+        )
+
+        assert result["iteration"] <= 6
+        assert result["n_dead"] <= 6

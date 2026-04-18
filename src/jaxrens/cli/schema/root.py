@@ -46,7 +46,7 @@ class RootConfig(BaseModel):
     # when no explicit ensemble: key is provided (backward compatibility).
     ensemble: EnsembleSpec = Field(default_factory=NVTEnsembleSpec)
     init: InitConfig = Field(
-        default_factory=lambda: InitConfig(start_species="1")
+        default_factory=lambda: InitConfig(start_species="1 1")
     )
     cell: CellConfig = Field(default_factory=CellConfig)
 

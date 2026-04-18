@@ -25,7 +25,6 @@ class BaseBackendSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    n_atoms: int = 13
     periodic: bool = False
 
     @property
@@ -38,11 +37,12 @@ class BaseBackendSpec(BaseModel):
 
         Subclasses that carry NeuralIL-specific fields override this method.
         All other backends use ``BackendConfig`` defaults for those fields.
+        ``n_atoms`` is derived from the initial walker positions at resolve
+        time, not stored on the backend spec.
         """
         return BackendConfig(
             backend_type=self.type,  # type: ignore[attr-defined]
             checkpoint_path=None,
-            n_atoms=self.n_atoms,
             periodic=self.periodic,
             cutoff=None,
         )
@@ -102,7 +102,6 @@ class LJBackendSpec(BaseBackendSpec):
         return BackendConfig(
             backend_type="lj",
             checkpoint_path=None,
-            n_atoms=self.n_atoms,
             periodic=self.periodic,
             cutoff=self.cutoff,
         )
@@ -122,7 +121,6 @@ class NeuralILBackendSpec(BaseBackendSpec):
         return BackendConfig(
             backend_type="neuralil",
             checkpoint_path=self.checkpoint_path,
-            n_atoms=self.n_atoms,
             periodic=self.periodic,
             cutoff=None,
             max_neighbors_list=list(self.max_neighbors_list),
@@ -144,7 +142,6 @@ class MACEBackendSpec(BaseBackendSpec):
         return BackendConfig(
             backend_type="mace",
             checkpoint_path=self.checkpoint_path,
-            n_atoms=self.n_atoms,
             periodic=self.periodic,
             cutoff=None,
         )

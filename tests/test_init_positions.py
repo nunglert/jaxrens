@@ -145,3 +145,60 @@ class TestGridPositionsInCell:
         pos = grid_positions_in_cell(_KEY, _CELL, n_atoms=1, min_distance=2.0)
         assert pos.shape == (1, 3)
         assert jnp.all(jnp.isfinite(pos))
+
+
+# ---------------------------------------------------------------------------
+# E2E test moved from test_schema.py::TestInitConfigResolver (line 2080)
+# ---------------------------------------------------------------------------
+
+class TestStartSpeciesE2ERunNS:
+    """test_start_species_e2e_run_ns moved from second TestInitConfigResolver."""
+
+    def test_start_species_e2e_run_ns(self, tmp_path):
+        """Resolver output feeds directly into run_from_config without error."""
+        import jax.numpy as jnp
+        from jaxrens.cli.resolve import resolve
+        from jaxrens.cli.schema import RootConfig
+        from jaxrens.cli.run import run_from_config
+
+        d = {
+            "run": {
+                "n_live": 6,
+                "max_iterations": 5,
+                "n_mcmc_steps": 3,
+                "seed": 0,
+            },
+            "moves": [{"move_type": "random_walk", "step_size": 0.3}],
+            "backend": {"backend_type": "harmonic"},
+            "output": {
+                "format": "none",
+                "working_dir": str(tmp_path),
+                "info_interval": 999,
+            },
+            "init": {
+                "start_species": "1 2",
+                "random_initialise_pos": True,
+                "random_initialise_cell": False,
+                "pos_randomization_mode": "grid",
+                "grid_distance": 1.5,
+                "init_distance_criterion": 0.5,
+                "random_init_max_n_tries": 50,
+                "start_energy_ceiling_per_atom": 1e6,
+                "pos_autoscale_cells": False,
+            },
+        }
+        root = RootConfig.model_validate(d)
+        resolved = resolve(root)
+
+        result = run_from_config(
+            resolved.ns,
+            list(resolved.moves),
+            resolved.backend,
+            resolved.output,
+            initial_positions=resolved.init.initial_positions,
+            initial_types=resolved.init.initial_types,
+            initial_energies=resolved.init.initial_energies,
+            initial_cells=resolved.init.initial_cells,
+        )
+        assert result["iteration"] > 0
+        assert jnp.isfinite(result["log_evidence"])

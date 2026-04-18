@@ -4,8 +4,10 @@ Source-of-atoms rules:
   Exactly one of {start_species, start_config_file, start_walker_set, restart_file}
   must be set.  Setting zero or more than one raises ``ValidationError``.
 
-Multi-composition species strings (e.g. ``"1 3: 0 16, 8 8"``) are deferred.
-Only the single-composition form (e.g. ``"1 3"``) is parsed here.
+Species strings use the form ``"Z N[, Z N]*"`` where ``Z`` is the atomic
+number and ``N`` is the count (e.g. ``"18 8"`` for 8 Ar atoms, or
+``"1 6, 3 6"`` for 6 H + 6 Li).  Multi-composition cohort strings
+(``"Z1 Z2: N1 N2, ..."``) are deferred.
 """
 
 from __future__ import annotations
@@ -72,39 +74,89 @@ class InitialWalkConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _parse_species_string(s: str) -> dict[int, int]:
-    """Parse a single-composition species string into element counts.
+    """Parse a species string into element counts.
 
-    Accepts the form ``"N_A N_B ..."`` where each token is an atomic number
-    and duplicate tokens accumulate (e.g. ``"1 3"`` -> ``{1: 1, 3: 1}``).
-    Multi-composition form (with ``:`` separator) is rejected here; it is
-    deferred to a future cohort-expansion step.
+    Accepts the form ``"Z N[, Z N]*"`` where ``Z`` is an atomic number and
+    ``N`` is the count of that element.  Multiple species are separated by
+    commas.
+
+    Examples::
+
+        "18 8"       -> {18: 8}          (8 argon atoms)
+        "1 6, 3 6"   -> {1: 6, 3: 6}    (6 hydrogen + 6 lithium)
+
+    The multi-composition cohort form ``"Z1 Z2: N1 N2, ..."`` is deferred to
+    a future cohort-expansion step and raises ``ValueError``.
+
+    Mass tokens (three-token groups ``"Z N mass"``) are not yet wired into any
+    move kernel and raise ``NotImplementedError``.
 
     Args:
-        s: Species string, e.g. ``"1 3"`` or ``"14 14 8 8 8"``.
+        s: Species string as described above.
 
     Returns:
-        Mapping from atomic number to count.
+        Mapping from atomic number to count, e.g. ``{18: 8}``.
 
     Raises:
-        ValueError: If the string contains ``:`` (multi-composition) or
-            contains non-integer tokens.
+        ValueError: If the string is empty, contains ``:``, contains
+            non-integer tokens, or has an odd number of tokens in any
+            comma-separated group.
+        NotImplementedError: If a mass token is detected (three tokens in a
+            group).
     """
+    if not s or not s.strip():
+        raise ValueError(
+            f"Species string must not be empty.  Received: {s!r}"
+        )
+
     if ":" in s:
         raise ValueError(
             f"Multi-composition species strings (containing ':') are not yet "
-            f"supported in step 6.  Received: {s!r}.  Defer to a future "
-            f"cohort-expansion step."
+            f"supported.  Received: {s!r}.  Multi-composition cohort support "
+            f"is deferred to a future step."
         )
-    tokens = s.strip().split()
+
     counts: dict[int, int] = {}
-    for tok in tokens:
-        if not re.fullmatch(r"\d+", tok):
+
+    for group_raw in s.split(","):
+        group = group_raw.strip()
+        if not group:
             raise ValueError(
-                f"Species string token {tok!r} is not a non-negative integer "
-                f"atomic number.  Full string: {s!r}"
+                f"Empty group in species string {s!r} — check for trailing "
+                f"commas or double commas."
             )
-        z = int(tok)
-        counts[z] = counts.get(z, 0) + 1
+        tokens = group.split()
+
+        if len(tokens) == 3:
+            raise NotImplementedError(
+                f"masses in start_species are not yet wired into any move "
+                f"kernel; drop the mass tokens for now.  Full string: {s!r}"
+            )
+
+        if len(tokens) % 2 != 0 or len(tokens) == 0:
+            raise ValueError(
+                f"Each comma-separated group must contain an even number of "
+                f"tokens (atomic_number count pairs).  Group {group!r} has "
+                f"{len(tokens)} token(s).  Full string: {s!r}"
+            )
+
+        for i in range(0, len(tokens), 2):
+            z_tok, n_tok = tokens[i], tokens[i + 1]
+            for label, tok in (("atomic number", z_tok), ("count", n_tok)):
+                if not re.fullmatch(r"\d+", tok):
+                    raise ValueError(
+                        f"Species string {label} token {tok!r} is not a "
+                        f"non-negative integer.  Full string: {s!r}"
+                    )
+            z = int(z_tok)
+            n = int(n_tok)
+            if n == 0:
+                raise ValueError(
+                    f"Count for atomic number {z} is zero in species string "
+                    f"{s!r}.  Every specified element must have count >= 1."
+                )
+            counts[z] = counts.get(z, 0) + n
+
     if not counts:
         raise ValueError(f"Species string {s!r} produced no atoms.")
     return counts
@@ -166,12 +218,17 @@ class InitConfig(BaseModel):
     def parsed_species(self) -> dict[int, int] | None:
         """Return element-count mapping when ``start_species`` is set.
 
+        Parses the ``"Z N[, Z N]*"`` format where ``Z`` is an atomic number
+        and ``N`` is the count.  For example ``"18 8"`` yields ``{18: 8}``
+        (eight argon atoms).
+
         Returns:
             ``{atomic_number: count}`` or ``None`` if ``start_species`` is
             not set.
 
         Raises:
             ValueError: If the species string cannot be parsed.
+            NotImplementedError: If mass tokens are detected.
         """
         if self.start_species is None:
             return None

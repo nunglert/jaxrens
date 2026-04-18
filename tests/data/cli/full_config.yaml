@@ -13,7 +13,6 @@ moves:
 
 backend:
   type: harmonic
-  n_atoms: 2
 
 output:
   format: none
@@ -38,7 +37,7 @@ ensemble:
   type: nvt
 
 init:
-  start_species: "1 1"
+  start_species: "1 2"
   random_initialise_pos: true
   pos_randomization_mode: grid
   grid_distance: 1.5

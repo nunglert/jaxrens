@@ -1,2 +1,3 @@
 - [CLI modernization plan](project_cli_modernization.md) — 8-step plan; steps 1–7 complete as of 2026-04-17
 - [Walker init package](project_init_package.md) — 7-step init build-out; steps 1–5 complete as of 2026-04-17 (cells, positions, rejection, resolver rewrite, structure loader, Mode B, Mode C walker-set, Mode D restart)
+- [Test file layout](project_test_layout.md) — Where each test category lives after 2026-04-17 test_schema.py split (schema vs resolver vs E2E)

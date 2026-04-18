@@ -495,7 +495,14 @@ def _handle_energy_calculator(value: str, cfg: dict, logs: list) -> None:
 
 
 def _handle_n_atoms(value: str, cfg: dict, logs: list) -> None:
-    _nest(cfg, "backend", "n_atoms", value=int(value))
+    logs.append({
+        "level": "INFO",
+        "message": (
+            f"n_atoms={value!r} is now derived automatically from "
+            "init.start_species / start_config_file at resolution time; "
+            "the value is ignored."
+        ),
+    })
 
 
 def _handle_periodic(value: str, cfg: dict, logs: list) -> None:
@@ -944,8 +951,6 @@ def _build_moves_from_scratch(cfg: dict, logs: list) -> None:
         return
 
     moves = []
-    # Cell moves need n_atoms in their spec.
-    n_atoms = cfg.get("backend", {}).get("n_atoms", 13)
 
     for move_type, count in counts.items():
         if count <= 0:
@@ -957,10 +962,10 @@ def _build_moves_from_scratch(cfg: dict, logs: list) -> None:
             spec["n_reflect"] = n_steps_default
         elif move_type == "hmc":
             spec["n_leapfrog"] = n_steps_default
-        elif move_type in ("volume", "shear", "stretch"):
-            spec["n_atoms"] = n_atoms
-        elif move_type == "single_atom_sweep":
-            spec["n_atoms"] = n_atoms
+        # Cell-move specs (volume, shear, stretch) and single_atom_sweep no
+        # longer carry n_atoms — it is derived from init positions at resolve
+        # time.  Cell-geometry bounds (max_vol_per_atom etc.) are read from
+        # the [cell] section, not from individual move specs.
         moves.append(spec)
 
     if moves:

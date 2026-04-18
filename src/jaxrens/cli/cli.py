@@ -139,13 +139,13 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     resolved = cohort[0]
     n_moves = len(resolved.moves)
     move_types = ", ".join(m.move_type for m in resolved.moves)
+    n_atoms = int(resolved.init.initial_positions.shape[-2])
     print(
         f"OK — cohort size: {n}\n"
         f"  run:     n_live={resolved.ns.n_live}, "
         f"max_iterations={resolved.ns.max_iterations}\n"
         f"  moves:   {n_moves} move(s) [{move_types}]\n"
-        f"  backend: {resolved.backend.backend_type}, "
-        f"n_atoms={resolved.backend.n_atoms}\n"
+        f"  backend: {resolved.backend.backend_type}, n_atoms={n_atoms}\n"
         f"  output:  format={resolved.output.format}, "
         f"prefix={resolved.output.out_file_prefix}"
     )

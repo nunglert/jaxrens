@@ -14,7 +14,6 @@ moves:
 
 backend:
   type: harmonic
-  n_atoms: 1
 
 output:
   format: none

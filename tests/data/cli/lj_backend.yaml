@@ -10,7 +10,6 @@ moves:
 
 backend:
   type: lj
-  n_atoms: 4
   epsilon: 1.0
   sigma: 1.0
   cutoff: 3.0

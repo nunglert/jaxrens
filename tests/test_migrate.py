@@ -57,7 +57,8 @@ class TestRoundTrip:
         assert cfg.run.n_live == 100
         assert cfg.run.max_iterations == 1000
         assert cfg.backend.type == "lj"  # type: ignore[union-attr]
-        assert cfg.backend.n_atoms == 13  # type: ignore[union-attr]
+        # n_atoms is no longer stored on BackendConfig; it is derived from init
+        # positions at resolve time.
 
     def test_n_cull_routed(self):
         raw = {**_minimal_raw(), "n_cull": "2"}
@@ -318,7 +319,6 @@ class TestValidateFlag:
                 n_reflect: 3
             backend:
               type: lj
-              n_atoms: 2
             output:
               format: extxyz
             ensemble:

@@ -9,7 +9,7 @@ side-channel that used to live in ``cli/run.py``.
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Callable, Literal, Union
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Literal, Union
 
 import jax.numpy as jnp
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,6 +17,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import alchemical, galilean, hmc, random_walk, single_atom, volume, shear, stretch
 from jaxrens.state.config import MoveConfig
+
+if TYPE_CHECKING:
+    from jaxrens.cli.schema.cell import CellConfig
 
 # ---------------------------------------------------------------------------
 # MoveType literal — kept for backward compatibility with callers that do
@@ -80,18 +83,52 @@ class BaseMoveSpec(BaseModel):
     def _build_kernel(self) -> Callable:
         raise NotImplementedError
 
-    def _kernel_kwargs(self) -> dict[str, Any]:
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellConfig | None" = None,
+    ) -> dict[str, Any]:
+        """Return kernel keyword arguments.
+
+        Simple move specs ignore ``n_atoms`` and ``cell_cfg``.  Cell-move
+        specs (volume, shear, stretch) and sweep specs use them to populate
+        ``n_atoms`` / cell-geometry bounds from the resolver-provided values
+        rather than duplicating those fields on the spec.
+
+        Args:
+            n_atoms: Number of atoms, derived from the resolved initial
+                positions.  ``None`` is accepted by specs that don't need it.
+            cell_cfg: ``CellConfig`` carrying cell-geometry constraints.
+                ``None`` is accepted by specs that don't need it.
+        """
         return {}
 
     def _extra_state_fields(self) -> dict[str, tuple[type, Callable]]:
         return {}
 
-    def to_descriptor(self) -> MoveKernel:
-        """Produce the ``MoveKernel`` for ``build_mwg``."""
+    def to_descriptor(
+        self,
+        *,
+        n_atoms: int | None = None,
+        cell_cfg: "CellConfig | None" = None,
+    ) -> MoveKernel:
+        """Produce the ``MoveKernel`` for ``build_mwg``.
+
+        Args:
+            n_atoms: Number of atoms, derived from the resolved initial
+                positions at resolver time.  Simple moves (random_walk,
+                galilean, …) ignore this.  Cell-move specs (volume, shear,
+                stretch) and single_atom_sweep use it to populate
+                ``kernel_kwargs["n_atoms"]``.
+            cell_cfg: ``CellConfig`` carrying cell-geometry constraints.
+                Cell-move specs use it to populate ``max_volume_per_atom``,
+                ``min_volume_per_atom``, ``min_aspect_ratio``, and
+                ``flat_V_prior`` in ``kernel_kwargs``.  Simple moves ignore it.
+        """
         return MoveKernel(
             name=self._effective_name(),
             build_kernel=self._build_kernel(),
-            kernel_kwargs=self._kernel_kwargs(),
+            kernel_kwargs=self._kernel_kwargs(n_atoms=n_atoms, cell_cfg=cell_cfg),
             weight=self.weight,
             step_size=self.step_size,
             extra_state_fields=self._extra_state_fields(),
@@ -119,7 +156,7 @@ class GalileanMoveSpec(BaseMoveSpec):
     def _build_kernel(self) -> Callable:
         return galilean.build_kernel
 
-    def _kernel_kwargs(self) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
         return {"n_reflect": self.n_reflect}
 
     def _extra_state_fields(self) -> dict[str, tuple[type, Callable]]:
@@ -143,7 +180,7 @@ class GmcMoveSpec(BaseMoveSpec):
     def _build_kernel(self) -> Callable:
         return galilean.build_kernel
 
-    def _kernel_kwargs(self) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
         return {"n_reflect": self.n_reflect}
 
     def _extra_state_fields(self) -> dict[str, tuple[type, Callable]]:
@@ -165,7 +202,7 @@ class HMCMoveSpec(BaseMoveSpec):
     def _build_kernel(self) -> Callable:
         return hmc.build_kernel
 
-    def _kernel_kwargs(self) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
         return {"n_leapfrog": self.n_leapfrog}
 
 
@@ -178,13 +215,18 @@ class SingleAtomMoveSpec(BaseMoveSpec):
 
 class SingleAtomSweepMoveSpec(BaseMoveSpec):
     type: Literal["single_atom_sweep"] = "single_atom_sweep"
-    n_atoms: int
 
     def _build_kernel(self) -> Callable:
         return single_atom.build_sweep_kernel
 
-    def _kernel_kwargs(self) -> dict[str, Any]:
-        return {"n_atoms": self.n_atoms}
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
+        if n_atoms is None:
+            raise ValueError(
+                "SingleAtomSweepMoveSpec.to_descriptor() requires n_atoms to "
+                "be provided by the resolver (derived from init positions). "
+                "Call to_descriptor(n_atoms=...) with the atom count."
+            )
+        return {"n_atoms": n_atoms}
 
 
 class SingleAtomSwapMoveSpec(BaseMoveSpec):
@@ -196,71 +238,92 @@ class SingleAtomSwapMoveSpec(BaseMoveSpec):
 
 class VolumeMoveSpec(BaseMoveSpec):
     type: Literal["volume"] = "volume"
-    n_atoms: int
-    max_vol_per_atom: float = 100.0
-    min_vol_per_atom: float = 1.0
-    min_aspect: float = 0.5
-    flat_v_prior: bool = False
 
     def _build_kernel(self) -> Callable:
         return volume.build_kernel
 
-    def _kernel_kwargs(self) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
+        if n_atoms is None:
+            raise ValueError(
+                "VolumeMoveSpec.to_descriptor() requires n_atoms to be "
+                "provided by the resolver (derived from init positions)."
+            )
+        if cell_cfg is None:
+            raise ValueError(
+                "VolumeMoveSpec.to_descriptor() requires cell_cfg to be "
+                "provided by the resolver (from the [cell] config section)."
+            )
         return {
-            "n_atoms": self.n_atoms,
-            "max_vol_per_atom": self.max_vol_per_atom,
-            "min_vol_per_atom": self.min_vol_per_atom,
-            "min_aspect": self.min_aspect,
-            "flat_v_prior": self.flat_v_prior,
+            "n_atoms": n_atoms,
+            "max_vol_per_atom": cell_cfg.max_volume_per_atom,
+            "min_vol_per_atom": cell_cfg.min_volume_per_atom,
+            "min_aspect": cell_cfg.min_aspect_ratio,
+            "flat_v_prior": cell_cfg.flat_V_prior,
         }
 
 
 class ShearMoveSpec(BaseMoveSpec):
     type: Literal["shear"] = "shear"
-    n_atoms: int
-    max_vol_per_atom: float = 100.0
-    min_vol_per_atom: float = 1.0
-    min_aspect: float = 0.5
 
     def _build_kernel(self) -> Callable:
         return shear.build_kernel
 
-    def _kernel_kwargs(self) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
+        if n_atoms is None:
+            raise ValueError(
+                "ShearMoveSpec.to_descriptor() requires n_atoms to be "
+                "provided by the resolver (derived from init positions)."
+            )
+        if cell_cfg is None:
+            raise ValueError(
+                "ShearMoveSpec.to_descriptor() requires cell_cfg to be "
+                "provided by the resolver (from the [cell] config section)."
+            )
         return {
-            "n_atoms": self.n_atoms,
-            "max_vol_per_atom": self.max_vol_per_atom,
-            "min_vol_per_atom": self.min_vol_per_atom,
-            "min_aspect": self.min_aspect,
+            "n_atoms": n_atoms,
+            "max_vol_per_atom": cell_cfg.max_volume_per_atom,
+            "min_vol_per_atom": cell_cfg.min_volume_per_atom,
+            "min_aspect": cell_cfg.min_aspect_ratio,
         }
 
 
 class StretchMoveSpec(BaseMoveSpec):
     type: Literal["stretch"] = "stretch"
-    n_atoms: int
-    max_vol_per_atom: float = 100.0
-    min_vol_per_atom: float = 1.0
-    min_aspect: float = 0.5
 
     def _build_kernel(self) -> Callable:
         return stretch.build_kernel
 
-    def _kernel_kwargs(self) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
+        if n_atoms is None:
+            raise ValueError(
+                "StretchMoveSpec.to_descriptor() requires n_atoms to be "
+                "provided by the resolver (derived from init positions)."
+            )
+        if cell_cfg is None:
+            raise ValueError(
+                "StretchMoveSpec.to_descriptor() requires cell_cfg to be "
+                "provided by the resolver (from the [cell] config section)."
+            )
         return {
-            "n_atoms": self.n_atoms,
-            "max_vol_per_atom": self.max_vol_per_atom,
-            "min_vol_per_atom": self.min_vol_per_atom,
-            "min_aspect": self.min_aspect,
+            "n_atoms": n_atoms,
+            "max_vol_per_atom": cell_cfg.max_volume_per_atom,
+            "min_vol_per_atom": cell_cfg.min_volume_per_atom,
+            "min_aspect": cell_cfg.min_aspect_ratio,
         }
 
 
 class AlchemicalMorphMoveSpec(BaseMoveSpec):
     type: Literal["alchemical_morph"] = "alchemical_morph"
     n_species: int
+    # NOTE: n_species could in principle be derived from len(symbol_map) in
+    # init_resolved, but that would require threading symbol_map through the
+    # resolver to to_descriptor().  Since it is single-valued and small, keeping
+    # it on the spec is a pragmatic trade-off; the inconsistency is flagged here.
 
     def _build_kernel(self) -> Callable:
         return alchemical.build_morph_kernel
 
-    def _kernel_kwargs(self) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
         return {"n_species": self.n_species}
 
 
@@ -269,6 +332,8 @@ class AlchemicalShiftMoveSpec(BaseMoveSpec):
 
     def _build_kernel(self) -> Callable:
         return alchemical.build_shift_kernel
+
+    # Inherits the no-op _kernel_kwargs from BaseMoveSpec.
 
 
 # ---------------------------------------------------------------------------

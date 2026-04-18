@@ -11,3 +11,4 @@ build/
 *.npz
 *.extxyz
 .venv/
+experiments
