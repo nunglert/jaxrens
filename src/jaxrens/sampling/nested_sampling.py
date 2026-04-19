@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from jaxrens.base import NSCallback
+from jaxrens.sampling.adaptation.manager import AdaptationManager
 from jaxrens.sampling.batch_descriptor import SingleRun, VmapRuns
 from jaxrens.sampling.termination import (
     IterationTermination,
@@ -659,23 +660,17 @@ def run_ns(
     # JIT-compile ns_step with step_fn, n_mcmc_steps, n_extra as static args
     jit_ns_step = descriptor.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
 
-    # Determine adaptation mode
-    use_full_auto = (
-        per_move_fns is not None
-        and move_descriptors is not None
-        and adjust_interval > 0
+    # AdaptationManager: owns per-move JIT'd adjust_step_size callables.
+    # is_active iff per_move_fns + move_descriptors + adjust_interval>0 are all set.
+    adapt_mgr = AdaptationManager(
+        move_descriptors=move_descriptors or [],
+        per_move_fns=per_move_fns,
+        batch_descriptor=descriptor,
+        adjust_n_samples=adjust_n_samples,
+        adjust_factor=adjust_factor,
+        adjust_max_rounds=adjust_max_rounds,
+        adjust_interval=adjust_interval,
     )
-
-    # Pre-compile per-move adjustment functions (once, before the loop)
-    if use_full_auto:
-        from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
-
-        jit_adjust_fns = []
-        for move_idx, desc in enumerate(move_descriptors):
-            # Each move gets its own JIT'd function with its static config baked in
-            jit_adjust_fns.append(
-                jax.jit(adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10))
-            )
 
     # Track per-move step sizes
     pop = ns_state.population
@@ -688,47 +683,15 @@ def run_ns(
     }
 
     for i in range(max_iterations):
-        # Step size adaptation via bisection (full_auto only; no fallback path)
+        # Step size adaptation via bisection (AdaptationManager; fires every adjust_interval)
         _adjust_fired = False
-        per_move_rates: list = []
-        per_move_counts: list = []
-        per_move_n_rounds: list = []
-        per_move_converged: list = []
-        per_move_cap_hits: list = []
-        per_move_floor_hits: list = []
-        per_move_bracket_detected: list = []
-        per_move_trial_n_evals: list = []
-        per_move_trial_n_grad_evals: list = []
-        if use_full_auto and i > 0 and i % adjust_interval == 0:
+        if adapt_mgr.fires(i):
             pop = ns_state.population
             emax = jnp.max(pop.energy)
-            for move_idx, desc in enumerate(move_descriptors):
-                rng_key, key_adjust = jax.random.split(rng_key)
-                (new_ss, rate, counts,
-                 n_rounds, converged, cap_hits, floor_hits, bracket_detected,
-                 trial_n_evals, trial_n_grad_evals,
-                 ) = jit_adjust_fns[move_idx](
-                    pop, per_move_fns[move_idx],
-                    current_step_sizes[move_idx], emax, key_adjust,
-                    adjust_n_samples, desc.min_rate, desc.max_rate,
-                    adjust_factor, desc.step_size_max, adjust_max_rounds,
-                )
-                current_step_sizes = current_step_sizes.at[move_idx].set(new_ss)
-                per_move_rates.append(float(rate))
-                per_move_counts.append(counts)
-                per_move_n_rounds.append(n_rounds)
-                per_move_converged.append(converged)
-                per_move_cap_hits.append(cap_hits)
-                per_move_floor_hits.append(floor_hits)
-                per_move_bracket_detected.append(bracket_detected)
-                per_move_trial_n_evals.append(trial_n_evals)
-                per_move_trial_n_grad_evals.append(trial_n_grad_evals)
-                logger.debug(
-                    "Adjusted %s: ss=%.4g rate=%.3f rounds=%d converged=%s",
-                    desc.name, float(new_ss), float(rate),
-                    int(n_rounds), bool(converged),
-                )
-            # Broadcast to all walkers
+            current_step_sizes, per_move_outputs, rng_key = adapt_mgr.apply(
+                pop, emax, rng_key, current_step_sizes,
+            )
+            # Broadcast updated step sizes to all walkers: (n_moves,) -> (n_walkers, n_moves)
             new_ss_pop = jnp.broadcast_to(
                 current_step_sizes, (n_walkers, current_step_sizes.shape[0]),
             )
@@ -757,20 +720,20 @@ def run_ns(
         _bump_cumulative_counters(_cumulative, info)
 
         # Populate per-move adaptation data into info dict for callbacks.
-        # Only present on iterations where full_auto just fired (adjust_interval).
+        # Only present on iterations where AdaptationManager just fired.
         if _adjust_fired:
             _pack_adjustment_info(
                 info,
                 current_step_sizes=current_step_sizes,
-                per_move_rates=per_move_rates,
-                per_move_counts=per_move_counts,
-                per_move_n_rounds=per_move_n_rounds,
-                per_move_converged=per_move_converged,
-                per_move_cap_hits=per_move_cap_hits,
-                per_move_floor_hits=per_move_floor_hits,
-                per_move_bracket_detected=per_move_bracket_detected,
-                per_move_trial_n_evals=per_move_trial_n_evals,
-                per_move_trial_n_grad_evals=per_move_trial_n_grad_evals,
+                per_move_rates=[float(v) for v in per_move_outputs["rate"]],
+                per_move_counts=list(per_move_outputs["counts"]),
+                per_move_n_rounds=list(per_move_outputs["n_rounds"]),
+                per_move_converged=list(per_move_outputs["converged"]),
+                per_move_cap_hits=list(per_move_outputs["cap_hits"]),
+                per_move_floor_hits=list(per_move_outputs["floor_hits"]),
+                per_move_bracket_detected=list(per_move_outputs["bracket_detected"]),
+                per_move_trial_n_evals=list(per_move_outputs["trial_n_evaluations"]),
+                per_move_trial_n_grad_evals=list(per_move_outputs["trial_n_grad_evaluations"]),
                 move_descriptors=move_descriptors,
             )
             # Also accumulate trial-phase evals into cumulative counters
@@ -942,16 +905,7 @@ def run_ns_parallel(
             PriorMassTermination(n_walkers, convergence_threshold),
         ]
 
-    # Determine adaptation mode
-    use_full_auto = (
-        per_move_fns is not None
-        and move_descriptors is not None
-        and adjust_interval > 0
-    )
-
-    if use_full_auto:
-        n_moves = len(move_descriptors)
-    elif move_descriptors is not None:
+    if move_descriptors is not None:
         n_moves = len(move_descriptors)
     else:
         n_moves = 1
@@ -964,37 +918,23 @@ def run_ns_parallel(
         ensemble_params_per_run=ensemble_params_per_run,
     )
 
-    # Pre-compile vmapped adjust_step_size (once per move, before the loop)
-    if use_full_auto:
-        from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
+    # BatchDescriptor for parallel dispatch (wrap_step / reduce_for_termination).
+    descriptor = VmapRuns(n_runs=n_runs)
 
-        # Build per-move vmapped+JIT'd functions.
-        # vmap is over the n_runs dimension of (population, step_size, emax, key).
-        # Static args (move_fn, n_samples, bounds, factor, max_ss, max_rounds)
-        # remain outside vmap.
-        jit_vmap_adjust_fns = []
-        for midx, desc in enumerate(move_descriptors):
-            def _make_vmap_fn(move_fn, n_samp, min_r, max_r, afac, max_ss, max_r2):
-                def _per_run(pop, ss, emax, key):
-                    return adjust_step_size(
-                        pop, move_fn, ss, emax, key,
-                        n_samp, min_r, max_r, afac, max_ss, max_r2,
-                    )
-                return jax.jit(jax.vmap(_per_run))
-            jit_vmap_adjust_fns.append(
-                _make_vmap_fn(
-                    per_move_fns[midx],
-                    adjust_n_samples,
-                    desc.min_rate,
-                    desc.max_rate,
-                    adjust_factor,
-                    desc.step_size_max,
-                    adjust_max_rounds,
-                )
-            )
+    # AdaptationManager: owns per-move JIT'd vmapped adjust_step_size callables.
+    # is_active iff per_move_fns + move_descriptors + adjust_interval>0 are all set.
+    adapt_mgr = AdaptationManager(
+        move_descriptors=move_descriptors or [],
+        per_move_fns=per_move_fns,
+        batch_descriptor=descriptor,
+        adjust_n_samples=adjust_n_samples,
+        adjust_factor=adjust_factor,
+        adjust_max_rounds=adjust_max_rounds,
+        adjust_interval=adjust_interval,
+    )
 
-        # (n_runs, n_moves) — current step sizes, one per run per move
-        current_step_sizes = ns_states.population.step_sizes[:, 0, :]  # (n_runs, n_moves)
+    # (n_runs, n_moves) — current step sizes, one per run per move
+    current_step_sizes = ns_states.population.step_sizes[:, 0, :]  # (n_runs, n_moves)
 
     # Per-run PRNG keys used during adaptation (independent of ns_states.rng_key)
     adapt_keys = jax.vmap(lambda k: jax.random.split(k)[0])(rng_keys)  # (n_runs,)
@@ -1006,8 +946,6 @@ def run_ns_parallel(
 
     info_interval = max(1, max_iterations // 20)
 
-    # BatchDescriptor for parallel dispatch (wrap_step / reduce_for_termination).
-    descriptor = VmapRuns(n_runs=n_runs)
     # JIT-compile vmapped ns_step
     jit_step = descriptor.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
 
@@ -1018,31 +956,13 @@ def run_ns_parallel(
     }
 
     for i in range(max_iterations):
-        # Step size adaptation via vmapped bisection (full_auto only)
-        if use_full_auto and i > 0 and i % adjust_interval == 0:
+        # Step size adaptation via AdaptationManager (vmapped bisection; fires every adjust_interval)
+        if adapt_mgr.fires(i):
             pop = ns_states.population
-            # (n_runs,) per-run emax
             emax_per_run = jnp.max(pop.energy, axis=1)  # (n_runs,)
-            # current_step_sizes: (n_runs, n_moves)
-            for move_idx, desc in enumerate(move_descriptors):
-                # Advance adapt_keys and derive per-run trial keys for this move.
-                # split_pairs: (n_runs, 2) — first column = new carry, second = trial key
-                split_pairs = jax.vmap(jax.random.split)(adapt_keys)  # (n_runs, 2)
-                adapt_keys = split_pairs[:, 0]   # carry forward
-                new_keys = split_pairs[:, 1]     # per-run trial keys
-
-                ss_move = current_step_sizes[:, move_idx]  # (n_runs,)
-                (new_ss_runs, rates, counts, n_rounds,
-                 converged, cap_hits, floor_hits, bracket_detected,
-                 _trial_n_evals_runs, _trial_n_grad_evals_runs,
-                 ) = jit_vmap_adjust_fns[move_idx](
-                    pop, ss_move, emax_per_run, new_keys,
-                )
-                current_step_sizes = current_step_sizes.at[:, move_idx].set(new_ss_runs)
-                logger.debug(
-                    "Adjusted %s (all runs): ss_mean=%.4g rate_mean=%.3f",
-                    desc.name, float(jnp.mean(new_ss_runs)), float(jnp.mean(rates)),
-                )
+            current_step_sizes, _, adapt_keys = adapt_mgr.apply(
+                pop, emax_per_run, adapt_keys, current_step_sizes,
+            )
             # Broadcast (n_runs, n_moves) -> (n_runs, n_walkers, n_moves)
             new_ss_pop = jnp.broadcast_to(
                 current_step_sizes[:, None, :],
