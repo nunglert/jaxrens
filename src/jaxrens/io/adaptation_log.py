@@ -17,6 +17,13 @@ Schema v2 (all of v1 plus):
     - ``floor_hits``          int32  — rounds where proposed ss hit 1e-20 floor
     - ``bracket_detected``    bool   — both too-high and too-low observed?
     - ``reject_reason_counts``  shape (N, n_runs, n_moves, 4) int32
+
+Schema v3 (all of v2 plus):
+  - Attribute ``adaptation_log_schema_version`` = 3
+  - Dataset ``n_evaluations``      shape (N, n_runs, n_moves) int64
+      — total backend calls per iter per move (energy-only + with-gradient)
+  - Dataset ``n_grad_evaluations`` shape (N, n_runs, n_moves) int64
+      — subset of n_evaluations that used value_and_grad (i.e. galilean, hmc)
 """
 
 from __future__ import annotations
@@ -38,13 +45,13 @@ class AdaptationLog:
     """Parsed adaptation trace loaded from an .adaptation.h5 file.
 
     Attributes:
-        iterations:        shape (n_entries,)               — NS iteration indices
-        step_sizes:        shape (n_entries, n_runs, n_moves) — per-move step sizes
-        acceptance_rates:  shape (n_entries, n_runs, n_moves) — per-move acc rates
-        move_names:        list of move name strings, length n_moves
-        n_runs:            number of parallel runs (1 for single-run)
-        n_moves:           number of move types
-        adjustment_stats:  dict of per-adjust-call diagnostics, or None for v1 files.
+        iterations:          shape (n_entries,)               — NS iteration indices
+        step_sizes:          shape (n_entries, n_runs, n_moves) — per-move step sizes
+        acceptance_rates:    shape (n_entries, n_runs, n_moves) — per-move acc rates
+        move_names:          list of move name strings, length n_moves
+        n_runs:              number of parallel runs (1 for single-run)
+        n_moves:             number of move types
+        adjustment_stats:    dict of per-adjust-call diagnostics, or None for v1/v2 files.
             Keys (all arrays shaped (n_entries, n_runs, n_moves) unless noted):
               - "n_rounds"            int32
               - "converged"           bool
@@ -52,6 +59,10 @@ class AdaptationLog:
               - "floor_hits"          int32
               - "bracket_detected"    bool
               - "reject_reason_counts" shape (n_entries, n_runs, n_moves, 4) int32
+        n_evaluations:       shape (n_entries, n_runs, n_moves) int64 — total backend
+            calls per iter per move. None for v1/v2 files.
+        n_grad_evaluations:  shape (n_entries, n_runs, n_moves) int64 — value_and_grad
+            subset. None for v1/v2 files.
     """
 
     iterations: np.ndarray          # (n_entries,)
@@ -61,6 +72,8 @@ class AdaptationLog:
     n_runs: int
     n_moves: int
     adjustment_stats: "dict[str, np.ndarray] | None" = None
+    n_evaluations: "np.ndarray | None" = None       # (n_entries, n_runs, n_moves) int64
+    n_grad_evaluations: "np.ndarray | None" = None  # (n_entries, n_runs, n_moves) int64
 
 
 class AdaptationLogger:
@@ -96,6 +109,10 @@ class AdaptationLogger:
         # Adjustment stats buffers — keyed by stat name; each entry (n_runs, n_moves) or (n_runs, n_moves, 4)
         self._buf_adj: dict[str, list[np.ndarray]] = {}
 
+        # v3: evaluation counter buffers
+        self._buf_n_evals: list[np.ndarray] = []       # each (n_runs, n_moves) int64
+        self._buf_n_grad_evals: list[np.ndarray] = []  # each (n_runs, n_moves) int64
+
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -108,6 +125,8 @@ class AdaptationLogger:
         step_sizes: np.ndarray,
         acceptance_rates: np.ndarray,
         adjustment_stats: "dict[str, np.ndarray] | None" = None,
+        n_evaluations: "np.ndarray | None" = None,
+        n_grad_evaluations: "np.ndarray | None" = None,
     ) -> None:
         """Buffer one entry.  Auto-flushes every ``_FLUSH_INTERVAL`` entries.
 
@@ -120,6 +139,11 @@ class AdaptationLogger:
                       "bracket_detected" (all shape (n_runs, n_moves) or (n_moves,)),
                       "reject_reason_counts" (shape (n_runs, n_moves, 4) or (n_moves, 4)).
                 If None, no adjustment_stats group is written (v1 behaviour).
+            n_evaluations:    optional shape (n_runs, n_moves) or (n_moves,) int64.
+                Total backend calls per iter per move. When provided (together with
+                n_grad_evaluations), schema v3 datasets are written.
+            n_grad_evaluations: optional, same shape as n_evaluations. Subset that
+                used value_and_grad.
         """
         if self._closed:
             raise RuntimeError("AdaptationLogger has been closed.")
@@ -153,6 +177,18 @@ class AdaptationLogger:
                     self._buf_adj[key] = []
                 self._buf_adj[key].append(arr)
 
+        # v3: buffer evaluation counts if provided
+        if n_evaluations is not None:
+            arr = np.asarray(n_evaluations, dtype=np.int64)
+            if arr.ndim == 1:
+                arr = arr[None, :]  # (n_moves,) -> (1, n_moves)
+            self._buf_n_evals.append(arr)
+        if n_grad_evaluations is not None:
+            arr = np.asarray(n_grad_evaluations, dtype=np.int64)
+            if arr.ndim == 1:
+                arr = arr[None, :]
+            self._buf_n_grad_evals.append(arr)
+
         if len(self._buf_iters) >= _FLUSH_INTERVAL:
             self._flush()
 
@@ -165,14 +201,19 @@ class AdaptationLogger:
             if self._buf_iters:
                 self._flush()
             self._closed = True
+            # Ensure v3 buffers are cleared even if _flush was not called
+            # (e.g., zero entries — no file created path)
+            self._buf_n_evals.clear()
+            self._buf_n_grad_evals.clear()
 
     @staticmethod
     def read(path: Path | str) -> AdaptationLog:
         """Load an .adaptation.h5 file into an AdaptationLog dataclass.
 
-        Supports both schema v1 (no adjustment_stats) and v2 (with
-        adjustment_stats/ group).  Legacy v1 files produce
-        ``adjustment_stats=None``.
+        Supports schema v1 (no adjustment_stats), v2 (with adjustment_stats/
+        group), and v3 (v2 plus n_evaluations / n_grad_evaluations datasets).
+        Legacy v1/v2 files produce ``n_evaluations=None`` and
+        ``n_grad_evaluations=None``.
 
         Args:
             path: Path to the HDF5 file.
@@ -209,6 +250,14 @@ class AdaptationLogger:
                     if key in grp:
                         adjustment_stats[key] = np.array(grp[key][:], dtype=dtype)
 
+            # v3: load evaluation count datasets if present
+            n_evaluations: "np.ndarray | None" = None
+            n_grad_evaluations: "np.ndarray | None" = None
+            if "n_evaluations" in f:
+                n_evaluations = np.array(f["n_evaluations"][:], dtype=np.int64)
+            if "n_grad_evaluations" in f:
+                n_grad_evaluations = np.array(f["n_grad_evaluations"][:], dtype=np.int64)
+
         return AdaptationLog(
             iterations=iterations,
             step_sizes=step_sizes,
@@ -217,6 +266,8 @@ class AdaptationLogger:
             n_runs=n_runs,
             n_moves=n_moves,
             adjustment_stats=adjustment_stats,
+            n_evaluations=n_evaluations,
+            n_grad_evaluations=n_grad_evaluations,
         )
 
     # ------------------------------------------------------------------
@@ -268,6 +319,14 @@ class AdaptationLogger:
             for key, buf_list in self._buf_adj.items():
                 adj_new[key] = np.stack(buf_list, axis=0)
 
+        # v3: prepare evaluation count arrays
+        has_evals = bool(self._buf_n_evals) and bool(self._buf_n_grad_evals)
+        evals_new: "np.ndarray | None" = None
+        grad_evals_new: "np.ndarray | None" = None
+        if has_evals:
+            evals_new = np.stack(self._buf_n_evals, axis=0).astype(np.int64)
+            grad_evals_new = np.stack(self._buf_n_grad_evals, axis=0).astype(np.int64)
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
         mode = "a" if self.path.exists() else "w"
@@ -293,8 +352,13 @@ class AdaptationLogger:
                 f.attrs["n_runs"] = self.n_runs
                 f.attrs["n_moves"] = self.n_moves
 
-                if has_adj:
+                # Determine schema version based on what data is present
+                if has_evals:
+                    f.attrs["adaptation_log_schema_version"] = 3
+                elif has_adj:
                     f.attrs["adaptation_log_schema_version"] = 2
+
+                if has_adj:
                     grp = f.create_group("adjustment_stats")
                     for key, arr in adj_new.items():
                         maxshape = _ADJ_STAT_MAXSHAPES.get(key, (None,) * arr.ndim)
@@ -302,6 +366,20 @@ class AdaptationLogger:
                         grp.create_dataset(
                             key, data=arr, maxshape=maxshape, chunks=chunk_shape
                         )
+
+                if has_evals:
+                    f.create_dataset(
+                        "n_evaluations",
+                        data=evals_new,
+                        maxshape=(None, self.n_runs, self.n_moves),
+                        chunks=(min(256, n_new), self.n_runs, self.n_moves),
+                    )
+                    f.create_dataset(
+                        "n_grad_evaluations",
+                        data=grad_evals_new,
+                        maxshape=(None, self.n_runs, self.n_moves),
+                        chunks=(min(256, n_new), self.n_runs, self.n_moves),
+                    )
             else:
                 # Subsequent write: extend and fill
                 n_old = f["iterations"].shape[0]
@@ -321,9 +399,18 @@ class AdaptationLogger:
                             grp[key].resize(n_old + n_new, axis=0)
                             grp[key][n_old:] = arr
 
+                if has_evals and "n_evaluations" in f:
+                    f["n_evaluations"].resize(n_old + n_new, axis=0)
+                    f["n_evaluations"][n_old:] = evals_new
+                if has_evals and "n_grad_evaluations" in f:
+                    f["n_grad_evaluations"].resize(n_old + n_new, axis=0)
+                    f["n_grad_evaluations"][n_old:] = grad_evals_new
+
         # Clear buffers
         self._buf_iters.clear()
         self._buf_ss.clear()
         self._buf_acc.clear()
         for buf_list in self._buf_adj.values():
             buf_list.clear()
+        self._buf_n_evals.clear()
+        self._buf_n_grad_evals.clear()

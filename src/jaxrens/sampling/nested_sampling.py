@@ -337,21 +337,30 @@ def ns_step(
             rr_counts = jnp.zeros((n_moves, 4), dtype=jnp.int32).at[
                 info.move_idx, scatter_col
             ].add(1)
-            return new_state, (info.accepted, n_acc, n_prop, rr_counts)
+            # Per-move energy evaluation counters
+            n_evals = jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(
+                jnp.int32(info.n_evaluations)
+            )
+            n_grad_evals = jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(
+                jnp.int32(info.n_grad_evaluations)
+            )
+            return new_state, (info.accepted, n_acc, n_prop, rr_counts, n_evals, n_grad_evals)
 
-        final, (accepted_arr, n_acc_arr, n_prop_arr, rr_arr) = jax.lax.scan(
+        final, (accepted_arr, n_acc_arr, n_prop_arr, rr_arr, n_evals_arr, n_grad_evals_arr) = jax.lax.scan(
             scan_body, walker, chain_keys
         )
         # Sum over the scan axis (n_mcmc_steps)
         return (
             final,
             jnp.sum(accepted_arr),
-            jnp.sum(n_acc_arr, axis=0),   # (n_moves,)
-            jnp.sum(n_prop_arr, axis=0),  # (n_moves,)
-            jnp.sum(rr_arr, axis=0),      # (n_moves, 4)
+            jnp.sum(n_acc_arr, axis=0),        # (n_moves,)
+            jnp.sum(n_prop_arr, axis=0),        # (n_moves,)
+            jnp.sum(rr_arr, axis=0),            # (n_moves, 4)
+            jnp.sum(n_evals_arr, axis=0),       # (n_moves,)
+            jnp.sum(n_grad_evals_arr, axis=0),  # (n_moves,)
         )
 
-    finals, acc_counts, chain_n_acc, chain_n_prop, chain_rr = jax.vmap(
+    finals, acc_counts, chain_n_acc, chain_n_prop, chain_rr, chain_n_evals, chain_n_grad_evals = jax.vmap(
         run_one_chain
     )(walk_batch, all_mcmc_keys)
 
@@ -377,9 +386,11 @@ def ns_step(
     total_steps = n_walk * n_mcmc_steps
     # Aggregate per-move counters across all walked walkers (vmap axis 0).
     # chain_n_acc / chain_n_prop / chain_rr have shape (n_walk, n_moves[, 4]).
-    agg_n_accepted = jnp.sum(chain_n_acc, axis=0)    # (n_moves,)
-    agg_n_proposed = jnp.sum(chain_n_prop, axis=0)   # (n_moves,)
-    agg_rr_counts = jnp.sum(chain_rr, axis=0)        # (n_moves, 4)
+    agg_n_accepted = jnp.sum(chain_n_acc, axis=0)          # (n_moves,)
+    agg_n_proposed = jnp.sum(chain_n_prop, axis=0)         # (n_moves,)
+    agg_rr_counts = jnp.sum(chain_rr, axis=0)              # (n_moves, 4)
+    agg_n_evals = jnp.sum(chain_n_evals, axis=0)           # (n_moves,)
+    agg_n_grad_evals = jnp.sum(chain_n_grad_evals, axis=0) # (n_moves,)
 
     info = {
         "emax": potential_max,
@@ -391,9 +402,12 @@ def ns_step(
         # Bucket convention: reject_reason_counts_per_move[:, 0] = accepted,
         #   [:, 1] = energy reject, [:, 2] = cell reject, [:, 3] = prior reject.
         # Each row sums to n_proposed_per_move for that move.
-        "n_accepted_per_move": agg_n_accepted,          # (n_moves,) int32
-        "n_proposed_per_move": agg_n_proposed,          # (n_moves,) int32
-        "reject_reason_counts_per_move": agg_rr_counts,  # (n_moves, 4) int32
+        "n_accepted_per_move": agg_n_accepted,               # (n_moves,) int32
+        "n_proposed_per_move": agg_n_proposed,               # (n_moves,) int32
+        "reject_reason_counts_per_move": agg_rr_counts,       # (n_moves, 4) int32
+        # Energy evaluation counters (summed over walkers and chain steps).
+        "n_evaluations_per_move": agg_n_evals,               # (n_moves,) int32
+        "n_grad_evaluations_per_move": agg_n_grad_evals,     # (n_moves,) int32
     }
     return new_ns_state, info
 
@@ -524,6 +538,10 @@ def run_ns(
     pop = ns_state.population
     current_step_sizes = pop.step_sizes[0]  # (n_move_types,) — same for all walkers
 
+    # Cumulative energy evaluation counters (Python-side, shape (n_moves,) int64)
+    cumulative_n_evaluations_per_move = np.zeros(n_moves, dtype=np.int64)
+    cumulative_n_grad_evaluations_per_move = np.zeros(n_moves, dtype=np.int64)
+
     for i in range(max_iterations):
         # Step size adaptation via bisection (full_auto only; no fallback path)
         _adjust_fired = False
@@ -534,13 +552,16 @@ def run_ns(
         per_move_cap_hits: list = []
         per_move_floor_hits: list = []
         per_move_bracket_detected: list = []
+        per_move_trial_n_evals: list = []
+        per_move_trial_n_grad_evals: list = []
         if use_full_auto and i > 0 and i % adjust_interval == 0:
             pop = ns_state.population
             emax = jnp.max(pop.energy)
             for move_idx, desc in enumerate(move_descriptors):
                 rng_key, key_adjust = jax.random.split(rng_key)
                 (new_ss, rate, counts,
-                 n_rounds, converged, cap_hits, floor_hits, bracket_detected
+                 n_rounds, converged, cap_hits, floor_hits, bracket_detected,
+                 trial_n_evals, trial_n_grad_evals,
                  ) = jit_adjust_fns[move_idx](
                     pop, per_move_fns[move_idx],
                     current_step_sizes[move_idx], emax, key_adjust,
@@ -555,6 +576,8 @@ def run_ns(
                 per_move_cap_hits.append(cap_hits)
                 per_move_floor_hits.append(floor_hits)
                 per_move_bracket_detected.append(bracket_detected)
+                per_move_trial_n_evals.append(trial_n_evals)
+                per_move_trial_n_grad_evals.append(trial_n_grad_evals)
                 logger.debug(
                     "Adjusted %s: ss=%.4g rate=%.3f rounds=%d converged=%s",
                     desc.name, float(new_ss), float(rate),
@@ -585,6 +608,14 @@ def run_ns(
 
         ns_state = new_ns_state
 
+        # Accumulate per-move evaluation counters (chain-phase)
+        cumulative_n_evaluations_per_move += np.asarray(
+            info["n_evaluations_per_move"], dtype=np.int64
+        )
+        cumulative_n_grad_evaluations_per_move += np.asarray(
+            info["n_grad_evaluations_per_move"], dtype=np.int64
+        )
+
         # Populate per-move adaptation data into info dict for callbacks.
         # Only present on iterations where full_auto just fired (adjust_interval).
         if _adjust_fired:
@@ -596,11 +627,26 @@ def run_ns(
             info["adjustment_cap_hits"] = jnp.array(per_move_cap_hits, dtype=jnp.int32)  # (n_moves,)
             info["adjustment_floor_hits"] = jnp.array(per_move_floor_hits, dtype=jnp.int32)  # (n_moves,)
             info["adjustment_bracket_detected"] = jnp.array(per_move_bracket_detected)  # (n_moves,)
+            trial_n_evals_arr = np.array(
+                [int(v) for v in per_move_trial_n_evals], dtype=np.int64
+            )  # (n_moves,)
+            trial_n_grad_evals_arr = np.array(
+                [int(v) for v in per_move_trial_n_grad_evals], dtype=np.int64
+            )  # (n_moves,)
+            info["trial_n_evaluations_per_move"] = trial_n_evals_arr
+            info["trial_n_grad_evaluations_per_move"] = trial_n_grad_evals_arr
+            # Also accumulate trial-phase evals into cumulative counters
+            cumulative_n_evaluations_per_move += trial_n_evals_arr
+            cumulative_n_grad_evaluations_per_move += trial_n_grad_evals_arr
             move_name_list = [d.name for d in move_descriptors]
             info["move_names"] = move_name_list
             info["move_reject_reasons"] = tuple(
                 frozenset(d.reject_reasons) for d in move_descriptors
             )
+
+        # Inject cumulative evaluation counters for callbacks (shape (n_moves,) int64)
+        info["cumulative_n_evaluations_per_move"] = cumulative_n_evaluations_per_move.copy()
+        info["cumulative_n_grad_evaluations_per_move"] = cumulative_n_grad_evaluations_per_move.copy()
 
         # The canonical periodic summary is printed by ProgressCallback;
         # do NOT add a duplicate logger.info call here.
@@ -835,6 +881,10 @@ def run_ns_parallel(
 
     jit_step = jax.jit(step_all_runs)
 
+    # Cumulative evaluation counters — shape (n_runs, n_moves) int64
+    cumulative_n_evaluations_per_move_p = np.zeros((n_runs, n_moves), dtype=np.int64)
+    cumulative_n_grad_evaluations_per_move_p = np.zeros((n_runs, n_moves), dtype=np.int64)
+
     for i in range(max_iterations):
         # Step size adaptation via vmapped bisection (full_auto only)
         if use_full_auto and i > 0 and i % adjust_interval == 0:
@@ -851,7 +901,8 @@ def run_ns_parallel(
 
                 ss_move = current_step_sizes[:, move_idx]  # (n_runs,)
                 (new_ss_runs, rates, counts, n_rounds,
-                 converged, cap_hits, floor_hits, bracket_detected
+                 converged, cap_hits, floor_hits, bracket_detected,
+                 _trial_n_evals_runs, _trial_n_grad_evals_runs,
                  ) = jit_vmap_adjust_fns[move_idx](
                     pop, ss_move, emax_per_run, new_keys,
                 )
@@ -882,6 +933,17 @@ def run_ns_parallel(
             continue
 
         ns_states = new_ns_states
+
+        # Accumulate per-move evaluation counters (chain-phase, all runs)
+        # infos["n_evaluations_per_move"] shape: (n_runs, n_moves)
+        cumulative_n_evaluations_per_move_p += np.asarray(
+            infos["n_evaluations_per_move"], dtype=np.int64
+        )
+        cumulative_n_grad_evaluations_per_move_p += np.asarray(
+            infos["n_grad_evaluations_per_move"], dtype=np.int64
+        )
+        infos["cumulative_n_evaluations_per_move"] = cumulative_n_evaluations_per_move_p.copy()
+        infos["cumulative_n_grad_evaluations_per_move"] = cumulative_n_grad_evaluations_per_move_p.copy()
 
         # Periodic log
         if i % info_interval == 0 or i == max_iterations - 1:

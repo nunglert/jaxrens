@@ -101,6 +101,7 @@ def adjust_step_size(
 ) -> tuple[
     jnp.ndarray, jnp.ndarray, jnp.ndarray,
     jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray,
+    jnp.ndarray, jnp.ndarray,
 ]:
     """Adjust step size for one move type until acceptance rate is in window.
 
@@ -126,7 +127,8 @@ def adjust_step_size(
 
     Returns:
         (new_step_size, final_rate, final_counts, n_rounds, converged,
-         cap_hits, floor_hits, bracket_detected)
+         cap_hits, floor_hits, bracket_detected,
+         trial_n_evaluations, trial_n_grad_evaluations)
         - new_step_size: scalar float — adjusted step size
         - final_rate: scalar float — acceptance rate at final round
         - final_counts: (4,) int32 — rejection reason counts from final round
@@ -136,19 +138,25 @@ def adjust_step_size(
         - floor_hits: scalar int32 — rounds where proposed ss hit 1e-20 floor
         - bracket_detected: scalar bool — True iff both too-high and too-low
           rates were observed during bisection (proper bracket formed)
+        - trial_n_evaluations: scalar int32 — total backend calls made during
+          all trial rounds (summed across walkers and rounds)
+        - trial_n_grad_evaluations: scalar int32 — value_and_grad subset of
+          trial_n_evaluations
     """
     n_walkers = population.energy.shape[0]
 
     # Carry: (step_size, step_size_prev, rate_prev, rng_key, round_idx,
     #         converged, reject_counts, cap_hits, floor_hits,
-    #         saw_too_high, saw_too_low)
+    #         saw_too_high, saw_too_low,
+    #         cumulative_n_evals, cumulative_n_grad_evals)
     def cond_fn(carry):
-        _, _, _, _, round_idx, converged, _, _, _, _, _ = carry
+        _, _, _, _, round_idx, converged, _, _, _, _, _, _, _ = carry
         return ~converged & (round_idx < max_rounds)
 
     def body_fn(carry):
         (ss, ss_prev, rate_prev, key, round_idx, converged, _,
-         cap_hits, floor_hits, saw_too_high, saw_too_low) = carry
+         cap_hits, floor_hits, saw_too_high, saw_too_low,
+         cum_evals, cum_grad_evals) = carry
 
         # 1. Sample walkers
         key, key_sample, key_trials = jax.random.split(key, 3)
@@ -175,9 +183,9 @@ def adjust_step_size(
 
         def trial_one(state, trial_key):
             _, info = move_fn(state, trial_key, emax)
-            return info.accepted, info.reject_reason
+            return info.accepted, info.reject_reason, info.n_evaluations, info.n_grad_evaluations
 
-        accepted, reasons = jax.vmap(trial_one)(sample, trial_keys)
+        accepted, reasons, n_evals_per_sample, n_grad_evals_per_sample = jax.vmap(trial_one)(sample, trial_keys)
         rate = jnp.mean(accepted.astype(jnp.float32))
 
         # Per-reason counts (code 0=accepted, 1=energy, 2=cell, 3=prior)
@@ -187,6 +195,12 @@ def adjust_step_size(
             jnp.sum(reasons == 2),
             jnp.sum(reasons == 3),
         ], dtype=jnp.int32)
+
+        # Accumulate evaluation counts over all trial rounds
+        round_evals = jnp.sum(n_evals_per_sample.astype(jnp.int32))
+        round_grad_evals = jnp.sum(n_grad_evals_per_sample.astype(jnp.int32))
+        new_cum_evals = cum_evals + round_evals
+        new_cum_grad_evals = cum_grad_evals + round_grad_evals
 
         # 4. Process rate → new step size + convergence flag + diagnostics
         new_ss, new_converged, cap_hit, floor_hit, too_high, too_low = _process_rate_jax(
@@ -202,7 +216,8 @@ def adjust_step_size(
         return (new_ss, ss, rate, key, round_idx + 1,
                 converged | new_converged, counts,
                 new_cap_hits, new_floor_hits,
-                new_saw_too_high, new_saw_too_low)
+                new_saw_too_high, new_saw_too_low,
+                new_cum_evals, new_cum_grad_evals)
 
     init_carry = (
         step_size,
@@ -216,13 +231,17 @@ def adjust_step_size(
         jnp.array(0, dtype=jnp.int32),   # floor_hits
         jnp.array(False),                 # saw_too_high
         jnp.array(False),                 # saw_too_low
+        jnp.array(0, dtype=jnp.int32),   # cumulative_n_evals
+        jnp.array(0, dtype=jnp.int32),   # cumulative_n_grad_evals
     )
 
     final = jax.lax.while_loop(cond_fn, body_fn, init_carry)
     (final_ss, _, final_rate, _, n_rounds, converged, final_counts,
-     cap_hits, floor_hits, saw_too_high, saw_too_low) = final
+     cap_hits, floor_hits, saw_too_high, saw_too_low,
+     trial_n_evals, trial_n_grad_evals) = final
 
     bracket_detected = saw_too_high & saw_too_low
 
     return (final_ss, final_rate, final_counts,
-            n_rounds, converged, cap_hits, floor_hits, bracket_detected)
+            n_rounds, converged, cap_hits, floor_hits, bracket_detected,
+            trial_n_evals, trial_n_grad_evals)

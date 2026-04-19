@@ -12,6 +12,7 @@ the pre-existing example output that ships in the repo.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import matplotlib
@@ -20,7 +21,7 @@ matplotlib.use("Agg")  # headless, must be before any other matplotlib import
 import numpy as np
 import pytest
 
-from jaxrens.cli.monitor import _format_reject_breakdown
+from jaxrens.cli.monitor import _format_reject_breakdown, ProgressCallback
 from jaxrens.postprocess.monitor import Monitor
 from jaxrens.postprocess.collection import MonitorCollection
 from jaxrens.postprocess import (
@@ -44,29 +45,38 @@ from jaxrens.postprocess.thermodynamics import (
 # ---------------------------------------------------------------------------
 
 class TestFormatRejectBreakdown:
-    """Unit tests for the reject-reason column formatter in monitor.py."""
+    """Unit tests for the reject-reason column formatter in monitor.py.
+
+    Percentages use fixed-width format ``{pct:>3.0f}%`` (4 chars incl. ``%``):
+    - 100% -> ``"100%"`` (no leading space)
+    - 60%  -> ``" 60%"`` (one leading space)
+    - 7%   -> ``"  7%"`` (two leading spaces)
+    """
 
     def test_energy_only_reasons_used(self):
-        """counts=[10,5,0,0] with reasons_used={"energy"} -> E=100%."""
+        """counts=[10,5,0,0] with reasons_used={"energy"} -> E=100% (no leading space)."""
         result = _format_reject_breakdown(
             [10, 5, 0, 0], reasons_used=frozenset({"energy"})
         )
         assert result == "   reject: E=100%"
 
     def test_energy_and_cell_reasons_used(self):
-        """counts=[10,3,2,0] with reasons_used={"energy","cell"} -> E=60% C=40%."""
+        """counts=[10,3,2,0] with reasons_used={"energy","cell"} -> E= 60% C= 40%."""
         result = _format_reject_breakdown(
             [10, 3, 2, 0], reasons_used=frozenset({"energy", "cell"})
         )
-        assert result == "   reject: E=60% C=40%"
+        assert result == "   reject: E= 60% C= 40%"
 
     def test_backward_compat_none_reasons_used(self):
-        """counts=[10,3,2,0] with reasons_used=None -> all three columns (backward compat)."""
+        """counts=[10,3,2,0] with reasons_used=None -> all three columns (backward compat).
+
+        Each percentage token is 4 chars: ``{label}={pct:>3.0f}%``.
+        """
         result = _format_reject_breakdown([10, 3, 2, 0], reasons_used=None)
-        # Expected: E=60% C=40% P=0%
-        assert "E=60%" in result
-        assert "C=40%" in result
-        assert "P=0%" in result
+        # E= 60%, C= 40%, P=  0%  (fixed-width, right-aligned in 3 chars)
+        assert "E= 60%" in result
+        assert "C= 40%" in result
+        assert "P=  0%" in result
 
     def test_all_accepted_returns_empty(self):
         """counts=[10,0,0,0] with any reasons_used -> empty string."""
@@ -79,13 +89,13 @@ class TestFormatRejectBreakdown:
         assert _format_reject_breakdown([0, 0, 0, 0]) == ""
 
     def test_all_three_reasons(self):
-        """counts=[5,3,1,1] with all three reasons -> E=60% C=20% P=20%."""
+        """counts=[5,3,1,1] with all three reasons -> E= 60% C= 20% P= 20%."""
         result = _format_reject_breakdown(
             [5, 3, 1, 1], reasons_used=frozenset({"energy", "cell", "prior"})
         )
-        assert "E=60%" in result
-        assert "C=20%" in result
-        assert "P=20%" in result
+        assert "E= 60%" in result
+        assert "C= 20%" in result
+        assert "P= 20%" in result
 
     def test_galilean_energy_only_output(self):
         """Galilean: reasons_used={"energy"}, some rejects -> only E column."""
@@ -102,8 +112,267 @@ class TestFormatRejectBreakdown:
         result = _format_reject_breakdown(
             [10, 0, 5, 0], reasons_used=frozenset({"energy"})
         )
-        # E=0% from declared, ???=5 from undeclared
+        # E=  0% from declared, ???=5 from undeclared
         assert "???" in result
+
+    def test_pct_token_width_is_four_chars(self):
+        """Every percentage token (label + '=' + digits + '%') must be exactly 5 chars.
+
+        Format: ``{label}={pct:>3.0f}%`` -> e.g. ``"E= 60%"`` (6 chars total for label+token).
+        The token itself ``= 60%`` is 5 chars.  We test by splitting on spaces and
+        inspecting the numeric portion widths.
+        """
+        # 53 energy rejects, 47 cell rejects out of 100 total rejects (0 accepted)
+        result = _format_reject_breakdown(
+            [0, 53, 47, 0], reasons_used=frozenset({"energy", "cell"})
+        )
+        # Should contain "E= 53%" and "C= 47%"
+        assert "E= 53%" in result
+        assert "C= 47%" in result
+
+    def test_single_digit_pct_padded(self):
+        """Single-digit percent is padded to two leading spaces: ``P=  7%``."""
+        # 1 reject in prior out of 14 total
+        result = _format_reject_breakdown(
+            [1, 7, 6, 1], reasons_used=frozenset({"energy", "cell", "prior"})
+        )
+        assert "P=  7%" in result
+
+
+# ---------------------------------------------------------------------------
+# ProgressCallback column-alignment tests
+# ---------------------------------------------------------------------------
+
+def _capture_progress_lines(info: dict, batched: bool = False) -> list[str]:
+    """Run ProgressCallback.on_iteration with a synthetic ns_state and capture the log output.
+
+    Returns the list of lines from the single logger.info call emitted by on_iteration.
+    Uses a plain dict for ns_state because _is_batched has a dict branch (.get()).
+    """
+    import jax.numpy as jnp
+
+    # _is_batched uses .get() when ns_state is not an NSState instance.
+    if batched:
+        ns_state = {"log_evidence": jnp.array([1.0, 1.1, 1.05])}
+    else:
+        ns_state = {"log_evidence": jnp.array(1.0)}
+
+    cb = ProgressCallback(info_interval=1)
+
+    # Capture logger output via a handler
+    records = []
+
+    class _RecordHandler(logging.Handler):
+        def emit(self, record):
+            records.append(self.format(record))
+
+    handler = _RecordHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    target_logger = logging.getLogger("jaxrens.cli.monitor")
+    target_logger.addHandler(handler)
+    old_level = target_logger.level
+    target_logger.setLevel(logging.DEBUG)
+    try:
+        cb.on_iteration(100, ns_state, info)
+    finally:
+        target_logger.removeHandler(handler)
+        target_logger.setLevel(old_level)
+
+    assert records, "ProgressCallback.on_iteration did not emit any log message"
+    # The callback emits a single multi-line message; split it.
+    return records[0].split("\n")
+
+
+def _acc_col_offset(row: str) -> int:
+    """Return the character index of 'acc=' within a per-move row string."""
+    idx = row.find("acc=")
+    assert idx != -1, f"'acc=' not found in row: {repr(row)}"
+    return idx
+
+
+class TestProgressCallbackAlignment:
+    """Assert that acc= starts at the same column across all per-move rows."""
+
+    def _make_single_run_info(self, n_moves: int = 3, with_rejects: bool = True):
+        """Build a minimal info dict for single-run mode."""
+        import jax.numpy as jnp
+
+        move_names = ["galilean", "volume", "shear_strain"]
+        ss = jnp.array([5.0, 0.011, 0.5])
+        acc = jnp.array([0.62, 0.10, 0.50])
+
+        if with_rejects:
+            # galilean: energy rejects only; volume: energy+cell; shear: energy only
+            rc = jnp.array([
+                [620, 380, 0, 0],    # galilean: 38% energy reject
+                [100, 90, 810, 0],   # volume: energy + cell rejects
+                [500, 500, 0, 0],    # shear: energy rejects
+            ])
+            move_reject_reasons = (
+                frozenset({"energy"}),
+                frozenset({"energy", "cell"}),
+                frozenset({"energy"}),
+            )
+        else:
+            rc = None
+            move_reject_reasons = None
+
+        return {
+            "emax": -102.3,
+            "step_sizes_per_move": ss,
+            "move_names": move_names,
+            "n_accepted_per_move": jnp.array([620, 100, 500]),
+            "n_proposed_per_move": jnp.array([1000, 1000, 1000]),
+            "reject_reason_counts_per_move": rc,
+            "move_reject_reasons": move_reject_reasons,
+        }
+
+    def _make_batched_info(self, n_runs: int = 3, n_moves: int = 3):
+        """Build a minimal info dict for batched (multi-run) mode."""
+        import jax.numpy as jnp
+
+        move_names = ["galilean", "volume", "shear_strain"]
+        # shape (n_runs, n_moves)
+        ss = jnp.ones((n_runs, n_moves)) * jnp.array([5.0, 0.011, 0.5])
+        acc = jnp.ones((n_runs, n_moves)) * jnp.array([0.62, 0.10, 0.50])
+        rc = jnp.ones((n_runs, n_moves, 4), dtype=jnp.int32) * jnp.array([500, 300, 200, 0])
+
+        return {
+            "emax": jnp.array([-102.3, -102.1, -102.5]),
+            "step_sizes_per_move": ss,
+            "move_names": move_names,
+            "n_accepted_per_move": acc * 1000,
+            "n_proposed_per_move": jnp.ones((n_runs, n_moves), dtype=jnp.int32) * 1000,
+            "reject_reason_counts_per_move": rc,
+            "move_reject_reasons": (
+                frozenset({"energy"}),
+                frozenset({"energy", "cell"}),
+                frozenset({"energy"}),
+            ),
+        }
+
+    def test_single_run_with_rejects_acc_aligned(self):
+        """All per-move rows in single-run output have acc= at the same column."""
+        info = self._make_single_run_info(with_rejects=True)
+        lines = _capture_progress_lines(info, batched=False)
+        move_rows = [l for l in lines if "acc=" in l]
+        assert len(move_rows) == 3, f"Expected 3 per-move rows, got: {move_rows}"
+        offsets = [_acc_col_offset(r) for r in move_rows]
+        assert len(set(offsets)) == 1, (
+            f"acc= column offset differs across rows: {offsets}\nRows:\n"
+            + "\n".join(move_rows)
+        )
+
+    def test_single_run_no_rejects_acc_aligned(self):
+        """Rows without reject suffix still have acc= at the same column."""
+        info = self._make_single_run_info(with_rejects=False)
+        lines = _capture_progress_lines(info, batched=False)
+        move_rows = [l for l in lines if "acc=" in l]
+        assert len(move_rows) == 3
+        offsets = [_acc_col_offset(r) for r in move_rows]
+        assert len(set(offsets)) == 1, (
+            f"acc= column offset differs: {offsets}\nRows:\n" + "\n".join(move_rows)
+        )
+
+    def test_single_run_reject_and_no_reject_same_column(self):
+        """Rows with and without reject suffix must have acc= at the same column.
+
+        Synthesise: galilean (no reject because 100% accepted), volume (with reject).
+        """
+        import jax.numpy as jnp
+
+        info = {
+            "emax": -50.0,
+            "step_sizes_per_move": jnp.array([5.0, 0.011]),
+            "move_names": ["galilean", "volume"],
+            "n_accepted_per_move": jnp.array([1000, 200]),
+            "n_proposed_per_move": jnp.array([1000, 1000]),
+            "reject_reason_counts_per_move": jnp.array([
+                [1000, 0, 0, 0],   # galilean: all accepted -> no reject suffix
+                [200, 500, 300, 0], # volume: energy+cell rejects
+            ]),
+            "move_reject_reasons": (
+                frozenset({"energy"}),
+                frozenset({"energy", "cell"}),
+            ),
+        }
+        lines = _capture_progress_lines(info, batched=False)
+        move_rows = [l for l in lines if "acc=" in l]
+        assert len(move_rows) == 2
+        offsets = [_acc_col_offset(r) for r in move_rows]
+        assert len(set(offsets)) == 1, (
+            f"acc= column not aligned between galilean (no-reject) and volume (with-reject):\n"
+            + "\n".join(f"  offset={o}: {repr(r)}" for o, r in zip(offsets, move_rows))
+        )
+        # Additionally verify that galilean row has no "reject:" and volume row does.
+        assert "reject:" not in move_rows[0], "galilean should have no reject suffix"
+        assert "reject:" in move_rows[1], "volume should have reject suffix"
+
+    def test_batched_acc_aligned(self):
+        """All per-move rows in batched output have acc= at the same column."""
+        info = self._make_batched_info()
+        lines = _capture_progress_lines(info, batched=True)
+        move_rows = [l for l in lines if "acc=" in l]
+        assert len(move_rows) == 3
+        offsets = [_acc_col_offset(r) for r in move_rows]
+        assert len(set(offsets)) == 1, (
+            f"acc= column differs in batched rows: {offsets}\nRows:\n"
+            + "\n".join(move_rows)
+        )
+
+    def test_name_width_16_chars(self):
+        """Name column is padded/truncated to 16 characters."""
+        import jax.numpy as jnp
+
+        # "replica_exchange" is exactly 16 chars — should fit without overflow
+        info = {
+            "emax": -10.0,
+            "step_sizes_per_move": jnp.array([1.0, 0.1]),
+            "move_names": ["a", "replica_exchange"],
+            "n_accepted_per_move": jnp.array([500, 500]),
+            "n_proposed_per_move": jnp.array([1000, 1000]),
+            "reject_reason_counts_per_move": None,
+            "move_reject_reasons": None,
+        }
+        lines = _capture_progress_lines(info, batched=False)
+        move_rows = [l for l in lines if "acc=" in l]
+        assert len(move_rows) == 2
+        offsets = [_acc_col_offset(r) for r in move_rows]
+        assert len(set(offsets)) == 1, (
+            f"Short name 'a' and 16-char name 'replica_exchange' produce different acc= offsets: {offsets}\n"
+            + "\n".join(move_rows)
+        )
+
+    def test_ss_scientific_notation_fixed_width(self):
+        """Step size is formatted as :>9.3e — same width regardless of magnitude."""
+        import jax.numpy as jnp
+
+        info = {
+            "emax": -10.0,
+            "step_sizes_per_move": jnp.array([5.0, 1e-6]),
+            "move_names": ["big", "small"],
+            "n_accepted_per_move": jnp.array([500, 500]),
+            "n_proposed_per_move": jnp.array([1000, 1000]),
+            "reject_reason_counts_per_move": None,
+            "move_reject_reasons": None,
+        }
+        lines = _capture_progress_lines(info, batched=False)
+        move_rows = [l for l in lines if "acc=" in l]
+        assert len(move_rows) == 2
+        offsets = [_acc_col_offset(r) for r in move_rows]
+        assert len(set(offsets)) == 1, (
+            f"Different ss magnitudes should not shift acc= column: {offsets}\n"
+            + "\n".join(move_rows)
+        )
+        # Both ss= tokens should have the same length after "ss="
+        # Format is "ss={v:>9.3e}" so the token after "ss=" is 9 chars + "  acc=" separator
+        for row in move_rows:
+            ss_start = row.find("ss=") + 3
+            acc_start = row.find("  acc=")
+            ss_token = row[ss_start:acc_start]
+            assert len(ss_token) == 9, (
+                f"ss token width should be 9 chars, got {len(ss_token)}: {repr(ss_token)}"
+            )
 
 
 # ---------------------------------------------------------------------------

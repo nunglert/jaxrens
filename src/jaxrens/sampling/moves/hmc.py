@@ -100,10 +100,15 @@ def build_kernel(
             overflow=acc_overflow,
         )
 
+        # leapfrog_step makes 2 value_and_grad calls per step (half-step each side).
+        # The final energy evaluation (line 84) is a plain backend call, not value_and_grad.
+        # Total: 2*n_leapfrog evaluations (all value_and_grad) + 1 plain eval = 2*n_leapfrog+1.
+        # n_grad_evaluations = 2*n_leapfrog (the value_and_grad subset only).
         info = MoveInfo(
             accepted=accepted,
             log_likelihood=-new_state.energy,
-            n_evaluations=2 * n_leapfrog,
+            n_evaluations=2 * n_leapfrog + 1,
+            n_grad_evaluations=jnp.int32(2 * n_leapfrog),
         )
 
         return new_state, info

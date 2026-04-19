@@ -41,6 +41,7 @@ class MoveInfo(NamedTuple):
     n_evaluations: int
     reject_reason: jnp.ndarray = jnp.int32(0)
     move_idx: jnp.ndarray = jnp.int32(0)
+    n_grad_evaluations: int = jnp.int32(0)
 
 
 class StepFn(Protocol):

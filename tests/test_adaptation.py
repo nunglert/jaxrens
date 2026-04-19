@@ -99,7 +99,7 @@ class TestBisectionMovesTowardWindow:
         jit_adjust = jax.jit(adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10))
 
         # Wide window [0.5, 0.9]; harmonic with ss=0.3 typically lands in window
-        new_ss, rate, _, n_rounds, converged, cap, floor, bracket = jit_adjust(
+        new_ss, rate, _, n_rounds, converged, cap, floor, bracket, *_ = jit_adjust(
             pop, harmonic_pop["per_move_fns"][0],
             jnp.array(0.3), emax, jax.random.key(1),
             40, 0.5, 0.9, 1.5, 5.0, 25,
@@ -121,7 +121,7 @@ class TestBisectionMovesTowardWindow:
 
         # harmonic acceptance ~0.73 — set window [0.8, 0.95] so rate=0.73 < min_rate
         # → bisection must DECREASE ss to reduce acceptance
-        new_ss, rate, _, n_rounds, converged, cap, floor, bracket = jit_adjust(
+        new_ss, rate, _, n_rounds, converged, cap, floor, bracket, *_ = jit_adjust(
             pop, harmonic_pop["per_move_fns"][0],
             jnp.array(0.3), emax, jax.random.key(2),
             50, 0.80, 0.95, 1.5, 5.0, 20,
@@ -138,7 +138,7 @@ class TestBisectionMovesTowardWindow:
         jit_adjust = jax.jit(adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10))
 
         max_rounds = 3
-        _, _, _, n_rounds, _, _, _, _ = jit_adjust(
+        _, _, _, n_rounds, *_ = jit_adjust(
             pop, harmonic_pop["per_move_fns"][0],
             jnp.array(0.3), emax, jax.random.key(10),
             20, 0.80, 0.95, 1.5, 5.0, max_rounds,
@@ -153,7 +153,7 @@ class TestBisectionMovesTowardWindow:
         emax = jnp.max(pop.energy)
         jit_adjust = jax.jit(adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10))
 
-        new_ss, rate, _, n_rounds, converged, cap, floor, bracket = jit_adjust(
+        new_ss, rate, _, n_rounds, converged, cap, floor, bracket, *_ = jit_adjust(
             pop, harmonic_pop["per_move_fns"][0],
             jnp.array(0.3), emax, jax.random.key(5),
             30, 0.2, 0.7, 1.5, 5.0, 10,
@@ -177,9 +177,10 @@ class TestBisectionJITAndVmap:
             jnp.array(0.3), emax, jax.random.key(0),
             20, 0.2, 0.7, 1.5, 5.0, 10,
         )
-        # Unpack 8-element tuple
+        # Unpack 10-element tuple (8 original + 2 eval counters added in Task 2)
         (new_ss, final_rate, final_counts, n_rounds,
-         converged, cap_hits, floor_hits, bracket) = result
+         converged, cap_hits, floor_hits, bracket,
+         trial_n_evals, trial_n_grad_evals) = result
         assert new_ss.shape == ()
         assert final_counts.shape == (4,)
         assert final_counts.dtype == jnp.int32

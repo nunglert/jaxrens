@@ -146,10 +146,15 @@ def build_kernel(
             overflow=acc_overflow,
         )
 
+        # n_reflect calls to value_and_grad (when use_forces=True),
+        # or n_reflect plain energy calls (when use_forces=False).
+        # n_grad_evaluations tracks the value_and_grad subset.
+        n_grad = n_reflect if use_forces else 0
         info = MoveInfo(
             accepted=accepted,
             log_likelihood=-new_state.energy,
             n_evaluations=n_reflect,
+            n_grad_evaluations=jnp.int32(n_grad),
         )
 
         return new_state, info

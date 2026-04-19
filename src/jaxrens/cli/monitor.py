@@ -87,7 +87,7 @@ def _format_reject_breakdown(
         pct_e = 100 * int(c[1]) / n_rej
         pct_c = 100 * int(c[2]) / n_rej
         pct_p = 100 * int(c[3]) / n_rej
-        return f"   reject: E={pct_e:.0f}% C={pct_c:.0f}% P={pct_p:.0f}%"
+        return f"   reject: E={pct_e:>3.0f}% C={pct_c:>3.0f}% P={pct_p:>3.0f}%"
 
     # Filter to declared reasons; build ordered parts list
     parts = []
@@ -96,7 +96,7 @@ def _format_reject_breakdown(
             idx = _BUCKET_IDX[reason]
             label = _BUCKET_LABEL[reason]
             pct = 100 * int(c[idx]) / n_rej
-            parts.append(f"{label}={pct:.0f}%")
+            parts.append(f"{label}={pct:>3.0f}%")
 
     if not parts:
         # reasons_used is non-empty but none match our known reasons —
@@ -163,6 +163,17 @@ class ProgressCallback:
         batched = _is_batched(ns_state)
 
         # ---- header line ------------------------------------------------
+        # Evaluation counter suffix (backward-compat: absent for callers that
+        # don't populate cumulative_n_evaluations_per_move)
+        cum_evals_arr = info.get("cumulative_n_evaluations_per_move")
+        cum_grad_arr = info.get("cumulative_n_grad_evaluations_per_move")
+        if cum_evals_arr is not None and cum_grad_arr is not None:
+            cum_e = float(np.asarray(cum_evals_arr).sum())
+            cum_g = float(np.asarray(cum_grad_arr).sum())
+            eval_suffix = f"  nE={cum_e:.2e}  nG={cum_g:.2e}"
+        else:
+            eval_suffix = ""
+
         if batched:
             emax_arr = jnp.asarray(info.get("emax", 0))
             log_z_arr = jnp.asarray(
@@ -174,6 +185,7 @@ class ProgressCallback:
                 f"  Emax=[{float(jnp.min(emax_arr)):.4g}..{float(jnp.max(emax_arr)):.4g}]"
                 f"  log_Z=[{float(jnp.min(log_z_arr)):.4f}..{float(jnp.max(log_z_arr)):.4f}]"
                 f"  dt={dt:.1f}s"
+                f"{eval_suffix}"
             )
         else:
             log_z = float(
@@ -185,6 +197,7 @@ class ProgressCallback:
                 f"  Emax={float(info.get('emax', 0)):.6g}"
                 f"  log_Z={log_z:.4f}"
                 f"  dt={dt:.1f}s"
+                f"{eval_suffix}"
             )
 
         # ---- per-move rows -----------------------------------------------
@@ -239,8 +252,8 @@ class ProgressCallback:
                     rc_sum = jnp.sum(rc, axis=0) if rc is not None else None
                     for k, name in enumerate(move_names):
                         row = (
-                            f"  {name:<12}  ss={float(ss_mean[k]):.4g}±{float(ss_std[k]):.3g}"
-                            f"     acc={float(acc_mean[k]):.2f}±{float(acc_std[k]):.2f}"
+                            f"  {name:<16}  ss={float(ss_mean[k]):>9.3e}±{float(ss_std[k]):>8.2e}"
+                            f"  acc={float(acc_mean[k]):>4.2f}±{float(acc_std[k]):>4.2f}"
                         )
                         if rc_sum is not None:
                             reasons_k = move_reject_reasons[k] if move_reject_reasons is not None else None
@@ -253,8 +266,8 @@ class ProgressCallback:
                         acc = acc[0] if acc.ndim == 2 else acc
                     for k, name in enumerate(move_names):
                         row = (
-                            f"  {name:<12}  ss={float(ss[k]):.4g}"
-                            f"     acc={float(acc[k]):.2f}"
+                            f"  {name:<16}  ss={float(ss[k]):>9.3e}"
+                            f"  acc={float(acc[k]):>4.2f}"
                         )
                         if rc is not None:
                             reasons_k = move_reject_reasons[k] if move_reject_reasons is not None else None
@@ -338,11 +351,26 @@ class AdaptationCallback:
                     adjustment_stats = {}
                 adjustment_stats[_adj_rename[info_key]] = np.asarray(val)
 
+        # Collect per-iter evaluation counts for v3 schema (shape (n_runs, n_moves))
+        n_evals_raw = info.get("n_evaluations_per_move")
+        n_grad_evals_raw = info.get("n_grad_evaluations_per_move")
+        n_evals_np: "np.ndarray | None" = None
+        n_grad_evals_np: "np.ndarray | None" = None
+        if n_evals_raw is not None:
+            arr = np.asarray(n_evals_raw, dtype=np.int64)
+            # Ensure (n_runs, n_moves) shape
+            n_evals_np = arr[None, :] if arr.ndim == 1 else arr
+        if n_grad_evals_raw is not None:
+            arr = np.asarray(n_grad_evals_raw, dtype=np.int64)
+            n_grad_evals_np = arr[None, :] if arr.ndim == 1 else arr
+
         self._adaptation_logger.write_entry(
             iteration=iteration,
             step_sizes=np.asarray(ss_np),
             acceptance_rates=np.asarray(acc_np),
             adjustment_stats=adjustment_stats,
+            n_evaluations=n_evals_np,
+            n_grad_evaluations=n_grad_evals_np,
         )
 
     def on_finish(self, ns_state: Any) -> None:

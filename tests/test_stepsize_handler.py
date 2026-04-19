@@ -161,7 +161,7 @@ class TestAdjustStepSize:
         jit_adjust = jax.jit(
             adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10)
         )
-        new_ss, rate, _, n_rounds, converged, cap_hits, floor_hits, bracket_detected = jit_adjust(
+        new_ss, rate, _, n_rounds, converged, cap_hits, floor_hits, bracket_detected, trial_n_evals, trial_n_grad_evals = jit_adjust(
             pop, s["per_move_fns"][0],
             jnp.array(0.001), emax, jax.random.key(123),
             30, 0.2, 0.7, 1.5, 5.0, 15,
@@ -174,6 +174,11 @@ class TestAdjustStepSize:
         assert floor_hits.dtype == jnp.int32
         assert converged.dtype == jnp.bool_
         assert bracket_detected.dtype == jnp.bool_
+        # new eval counter fields
+        assert trial_n_evals.dtype == jnp.int32
+        assert trial_n_grad_evals.dtype == jnp.int32
+        assert int(trial_n_evals) >= 0
+        assert int(trial_n_grad_evals) >= 0
 
     def test_converges_to_window(self, harmonic_mwg):
         """Adjusted step size should produce rate within target window."""
@@ -184,7 +189,7 @@ class TestAdjustStepSize:
         jit_adjust = jax.jit(
             adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10)
         )
-        new_ss, rate, _, n_rounds, converged, cap_hits, floor_hits, bracket_detected = jit_adjust(
+        new_ss, rate, _, n_rounds, converged, cap_hits, floor_hits, bracket_detected, *_ = jit_adjust(
             pop, s["per_move_fns"][0],
             jnp.array(0.5), emax, jax.random.key(456),
             40, 0.2, 0.7, 1.5, 5.0, 15,
@@ -193,8 +198,8 @@ class TestAdjustStepSize:
         # (generous tolerance since stochastic)
         assert 0.05 < float(rate) < 0.95
 
-    def test_return_tuple_has_eight_elements(self, harmonic_mwg):
-        """adjust_step_size must return exactly 8 elements."""
+    def test_return_tuple_has_ten_elements(self, harmonic_mwg):
+        """adjust_step_size must return exactly 10 elements (added trial eval counters in Task 2)."""
         s = harmonic_mwg
         pop = s["ns_state"].population
         emax = jnp.max(pop.energy)
@@ -204,7 +209,7 @@ class TestAdjustStepSize:
             jnp.array(0.1), emax, jax.random.key(0),
             20, 0.2, 0.7, 1.5, 5.0, 10,
         )
-        assert len(result) == 8
+        assert len(result) == 10
 
     def test_n_rounds_bounded_by_max_rounds(self, harmonic_mwg):
         """n_rounds must not exceed max_rounds."""
@@ -216,7 +221,7 @@ class TestAdjustStepSize:
         jit_adjust = jax.jit(
             adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10)
         )
-        _, _, _, n_rounds, _, _, _, _ = jit_adjust(
+        _, _, _, n_rounds, *_ = jit_adjust(
             pop, s["per_move_fns"][0],
             jnp.array(0.5), emax, jax.random.key(7),
             20, 0.2, 0.7, 1.5, 5.0, max_rounds,
@@ -233,7 +238,7 @@ class TestAdjustStepSize:
             adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10)
         )
         # step_size near max so scale-up hits the cap
-        _, _, _, n_rounds, _, cap_hits, floor_hits, _ = jit_adjust(
+        _, _, _, n_rounds, _, cap_hits, floor_hits, *_ = jit_adjust(
             pop, s["per_move_fns"][0],
             jnp.array(4.5), emax, jax.random.key(99),
             30, 0.2, 0.7, 1.5, 5.0, 10,
@@ -253,7 +258,7 @@ class TestAdjustStepSize:
         jit_adjust = jax.jit(
             adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10)
         )
-        new_ss, final_rate, final_counts, n_rounds, converged, cap_hits, floor_hits, bracket_detected = jit_adjust(
+        new_ss, final_rate, final_counts, n_rounds, converged, cap_hits, floor_hits, bracket_detected, trial_n_evals, trial_n_grad_evals = jit_adjust(
             pop, s["per_move_fns"][0],
             jnp.array(0.3), emax, jax.random.key(1),
             20, 0.2, 0.7, 1.5, 5.0, 10,
@@ -272,6 +277,11 @@ class TestAdjustStepSize:
         assert floor_hits.dtype == jnp.int32
         assert bracket_detected.shape == ()
         assert bracket_detected.dtype == jnp.bool_
+        # New eval counter fields
+        assert trial_n_evals.shape == ()
+        assert trial_n_evals.dtype == jnp.int32
+        assert trial_n_grad_evals.shape == ()
+        assert trial_n_grad_evals.dtype == jnp.int32
 
     def test_vmap_compatible(self, harmonic_mwg):
         """adjust_step_size must be vmappable over rng_key."""
