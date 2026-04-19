@@ -22,7 +22,7 @@ import numpy as np
 
 from jaxrens.base import NSCallback
 from jaxrens.sampling.adaptation.manager import AdaptationManager
-from jaxrens.sampling.batch_descriptor import SingleRun, VmapRuns
+from jaxrens.sampling.batch_descriptor import PmapVmapRuns, SingleRun, VmapRuns
 from jaxrens.sampling.run_loop import (
     _bump_cumulative_counters,
     _dispatch_callbacks,
@@ -781,4 +781,304 @@ def run_ns_parallel(
         "n_dead": ns_states.n_dead,
         "n_walkers": n_walkers,
         "n_runs": n_runs,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU NS: pmap(vmap(ns_step))
+# ---------------------------------------------------------------------------
+
+
+def init_ns_multi_gpu(
+    init_fn: Callable,
+    positions: jnp.ndarray,
+    types: jnp.ndarray,
+    energies: jnp.ndarray,
+    cells: jnp.ndarray | None,
+    rng_keys: jax.Array,
+    n_gpu: int,
+    n_per_gpu: int,
+    max_dead: int = 50000,
+    step_sizes: jnp.ndarray | None = None,
+    ensemble_params_per_run: list[dict] | None = None,
+    restart_states: list[list] | None = None,
+) -> NSState:
+    """Initialize a ``(G, P, ...)``-shaped NSState for pmap(vmap) execution.
+
+    Delegates to ``init_ns_parallel`` with ``n_runs = G*P``, then reshapes
+    all dynamic fields from ``(G*P, ...)`` to ``(G, P, ...)``.
+
+    Args:
+        init_fn: MCState constructor from ``build_mwg()``.
+        positions: Shape ``(G*P, n_walkers, n_atoms, 3)`` or ``(G, P, n_walkers, n_atoms, 3)``.
+            If 5-D, interpreted as already having the ``(G, P)`` prefix.
+        types: Shape ``(n_atoms,)`` shared, or ``(G*P, n_walkers, n_atoms)``.
+        energies: Shape ``(G*P, n_walkers)`` or ``(G, P, n_walkers)``.
+        cells: Shape ``(G*P, n_walkers, 3, 3)`` or ``(G, P, n_walkers, 3, 3)`` or None.
+        rng_keys: Shape ``(G*P,)`` or ``(G, P)`` — one key per run.
+        n_gpu: Number of GPU devices (G).
+        n_per_gpu: Number of NS runs per GPU (P).
+        max_dead: Max dead points per run.
+        step_sizes: Per-move step sizes (shared across all runs).
+        ensemble_params_per_run: Flat list of ``G*P`` dicts, or ``None``.
+        restart_states: ``(G, P)`` nested list of ``RestartBundle | None``, or
+            ``None`` for a fresh start on all runs.  Mixed restart (some runs
+            fresh, some from checkpoint) is supported.
+
+    Returns:
+        NSState with shape ``(G, P, ...)`` on all dynamic fields.
+    """
+    n_total = n_gpu * n_per_gpu
+
+    # Flatten (G, P, ...) -> (G*P, ...) if inputs arrive in 2D-prefix form.
+    # We detect 2D-prefix by checking if arr.shape[:2] == (n_gpu, n_per_gpu).
+    def _flatten_leading(arr):
+        """If arr has a (G, P) leading prefix, merge to (G*P)."""
+        if arr is None:
+            return arr
+        if arr.ndim >= 2 and arr.shape[0] == n_gpu and arr.shape[1] == n_per_gpu:
+            return arr.reshape((n_total,) + arr.shape[2:])
+        return arr
+
+    positions_flat = _flatten_leading(positions)   # (G*P, K, A, 3)
+    energies_flat = _flatten_leading(energies)      # (G*P, K)
+    cells_flat = _flatten_leading(cells) if cells is not None else None
+    rng_keys_flat = rng_keys.reshape(n_total) if rng_keys.ndim == 2 else rng_keys
+
+    # Flatten restart_states from (G, P) nested list to flat list of G*P.
+    rs_flat: list | None = None
+    if restart_states is not None:
+        rs_flat = []
+        for gpu_list in restart_states:
+            rs_flat.extend(gpu_list)
+
+    # Build flat (G*P, ...) NSState via init_ns_parallel.
+    flat_states = init_ns_parallel(
+        init_fn, positions_flat, types, energies_flat, cells_flat,
+        rng_keys_flat, max_dead, step_sizes,
+        ensemble_params_per_run=ensemble_params_per_run,
+        restart_states=rs_flat,
+    )
+
+    # Reshape all dynamic fields from (G*P, ...) to (G, P, ...).
+    def _reshape(x):
+        if x is None:
+            return x
+        arr = jnp.asarray(x)
+        return arr.reshape((n_gpu, n_per_gpu) + arr.shape[1:])
+
+    return jax.tree.map(_reshape, flat_states)
+
+
+def run_ns_multi_gpu(
+    positions: jnp.ndarray,
+    types: jnp.ndarray,
+    energies: jnp.ndarray,
+    cells: jnp.ndarray | None,
+    init_fn: Callable,
+    step_fn: Callable,
+    rng_keys: jax.Array,
+    n_gpu: int,
+    n_per_gpu: int,
+    n_walkers: int | None = None,
+    max_iterations: int = 10000,
+    n_mcmc_steps: int = 20,
+    n_extra: int = 0,
+    convergence_threshold: float = 0.1,
+    initial_step_size: float = 0.1,
+    target_acceptance: float = 0.5,
+    callbacks: list[Any] | None = None,
+    termination_criteria: list[TerminationCriterion] | None = None,
+    ensemble_params_per_run: list[dict] | None = None,
+    per_move_fns: list[Callable] | None = None,
+    move_descriptors: list | None = None,
+    adjust_interval: int = 0,
+    adjust_n_samples: int = 50,
+    adjust_max_rounds: int = 15,
+    adjust_factor: float = 1.5,
+    restart_states: list[list] | None = None,
+) -> dict:
+    """Run NS with ``pmap(vmap(ns_step))`` dispatch across G GPUs × P runs each.
+
+    Shape convention: ``(G, P, ...)`` where G=n_gpu, P=n_per_gpu.
+
+    Args:
+        positions: ``(G*P, n_walkers, n_atoms, 3)`` or ``(G, P, n_walkers, n_atoms, 3)``.
+        types: ``(n_atoms,)`` shared, or ``(G*P, n_walkers, n_atoms)``.
+        energies: ``(G*P, n_walkers)`` or ``(G, P, n_walkers)``.
+        cells: ``(G*P, n_walkers, 3, 3)`` / ``(G, P, n_walkers, 3, 3)`` or None.
+        init_fn: MCState constructor from ``build_mwg()``.
+        step_fn: MCMC step function from ``build_mwg()``.
+        rng_keys: ``(G*P,)`` or ``(G, P)`` per-run PRNG keys.
+        n_gpu: Number of GPU devices to use (G).  Must satisfy
+            ``n_gpu >= 1`` and ``n_gpu <= len(jax.devices())``.
+        n_per_gpu: Number of independent NS runs per GPU (P).
+            Must be ``>= 1``.
+        n_walkers: Inferred from positions if None.
+        max_iterations: Max NS iterations per run.
+        n_mcmc_steps: MCMC steps per walker (static).
+        n_extra: Extra walkers to walk per iteration (static).
+        convergence_threshold: For ``PriorMassTermination``.
+        initial_step_size: Starting step size.
+        target_acceptance: Kept for interface parity; unused directly.
+        callbacks: List of callback objects with optional ``on_iteration`` /
+            ``on_finish`` methods.  Callbacks receive the ``(G, P, ...)``-shaped
+            ``NSState`` directly.  Each ``info`` dict contains
+            ``info["_batch"] = PmapVmapRuns(n_gpu, n_per_gpu)`` so callbacks
+            can identify the batch shape via ``info["_batch"].is_batched``.
+            ``log_evidence`` in the associated ``NSState`` has shape ``(G, P)``.
+        termination_criteria: Optional.  Defaults to
+            ``[IterationTermination(max_iterations),
+               PriorMassTermination(n_walkers, convergence_threshold)]``.
+        ensemble_params_per_run: Flat list of ``G*P`` dicts, or ``None``.
+        per_move_fns: Per-move step functions for bisection adaptation.
+        move_descriptors: ``MoveKernel`` descriptors carrying rate bounds + max ss.
+        adjust_interval: Adapt every N iters.  0 = no adaptation.
+        adjust_n_samples: Walkers sampled per bisection trial round (static).
+        adjust_max_rounds: Max bisection rounds per adjust call (static).
+        adjust_factor: Multiplicative bisection factor (static).
+        restart_states: ``(G, P)`` nested list of ``RestartBundle | None``.
+            Pass ``None`` (default) for a fresh start on all runs.
+            Mixed restart (some checkpointed, some fresh) is supported
+            within a single call.
+
+    Returns:
+        Dict with shapes ``(G, P, ...)`` on all array fields:
+        ``log_evidence``, ``n_dead``, ``iteration`` → ``(G, P)``;
+        ``dead_energies`` → ``(G, P, max_dead)``;
+        ``positions`` → ``(G, P, n_walkers, n_atoms, 3)``; etc.
+
+    Raises:
+        ValueError: If ``n_gpu < 1``, ``n_per_gpu < 1``, or
+            ``n_gpu > len(jax.devices())``.
+    """
+    if callbacks is None:
+        callbacks = []
+
+    if n_gpu < 1:
+        raise ValueError(f"n_gpu must be >= 1, got {n_gpu}")
+    if n_per_gpu < 1:
+        raise ValueError(f"n_per_gpu must be >= 1, got {n_per_gpu}")
+    n_available = len(jax.devices())
+    if n_gpu > n_available:
+        raise ValueError(
+            f"n_gpu={n_gpu} exceeds available devices={n_available}. "
+            f"Available: {jax.devices()}"
+        )
+
+    n_total = n_gpu * n_per_gpu
+
+    # Infer n_walkers from the position array.
+    # Positions may be (G*P, K, A, 3) or (G, P, K, A, 3).
+    if n_walkers is None:
+        if positions.ndim == 5:
+            # (G, P, K, A, 3) form
+            n_walkers = positions.shape[2]
+        else:
+            # (G*P, K, A, 3) form
+            n_walkers = positions.shape[1]
+
+    if termination_criteria is None:
+        termination_criteria = [
+            IterationTermination(max_iterations),
+            PriorMassTermination(n_walkers, convergence_threshold),
+        ]
+    if move_descriptors is not None:
+        n_moves = len(move_descriptors)
+    elif per_move_fns is not None:
+        n_moves = len(per_move_fns)
+    else:
+        n_moves = 1
+
+    # Flatten rng_keys to (G*P,) for init.
+    rng_keys_flat = rng_keys.reshape(n_total) if rng_keys.ndim == 2 else rng_keys
+
+    # Initialize (G, P, ...) state via init_ns_multi_gpu.
+    ns_states = init_ns_multi_gpu(
+        init_fn, positions, types, energies, cells,
+        rng_keys_flat, n_gpu, n_per_gpu,
+        max_dead=max_iterations,
+        step_sizes=jnp.full(n_moves, initial_step_size),
+        ensemble_params_per_run=ensemble_params_per_run,
+        restart_states=restart_states,
+    )
+
+    logger.info(
+        "Starting multi-GPU NS: n_gpu=%d, n_per_gpu=%d (%d total runs), "
+        "n_walkers=%d, max_iter=%d, n_mcmc=%d, n_extra=%d",
+        n_gpu, n_per_gpu, n_total, n_walkers, max_iterations, n_mcmc_steps, n_extra,
+    )
+
+    descriptor = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+    adapt_mgr = AdaptationManager(
+        move_descriptors=move_descriptors or [],
+        per_move_fns=per_move_fns,
+        batch_descriptor=descriptor,
+        adjust_n_samples=adjust_n_samples,
+        adjust_factor=adjust_factor,
+        adjust_max_rounds=adjust_max_rounds,
+        adjust_interval=adjust_interval,
+    )
+
+    # Per-run PRNG keys for adaptation (shape (G, P)).
+    # Derive from rng_keys_flat by splitting, then reshape to (G, P).
+    adapt_keys_flat = jax.vmap(lambda k: jax.random.split(k)[0])(rng_keys_flat)
+    adapt_keys = adapt_keys_flat.reshape(n_gpu, n_per_gpu)
+
+    ns_states, adapt_keys, _cumulative = _run_loop(
+        descriptor=descriptor,
+        adapt_mgr=adapt_mgr,
+        ns_state=ns_states,
+        step_fn=step_fn,
+        n_mcmc_steps=n_mcmc_steps,
+        n_extra=n_extra,
+        max_iterations=max_iterations,
+        termination_criteria=termination_criteria,
+        callbacks=callbacks,
+        n_moves=n_moves,
+        move_descriptors=move_descriptors,
+        rng_key=adapt_keys,
+        info_interval=max(1, max_iterations // 20),
+    )
+
+    # Final evidence: per-run contribution from remaining live walkers.
+    # ns_states.population.energy shape: (G, P, K)
+    remaining_potentials = ns_states.population.energy  # (G, P, K)
+    log_remaining_mass = -ns_states.iteration / n_walkers  # (G, P)
+    log_avg_likelihood = -jnp.mean(remaining_potentials, axis=-1)  # (G, P)
+    ns_states = ns_states.set(
+        log_evidence=jnp.logaddexp(
+            ns_states.log_evidence,
+            log_remaining_mass + log_avg_likelihood,
+        ),
+    )
+
+    for g in range(n_gpu):
+        for p in range(n_per_gpu):
+            logger.info(
+                "GPU %d run %d complete: %d dead points, log_Z=%.4f",
+                g, p, int(ns_states.n_dead[g, p]),
+                float(ns_states.log_evidence[g, p]),
+            )
+
+    for cb in callbacks:
+        if hasattr(cb, "on_finish"):
+            cb.on_finish(ns_states)
+
+    pop = ns_states.population
+    return {
+        "positions": pop.positions,
+        "types": pop.types,
+        "energies": pop.energy,
+        "cells": pop.cell,
+        "dead_energies": ns_states.dead_energies,
+        "dead_positions": ns_states.dead_positions,
+        "dead_volumes": ns_states.dead_volumes,
+        "log_evidence": ns_states.log_evidence,    # (G, P)
+        "iteration": ns_states.iteration,           # (G, P)
+        "n_dead": ns_states.n_dead,                 # (G, P)
+        "n_walkers": n_walkers,
+        "n_gpu": n_gpu,
+        "n_per_gpu": n_per_gpu,
+        "n_runs": n_total,
     }

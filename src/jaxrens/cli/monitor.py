@@ -259,14 +259,25 @@ class ProgressCallback:
             if acc_per_move is not None:
                 acc = jnp.asarray(acc_per_move)
 
-                if batched and ss.ndim == 2:
-                    # ss shape (n_runs, n_moves), acc shape (n_runs, n_moves)
-                    ss_mean = jnp.mean(ss, axis=0)
-                    ss_std = jnp.std(ss, axis=0)
-                    acc_mean = jnp.mean(acc, axis=0)
-                    acc_std = jnp.std(acc, axis=0)
-                    # Reject counts: sum over runs, shape (n_moves, 4)
-                    rc_sum = jnp.sum(rc, axis=0) if rc is not None else None
+                # Flatten any leading batch dims (ndim >= 2) into one run axis so
+                # the batched-stats branch sees shape (n_runs_flat, n_moves).
+                # This handles both VmapRuns (ndim==2) and PmapVmapRuns (ndim==3,
+                # shape (G,P,n_moves)).
+                if batched and ss.ndim >= 2:
+                    # Flatten all leading dims: (G, P, n_moves) -> (G*P, n_moves)
+                    n_moves_here = ss.shape[-1]
+                    ss_flat = ss.reshape(-1, n_moves_here)
+                    acc_flat = acc.reshape(-1, n_moves_here)
+                    ss_mean = jnp.mean(ss_flat, axis=0)
+                    ss_std = jnp.std(ss_flat, axis=0)
+                    acc_mean = jnp.mean(acc_flat, axis=0)
+                    acc_std = jnp.std(acc_flat, axis=0)
+                    # Reject counts: flatten leading dims, then sum over runs.
+                    if rc is not None:
+                        rc_flat = jnp.asarray(rc).reshape(-1, n_moves_here, 4)
+                        rc_sum = jnp.sum(rc_flat, axis=0)  # (n_moves, 4)
+                    else:
+                        rc_sum = None
                     for k, name in enumerate(move_names):
                         row = (
                             f"  {name:<16}  ss={float(ss_mean[k]):>9.3e}±{float(ss_std[k]):>8.2e}"
@@ -299,19 +310,46 @@ class ProgressCallback:
     def on_finish(self, ns_state: Any) -> None:
         elapsed = time.time() - self._start_time
         if isinstance(ns_state, NSState):
-            logger.info(
-                "NS finished: %d iterations, log_Z=%.4f, elapsed=%.1fs",
-                int(ns_state.iteration),
-                float(ns_state.log_evidence),
-                elapsed,
-            )
+            # For batched runs (VmapRuns/PmapVmapRuns), iteration and log_evidence
+            # may have shape (n_runs,) or (G, P).  Report aggregate stats.
+            iteration_arr = jnp.asarray(ns_state.iteration)
+            log_z_arr = jnp.asarray(ns_state.log_evidence)
+            if iteration_arr.ndim > 0:
+                logger.info(
+                    "NS finished: iter=[%d..%d], log_Z=[%.4f..%.4f], elapsed=%.1fs",
+                    int(jnp.min(iteration_arr)),
+                    int(jnp.max(iteration_arr)),
+                    float(jnp.min(log_z_arr)),
+                    float(jnp.max(log_z_arr)),
+                    elapsed,
+                )
+            else:
+                logger.info(
+                    "NS finished: %d iterations, log_Z=%.4f, elapsed=%.1fs",
+                    int(iteration_arr),
+                    float(log_z_arr),
+                    elapsed,
+                )
         else:
-            logger.info(
-                "NS finished: %d iterations, log_Z=%.4f, elapsed=%.1fs",
-                ns_state["iteration"],
-                float(ns_state["log_evidence"]),
-                elapsed,
-            )
+            log_z_arr = jnp.asarray(ns_state.get("log_evidence", float("-inf")))
+            iteration_val = ns_state.get("iteration", 0)
+            iter_arr = jnp.asarray(iteration_val)
+            if iter_arr.ndim > 0:
+                logger.info(
+                    "NS finished: iter=[%d..%d], log_Z=[%.4f..%.4f], elapsed=%.1fs",
+                    int(jnp.min(iter_arr)),
+                    int(jnp.max(iter_arr)),
+                    float(jnp.min(log_z_arr)),
+                    float(jnp.max(log_z_arr)),
+                    elapsed,
+                )
+            else:
+                logger.info(
+                    "NS finished: %d iterations, log_Z=%.4f, elapsed=%.1fs",
+                    int(iter_arr),
+                    float(log_z_arr),
+                    elapsed,
+                )
 
 
 class AdaptationCallback:
@@ -338,10 +376,16 @@ class AdaptationCallback:
         ss_np = jnp.asarray(ss)
         acc_np = jnp.asarray(acc)
 
-        # Ensure (n_runs, n_moves) shape — logger handles 1D -> (1, n_moves)
+        # Ensure (n_runs, n_moves) shape — logger handles 1D -> (1, n_moves).
+        # PmapVmapRuns produces (G, P, n_moves); flatten to (G*P, n_moves).
         if ss_np.ndim == 1:
             ss_np = ss_np[None, :]
             acc_np = acc_np[None, :]
+        elif ss_np.ndim >= 3:
+            # (G, P, n_moves) or higher — flatten all leading dims
+            n_moves_here = ss_np.shape[-1]
+            ss_np = ss_np.reshape(-1, n_moves_here)
+            acc_np = acc_np.reshape(-1, n_moves_here)
 
         # Collect per-adjust-call diagnostic stats when present (v2 schema)
         adjustment_stats: "dict[str, np.ndarray] | None" = None

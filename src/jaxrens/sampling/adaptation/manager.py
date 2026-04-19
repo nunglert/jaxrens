@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
-from jaxrens.sampling.batch_descriptor import BatchDescriptor, SingleRun, VmapRuns
+from jaxrens.sampling.batch_descriptor import BatchDescriptor, PmapVmapRuns, SingleRun, VmapRuns
 
 logger = logging.getLogger(__name__)
 
@@ -164,14 +164,24 @@ class AdaptationManager:
             )
 
         is_vmap = isinstance(self._batch_descriptor, VmapRuns)
+        is_pmap_vmap = isinstance(self._batch_descriptor, PmapVmapRuns)
 
         # Collect per-move outputs as lists (one item per move).
-        # For SingleRun: each item is a scalar/array.
-        # For VmapRuns:  each item is a (n_runs, ...) array.
+        # For SingleRun:    each item is a scalar/array.
+        # For VmapRuns:     each item is a (n_runs, ...) array.
+        # For PmapVmapRuns: each item is a (G, P, ...) array.
         per_move_results: list[tuple] = []
 
         for move_idx, desc in enumerate(self._move_descriptors):
-            if is_vmap:
+            if is_pmap_vmap:
+                # current_step_sizes: (G, P, n_moves); rng_key: (G, P)
+                # emax: (G, P)
+                rng_key, key_adjust = self._split_pmap_vmap_keys(rng_key)
+                ss_move = current_step_sizes[:, :, move_idx]  # (G, P)
+                result = self._jit_fns[move_idx](pop, ss_move, emax, key_adjust)
+                new_ss = result[0]  # (G, P)
+                current_step_sizes = current_step_sizes.at[:, :, move_idx].set(new_ss)
+            elif is_vmap:
                 # current_step_sizes: (n_runs, n_moves); rng_key: (n_runs,)
                 # emax: (n_runs,)
                 rng_key, key_adjust = self._split_vmap_keys(rng_key)
@@ -195,13 +205,17 @@ class AdaptationManager:
             per_move_results.append(result[1:])  # skip new_ss (index 0)
 
         # Stack per-move results into arrays keyed by diagnostic name.
-        # For SingleRun, each result[k] is a scalar/array; stack along axis 0 → (n_moves, ...).
-        # For VmapRuns, each result[k] is (n_runs, ...) → stack along axis 1 (new axis after n_runs).
-        # Convenient: jnp.stack(..., axis=0) then transpose to (n_runs, n_moves, ...) if needed.
+        # For SingleRun:    each result[k] is scalar or (4,); stack → (n_moves, ...).
+        # For VmapRuns:     each result[k] is (n_runs,) or (n_runs, 4); stack → (n_runs, n_moves, ...).
+        # For PmapVmapRuns: each result[k] is (G, P) or (G, P, 4); stack → (G, P, n_moves, ...).
         per_move_outputs: dict = {}
         for k, key_name in enumerate(_DIAG_KEYS):
             values = [r[k] for r in per_move_results]
-            if is_vmap:
+            if is_pmap_vmap:
+                # Each value is (G, P) or (G, P, 4) etc.
+                # Stack along axis 2 to get (G, P, n_moves) or (G, P, n_moves, 4).
+                stacked = jnp.stack(values, axis=2)  # (G, P, n_moves, ...)
+            elif is_vmap:
                 # Each value is (n_runs,) or (n_runs, 4) etc.
                 # Stack along a new axis 1 to get (n_runs, n_moves) or (n_runs, n_moves, 4).
                 stacked = jnp.stack(values, axis=1)  # (n_runs, n_moves, ...)
@@ -212,8 +226,9 @@ class AdaptationManager:
             per_move_outputs[key_name] = stacked
 
         # Return the advanced rng_key so the caller can carry it forward.
-        # For SingleRun: rng_key is the residual after n_moves splits.
-        # For VmapRuns: rng_key is the (n_runs,) carry after n_moves per-run splits.
+        # For SingleRun:    rng_key is the residual after n_moves splits.
+        # For VmapRuns:     rng_key is the (n_runs,) carry after n_moves per-run splits.
+        # For PmapVmapRuns: rng_key is the (G, P) carry after n_moves per-run splits.
         return current_step_sizes, per_move_outputs, rng_key
 
     # ------------------------------------------------------------------
@@ -224,13 +239,20 @@ class AdaptationManager:
         """Build one JIT'd callable per move type.
 
         For ``SingleRun``:
-            ``jax.jit(adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10))``
+            ``jax.jit(lambda pop, ss, emax, key: adjust_step_size(...))``
             with the static config baked in via a closure.
 
         For ``VmapRuns``:
             ``jax.jit(jax.vmap(lambda pop_r, ss_r, emax_r, key_r: adjust_step_size(...)))``
             where the static config is captured in the closure.
+
+        For ``PmapVmapRuns``:
+            ``jax.pmap(jax.vmap(lambda pop_r, ss_r, emax_r, key_r: adjust_step_size(...)),
+            axis_name="gpu")``
+            Outer pmap over G (GPU) axis; inner vmap over P (per-GPU runs) axis.
+            pmap is self-JIT-compiling so no additional jax.jit is added.
         """
+        is_pmap_vmap = isinstance(self._batch_descriptor, PmapVmapRuns)
         is_vmap = isinstance(self._batch_descriptor, VmapRuns)
         fns = []
         for move_idx, desc in enumerate(self._move_descriptors):
@@ -242,7 +264,31 @@ class AdaptationManager:
             max_ss = desc.step_size_max
             max_rounds = self._adjust_max_rounds
 
-            if is_vmap:
+            if is_pmap_vmap:
+                # Close over all static args so pmap(vmap(...)) sees no static arg issues.
+                # pop has shape (G, P, n_walkers, ...); ss_move shape (G, P); emax (G, P);
+                # key_adjust (G, P).
+                # pmap maps over G, vmap maps over P, inner fn gets single-run shapes.
+                def _make_pmap_vmap_fn(
+                    _move_fn=move_fn,
+                    _n_samp=n_samp,
+                    _min_r=min_r,
+                    _max_r=max_r,
+                    _afac=afac,
+                    _max_ss=max_ss,
+                    _max_rounds=max_rounds,
+                ) -> Callable:
+                    def _per_run(pop_r, ss_r, emax_r, key_r):
+                        return adjust_step_size(
+                            pop_r, _move_fn, ss_r, emax_r, key_r,
+                            _n_samp, _min_r, _max_r, _afac, _max_ss, _max_rounds,
+                        )
+                    # pmap is self-JIT-compiling — do NOT wrap in jax.jit.
+                    return jax.pmap(jax.vmap(_per_run), axis_name="gpu")
+
+                fns.append(_make_pmap_vmap_fn())
+
+            elif is_vmap:
                 # Close over all static args so vmap sees no static arg boundary issues.
                 def _make_vmap_fn(
                     _move_fn=move_fn,
@@ -296,4 +342,19 @@ class AdaptationManager:
         pairs = jax.vmap(jax.random.split)(rng_key)  # (n_runs, 2)
         carry = pairs[:, 0]
         trial = pairs[:, 1]
+        return carry, trial
+
+    def _split_pmap_vmap_keys(
+        self, rng_key: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        """Split a (G, P) key array into two (G, P) arrays.
+
+        Returns ``(carry_keys, trial_keys)`` each of shape ``(G, P)``.
+        """
+        # vmap over G then over P: jax.random.split(k) → (2,) → index 0 and 1.
+        pairs = jax.vmap(
+            jax.vmap(jax.random.split)
+        )(rng_key)  # (G, P, 2) typed-key array
+        carry = pairs[:, :, 0]  # (G, P)
+        trial = pairs[:, :, 1]  # (G, P)
         return carry, trial

@@ -1,6 +1,36 @@
 """Checkpoint save/load for NS run resumption.
 
 HDF5-based checkpointing of full NS state.
+
+Shape conventions
+-----------------
+``save_checkpoint`` and ``load_checkpoint`` are shape-agnostic.  The state
+dict produced by ``run_ns`` (single run) has scalar ``log_evidence``,
+``n_dead``, ``iteration``.  The dict produced by ``run_ns_parallel`` has
+1-D ``(n_runs,)`` shapes for those fields.  The dict produced by
+``run_ns_multi_gpu`` has 2-D ``(G, P)`` shapes.
+
+All these shapes round-trip correctly:
+
+* **Save**: arrays are stored as HDF5 datasets (any shape); scalars are stored
+  as HDF5 attrs.  A field is treated as a scalar only when
+  ``np.asarray(value).ndim == 0``.  ``float(...)`` / ``int(...)`` casts are
+  avoided for fields that may be batched.
+* **Load**: datasets are read back with their stored shape.  ``iteration``,
+  ``n_dead``, and ``n_walkers`` are returned as plain Python ints (they are
+  always stored as scalars — only ``log_evidence`` can be batched).
+* **Dead-point padding** (``load_checkpoint``): works for 1-D dead arrays
+  (``n_dead`` is a scalar).  For multi-run checkpoints, the caller is
+  expected to save only the live-walker ``NSState``; use ``save_ns_state`` /
+  ``load_ns_state`` (future) for batched restarts, or save per-run slices.
+
+Batch-shape inference
+---------------------
+After loading, the caller can inspect ``state["log_evidence"].shape`` to
+determine the batch shape:
+* ``()`` → ``SingleRun``
+* ``(n_runs,)`` → ``VmapRuns``
+* ``(G, P)`` → ``PmapVmapRuns``
 """
 
 from __future__ import annotations
@@ -18,6 +48,27 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _to_np(value: Any) -> np.ndarray:
+    """Convert a JAX / numpy / Python numeric value to a numpy array."""
+    return np.asarray(value)
+
+
+def _store_field(f: h5py.File, key: str, value: Any) -> None:
+    """Store *value* as an HDF5 dataset (any shape) or attr (scalar 0-D).
+
+    Scalar 0-D numpy arrays are stored as attrs for backward compatibility
+    with the ``f.attrs["iteration"]`` read pattern in old files.  Arrays with
+    ``ndim >= 1`` are stored as datasets so their full shape is preserved.
+    """
+    arr = _to_np(value)
+    if arr.ndim == 0:
+        # Scalar — store as attr; use Python int/float for cleaner HDF5 type.
+        py_val = arr.item()
+        f.attrs[key] = py_val
+    else:
+        f.create_dataset(key, data=arr)
+
+
 def save_checkpoint(
     path: Path | str,
     ns_state: dict,
@@ -25,48 +76,102 @@ def save_checkpoint(
 ) -> None:
     """Save NS state to HDF5 checkpoint.
 
+    Handles any leading batch shape on ``log_evidence``, ``n_dead``,
+    ``iteration``, ``dead_energies``, and ``dead_positions``:
+
+    * ``SingleRun``: all scalar / 1-D — stored as attrs or 1-D datasets.
+    * ``VmapRuns``: ``log_evidence`` / ``n_dead`` / ``iteration`` are 1-D
+      ``(n_runs,)`` — stored as 1-D datasets.
+    * ``PmapVmapRuns``: those fields are ``(G, P)`` — stored as 2-D datasets.
+
+    The ``dead_energies`` slicing ``[:n_dead]`` is only applied when
+    ``n_dead`` is a scalar (single run).  For batched runs the full padded
+    array is saved (callers are expected to slice per-run before saving if
+    space is a concern).
+
     Args:
         path: Path for the checkpoint file.
-        ns_state: NS state dict from run_ns / ns_step.
+        ns_state: NS state dict from run_ns / run_ns_parallel / run_ns_multi_gpu.
         symbol_map: Optional mapping from type codes to element symbols.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    n_dead_arr = _to_np(ns_state["n_dead"])
+    is_scalar_run = n_dead_arr.ndim == 0
+
     with h5py.File(path, "w") as f:
-        f.create_dataset("positions", data=np.asarray(ns_state["positions"]))
-        f.create_dataset("types", data=np.asarray(ns_state["types"]))
-        f.create_dataset("energies", data=np.asarray(ns_state["energies"]))
+        f.create_dataset("positions", data=_to_np(ns_state["positions"]))
+        f.create_dataset("types", data=_to_np(ns_state["types"]))
+        f.create_dataset("energies", data=_to_np(ns_state["energies"]))
         if ns_state.get("cells") is not None:
-            f.create_dataset("cells", data=np.asarray(ns_state["cells"]))
-        f.create_dataset(
-            "dead_energies",
-            data=np.asarray(ns_state["dead_energies"][: ns_state["n_dead"]]),
-        )
-        f.create_dataset(
-            "dead_positions",
-            data=np.asarray(ns_state["dead_positions"][: ns_state["n_dead"]]),
-        )
-        if ns_state.get("dead_volumes") is not None:
+            f.create_dataset("cells", data=_to_np(ns_state["cells"]))
+
+        if is_scalar_run:
+            # Compact storage: only store the live dead entries.
+            n_dead_int = int(n_dead_arr)
             f.create_dataset(
-                "dead_volumes",
-                data=np.asarray(ns_state["dead_volumes"][: ns_state["n_dead"]]),
+                "dead_energies",
+                data=_to_np(ns_state["dead_energies"][:n_dead_int]),
             )
+            f.create_dataset(
+                "dead_positions",
+                data=_to_np(ns_state["dead_positions"][:n_dead_int]),
+            )
+            if ns_state.get("dead_volumes") is not None:
+                f.create_dataset(
+                    "dead_volumes",
+                    data=_to_np(ns_state["dead_volumes"][:n_dead_int]),
+                )
+        else:
+            # Batched run: save full padded arrays; batch dims preserved.
+            f.create_dataset(
+                "dead_energies", data=_to_np(ns_state["dead_energies"])
+            )
+            f.create_dataset(
+                "dead_positions", data=_to_np(ns_state["dead_positions"])
+            )
+            if ns_state.get("dead_volumes") is not None:
+                f.create_dataset(
+                    "dead_volumes", data=_to_np(ns_state["dead_volumes"])
+                )
+
         if ns_state.get("live_volumes") is not None:
-            f.create_dataset(
-                "live_volumes",
-                data=np.asarray(ns_state["live_volumes"]),
-            )
-        f.attrs["log_evidence"] = float(ns_state["log_evidence"])
-        f.attrs["iteration"] = int(ns_state["iteration"])
-        f.attrs["n_dead"] = int(ns_state["n_dead"])
+            f.create_dataset("live_volumes", data=_to_np(ns_state["live_volumes"]))
+
+        # log_evidence may be batched — store as dataset when ndim >= 1.
+        _store_field(f, "log_evidence", ns_state["log_evidence"])
+
+        # iteration / n_dead / n_walkers are always scalar for single runs;
+        # for batched runs they can be arrays.  Use _store_field to avoid
+        # float()/int() casts on arrays.
+        _store_field(f, "iteration", ns_state["iteration"])
+        _store_field(f, "n_dead", ns_state["n_dead"])
+        # n_walkers is always a plain Python int in all three result dicts.
         f.attrs["n_walkers"] = int(ns_state["n_walkers"])
+
         if symbol_map is not None:
             f.attrs["symbol_map"] = json.dumps(
                 {str(k): v for k, v in symbol_map.items()}
             )
 
-    logger.info("Checkpoint saved to %s (iteration %d)", path, ns_state["iteration"])
+    # Log a safe iteration value regardless of batch shape.
+    _iter_arr = _to_np(ns_state["iteration"])
+    _iter_log = int(_iter_arr.flat[0]) if _iter_arr.size > 0 else -1
+    logger.info("Checkpoint saved to %s (iteration %s)", path, _iter_log)
+
+
+def _read_field(f: h5py.File, key: str) -> np.ndarray | int | float:
+    """Read a field that may be stored either as an attr or a dataset.
+
+    Returns a numpy array (dataset) or a Python scalar (attr).
+    """
+    if key in f:
+        return f[key][()]   # numpy array, shape preserved
+    elif key in f.attrs:
+        return f.attrs[key]  # scalar attr
+    else:
+        raise KeyError(f"Field '{key}' not found in checkpoint (neither dataset nor attr).")
 
 
 def load_checkpoint(
@@ -75,46 +180,81 @@ def load_checkpoint(
 ) -> dict:
     """Load NS state from HDF5 checkpoint.
 
+    Handles checkpoints written by any of the three run variants:
+    ``run_ns`` (scalar fields), ``run_ns_parallel`` (1-D), and
+    ``run_ns_multi_gpu`` (2-D ``(G, P)``).
+
+    The returned ``log_evidence`` has whatever shape was stored.  Call
+    ``state["log_evidence"].shape`` to infer the batch configuration.
+
+    Dead-array padding is only applied for **scalar** (single-run)
+    checkpoints where ``n_dead`` is a plain integer.  For batched
+    checkpoints the full stored arrays are returned as-is.
+
     Args:
         path: Path to checkpoint file.
         rng_key: New RNG key for resumed run. If None, uses key(0).
 
     Returns:
-        NS state dict compatible with ns_step / run_ns.
+        NS state dict compatible with ns_step / run_ns and variants.
     """
     path = Path(path)
     if rng_key is None:
         rng_key = jax.random.key(0)
 
     with h5py.File(path, "r") as f:
-        positions = jnp.array(f["positions"][:])
-        types = jnp.array(f["types"][:])
-        energies = jnp.array(f["energies"][:])
-        cells = jnp.array(f["cells"][:]) if "cells" in f else None
-        dead_energies_data = jnp.array(f["dead_energies"][:])
-        dead_positions_data = jnp.array(f["dead_positions"][:])
-        log_evidence = jnp.array(f.attrs["log_evidence"])
-        iteration = int(f.attrs["iteration"])
-        n_dead = int(f.attrs["n_dead"])
+        positions = jnp.array(f["positions"][()])
+        types = jnp.array(f["types"][()])
+        energies = jnp.array(f["energies"][()])
+        cells = jnp.array(f["cells"][()]) if "cells" in f else None
+
+        dead_energies_raw = jnp.array(f["dead_energies"][()])
+        dead_positions_raw = jnp.array(f["dead_positions"][()])
+
+        # log_evidence: stored as dataset (batched) or attr (scalar).
+        log_evidence_raw = _read_field(f, "log_evidence")
+        log_evidence = jnp.array(log_evidence_raw)
+
+        # iteration / n_dead: may be dataset or attr.
+        iteration_raw = _read_field(f, "iteration")
+        n_dead_raw = _read_field(f, "n_dead")
         n_walkers = int(f.attrs["n_walkers"])
 
-    # Pad dead arrays to reasonable max_dead
-    max_dead = max(n_dead * 2, 50000)
-    dead_energies = jnp.full(max_dead, jnp.inf)
-    dead_energies = dead_energies.at[:n_dead].set(dead_energies_data)
-    dead_positions = jnp.zeros((max_dead, *positions.shape[1:]))
-    dead_positions = dead_positions.at[:n_dead].set(dead_positions_data)
+        dead_volumes_raw = jnp.array(f["dead_volumes"][()]) if "dead_volumes" in f else None
+        live_volumes = jnp.array(f["live_volumes"][()]) if "live_volumes" in f else None
 
-    with h5py.File(path, "r") as f:
-        if "dead_volumes" in f:
-            dead_volumes_data = jnp.array(f["dead_volumes"][:])
+    # Determine whether this is a scalar (single-run) checkpoint.
+    n_dead_np = np.asarray(n_dead_raw)
+    is_scalar_run = n_dead_np.ndim == 0
+    iteration_np = np.asarray(iteration_raw)
+
+    if is_scalar_run:
+        # Single-run: pad dead arrays to max_dead.
+        n_dead = int(n_dead_np)
+        iteration = int(iteration_np)
+        max_dead = max(n_dead * 2, 50000)
+
+        dead_energies = jnp.full(max_dead, jnp.inf)
+        dead_energies = dead_energies.at[:n_dead].set(dead_energies_raw)
+
+        dead_positions = jnp.zeros((max_dead, *positions.shape[1:]))
+        dead_positions = dead_positions.at[:n_dead].set(dead_positions_raw)
+
+        if dead_volumes_raw is not None:
             dead_volumes = jnp.zeros(max_dead)
-            dead_volumes = dead_volumes.at[:n_dead].set(dead_volumes_data)
+            dead_volumes = dead_volumes.at[:n_dead].set(dead_volumes_raw)
         else:
             dead_volumes = None
-        live_volumes = jnp.array(f["live_volumes"][:]) if "live_volumes" in f else None
+    else:
+        # Batched run: return stored arrays directly (no padding).
+        n_dead = n_dead_np          # shape (n_runs,) or (G, P)
+        iteration = iteration_np    # shape (n_runs,) or (G, P)
+        dead_energies = dead_energies_raw
+        dead_positions = dead_positions_raw
+        dead_volumes = dead_volumes_raw
 
-    logger.info("Checkpoint loaded from %s (iteration %d)", path, iteration)
+    _iter_log = int(np.asarray(iteration_raw).flat[0]) if np.asarray(iteration_raw).size > 0 else -1
+    logger.info("Checkpoint loaded from %s (iteration %s)", path, _iter_log)
 
     return {
         "positions": positions,

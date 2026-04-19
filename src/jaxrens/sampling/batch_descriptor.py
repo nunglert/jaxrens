@@ -317,22 +317,45 @@ class VmapRuns(BatchDescriptor):
 
 @dataclass(frozen=True)
 class PmapVmapRuns(BatchDescriptor):
-    """Descriptor stub for pmap(vmap(...)) multi-GPU multi-run NS.
+    """Descriptor for ``pmap(vmap(...))`` multi-GPU multi-run NS.
 
-    **Not yet implemented** — all methods raise ``NotImplementedError``.
-    The stub is present so that commit 4's ``run_loop.py`` can reference
-    the class without a ``if descriptor is not None`` guard on every branch.
+    Shape convention: ``(G, P, K, ...)`` where
+
+    * ``G = n_gpu`` — pmap axis (one shard per GPU device).
+    * ``P = n_per_gpu`` — vmap axis (independent NS runs per GPU).
+    * ``K`` — walker axis (already handled inside ``ns_step`` via vmap).
+
+    For ``n_gpu=1`` this degenerates to ``(1, P, K, ...)`` and pmap runs on
+    the single available device, which is useful for testing.
+
+    **wrap_step** composes ``jax.pmap`` (G axis) over ``jax.vmap`` (P axis):
+
+    .. code-block:: python
+
+        per_run   = lambda s: ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)
+        per_device = jax.vmap(per_run)
+        jit_step   = jax.pmap(per_device, axis_name="gpu")
+
+    ``jax.pmap`` is self-JIT-compiling; do **not** wrap in an additional
+    ``jax.jit`` — that causes XLA sharding conflicts.
+
+    **split_keys** produces ``(G, P, n_sub_keys)``-shaped key arrays via two
+    nested splits: first ``(G,)`` per-GPU keys, then ``(P, n_sub_keys)`` per
+    GPU via ``jax.vmap``.
+
+    **reduce_for_termination** takes the worst-of across both G and P axes
+    (same as VmapRuns but over a 2-D input rather than 1-D).
 
     Attributes
     ----------
     n_gpu : int
-        Number of GPU devices.
+        Number of GPU devices (G).
     n_per_gpu : int
-        Number of NS runs per GPU.
+        Number of NS runs per GPU (P).
     n_runs : int
         Total runs: ``n_gpu * n_per_gpu``.
     shape_prefix : tuple[int, ...]
-        ``(n_gpu, n_per_gpu)``.
+        ``(n_gpu, n_per_gpu)`` — leading shape of all batched arrays.
     """
 
     n_gpu: int
@@ -346,18 +369,109 @@ class PmapVmapRuns(BatchDescriptor):
 
     @property
     def is_batched(self) -> bool:
-        """Always ``True`` — stub for future multi-GPU multi-run NS."""
+        """Always ``True`` — multiple NS runs are distributed across G×P."""
         return True
 
-    def wrap_step(self, ns_step_fn, step_fn, n_mcmc_steps: int, n_extra: int):
-        raise NotImplementedError("pmap variant not yet implemented")
+    def wrap_step(
+        self,
+        ns_step_fn,
+        step_fn,
+        n_mcmc_steps: int,
+        n_extra: int,
+    ):
+        """Return a pmap(vmap(...)) NS step callable.
+
+        The returned callable has signature::
+
+            pmap_step(ns_states)  ->  (ns_states, infos)
+
+        where ``ns_states`` has leading shape ``(G, P, ...)``.
+
+        ``jax.pmap`` is already JIT-compiled internally; the returned
+        function is **not** additionally wrapped in ``jax.jit``.
+
+        Parameters
+        ----------
+        ns_step_fn : callable
+            Raw ``ns_step`` (or compatible replacement).
+        step_fn : callable
+            MCMC step function captured in the closure (static for vmap).
+        n_mcmc_steps : int
+            Number of MCMC steps per walker (static).
+        n_extra : int
+            Number of additional walkers per iteration (static).
+
+        Returns
+        -------
+        callable
+            ``jax.pmap(jax.vmap(per_run), axis_name="gpu")`` where
+            ``per_run(s) = ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)``.
+        """
+        # Close over Python-level statics to avoid static_argnums under pmap.
+        def per_run(s):
+            return ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)
+
+        per_device = jax.vmap(per_run)
+        # pmap handles JIT internally — do NOT add jax.jit here.
+        return jax.pmap(per_device, axis_name="gpu")
 
     def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
-        raise NotImplementedError("pmap variant not yet implemented")
+        """Split a PRNG key array into ``(G, P, n_sub_keys)`` shape.
+
+        Two nested splits:
+
+        1. Split ``rng_key`` (shape ``(G,)``) into ``(G, P+1)`` — first
+           column becomes the per-GPU carry, remaining columns become
+           ``(G, P)`` run keys.
+        2. vmap over G: for each GPU's ``(P,)`` key array, split each of
+           the P keys into ``n_sub_keys`` sub-keys, producing
+           ``(G, P, n_sub_keys)``.
+
+        Parameters
+        ----------
+        rng_key : jax.Array
+            Shape ``(G,)`` — one key per GPU device.
+        n_sub_keys : int
+            Number of sub-keys per run.
+
+        Returns
+        -------
+        jax.Array
+            Shape ``(G, P, n_sub_keys)`` with typed-key dtype.
+        """
+        n_per_gpu = self.n_per_gpu
+
+        # Step 1: split each GPU key into n_per_gpu sub-keys.
+        # vmap over G: jax.random.split(k, n_per_gpu) → (P,) per GPU → (G, P)
+        per_gpu_keys = jax.vmap(
+            lambda k: jax.random.split(k, n_per_gpu)
+        )(rng_key)  # (G, P)
+
+        # Step 2: for each (g, p) key, split into n_sub_keys.
+        # vmap over G then over P.
+        sub_keys = jax.vmap(
+            jax.vmap(lambda k: jax.random.split(k, n_sub_keys))
+        )(per_gpu_keys)  # (G, P, n_sub_keys)
+
+        return sub_keys
 
     def reduce_for_termination(
         self,
         log_evidence: jax.Array,
         hmax: jax.Array,
     ) -> tuple[float, float]:
-        raise NotImplementedError("pmap variant not yet implemented")
+        """Worst-of reduction across both G and P axes.
+
+        Parameters
+        ----------
+        log_evidence : jax.Array
+            Shape ``(G, P)``.
+        hmax : jax.Array
+            Shape ``(G, P)``.
+
+        Returns
+        -------
+        (float(jnp.min(log_evidence)), float(jnp.max(hmax)))
+            Worst-case scalars across all runs on all GPUs.
+        """
+        return float(jnp.min(log_evidence)), float(jnp.max(hmax))

@@ -370,3 +370,227 @@ class TestFreeEnergy:
             f"Gibbs-Helmholtz: d(-log Z)/dbeta = {d_neg_logZ_dbeta:.4f}, "
             f"<E> = {float(mean_E):.4f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Batch-shape tests: (G, P, max_dead) inputs
+# ---------------------------------------------------------------------------
+
+# Helper: build (G, P, max_dead) dead_energies and (G, P, n_live) live_energies
+# by stacking independent 1-D runs.
+
+def _make_gp_data(G: int = 1, P: int = 2, n_dead: int = 500, n_live: int = 50) -> tuple:
+    """Return (dead_energies, live_energies) with shape (G, P, n_dead/n_live).
+
+    Each (g, p) slice is independently generated so per-slice vs batch
+    comparisons are exact (reshape-only, no approximation).
+    """
+    slices_dead = []
+    slices_live = []
+    for g in range(G):
+        row_d, row_l = [], []
+        for p in range(P):
+            seed = g * P + p
+            d, l = _generate_harmonic_ns_data(n_dead=n_dead, n_live=n_live, seed=seed + 10)
+            row_d.append(d)
+            row_l.append(l)
+        slices_dead.append(jnp.stack(row_d))
+        slices_live.append(jnp.stack(row_l))
+    dead = jnp.stack(slices_dead)   # (G, P, n_dead)
+    live = jnp.stack(slices_live)   # (G, P, n_live)
+    return dead, live
+
+
+class TestBatchShapeCalcLogWeights:
+    """calc_log_weights is inherently 1-D; verify it still works as before."""
+
+    def test_1d_shape_unchanged(self):
+        log_w = calc_log_weights(50, 20, 1)
+        assert log_w.shape == (50,)
+
+
+class TestBatchShapeLogEvidence:
+    """log_evidence with (G, P, max_dead) input."""
+
+    def test_output_shape_gp(self):
+        G, P = 1, 2
+        dead, live = _make_gp_data(G, P)
+        out = log_evidence(dead, live, n_live=50)
+        assert out.shape == (G, P), f"Expected ({G}, {P}), got {out.shape}"
+
+    def test_matches_per_slice(self):
+        """Batched result must equal per-slice 1-D result."""
+        G, P = 1, 2
+        dead, live = _make_gp_data(G, P)
+        batched = log_evidence(dead, live, n_live=50)
+        for g in range(G):
+            for p in range(P):
+                ref = log_evidence(dead[g, p], live[g, p], n_live=50)
+                assert jnp.allclose(batched[g, p], ref, atol=1e-5), (
+                    f"Mismatch at ({g},{p}): batch={batched[g,p]:.6f}, ref={ref:.6f}"
+                )
+
+    def test_1d_still_returns_scalar(self):
+        dead_1d, live_1d = _generate_harmonic_ns_data(n_dead=200, n_live=20)
+        out = log_evidence(dead_1d, live_1d, n_live=20)
+        assert out.ndim == 0, f"Expected scalar, got ndim={out.ndim}"
+
+    def test_jit_compatible(self):
+        G, P = 1, 2
+        dead, live = _make_gp_data(G, P)
+        n_live = 50
+        jitted = jax.jit(lambda d, l: log_evidence(d, l, n_live=n_live))
+        out = jitted(dead, live)
+        assert out.shape == (G, P)
+        assert jnp.all(jnp.isfinite(out))
+
+
+class TestBatchShapePartitionFunction:
+    """partition_function with (G, P, max_dead) input."""
+
+    def test_output_shape_gp(self):
+        G, P = 1, 2
+        dead, live = _make_gp_data(G, P)
+        out = partition_function(1.0, dead, live, n_live=50)
+        assert out.shape == (G, P), f"Expected ({G}, {P}), got {out.shape}"
+
+    def test_matches_per_slice(self):
+        G, P = 1, 2
+        dead, live = _make_gp_data(G, P)
+        batched = partition_function(1.0, dead, live, n_live=50)
+        for g in range(G):
+            for p in range(P):
+                ref = partition_function(1.0, dead[g, p], live[g, p], n_live=50)
+                assert jnp.allclose(batched[g, p], ref, atol=1e-5), (
+                    f"Mismatch at ({g},{p}): batch={batched[g,p]:.6f}, ref={ref:.6f}"
+                )
+
+    def test_1d_still_returns_scalar(self):
+        dead_1d, live_1d = _generate_harmonic_ns_data(n_dead=200, n_live=20)
+        out = partition_function(1.0, dead_1d, live_1d, n_live=20)
+        assert out.ndim == 0
+
+    def test_jit_compatible(self):
+        G, P = 1, 2
+        dead, live = _make_gp_data(G, P)
+        n_live = 50
+        jitted = jax.jit(lambda d, l: partition_function(1.0, d, l, n_live=n_live))
+        out = jitted(dead, live)
+        assert out.shape == (G, P)
+        assert jnp.all(jnp.isfinite(out))
+
+
+class TestBatchShapeHeatCapacity:
+    """heat_capacity with (G, P, max_dead) input."""
+
+    def test_output_shape_gp(self):
+        G, P = 1, 2
+        dead, live = _make_gp_data(G, P)
+        out = heat_capacity(1.0, dead, live, n_live=50)
+        assert out.shape == (G, P), f"Expected ({G}, {P}), got {out.shape}"
+
+    def test_matches_per_slice(self):
+        G, P = 1, 2
+        dead, live = _make_gp_data(G, P)
+        batched = heat_capacity(1.0, dead, live, n_live=50)
+        for g in range(G):
+            for p in range(P):
+                ref = heat_capacity(1.0, dead[g, p], live[g, p], n_live=50)
+                assert jnp.allclose(batched[g, p], ref, atol=1e-5), (
+                    f"Mismatch at ({g},{p}): batch={batched[g,p]:.6f}, ref={ref:.6f}"
+                )
+
+    def test_1d_still_returns_scalar(self):
+        dead_1d, live_1d = _generate_harmonic_ns_data(n_dead=200, n_live=20)
+        out = heat_capacity(1.0, dead_1d, live_1d, n_live=20)
+        assert out.ndim == 0
+
+    def test_jit_compatible(self):
+        G, P = 1, 2
+        dead, live = _make_gp_data(G, P)
+        n_live = 50
+        jitted = jax.jit(lambda d, l: heat_capacity(1.0, d, l, n_live=n_live))
+        out = jitted(dead, live)
+        assert out.shape == (G, P)
+        assert jnp.all(jnp.isfinite(out))
+        assert jnp.all(out >= 0.0)
+
+
+class TestBatchShapeExpectation:
+    """expectation with (G, P, max_dead) input."""
+
+    def test_output_shape_gp(self):
+        G, P, n_dead, n_live = 1, 2, 500, 50
+        dead, live = _make_gp_data(G, P, n_dead=n_dead, n_live=n_live)
+        # Observable: just the energies concatenated per run.
+        obs = jnp.concatenate([dead, live], axis=-1)  # (G, P, n_dead + n_live)
+        out = expectation(obs, 1.0, dead, live, n_live=n_live)
+        assert out.shape == (G, P), f"Expected ({G}, {P}), got {out.shape}"
+
+    def test_matches_per_slice(self):
+        G, P, n_dead, n_live = 1, 2, 300, 30
+        dead, live = _make_gp_data(G, P, n_dead=n_dead, n_live=n_live)
+        obs = jnp.concatenate([dead, live], axis=-1)
+        batched = expectation(obs, 1.0, dead, live, n_live=n_live)
+        for g in range(G):
+            for p in range(P):
+                ref = expectation(obs[g, p], 1.0, dead[g, p], live[g, p], n_live=n_live)
+                assert jnp.allclose(batched[g, p], ref, atol=1e-5), (
+                    f"Mismatch at ({g},{p}): batch={batched[g,p]:.6f}, ref={ref:.6f}"
+                )
+
+    def test_1d_still_returns_scalar(self):
+        dead_1d, live_1d = _generate_harmonic_ns_data(n_dead=200, n_live=20)
+        obs = jnp.concatenate([dead_1d, live_1d])
+        out = expectation(obs, 1.0, dead_1d, live_1d, n_live=20)
+        assert out.ndim == 0
+
+    def test_jit_compatible(self):
+        G, P, n_dead, n_live = 1, 2, 200, 20
+        dead, live = _make_gp_data(G, P, n_dead=n_dead, n_live=n_live)
+        obs = jnp.concatenate([dead, live], axis=-1)
+        n_live_static = n_live
+        jitted = jax.jit(lambda obs_, d, l: expectation(obs_, 1.0, d, l, n_live=n_live_static))
+        out = jitted(obs, dead, live)
+        assert out.shape == (G, P)
+
+
+class TestBatchShapeFreeEnergy:
+    """free_energy handles batched log_Z_beta."""
+
+    def test_output_shape_gp(self):
+        G, P = 1, 2
+        dead, live = _make_gp_data(G, P)
+        log_Z = partition_function(1.0, dead, live, n_live=50)
+        F = free_energy(1.0, log_Z)
+        assert F.shape == (G, P), f"Expected ({G}, {P}), got {F.shape}"
+
+    def test_matches_per_slice(self):
+        G, P = 1, 2
+        dead, live = _make_gp_data(G, P)
+        log_Z = partition_function(1.0, dead, live, n_live=50)
+        F_batch = free_energy(1.0, log_Z)
+        for g in range(G):
+            for p in range(P):
+                log_Z_ref = partition_function(1.0, dead[g, p], live[g, p], n_live=50)
+                F_ref = free_energy(1.0, log_Z_ref)
+                assert jnp.allclose(F_batch[g, p], F_ref, atol=1e-5), (
+                    f"Mismatch at ({g},{p}): batch={F_batch[g,p]:.6f}, ref={F_ref:.6f}"
+                )
+
+    def test_1d_still_returns_scalar(self):
+        dead_1d, live_1d = _generate_harmonic_ns_data(n_dead=200, n_live=20)
+        log_Z = partition_function(1.0, dead_1d, live_1d, n_live=20)
+        F = free_energy(1.0, log_Z)
+        assert F.ndim == 0
+
+    def test_jit_compatible(self):
+        G, P = 1, 2
+        dead, live = _make_gp_data(G, P)
+        n_live = 50
+        jitted = jax.jit(lambda d, l: free_energy(
+            1.0, partition_function(1.0, d, l, n_live=n_live)
+        ))
+        out = jitted(dead, live)
+        assert out.shape == (G, P)
+        assert jnp.all(jnp.isfinite(out))

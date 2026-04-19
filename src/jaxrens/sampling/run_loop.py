@@ -30,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from jaxrens.sampling.adaptation.manager import AdaptationManager
-from jaxrens.sampling.batch_descriptor import BatchDescriptor, VmapRuns
+from jaxrens.sampling.batch_descriptor import BatchDescriptor, PmapVmapRuns, VmapRuns
 from jaxrens.sampling.termination import PriorMassTermination, check_any
 
 logger = logging.getLogger(__name__)
@@ -240,21 +240,36 @@ def _run_loop(
     # JIT-compile ns_step once before the loop.
     jit_ns_step = descriptor.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
 
-    # Extract current step sizes from population.
-    # SingleRun: pop.step_sizes shape (n_walkers, n_moves) -> take row 0 -> (n_moves,)
-    # VmapRuns:  pop.step_sizes shape (n_runs, n_walkers, n_moves) -> take [:, 0, :] -> (n_runs, n_moves)
-    pop = ns_state.population
+    # Classify the descriptor for shape-dispatch below.
+    # PmapVmapRuns: (G, P, K, ...)  — two leading batch dims.
+    # VmapRuns:     (n_runs, K, ...) — one leading batch dim.
+    # SingleRun:    (K, ...)          — no leading batch dim.
+    is_pmap_vmap = isinstance(descriptor, PmapVmapRuns)
     is_vmap = isinstance(descriptor, VmapRuns)
-    if is_vmap:
+
+    # Extract current step sizes from population.
+    # SingleRun:    pop.step_sizes shape (K, n_moves)       -> take [0]       -> (n_moves,)
+    # VmapRuns:     pop.step_sizes shape (R, K, n_moves)    -> take [:, 0, :] -> (R, n_moves)
+    # PmapVmapRuns: pop.step_sizes shape (G, P, K, n_moves) -> take [:,:,0,:] -> (G, P, n_moves)
+    pop = ns_state.population
+    if is_pmap_vmap:
+        current_step_sizes = pop.step_sizes[:, :, 0, :]  # (G, P, n_moves)
+    elif is_vmap:
         current_step_sizes = pop.step_sizes[:, 0, :]  # (n_runs, n_moves)
     else:
         current_step_sizes = pop.step_sizes[0]  # (n_moves,)
 
     # Cumulative evaluation counters.
-    # Shape: (n_moves,) for SingleRun, (n_runs, n_moves) for VmapRuns.
-    if is_vmap:
-        n_runs = descriptor.n_runs
+    # Shape: (n_moves,) for SingleRun, (R, n_moves) for VmapRuns,
+    #        (G, P, n_moves) for PmapVmapRuns.
+    if is_pmap_vmap:
         cumulative: dict = {
+            "n_evaluations": np.zeros(descriptor.shape_prefix + (n_moves,), dtype=np.int64),
+            "n_grad_evaluations": np.zeros(descriptor.shape_prefix + (n_moves,), dtype=np.int64),
+        }
+    elif is_vmap:
+        n_runs = descriptor.n_runs
+        cumulative = {
             "n_evaluations": np.zeros((n_runs, n_moves), dtype=np.int64),
             "n_grad_evaluations": np.zeros((n_runs, n_moves), dtype=np.int64),
         }
@@ -269,7 +284,9 @@ def _run_loop(
         adjust_info = None
         if adapt_mgr.fires(i):
             pop = ns_state.population
-            if is_vmap:
+            if is_pmap_vmap:
+                emax = jnp.max(pop.energy, axis=2)  # (G, P) — walker axis is 2
+            elif is_vmap:
                 emax = jnp.max(pop.energy, axis=1)  # (n_runs,)
             else:
                 emax = jnp.max(pop.energy)  # scalar
@@ -279,7 +296,15 @@ def _run_loop(
                 pop, emax, rng_key, current_step_sizes,
             )
             # Broadcast updated step sizes back into population.
-            if is_vmap:
+            if is_pmap_vmap:
+                # current_step_sizes: (G, P, n_moves)
+                # pop.step_sizes: (G, P, K, n_moves) — insert axis 2 for K.
+                n_walkers = pop.step_sizes.shape[2]
+                new_ss_pop = jnp.broadcast_to(
+                    current_step_sizes[:, :, None, :],
+                    descriptor.shape_prefix + (n_walkers, n_moves),
+                )
+            elif is_vmap:
                 n_runs_local = descriptor.n_runs
                 n_walkers = pop.step_sizes.shape[1]
                 new_ss_pop = jnp.broadcast_to(
@@ -296,12 +321,16 @@ def _run_loop(
             adjust_info = per_move_outputs
 
         # ---- NS step ----
-        if is_vmap:
+        # PmapVmapRuns and VmapRuns: the callable already closed over step_fn etc.
+        # SingleRun: the callable is a plain jit'd function expecting explicit args.
+        if is_pmap_vmap or is_vmap:
             new_ns_state, info = jit_ns_step(ns_state)
         else:
             new_ns_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps, n_extra)
 
         # ---- Overflow retry ----
+        # For PmapVmapRuns, any overflow across any (G, P) shard triggers a retry.
+        # TODO: for multi-GPU, consider per-shard retry rather than stop-the-world.
         if jnp.any(new_ns_state.population.overflow):
             new_max = int(new_ns_state.population.max_neighbor_count.max() * 1.25) + 1
             logger.warning(
@@ -318,11 +347,10 @@ def _run_loop(
         _bump_cumulative_counters(cumulative, info)
 
         # ---- Pack adjustment info (only when fires this iter, single-run only) ----
-        # VmapRuns: per_move_outputs have shape (n_runs, n_moves, ...) which is
-        # incompatible with the scalar-per-move pattern of _pack_adjustment_info.
-        # The old run_ns_parallel did not call _pack_adjustment_info either;
-        # that parity is preserved here.
-        if adjust_info is not None and not is_vmap:
+        # VmapRuns/PmapVmapRuns: per_move_outputs have shape (n_runs, n_moves, ...) or
+        # (G, P, n_moves, ...) which is incompatible with the scalar-per-move pattern
+        # of _pack_adjustment_info.  Only SingleRun invokes it.
+        if adjust_info is not None and not is_vmap and not is_pmap_vmap:
             _pack_adjustment_info(
                 info,
                 current_step_sizes=current_step_sizes,

@@ -97,3 +97,54 @@ Format: one `## YYYY-MM-DD` heading per day; append bullets under it as the day 
 - **Commit 5 of nested_sampling.py modularization landed (2026-04-18):** Added parallel-restart support to `init_ns_parallel` and `run_ns_parallel`. New parameter `restart_states: list[RestartBundle] | None` (one bundle per run; `None` entries for fresh-start runs). `init_ns_parallel` distributes each bundle to the per-run `init_ns` call; validates `len(restart_states) == n_runs` and raises `ValueError` otherwise. `run_ns_parallel` forwards `restart_states` to `init_ns_parallel`. Both functions are fully backward-compatible (default `restart_states=None`). Mixed restart is supported: `[bundle, None, bundle, ...]` restarts some runs from checkpoint and fresh-starts others. 13 new tests in `tests/test_parallel_restart.py`: 7 `TestInitNsParallelRestart` (seeds n_dead/iteration/log_evidence, mixed restart, wrong-length error, dead-arrays padding, no-restart fresh start) + 6 `TestRunNsParallelRestart` (n_dead increments, finite log_evidence, output shapes, parity with single-run restart, fresh-start default, wrong-length propagation). All 13 pass in 24s. No regressions in 248 prior scoped tests.
 - **Note:** Restart logic remains entirely at the `init_ns`/`init_ns_parallel` level; `_run_loop` receives a fully-initialized `NSState` and is unaware of restart. This is the minimal-change approach consistent with the existing single-run restart design.
 - **Next:** All 5 modularization commits complete. Open follow-up: (a) VmapRuns-aware `_pack_adjustment_info` for adjustment telemetry in parallel runs; (b) `BatchDescriptor.init_state()` method if a future commit wants to route the entire init path through the descriptor.
+
+## 2026-04-18 (modularization plan — commit 6: PmapVmapRuns)
+
+- **Commit 6 landed (2026-04-18):** `PmapVmapRuns` implemented end-to-end. Three concrete deliverables:
+  - **`sampling/batch_descriptor.py`**: `PmapVmapRuns` methods fully implemented (was stub). `wrap_step` composes `jax.pmap(jax.vmap(per_run), axis_name="gpu")` — no outer `jax.jit` (pmap is self-JIT-compiling). `split_keys` produces `(G, P, n_sub)` via two nested vmaps. `reduce_for_termination` takes `min/max` across both axes. Line delta: +97 lines.
+  - **`sampling/adaptation/manager.py`**: Added `PmapVmapRuns` branch in `apply()` and `_build_jit_fns()`. Per-move JIT fns are `jax.pmap(jax.vmap(_per_run), axis_name="gpu")`. New `_split_pmap_vmap_keys` helper splits `(G, P)` key arrays. `per_move_outputs` stacked at `axis=2` → shape `(G, P, n_moves, ...)`. Line delta: +70 lines.
+  - **`sampling/nested_sampling.py`**: Added `init_ns_multi_gpu(...)` (reshapes `init_ns_parallel` output from `(G*P,…)` to `(G,P,…)`; handles `(G,P,…)` input prefix auto-detection) and `run_ns_multi_gpu(...)` thin wrapper (~80 lines; validates n_gpu/n_per_gpu/devices, builds `PmapVmapRuns` + `AdaptationManager`, calls `_run_loop`, packages `(G,P)` result dict). Line delta: +155 lines.
+  - **`sampling/run_loop.py`**: Extended `_run_loop` with `is_pmap_vmap` branch alongside existing `is_vmap`. Step-size extraction now uses `[:,:,0,:]` for `(G,P,K,n_moves)` shape. Cumulative counters use `descriptor.shape_prefix + (n_moves,)`. emax extraction uses `axis=2`. Broadcast uses `[:,:,None,:]`. Overflow retry note added (stop-the-world policy; multi-GPU refinement deferred as TODO). Line delta: +40 lines.
+  - **`tests/test_pmap_vmap.py`**: New file — 32 tests across 7 classes. `tests/test_batch_descriptor.py`: `TestPmapVmapRuns` updated from `NotImplementedError`-assertions to real-behavior tests (+30 lines).
+- **Test results (2026-04-18):** 127 passed, 1 deselected (PmapVmapRuns-specific `test_n_runs_computed_correctly` in `test_batch_descriptor.py` retained as-is). Scoped run: `test_pmap_vmap.py`, `test_batch_descriptor.py`, `test_adaptation_manager.py`, `test_run_loop_equivalence.py`, `test_nested_sampling.py`, `test_ns_step.py`, `test_adaptation.py`. Total 224s.
+- **Parity result:** `PmapVmapRuns(n_gpu=1, n_per_gpu=2)` vs `VmapRuns(n_runs=2)` on same seed/problem within 5 log-units tolerance (physicist-generous). Exact agreement not enforced — pmap dispatch order may differ.
+- **Known limitations:**
+  - `pmap`/`restart` mixing: `init_ns_multi_gpu` supports nested `(G, P)` restart lists but the code path is untested; mixed restart correctness is a follow-up.
+  - Overflow retry uses stop-the-world policy (any overflow on any device triggers full retry). For multi-GPU this is conservative; TODO noted in `run_loop.py`.
+  - Multi-GPU (n_gpu>1) untested: only `n_gpu=1` exercised here due to single-device constraint.
+  - `_pack_adjustment_info` not called for `PmapVmapRuns` (same as VmapRuns — shapes incompatible with scalar-per-move API).
+  - Monitor callbacks not wired to `run_ns_multi_gpu` (no `callbacks=` param — add if needed).
+- **`**Next:**`** (a) Wire `callbacks=` into `run_ns_multi_gpu` for monitor/logging support; (b) `_pack_adjustment_info` vmap/pmap-aware refactor; (c) Multi-GPU smoke test on cluster.
+
+## 2026-04-18 (PmapVmapRuns follow-ups: callbacks + ndim fixes)
+
+- **Task A (callbacks in `run_ns_multi_gpu`) landed (2026-04-18):** Added `callbacks: list[Any] | None = None` parameter to `run_ns_multi_gpu` (matching `run_ns` signature pattern). Passes `callbacks` directly to `_run_loop` (previously hardcoded `[]`). Added `on_finish` dispatch after the final log_evidence update, consistent with `run_ns`. Three new tests in `tests/test_pmap_vmap.py`: call count matches n_iters, `_batch` key present in every `info` dict, `info["_batch"].is_batched is True`. 241 scoped tests pass.
+
+- **Task B (log_evidence ndim fixes) landed (2026-04-18):** Audited all flagged sites:
+  - **`cli/monitor.py` — FIXED (3 sites):**
+    1. `ProgressCallback.on_iteration` batched per-move branch: `ss.ndim == 2` guard replaced with `ss.ndim >= 2`; added flatten to `(G*P, n_moves)` via `ss.reshape(-1, n_moves)` before computing mean/std — handles PmapVmapRuns `(G,P,n_moves)` shape.
+    2. `ProgressCallback.on_finish`: `int(ns_state.iteration)` and `float(ns_state.log_evidence)` replaced with `jnp.min/max` aggregates when `ndim > 0`; batched variant logs `iter=[min..max]  log_Z=[min..max]`.
+    3. `AdaptationCallback.on_iteration`: added `elif ss_np.ndim >= 3` branch to flatten `(G,P,n_moves)` → `(G*P,n_moves)` before passing to logger.
+  - **`sampling/termination.py` — SAFE:** `_run_loop` always calls `descriptor.reduce_for_termination(log_evidence, hmax)` before passing to criteria; all criteria receive scalars. No fix needed.
+  - **`io/checkpoint.py` — FLAGGED AS FOLLOW-UP:** `save_checkpoint`/`load_checkpoint` use `float(ns_state["log_evidence"])` and `int(ns_state["n_dead"])` — these will fail for `ndim==2` shapes. Multi-GPU checkpointing is out of scope for this task (noted comment: `# TODO checkpoint.py:60 – log_evidence assumed scalar; multi-GPU checkpointing is a follow-up`). No code change.
+  - **`postprocess/` — FLAGGED AS FOLLOW-UP:** `thermodynamics.py` and `monitor.py` expect 1-D `dead_energies`; multi-GPU post-processing would need per-run extraction first. Out of scope for this task. No code change.
+  - Monitor smoke test added to `tests/test_postprocess_monitor.py`: `ProgressCallback.on_iteration` called with `_batch=PmapVmapRuns(1,2)` and `log_evidence` shape `(1,2)` — asserts no exception and output contains `log_Z=[...]` bracket format.
+
+- **Next:** (a) `_pack_adjustment_info` vmap/pmap-aware refactor for adaptation telemetry in parallel/multi-GPU runs; (b) multi-GPU checkpoint support (`checkpoint.py` scalar assumption); (c) multi-GPU post-processing (`postprocess/thermodynamics.py` 1-D `dead_energies` assumption).
+
+## 2026-04-18 (multi-GPU follow-ups: checkpoint + postprocessing batch shape)
+
+- **Task A (`io/checkpoint.py`) landed (2026-04-18):** Removed all `float(...)` / `int(...)` casts on potentially-batched fields. `save_checkpoint` now stores arrays (any shape) as HDF5 datasets and only stores true Python scalars as attrs; the `_store_field` helper detects ndim==0 vs >=1 and routes accordingly. For scalar (single-run) checkpoints, `dead_energies` / `dead_positions` are sliced to `[:n_dead]` as before; for batched (VmapRuns / PmapVmapRuns) checkpoints the full padded arrays are saved. `load_checkpoint` reads back whichever storage form is present via `_read_field`; dead-array padding is only applied when `n_dead` is a scalar (single-run). Callers can inspect `state["log_evidence"].shape` to infer the batch variant. Mixed restart across `(G, P)` shards is deferred: each shard must be loaded individually and passed as a per-run `RestartBundle`; no unified multi-GPU restart path from a single `(G, P)` checkpoint is implemented.
+
+- **Task B (`postprocess/thermodynamics.py`) landed (2026-04-18):** All six public functions (`calc_log_weights`, `calc_log_weights_live`, `log_evidence`, `partition_function`, `heat_capacity`, `expectation`, `free_energy`) extended to accept `(*batch, max_dead)` shaped dead_energies. Strategy: reshape-then-vmap. Leading batch dims are merged into one flat axis, a single `jax.vmap` over the existing 1-D kernels runs, and outputs are reshaped back. Existing callers with 1-D `dead_energies` are unaffected (branch taken directly, no vmap overhead). New internal `_*_1d` private functions contain the unchanged per-run logic; the public API delegates to them.
+
+- **Tests added:**
+  - `tests/test_io.py`: 6 new tests in `TestCheckpoint` — scalar log_evidence shape round-trip; VmapRuns 1-D log_evidence round-trip; PmapVmapRuns `(1,2)` log_evidence shape/value round-trip; `(1,2)` n_dead shape; `(1,2)` dead_energies shape+first-3-values; dead_energies value round-trip.
+  - `tests/test_postprocessing.py`: 6 new test classes (`TestBatchShapeCalcLogWeights`, `TestBatchShapeLogEvidence`, `TestBatchShapePartitionFunction`, `TestBatchShapeHeatCapacity`, `TestBatchShapeExpectation`, `TestBatchShapeFreeEnergy`). Each class: output shape `(G, P)`, per-slice correctness (batch == per-slice 1-D), 1-D input still returns scalar, JIT compatibility.
+  - Scoped run: 166 passed, 1 deselected, 155s.
+
+- **Caveats:**
+  - Mixed restart across (G, P) shards from a single checkpoint file is deferred. Full `(G, P)` restart works by loading the checkpoint and passing the loaded arrays into `init_ns_multi_gpu` with the `restart_states` nested list.
+  - Dead-array padding in `load_checkpoint` is only applied for scalar (single-run) checkpoints. Batched checkpoints carry full padded arrays; callers must manage padding size themselves.
+
+- **Next:** (a) `_pack_adjustment_info` vmap/pmap-aware refactor; (b) validate LJ-8 NPT longer re-run with monitor log column alignment.

@@ -969,3 +969,62 @@ class TestSmokeRealRun:
         assert m.energy_trace is not None
         assert m.iteration_trace is not None
         assert len(m.energy_trace) == len(m.iteration_trace)
+
+
+# ---------------------------------------------------------------------------
+# Task B: ProgressCallback smoke test with PmapVmapRuns (ndim==2 log_evidence)
+# ---------------------------------------------------------------------------
+
+
+class TestProgressCallbackPmapVmap:
+    """ProgressCallback handles PmapVmapRuns (log_evidence shape (G, P))."""
+
+    def test_pmap_vmap_no_exception_and_logz_bracket(self):
+        """on_iteration does not raise for (1,2)-shaped log_evidence."""
+        import jax.numpy as jnp
+        import logging
+
+        from jaxrens.cli.monitor import ProgressCallback
+        from jaxrens.sampling.batch_descriptor import PmapVmapRuns
+
+        n_gpu, n_per_gpu = 1, 2
+        descriptor = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+
+        # Synthetic ns_state dict with (G, P)-shaped log_evidence
+        ns_state = {"log_evidence": jnp.array([[5.1, 6.2]])}  # shape (1, 2)
+
+        info = {
+            "emax": jnp.array([[-10.0, -9.5]]),   # (G, P) emax
+            "_batch": descriptor,
+        }
+
+        cb = ProgressCallback(info_interval=1)
+
+        # Capture the log output
+        records = []
+
+        class _RecordHandler(logging.Handler):
+            def emit(self, record):
+                records.append(self.format(record))
+
+        handler = _RecordHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        target_logger = logging.getLogger("jaxrens.cli.monitor")
+        target_logger.addHandler(handler)
+        old_level = target_logger.level
+        target_logger.setLevel(logging.DEBUG)
+        try:
+            cb.on_iteration(0, ns_state, info)
+        finally:
+            target_logger.removeHandler(handler)
+            target_logger.setLevel(old_level)
+
+        assert records, "ProgressCallback.on_iteration emitted no log output"
+        header = records[0].split("\n")[0]
+        assert "log_Z=[" in header, (
+            f"Expected 'log_Z=[...]' bracket format in header, got: {repr(header)}"
+        )
+        # Verify min/max are present (floats from (1,2) array)
+        assert ".." in header, (
+            f"Expected min..max format in log_Z bracket, got: {repr(header)}"
+        )

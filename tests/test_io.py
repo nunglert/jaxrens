@@ -104,6 +104,29 @@ class TestFormats:
 # ---------------------------------------------------------------------------
 
 
+def _make_pmap_vmap_ns_state(G: int = 1, P: int = 2, n_walkers: int = 4, n_atoms: int = 2, max_dead: int = 5):
+    """Construct a fake ``(G, P, ...)``-shaped NS state dict without actually running pmap.
+
+    Used to test checkpoint round-trips for multi-GPU output shapes.
+    """
+    key = jax.random.key(0)
+    return {
+        "positions": jnp.zeros((G, P, n_walkers, n_atoms, 3)),
+        "types": jnp.zeros((G, P, n_walkers, n_atoms), dtype=jnp.int32),
+        "energies": jax.random.uniform(key, (G, P, n_walkers)),
+        "cells": None,
+        "dead_energies": jnp.full((G, P, max_dead), jnp.inf).at[:, :, :3].set(
+            jnp.array([5.0, 4.0, 3.0])
+        ),
+        "dead_positions": jnp.zeros((G, P, max_dead, n_atoms, 3)),
+        "log_evidence": jnp.full((G, P), -2.5) + jax.random.uniform(key, (G, P)) * 0.1,
+        "iteration": jnp.full((G, P), 3, dtype=jnp.int32),
+        "n_dead": jnp.full((G, P), 3, dtype=jnp.int32),
+        "n_walkers": n_walkers,
+        "rng_key": jax.random.key(7),
+    }
+
+
 class TestCheckpoint:
     def test_save_load_roundtrip(self, ns_state, tmp_path):
         path = tmp_path / "test.checkpoint.h5"
@@ -124,6 +147,124 @@ class TestCheckpoint:
         save_checkpoint(path, ns_state)
         loaded = load_checkpoint(path)
         assert loaded["cells"] is None
+
+    def test_scalar_log_evidence_shape_roundtrip(self, ns_state, tmp_path):
+        """Scalar log_evidence (SingleRun) round-trips with shape ()."""
+        path = tmp_path / "scalar_le.h5"
+        save_checkpoint(path, ns_state)
+        loaded = load_checkpoint(path)
+        assert loaded["log_evidence"].shape == (), (
+            f"Expected scalar, got shape {loaded['log_evidence'].shape}"
+        )
+        assert jnp.allclose(loaded["log_evidence"], ns_state["log_evidence"])
+
+    # ------------------------------------------------------------------
+    # VmapRuns: (n_runs,)-shaped state
+    # ------------------------------------------------------------------
+
+    def test_vmap_1d_log_evidence_roundtrip(self, tmp_path):
+        """VmapRuns (n_runs=2) state round-trips shape and values."""
+        n_runs, n_walkers, n_atoms = 2, 4, 2
+        max_dead = 5
+        key = jax.random.key(10)
+        state = {
+            "positions": jnp.zeros((n_runs, n_walkers, n_atoms, 3)),
+            "types": jnp.zeros((n_runs, n_walkers, n_atoms), dtype=jnp.int32),
+            "energies": jax.random.uniform(key, (n_runs, n_walkers)),
+            "cells": None,
+            "dead_energies": jnp.full((n_runs, max_dead), jnp.inf).at[:, :3].set(
+                jnp.array([5.0, 4.0, 3.0])
+            ),
+            "dead_positions": jnp.zeros((n_runs, max_dead, n_atoms, 3)),
+            "log_evidence": jnp.array([-2.5, -3.0]),   # (n_runs,)
+            "iteration": jnp.array([3, 3], dtype=jnp.int32),
+            "n_dead": jnp.array([3, 3], dtype=jnp.int32),
+            "n_walkers": n_walkers,
+        }
+
+        path = tmp_path / "vmap.checkpoint.h5"
+        save_checkpoint(path, state)
+        loaded = load_checkpoint(path)
+
+        assert loaded["log_evidence"].shape == (n_runs,), (
+            f"Expected (n_runs,), got {loaded['log_evidence'].shape}"
+        )
+        assert jnp.allclose(loaded["log_evidence"], state["log_evidence"])
+        assert loaded["n_dead"].shape == (n_runs,)
+        assert loaded["dead_energies"].shape == (n_runs, max_dead)
+
+    # ------------------------------------------------------------------
+    # PmapVmapRuns: (G, P)-shaped state
+    # ------------------------------------------------------------------
+
+    def test_pmap_vmap_log_evidence_shape_roundtrip(self, tmp_path):
+        """PmapVmapRuns (G=1, P=2) state: log_evidence shape (1, 2) round-trips."""
+        G, P = 1, 2
+        state = _make_pmap_vmap_ns_state(G=G, P=P)
+        path = tmp_path / "pmap_vmap.checkpoint.h5"
+        save_checkpoint(path, state)
+        loaded = load_checkpoint(path)
+
+        assert loaded["log_evidence"].shape == (G, P), (
+            f"Expected ({G}, {P}), got {loaded['log_evidence'].shape}"
+        )
+
+    def test_pmap_vmap_log_evidence_value_roundtrip(self, tmp_path):
+        """PmapVmapRuns state: log_evidence values are preserved."""
+        state = _make_pmap_vmap_ns_state(G=1, P=2)
+        path = tmp_path / "pmap_vmap_val.checkpoint.h5"
+        save_checkpoint(path, state)
+        loaded = load_checkpoint(path)
+
+        assert jnp.allclose(loaded["log_evidence"], state["log_evidence"]), (
+            f"log_evidence mismatch: stored={state['log_evidence']}, "
+            f"loaded={loaded['log_evidence']}"
+        )
+
+    def test_pmap_vmap_n_dead_shape_roundtrip(self, tmp_path):
+        """PmapVmapRuns state: n_dead has shape (G, P) after round-trip."""
+        G, P = 1, 2
+        state = _make_pmap_vmap_ns_state(G=G, P=P)
+        path = tmp_path / "pmap_vmap_ndead.checkpoint.h5"
+        save_checkpoint(path, state)
+        loaded = load_checkpoint(path)
+
+        n_dead_np = np.asarray(loaded["n_dead"])
+        assert n_dead_np.shape == (G, P), (
+            f"Expected n_dead shape ({G}, {P}), got {n_dead_np.shape}"
+        )
+
+    def test_pmap_vmap_dead_energies_shape_roundtrip(self, tmp_path):
+        """PmapVmapRuns state: dead_energies shape (G, P, max_dead) preserved."""
+        G, P, max_dead = 1, 2, 5
+        state = _make_pmap_vmap_ns_state(G=G, P=P, max_dead=max_dead)
+        path = tmp_path / "pmap_vmap_de.checkpoint.h5"
+        save_checkpoint(path, state)
+        loaded = load_checkpoint(path)
+
+        assert loaded["dead_energies"].shape == (G, P, max_dead), (
+            f"Expected ({G}, {P}, {max_dead}), got {loaded['dead_energies'].shape}"
+        )
+        # First 3 entries per run match stored values.
+        assert jnp.allclose(
+            loaded["dead_energies"][:, :, :3],
+            state["dead_energies"][:, :, :3],
+        )
+
+    def test_pmap_vmap_dead_energies_value_roundtrip(self, tmp_path):
+        """PmapVmapRuns state: dead_energies values round-trip exactly."""
+        state = _make_pmap_vmap_ns_state(G=1, P=2)
+        path = tmp_path / "pmap_vmap_de_val.checkpoint.h5"
+        save_checkpoint(path, state)
+        loaded = load_checkpoint(path)
+
+        assert jnp.allclose(
+            loaded["dead_energies"], state["dead_energies"],
+            equal_nan=True,   # inf == inf under allclose
+        ) or jnp.all(
+            (loaded["dead_energies"] == state["dead_energies"])
+            | (jnp.isinf(loaded["dead_energies"]) & jnp.isinf(state["dead_energies"]))
+        )
 
 
 # ---------------------------------------------------------------------------

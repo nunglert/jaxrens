@@ -267,23 +267,86 @@ class TestPmapVmapRuns:
         assert d.n_runs == 8
         assert d.shape_prefix == (2, 4)
 
-    def test_wrap_step_raises(self):
-        d = PmapVmapRuns(n_gpu=2, n_per_gpu=2)
-        with pytest.raises(NotImplementedError, match="pmap variant not yet implemented"):
-            d.wrap_step(None, None, 5, 0)
-
-    def test_split_keys_raises(self):
-        d = PmapVmapRuns(n_gpu=2, n_per_gpu=2)
-        with pytest.raises(NotImplementedError, match="pmap variant not yet implemented"):
-            d.split_keys(jax.random.key(0), 3)
-
-    def test_reduce_for_termination_raises(self):
-        d = PmapVmapRuns(n_gpu=2, n_per_gpu=2)
-        with pytest.raises(NotImplementedError, match="pmap variant not yet implemented"):
-            d.reduce_for_termination(jnp.array(0.0), jnp.array(0.0))
+    def test_is_batched(self):
+        d = PmapVmapRuns(n_gpu=1, n_per_gpu=3)
+        assert d.is_batched is True
 
     def test_n_runs_computed_correctly(self):
         for n_gpu, n_per in [(1, 1), (2, 4), (4, 8)]:
             d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per)
             assert d.n_runs == n_gpu * n_per
             assert d.shape_prefix == (n_gpu, n_per)
+
+    # --- split_keys ---
+
+    def test_split_keys_shape(self):
+        """split_keys returns shape (G, P, n_sub_keys) with typed-key dtype."""
+        n_gpu, n_per_gpu = 1, 3
+        d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+        base_key = jax.random.key(0)
+        gpu_keys = jax.random.split(base_key, n_gpu)  # (G,)
+        result = d.split_keys(gpu_keys, 5)
+        assert result.shape == (n_gpu, n_per_gpu, 5)
+
+    def test_split_keys_deterministic(self):
+        """Two calls with the same key produce identical results."""
+        n_gpu, n_per_gpu = 1, 2
+        d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+        gpu_keys = jax.random.split(jax.random.key(7), n_gpu)
+        r1 = d.split_keys(gpu_keys, 4)
+        r2 = d.split_keys(gpu_keys, 4)
+        np.testing.assert_array_equal(
+            np.asarray(jax.random.key_data(r1)),
+            np.asarray(jax.random.key_data(r2)),
+        )
+
+    def test_split_keys_under_jit(self):
+        n_gpu, n_per_gpu = 1, 3
+        d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+        gpu_keys = jax.random.split(jax.random.key(3), n_gpu)
+
+        @jax.jit
+        def _split(keys):
+            return d.split_keys(keys, 4)
+
+        result = _split(gpu_keys)
+        assert result.shape == (n_gpu, n_per_gpu, 4)
+
+    # --- reduce_for_termination ---
+
+    def test_reduce_worst_of_2d(self):
+        """reduce_for_termination on (G, P) input returns worst-of scalars."""
+        d = PmapVmapRuns(n_gpu=1, n_per_gpu=3)
+        log_ev = jnp.array([[-10.0, -5.0, -7.0]])  # (1, 3)
+        hmax = jnp.array([[2.0, 5.0, 3.0]])         # (1, 3)
+        ev_out, hmax_out = d.reduce_for_termination(log_ev, hmax)
+        assert isinstance(ev_out, float)
+        assert isinstance(hmax_out, float)
+        assert abs(ev_out - (-10.0)) < 1e-6   # min across all
+        assert abs(hmax_out - 5.0) < 1e-6     # max across all
+
+    def test_reduce_scalar_outputs(self):
+        d = PmapVmapRuns(n_gpu=1, n_per_gpu=4)
+        log_ev = jnp.zeros((1, 4))
+        hmax = jnp.ones((1, 4))
+        ev_out, hmax_out = d.reduce_for_termination(log_ev, hmax)
+        assert isinstance(ev_out, float)
+        assert isinstance(hmax_out, float)
+
+    # --- wrap_step ---
+
+    def test_wrap_step_returns_callable(self):
+        d = PmapVmapRuns(n_gpu=1, n_per_gpu=2)
+        jit_step = d.wrap_step(_fake_ns_step_vmap, None, 5, 0)
+        assert callable(jit_step)
+
+    def test_wrap_step_call_pmap_vmap(self):
+        """wrap_step on (G, P)-batched fake state runs without error."""
+        n_gpu, n_per_gpu = 1, 2
+        d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+        jit_step = d.wrap_step(_fake_ns_step_vmap, None, 5, 0)
+        # (G, P) batch — pmap maps over G, vmap maps over P.
+        batched_state = _FakeState(jnp.ones((n_gpu, n_per_gpu)))
+        out_states, out_infos = jit_step(batched_state)
+        assert isinstance(out_states, _FakeState)
+        assert out_states.value.shape == (n_gpu, n_per_gpu)
