@@ -51,7 +51,12 @@ def build_kernel(
         transform = jnp.diag(diag)
 
         new_cell = state.cell @ transform
-        new_positions = state.positions @ transform
+        # HIGHEST precision: TF32 (10-bit mantissa on GPU) corrupts positions@T
+        # by ~3.7e-3 even for identity T, spiking LJ energy at dense packing.
+        new_positions = jnp.einsum(
+            "ij,jk->ik", state.positions, transform,
+            precision=jax.lax.Precision.HIGHEST,
+        )
 
         new_energy, count, overflow = backend(
             new_positions, state.types, new_cell, state.max_neighbors,
@@ -62,7 +67,13 @@ def build_kernel(
             new_cell, n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect
         )
 
-        accepted = (new_energy < likelihood_constraint) & cell_valid
+        energy_ok = new_energy < likelihood_constraint
+        accepted = energy_ok & cell_valid
+
+        reject_reason = jnp.where(
+            accepted, jnp.int32(0),
+            jnp.where(~energy_ok, jnp.int32(1), jnp.int32(2)),
+        )
 
         new_state = state.set(
             positions=jnp.where(accepted, new_positions, state.positions),
@@ -76,6 +87,7 @@ def build_kernel(
             accepted=accepted,
             log_likelihood=-new_state.energy,
             n_evaluations=1,
+            reject_reason=reject_reason,
         )
 
         return new_state, info

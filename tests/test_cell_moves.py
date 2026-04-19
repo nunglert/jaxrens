@@ -505,3 +505,104 @@ class TestLJIntegration:
         assert jnp.all(volumes > 0.0), "All volumes should be positive"
         assert jnp.all(volumes / n_atoms <= 100.0), "Volume per atom constraint"
         assert jnp.all(volumes / n_atoms >= 1.0), "Min volume per atom constraint"
+
+
+# ---------------------------------------------------------------------------
+# Regression Tests for TF32 precision fix (Fix 1)
+# ---------------------------------------------------------------------------
+
+
+class TestTF32PrecisionFix:
+    """Regression tests for TF32 matmul precision bug.
+
+    On CUDA, JAX defaults to TF32 (10-bit mantissa).  Even for identity T,
+    `positions @ eye(3)` introduces ~3.7e-3 noise per element, which is
+    enough to spike LJ energy by 10^2-10^3 units at dense packing, causing
+    100% rejection regardless of step size.
+
+    The fix (jnp.einsum with Precision.HIGHEST) must produce bit-exact
+    results for an identity transform and keep energy stable at tiny step size.
+    Both tests pass on CPU (no TF32) and catch regressions on GPU (TF32 active).
+    """
+
+    def test_transform_positions_identity_is_bit_exact(self):
+        """positions @ eye(3) must be bit-exact after the HIGHEST precision fix.
+
+        This catches any reintroduction of TF32 matmul in transform_positions
+        (cell.py), which is shared by the shear move path.
+        """
+        # Use a realistic dense-packing scenario: 64 atoms, cell side ~11 Å
+        key = jax.random.key(0)
+        n_atoms = 64
+        cell_side = 11.0
+        cell = cell_side * jnp.eye(3)
+        positions = jax.random.uniform(key, (n_atoms, 3), minval=0.0, maxval=cell_side)
+
+        new_positions = transform_positions(positions, cell, cell)  # T = identity
+
+        max_err = float(jnp.max(jnp.abs(new_positions - positions)))
+        assert max_err == 0.0, (
+            f"transform_positions(identity) is not bit-exact: max |err| = {max_err:.3e}. "
+            "TF32 precision leaking through — check Precision.HIGHEST in cell.py."
+        )
+
+    def test_transform_positions_identity_bit_exact_under_jit(self):
+        """Same bit-exactness check, compiled under jax.jit."""
+        key = jax.random.key(1)
+        n_atoms = 64
+        cell_side = 11.0
+        cell = cell_side * jnp.eye(3)
+        positions = jax.random.uniform(key, (n_atoms, 3), minval=0.0, maxval=cell_side)
+
+        jit_transform = jax.jit(transform_positions)
+        new_positions = jit_transform(positions, cell, cell)
+
+        max_err = float(jnp.max(jnp.abs(new_positions - positions)))
+        assert max_err == 0.0, (
+            f"JIT transform_positions(identity) is not bit-exact: max |err| = {max_err:.3e}. "
+            "TF32 precision leaking through — check Precision.HIGHEST in cell.py."
+        )
+
+    def test_volume_move_tiny_step_size_preserves_energy(self):
+        """A volume move at ss=1e-20 must return new_energy == pre-move energy.
+
+        At an infinitesimally small step, the proposed new cell is
+        indistinguishable from the old one, so the energy should be
+        identical to within 1e-10.  On GPU with TF32, the position matmul
+        would introduce ~3.7e-3 noise, causing the energy to spike and this
+        assertion to fail.
+        """
+        backend = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5)
+        n_atoms = 4
+
+        cell = 5.0 * jnp.eye(3)
+        positions = jnp.array([
+            [0.5, 0.5, 0.5],
+            [2.0, 0.5, 0.5],
+            [0.5, 2.0, 0.5],
+            [0.5, 0.5, 2.0],
+        ])
+        types = jnp.zeros(n_atoms, dtype=jnp.int32)
+
+        init_energy = backend(positions, types, cell, 0)[0]
+        # Tiny step size: proposed volume change is ~1e-20 * n_atoms * N(0,1)
+        state = _make_cell_state(positions, types, energy=init_energy,
+                                 cell=cell, step_size=1e-20)
+
+        step = jax.jit(vol_build_kernel(
+            backend, n_atoms,
+            max_vol_per_atom=100.0,
+            min_vol_per_atom=1.0,
+            min_aspect=0.5,
+        ))
+
+        key = jax.random.key(42)
+        new_state, info = step(key, state, likelihood_constraint=1e10)
+
+        # The proposed energy at an infinitesimal step must equal original energy
+        # (tolerance 1e-10; TF32 noise would give ~1e2 discrepancy at dense packing)
+        energy_diff = float(jnp.abs(new_state.energy - init_energy))
+        assert energy_diff < 1e-10, (
+            f"Energy changed by {energy_diff:.3e} at ss=1e-20.  "
+            "Expected bit-stable result — TF32 may be leaking through the matmul."
+        )

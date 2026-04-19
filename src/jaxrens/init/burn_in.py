@@ -116,7 +116,7 @@ def _apply_adaptation(
         n_walkers = ns_state.n_walkers
         for move_idx, policy in enumerate(adaptation_policies):
             key, key_adj = jax.random.split(key)
-            new_ss, _ = jit_adjust_fns[move_idx](
+            new_ss, *_ = jit_adjust_fns[move_idx](
                 population,
                 per_move_fns[move_idx],
                 current_step_sizes[move_idx],
@@ -149,7 +149,7 @@ def _apply_adaptation(
             run_keys = jax.random.split(key_adj, n_runs)
 
             def adjust_one_run(run_pop, run_ss, run_emax, run_key):
-                new_ss, _ = jit_adjust_fns[move_idx](
+                new_ss, *_ = jit_adjust_fns[move_idx](
                     run_pop,
                     per_move_fns[move_idx],
                     run_ss,

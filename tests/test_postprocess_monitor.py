@@ -20,6 +20,7 @@ matplotlib.use("Agg")  # headless, must be before any other matplotlib import
 import numpy as np
 import pytest
 
+from jaxrens.cli.monitor import _format_reject_breakdown
 from jaxrens.postprocess.monitor import Monitor
 from jaxrens.postprocess.collection import MonitorCollection
 from jaxrens.postprocess import (
@@ -36,6 +37,73 @@ from jaxrens.postprocess.thermodynamics import (
     partition_function as thermo_partition_function,
     free_energy as thermo_free_energy,
 )
+
+
+# ---------------------------------------------------------------------------
+# _format_reject_breakdown unit tests
+# ---------------------------------------------------------------------------
+
+class TestFormatRejectBreakdown:
+    """Unit tests for the reject-reason column formatter in monitor.py."""
+
+    def test_energy_only_reasons_used(self):
+        """counts=[10,5,0,0] with reasons_used={"energy"} -> E=100%."""
+        result = _format_reject_breakdown(
+            [10, 5, 0, 0], reasons_used=frozenset({"energy"})
+        )
+        assert result == "   reject: E=100%"
+
+    def test_energy_and_cell_reasons_used(self):
+        """counts=[10,3,2,0] with reasons_used={"energy","cell"} -> E=60% C=40%."""
+        result = _format_reject_breakdown(
+            [10, 3, 2, 0], reasons_used=frozenset({"energy", "cell"})
+        )
+        assert result == "   reject: E=60% C=40%"
+
+    def test_backward_compat_none_reasons_used(self):
+        """counts=[10,3,2,0] with reasons_used=None -> all three columns (backward compat)."""
+        result = _format_reject_breakdown([10, 3, 2, 0], reasons_used=None)
+        # Expected: E=60% C=40% P=0%
+        assert "E=60%" in result
+        assert "C=40%" in result
+        assert "P=0%" in result
+
+    def test_all_accepted_returns_empty(self):
+        """counts=[10,0,0,0] with any reasons_used -> empty string."""
+        assert _format_reject_breakdown([10, 0, 0, 0], reasons_used=frozenset({"energy"})) == ""
+        assert _format_reject_breakdown([10, 0, 0, 0], reasons_used=None) == ""
+        assert _format_reject_breakdown([10, 0, 0, 0], reasons_used=frozenset({"energy", "cell", "prior"})) == ""
+
+    def test_zero_total_returns_empty(self):
+        """counts=[0,0,0,0] -> empty string."""
+        assert _format_reject_breakdown([0, 0, 0, 0]) == ""
+
+    def test_all_three_reasons(self):
+        """counts=[5,3,1,1] with all three reasons -> E=60% C=20% P=20%."""
+        result = _format_reject_breakdown(
+            [5, 3, 1, 1], reasons_used=frozenset({"energy", "cell", "prior"})
+        )
+        assert "E=60%" in result
+        assert "C=20%" in result
+        assert "P=20%" in result
+
+    def test_galilean_energy_only_output(self):
+        """Galilean: reasons_used={"energy"}, some rejects -> only E column."""
+        result = _format_reject_breakdown(
+            [50, 50, 0, 0], reasons_used=frozenset({"energy"})
+        )
+        assert "E=100%" in result
+        assert "C=" not in result
+        assert "P=" not in result
+
+    def test_unknown_reject_flagged(self):
+        """If rejects appear outside declared reasons, ???= flag is appended."""
+        # 5 rejects in cell bucket (2) but reasons_used only says energy (1)
+        result = _format_reject_breakdown(
+            [10, 0, 5, 0], reasons_used=frozenset({"energy"})
+        )
+        # E=0% from declared, ???=5 from undeclared
+        assert "???" in result
 
 
 # ---------------------------------------------------------------------------

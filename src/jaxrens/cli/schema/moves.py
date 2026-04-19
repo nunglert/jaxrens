@@ -106,6 +106,16 @@ class BaseMoveSpec(BaseModel):
     def _extra_state_fields(self) -> dict[str, tuple[type, Callable]]:
         return {}
 
+    def _reject_reasons(self) -> frozenset[str]:
+        """Return the set of reject-reason buckets this move can emit.
+
+        Subclasses override this when their kernel can emit cell or prior
+        rejection reasons (buckets 2 and 3 respectively).  The default is
+        energy-only rejection (bucket 1), which covers all atom-displacement
+        moves that never call check_cell_shape or sample from a prior.
+        """
+        return frozenset({"energy"})
+
     def to_descriptor(
         self,
         *,
@@ -132,6 +142,7 @@ class BaseMoveSpec(BaseModel):
             weight=self.weight,
             step_size=self.step_size,
             extra_state_fields=self._extra_state_fields(),
+            reject_reasons=self._reject_reasons(),
         )
 
 
@@ -239,6 +250,9 @@ class SingleAtomSwapMoveSpec(BaseMoveSpec):
 class VolumeMoveSpec(BaseMoveSpec):
     type: Literal["volume"] = "volume"
 
+    def _reject_reasons(self) -> frozenset[str]:
+        return frozenset({"energy", "cell", "prior"})
+
     def _build_kernel(self) -> Callable:
         return volume.build_kernel
 
@@ -265,6 +279,9 @@ class VolumeMoveSpec(BaseMoveSpec):
 class ShearMoveSpec(BaseMoveSpec):
     type: Literal["shear"] = "shear"
 
+    def _reject_reasons(self) -> frozenset[str]:
+        return frozenset({"energy", "cell"})
+
     def _build_kernel(self) -> Callable:
         return shear.build_kernel
 
@@ -289,6 +306,9 @@ class ShearMoveSpec(BaseMoveSpec):
 
 class StretchMoveSpec(BaseMoveSpec):
     type: Literal["stretch"] = "stretch"
+
+    def _reject_reasons(self) -> frozenset[str]:
+        return frozenset({"energy", "cell"})
 
     def _build_kernel(self) -> Callable:
         return stretch.build_kernel

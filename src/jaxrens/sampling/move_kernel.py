@@ -34,6 +34,11 @@ class MoveKernel:
                 {"direction": (jnp.ndarray, lambda pos, types: jnp.zeros_like(pos))}
             The MWG factory unions extra_state_fields from all descriptors
             to build the MCState class dynamically.
+        reject_reasons: Set of reject-reason bucket names this move can emit.
+            Valid values: "energy", "cell", "prior". "accepted" (bucket 0) is
+            always relevant and is excluded from this set. Used by the monitor
+            to suppress uninformative zero-columns in the reject breakdown.
+            Default is frozenset({"energy"}) — energy-only rejection.
     """
 
     name: str
@@ -45,3 +50,4 @@ class MoveKernel:
     min_rate: float = 0.25
     max_rate: float = 0.65
     extra_state_fields: dict[str, tuple[type, Callable]] = field(default_factory=dict)
+    reject_reasons: frozenset[str] = field(default_factory=lambda: frozenset({"energy"}))

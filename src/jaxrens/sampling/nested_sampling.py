@@ -21,12 +21,6 @@ import jax.numpy as jnp
 import numpy as np
 
 from jaxrens.base import NSCallback
-from jaxrens.sampling.adaptation.step_size import (
-    AdaptationState,
-    dual_averaging_update,
-    get_step_size,
-    init_adaptation,
-)
 from jaxrens.sampling.termination import (
     IterationTermination,
     PriorMassTermination,
@@ -316,13 +310,50 @@ def ns_step(
     all_mcmc_keys = jax.vmap(lambda k: jax.random.split(k, n_mcmc_steps))(chain_keys)
 
     def run_one_chain(walker, chain_keys):
+        # Bucket convention for reject_reason_counts_per_move:
+        #   axis 1 index 0 = accepted count
+        #   axis 1 index 1 = energy reject count
+        #   axis 1 index 2 = cell reject count
+        #   axis 1 index 3 = prior reject count
+        # Each row sums to n_proposed_per_move for that move.
+        # This makes the 4 buckets exclusive and exhaustive.
         def scan_body(state, step_key):
             new_state, info = step_fn(step_key, state, potential_max)
-            return new_state, info.accepted
-        final, accepted_arr = jax.lax.scan(scan_body, walker, chain_keys)
-        return final, jnp.sum(accepted_arr)
+            # Per-move accepted count: scatter accepted flag onto move_idx
+            n_acc = jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(
+                info.accepted.astype(jnp.int32)
+            )
+            # Per-move proposed count: always +1 for this move
+            n_prop = jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(1)
+            # Per-move reject-reason bucket: index into (move_idx, reason)
+            # reason=0 means accepted, so accepted moves go into bucket 0.
+            # Gate rejected moves: non-cell moves leave reject_reason at default
+            # 0 (same as accepted), so force any rejected move with reason=0
+            # into bucket 1 (energy). This preserves the invariant
+            # rr[:, 0] == n_accepted_per_move without touching move kernels.
+            scatter_col = jnp.where(
+                info.accepted, jnp.int32(0), jnp.maximum(info.reject_reason, jnp.int32(1))
+            )
+            rr_counts = jnp.zeros((n_moves, 4), dtype=jnp.int32).at[
+                info.move_idx, scatter_col
+            ].add(1)
+            return new_state, (info.accepted, n_acc, n_prop, rr_counts)
 
-    finals, acc_counts = jax.vmap(run_one_chain)(walk_batch, all_mcmc_keys)
+        final, (accepted_arr, n_acc_arr, n_prop_arr, rr_arr) = jax.lax.scan(
+            scan_body, walker, chain_keys
+        )
+        # Sum over the scan axis (n_mcmc_steps)
+        return (
+            final,
+            jnp.sum(accepted_arr),
+            jnp.sum(n_acc_arr, axis=0),   # (n_moves,)
+            jnp.sum(n_prop_arr, axis=0),  # (n_moves,)
+            jnp.sum(rr_arr, axis=0),      # (n_moves, 4)
+        )
+
+    finals, acc_counts, chain_n_acc, chain_n_prop, chain_rr = jax.vmap(
+        run_one_chain
+    )(walk_batch, all_mcmc_keys)
 
     # 7. Scatter walked walkers back into population
     new_pop = jax.tree.map(
@@ -344,12 +375,25 @@ def ns_step(
 
     total_accepted = jnp.sum(acc_counts)
     total_steps = n_walk * n_mcmc_steps
+    # Aggregate per-move counters across all walked walkers (vmap axis 0).
+    # chain_n_acc / chain_n_prop / chain_rr have shape (n_walk, n_moves[, 4]).
+    agg_n_accepted = jnp.sum(chain_n_acc, axis=0)    # (n_moves,)
+    agg_n_proposed = jnp.sum(chain_n_prop, axis=0)   # (n_moves,)
+    agg_rr_counts = jnp.sum(chain_rr, axis=0)        # (n_moves, 4)
+
     info = {
         "emax": potential_max,
         "hmax": potential_max,  # backward compat — same as emax now
         "worst_idx": worst_idx,
         "clone_idx": clone_idx,
         "acceptance_rate": total_accepted / total_steps,
+        # Chain-level per-move statistics (raw counts; let consumers compute rates).
+        # Bucket convention: reject_reason_counts_per_move[:, 0] = accepted,
+        #   [:, 1] = energy reject, [:, 2] = cell reject, [:, 3] = prior reject.
+        # Each row sums to n_proposed_per_move for that move.
+        "n_accepted_per_move": agg_n_accepted,          # (n_moves,) int32
+        "n_proposed_per_move": agg_n_proposed,          # (n_moves,) int32
+        "reject_reason_counts_per_move": agg_rr_counts,  # (n_moves, 4) int32
     }
     return new_ns_state, info
 
@@ -400,7 +444,6 @@ def run_ns(
     convergence_threshold: float = 0.1,
     initial_step_size: float = 0.1,
     target_acceptance: float = 0.5,
-    adapt_warmup: int = 100,
     callbacks: list[Any] | None = None,
     termination_criteria: list[TerminationCriterion] | None = None,
     ensemble_params: dict | None = None,
@@ -431,18 +474,21 @@ def run_ns(
             PriorMassTermination(n_walkers, convergence_threshold),
         ]
 
-    # Initialize NSState with batched MCState population
+    # Initialize NSState with batched MCState population.
+    # Size step_sizes per number of moves when known; falls back to length-1
+    # broadcast for legacy callers that don't pass per_move_fns / descriptors.
+    if per_move_fns is not None:
+        n_moves = len(per_move_fns)
+    elif move_descriptors is not None:
+        n_moves = len(move_descriptors)
+    else:
+        n_moves = 1
     ns_state = init_ns(
         init_fn, positions, types, energies, cells, rng_key,
         max_dead=max_iterations,
-        step_sizes=jnp.full(1, initial_step_size),
+        step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params=ensemble_params,
         restart_state=restart_state,
-    )
-
-    adapt_state = init_adaptation(
-        initial_step_size=initial_step_size,
-        target_acceptance=target_acceptance,
     )
 
     n_atoms = positions.shape[1] if positions.ndim >= 2 else None
@@ -479,39 +525,47 @@ def run_ns(
     current_step_sizes = pop.step_sizes[0]  # (n_move_types,) — same for all walkers
 
     for i in range(max_iterations):
-        # Step size adaptation
+        # Step size adaptation via bisection (full_auto only; no fallback path)
+        _adjust_fired = False
+        per_move_rates: list = []
+        per_move_counts: list = []
+        per_move_n_rounds: list = []
+        per_move_converged: list = []
+        per_move_cap_hits: list = []
+        per_move_floor_hits: list = []
+        per_move_bracket_detected: list = []
         if use_full_auto and i > 0 and i % adjust_interval == 0:
             pop = ns_state.population
             emax = jnp.max(pop.energy)
             for move_idx, desc in enumerate(move_descriptors):
                 rng_key, key_adjust = jax.random.split(rng_key)
-                new_ss, rate = jit_adjust_fns[move_idx](
+                (new_ss, rate, counts,
+                 n_rounds, converged, cap_hits, floor_hits, bracket_detected
+                 ) = jit_adjust_fns[move_idx](
                     pop, per_move_fns[move_idx],
                     current_step_sizes[move_idx], emax, key_adjust,
                     adjust_n_samples, desc.min_rate, desc.max_rate,
                     adjust_factor, desc.step_size_max, adjust_max_rounds,
                 )
                 current_step_sizes = current_step_sizes.at[move_idx].set(new_ss)
-                logger.info(
-                    "Adjusted %s: ss=%.4g rate=%.3f",
+                per_move_rates.append(float(rate))
+                per_move_counts.append(counts)
+                per_move_n_rounds.append(n_rounds)
+                per_move_converged.append(converged)
+                per_move_cap_hits.append(cap_hits)
+                per_move_floor_hits.append(floor_hits)
+                per_move_bracket_detected.append(bracket_detected)
+                logger.debug(
+                    "Adjusted %s: ss=%.4g rate=%.3f rounds=%d converged=%s",
                     desc.name, float(new_ss), float(rate),
+                    int(n_rounds), bool(converged),
                 )
             # Broadcast to all walkers
             new_ss_pop = jnp.broadcast_to(
                 current_step_sizes, (n_walkers, current_step_sizes.shape[0]),
             )
             ns_state = ns_state.set(population=pop.set(step_sizes=new_ss_pop))
-        elif not use_full_auto and i < adapt_warmup:
-            # Fallback: simple dual averaging (single scalar for all moves)
-            step_size = get_step_size(adapt_state)
-            pop = ns_state.population
-            n_move_types = pop.step_sizes.shape[-1]
-            new_step_sizes = jnp.broadcast_to(
-                step_size, (n_walkers, n_move_types)
-            )
-            ns_state = ns_state.set(
-                population=pop.set(step_sizes=new_step_sizes),
-            )
+            _adjust_fired = True
 
         # Run one NS iteration (JIT'd)
         new_ns_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps, n_extra)
@@ -531,24 +585,25 @@ def run_ns(
 
         ns_state = new_ns_state
 
-        # Dual averaging update (fallback, outside JIT)
-        if not use_full_auto and i < adapt_warmup:
-            adapt_state = dual_averaging_update(
-                adapt_state,
-                accepted=jnp.array(info["acceptance_rate"] > target_acceptance),
-                target_acceptance=target_acceptance,
+        # Populate per-move adaptation data into info dict for callbacks.
+        # Only present on iterations where full_auto just fired (adjust_interval).
+        if _adjust_fired:
+            info["step_sizes_per_move"] = current_step_sizes        # (n_moves,)
+            info["acceptance_rates_per_move"] = jnp.array(per_move_rates)  # (n_moves,)
+            info["reject_counts_per_move"] = jnp.stack(per_move_counts, axis=0)  # (n_moves, 4)
+            info["adjustment_n_rounds"] = jnp.array(per_move_n_rounds, dtype=jnp.int32)  # (n_moves,)
+            info["adjustment_converged"] = jnp.array(per_move_converged)        # (n_moves,)
+            info["adjustment_cap_hits"] = jnp.array(per_move_cap_hits, dtype=jnp.int32)  # (n_moves,)
+            info["adjustment_floor_hits"] = jnp.array(per_move_floor_hits, dtype=jnp.int32)  # (n_moves,)
+            info["adjustment_bracket_detected"] = jnp.array(per_move_bracket_detected)  # (n_moves,)
+            move_name_list = [d.name for d in move_descriptors]
+            info["move_names"] = move_name_list
+            info["move_reject_reasons"] = tuple(
+                frozenset(d.reject_reasons) for d in move_descriptors
             )
 
-        # Periodic INFO log
-        if i % info_interval == 0 or i == max_iterations - 1:
-            logger.info(
-                "iter=%d  Emax=%.6g  log_Z=%.4f  acc=%.2f  ss=%s",
-                int(ns_state.iteration),
-                float(info["emax"]),
-                float(ns_state.log_evidence),
-                float(info["acceptance_rate"]),
-                str(np.array(current_step_sizes).round(4)) if use_full_auto else f"{float(get_step_size(adapt_state)):.4g}",
-            )
+        # The canonical periodic summary is printed by ProgressCallback;
+        # do NOT add a duplicate logger.info call here.
 
         # Callbacks
         for cb in callbacks:
@@ -653,16 +708,22 @@ def run_ns_parallel(
     convergence_threshold: float = 0.1,
     initial_step_size: float = 0.1,
     target_acceptance: float = 0.5,
-    adapt_warmup: int = 100,
     termination_criteria: list[TerminationCriterion] | None = None,
     ensemble_params_per_run: list[dict] | None = None,
+    per_move_fns: list[Callable] | None = None,
+    move_descriptors: list | None = None,
+    adjust_interval: int = 0,
+    adjust_n_samples: int = 50,
+    adjust_max_rounds: int = 15,
+    adjust_factor: float = 1.5,
 ) -> dict:
     """Run multiple NS calculations in parallel via vmap(ns_step).
 
     All runs share the same step_fn, n_mcmc_steps, and n_extra.
-    Each run has independent RNG, adaptation, and (optionally) ensemble
-    parameters. The outer Python loop handles adaptation, overflow
-    detection, termination, and logging.
+    Each run has independent RNG and (optionally) ensemble parameters.
+    When per_move_fns / move_descriptors / adjust_interval are provided,
+    step sizes are adapted via vmapped adjust_step_size bisection.
+    Without them, step sizes remain at initial_step_size throughout.
 
     Args:
         positions: (n_runs, n_walkers, n_atoms, 3)
@@ -678,10 +739,16 @@ def run_ns_parallel(
         n_extra: Extra walkers to walk per iteration (static).
         convergence_threshold: For PriorMassTermination.
         initial_step_size: Starting step size.
-        target_acceptance: Target acceptance rate.
-        adapt_warmup: Iterations for step size warmup.
+        target_acceptance: Target acceptance rate (unused directly; kept for
+            interface parity with run_ns).
         termination_criteria: Optional. If None, uses defaults.
         ensemble_params_per_run: Per-run ensemble params (e.g. different pressures).
+        per_move_fns: Per-move step functions for bisection adaptation.
+        move_descriptors: MoveKernel descriptors carrying rate bounds + max ss.
+        adjust_interval: Adapt every N iterations. 0 = no adaptation.
+        adjust_n_samples: Walkers to sample per bisection trial round (static).
+        adjust_max_rounds: Max bisection rounds per adjust call (static).
+        adjust_factor: Multiplicative bisection factor (static).
 
     Returns:
         Dict with (n_runs, ...) shaped arrays on all fields.
@@ -696,21 +763,62 @@ def run_ns_parallel(
             PriorMassTermination(n_walkers, convergence_threshold),
         ]
 
+    # Determine adaptation mode
+    use_full_auto = (
+        per_move_fns is not None
+        and move_descriptors is not None
+        and adjust_interval > 0
+    )
+
+    if use_full_auto:
+        n_moves = len(move_descriptors)
+    elif move_descriptors is not None:
+        n_moves = len(move_descriptors)
+    else:
+        n_moves = 1
+
     # Initialize batched NSState: (n_runs, ...) on all dynamic fields
     ns_states = init_ns_parallel(
         init_fn, positions, types, energies, cells, rng_keys,
         max_dead=max_iterations,
-        step_sizes=jnp.full(1, initial_step_size),
+        step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params_per_run=ensemble_params_per_run,
     )
 
-    # Per-run adaptation: stack n_runs copies of AdaptationState
-    adapt_states_list = [
-        init_adaptation(initial_step_size=initial_step_size,
-                        target_acceptance=target_acceptance)
-        for _ in range(n_runs)
-    ]
-    adapt_states = jax.tree.map(lambda *xs: jnp.stack(xs), *adapt_states_list)
+    # Pre-compile vmapped adjust_step_size (once per move, before the loop)
+    if use_full_auto:
+        from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
+
+        # Build per-move vmapped+JIT'd functions.
+        # vmap is over the n_runs dimension of (population, step_size, emax, key).
+        # Static args (move_fn, n_samples, bounds, factor, max_ss, max_rounds)
+        # remain outside vmap.
+        jit_vmap_adjust_fns = []
+        for midx, desc in enumerate(move_descriptors):
+            def _make_vmap_fn(move_fn, n_samp, min_r, max_r, afac, max_ss, max_r2):
+                def _per_run(pop, ss, emax, key):
+                    return adjust_step_size(
+                        pop, move_fn, ss, emax, key,
+                        n_samp, min_r, max_r, afac, max_ss, max_r2,
+                    )
+                return jax.jit(jax.vmap(_per_run))
+            jit_vmap_adjust_fns.append(
+                _make_vmap_fn(
+                    per_move_fns[midx],
+                    adjust_n_samples,
+                    desc.min_rate,
+                    desc.max_rate,
+                    adjust_factor,
+                    desc.step_size_max,
+                    adjust_max_rounds,
+                )
+            )
+
+        # (n_runs, n_moves) — current step sizes, one per run per move
+        current_step_sizes = ns_states.population.step_sizes[:, 0, :]  # (n_runs, n_moves)
+
+    # Per-run PRNG keys used during adaptation (independent of ns_states.rng_key)
+    adapt_keys = jax.vmap(lambda k: jax.random.split(k)[0])(rng_keys)  # (n_runs,)
 
     logger.info(
         "Starting parallel NS: %d runs, %d walkers, max_iter=%d, n_mcmc=%d, n_extra=%d",
@@ -728,19 +836,36 @@ def run_ns_parallel(
     jit_step = jax.jit(step_all_runs)
 
     for i in range(max_iterations):
-        # Adaptation: per-run step_size broadcast
-        if i < adapt_warmup:
-            step_sizes_per_run = jax.vmap(get_step_size)(adapt_states)  # (n_runs,)
+        # Step size adaptation via vmapped bisection (full_auto only)
+        if use_full_auto and i > 0 and i % adjust_interval == 0:
             pop = ns_states.population
-            n_move_types = pop.step_sizes.shape[-1]
-            # Broadcast: (n_runs,) -> (n_runs, n_walkers, n_move_types)
-            new_step_sizes = jnp.broadcast_to(
-                step_sizes_per_run[:, None, None],
-                (n_runs, n_walkers, n_move_types),
+            # (n_runs,) per-run emax
+            emax_per_run = jnp.max(pop.energy, axis=1)  # (n_runs,)
+            # current_step_sizes: (n_runs, n_moves)
+            for move_idx, desc in enumerate(move_descriptors):
+                # Advance adapt_keys and derive per-run trial keys for this move.
+                # split_pairs: (n_runs, 2) — first column = new carry, second = trial key
+                split_pairs = jax.vmap(jax.random.split)(adapt_keys)  # (n_runs, 2)
+                adapt_keys = split_pairs[:, 0]   # carry forward
+                new_keys = split_pairs[:, 1]     # per-run trial keys
+
+                ss_move = current_step_sizes[:, move_idx]  # (n_runs,)
+                (new_ss_runs, rates, counts, n_rounds,
+                 converged, cap_hits, floor_hits, bracket_detected
+                 ) = jit_vmap_adjust_fns[move_idx](
+                    pop, ss_move, emax_per_run, new_keys,
+                )
+                current_step_sizes = current_step_sizes.at[:, move_idx].set(new_ss_runs)
+                logger.debug(
+                    "Adjusted %s (all runs): ss_mean=%.4g rate_mean=%.3f",
+                    desc.name, float(jnp.mean(new_ss_runs)), float(jnp.mean(rates)),
+                )
+            # Broadcast (n_runs, n_moves) -> (n_runs, n_walkers, n_moves)
+            new_ss_pop = jnp.broadcast_to(
+                current_step_sizes[:, None, :],
+                (n_runs, n_walkers, n_moves),
             )
-            ns_states = ns_states.set(
-                population=pop.set(step_sizes=new_step_sizes),
-            )
+            ns_states = ns_states.set(population=pop.set(step_sizes=new_ss_pop))
 
         # Batched NS step (all runs in parallel)
         new_ns_states, infos = jit_step(ns_states)
@@ -757,15 +882,6 @@ def run_ns_parallel(
             continue
 
         ns_states = new_ns_states
-
-        # Per-run adaptation (vmapped)
-        if i < adapt_warmup:
-            adapt_states = jax.vmap(
-                lambda s, acc: dual_averaging_update(
-                    s, accepted=acc > target_acceptance,
-                    target_acceptance=target_acceptance,
-                )
-            )(adapt_states, infos["acceptance_rate"])
 
         # Periodic log
         if i % info_interval == 0 or i == max_iterations - 1:

@@ -543,6 +543,15 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
     backend = root.backend.to_backend_config()
     energy_backend = root.backend.build_backend()
 
+    # Wrap with ensemble corrections so that initial energies are computed on
+    # the same scale as the NS loop (U + P*V for NPT).  Without this, walkers
+    # are initialized with bare LJ energies while the MWG step_fn returns
+    # ensemble-corrected energies — causing systematic emax < new_energy for
+    # all cell moves and 100% rejection from the first adapt call.
+    if pressure is not None:
+        from jaxrens.backends.ensemble import EnsembleBackend
+        energy_backend = EnsembleBackend(energy_backend, pressure=float(pressure))
+
     output = OutputConfig(
         format=root.output.format,
         traj_interval=root.output.traj_interval,
@@ -584,10 +593,17 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
     # config field — this is the single canonical source of truth.
     n_atoms = int(resolved_init.initial_positions.shape[-2])
 
+    import dataclasses as _dc
+
     moves = tuple(m.to_move_config() for m in root.moves)
     move_descriptors = tuple(
-        m.to_descriptor(n_atoms=n_atoms, cell_cfg=root.cell)
-        for m in root.moves
+        _dc.replace(
+            m.to_descriptor(n_atoms=n_atoms, cell_cfg=root.cell),
+            min_rate=policy.min_rate,
+            max_rate=policy.max_rate,
+            step_size_max=policy.step_size_max,
+        )
+        for m, policy in zip(root.moves, adaptation_policies)
     )
 
     return ResolvedConfig(

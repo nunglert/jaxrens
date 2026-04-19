@@ -198,6 +198,46 @@ class MonitorCollection:
             ax = plot_log_evidence_trace(monitor, ax=ax, **kwargs)
         return ax
 
+    def plot_step_sizes(self, *, ax=None, per_run: bool = False, **kwargs):
+        """Overlay step-size traces for all monitors that have adaptation data.
+
+        Monitors without ``adaptation_trace`` are silently skipped.
+
+        Args:
+            ax:      Existing axes.  Created if None.
+            per_run: Passed through to :func:`~jaxrens.postprocess.plotting.plot_step_sizes`.
+            **kwargs: Forwarded to each ``plot_step_sizes`` call.
+
+        Returns:
+            The Axes object.
+        """
+        from jaxrens.postprocess.plotting import plot_step_sizes
+
+        for monitor in self._monitors:
+            if monitor.adaptation_trace is not None:
+                ax = plot_step_sizes(monitor, ax=ax, per_run=per_run, **kwargs)
+        return ax
+
+    def plot_acceptance_rates(self, *, ax=None, per_run: bool = False, **kwargs):
+        """Overlay acceptance-rate traces for all monitors that have adaptation data.
+
+        Monitors without ``adaptation_trace`` are silently skipped.
+
+        Args:
+            ax:      Existing axes.  Created if None.
+            per_run: Passed through to :func:`~jaxrens.postprocess.plotting.plot_acceptance_rates`.
+            **kwargs: Forwarded to each ``plot_acceptance_rates`` call.
+
+        Returns:
+            The Axes object.
+        """
+        from jaxrens.postprocess.plotting import plot_acceptance_rates
+
+        for monitor in self._monitors:
+            if monitor.adaptation_trace is not None:
+                ax = plot_acceptance_rates(monitor, ax=ax, per_run=per_run, **kwargs)
+        return ax
+
     # ------------------------------------------------------------------
     # Tabular summary
     # ------------------------------------------------------------------

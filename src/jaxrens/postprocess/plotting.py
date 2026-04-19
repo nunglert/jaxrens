@@ -89,23 +89,22 @@ def plot_log_evidence_trace(
     Returns:
         The Axes object.
     """
-    from jax.scipy.special import logsumexp
-    import jax.numpy as jnp
-
     from jaxrens.postprocess.thermodynamics import calc_log_weights
 
     ax = _get_ax(ax)
     kwargs.setdefault("label", monitor.label or "log Z trace")
 
     n_dead = monitor.n_dead
-    dead_e = jnp.asarray(monitor.dead_energies)
-    log_w = calc_log_weights(n_dead, monitor.n_live, monitor.n_cull)
-    log_L = -dead_e
+    log_w = np.asarray(calc_log_weights(n_dead, monitor.n_live, monitor.n_cull))
+    log_L = -np.asarray(monitor.dead_energies)
+    log_terms = log_w + log_L
 
-    # Cumulative log Z: log sum_{i<=k} w_i * L_i
-    cumulative = np.zeros(n_dead)
-    for k in range(1, n_dead + 1):
-        cumulative[k - 1] = float(logsumexp(log_w[:k] + log_L[:k]))
+    # Cumulative log Z via running logaddexp — pure numpy, O(n_dead).
+    cumulative = np.empty(n_dead)
+    running = -np.inf
+    for i in range(n_dead):
+        running = np.logaddexp(running, log_terms[i])
+        cumulative[i] = running
 
     ax.plot(np.arange(1, n_dead + 1), cumulative, **kwargs)
     ax.set_xlabel("Dead-point index")
@@ -194,4 +193,134 @@ def plot_free_energy(
     ax.plot(T, F, **kwargs)
     ax.set_xlabel("T")
     ax.set_ylabel("F")
+    return ax
+
+
+def plot_step_sizes(
+    monitor: "Monitor",
+    *,
+    ax: "Axes | None" = None,
+    per_run: bool = False,
+    **kwargs,
+) -> "Axes":
+    """Plot per-move step size vs iteration from the adaptation trace.
+
+    When the trace is batched (``n_runs > 1``) and ``per_run=True``, draws one
+    line per (move, run) combination.  When ``per_run=False`` (default), plots
+    the mean across runs with a shaded ``fill_between`` for ±1 std.
+
+    Args:
+        monitor:  Populated Monitor with a non-None ``adaptation_trace``.
+        ax:       Existing axes.  Created if None.
+        per_run:  If True, draw individual run lines instead of mean±std.
+        **kwargs: Forwarded to ``ax.plot`` (not to ``fill_between``).
+
+    Returns:
+        The Axes object.
+
+    Raises:
+        ValueError: If ``monitor.adaptation_trace`` is None.
+    """
+    import matplotlib.pyplot as plt
+
+    if monitor.adaptation_trace is None:
+        raise ValueError(
+            "Monitor has no adaptation_trace.  Load from a directory that "
+            "contains a .adaptation.h5 file."
+        )
+
+    ax = _get_ax(ax)
+    trace = monitor.adaptation_trace
+
+    iters = trace.iterations                     # (n_entries,)
+    ss = trace.step_sizes                        # (n_entries, n_runs, n_moves)
+    move_names = trace.move_names
+    n_moves = trace.n_moves
+    n_runs = trace.n_runs
+
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    for k, name in enumerate(move_names):
+        color = colors[k % len(colors)]
+        ss_k = ss[:, :, k]  # (n_entries, n_runs)
+
+        if per_run or n_runs == 1:
+            for r in range(n_runs):
+                lbl = f"{name}" if n_runs == 1 else f"{name} run{r}"
+                ax.plot(iters, ss_k[:, r], label=lbl, color=color, **kwargs)
+        else:
+            mean_k = ss_k.mean(axis=1)
+            std_k = ss_k.std(axis=1)
+            ax.plot(iters, mean_k, label=name, color=color, **kwargs)
+            ax.fill_between(iters, mean_k - std_k, mean_k + std_k,
+                            alpha=0.2, color=color)
+
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("step size")
+    ax.legend()
+    return ax
+
+
+def plot_acceptance_rates(
+    monitor: "Monitor",
+    *,
+    ax: "Axes | None" = None,
+    per_run: bool = False,
+    **kwargs,
+) -> "Axes":
+    """Plot per-move acceptance rate vs iteration from the adaptation trace.
+
+    When the trace is batched (``n_runs > 1``) and ``per_run=True``, draws one
+    line per (move, run) combination.  When ``per_run=False`` (default), plots
+    the mean across runs with a shaded ``fill_between`` for ±1 std.
+
+    Args:
+        monitor:  Populated Monitor with a non-None ``adaptation_trace``.
+        ax:       Existing axes.  Created if None.
+        per_run:  If True, draw individual run lines instead of mean±std.
+        **kwargs: Forwarded to ``ax.plot`` (not to ``fill_between``).
+
+    Returns:
+        The Axes object.
+
+    Raises:
+        ValueError: If ``monitor.adaptation_trace`` is None.
+    """
+    import matplotlib.pyplot as plt
+
+    if monitor.adaptation_trace is None:
+        raise ValueError(
+            "Monitor has no adaptation_trace.  Load from a directory that "
+            "contains a .adaptation.h5 file."
+        )
+
+    ax = _get_ax(ax)
+    trace = monitor.adaptation_trace
+
+    iters = trace.iterations                      # (n_entries,)
+    acc = trace.acceptance_rates                  # (n_entries, n_runs, n_moves)
+    move_names = trace.move_names
+    n_moves = trace.n_moves
+    n_runs = trace.n_runs
+
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    for k, name in enumerate(move_names):
+        color = colors[k % len(colors)]
+        acc_k = acc[:, :, k]  # (n_entries, n_runs)
+
+        if per_run or n_runs == 1:
+            for r in range(n_runs):
+                lbl = f"{name}" if n_runs == 1 else f"{name} run{r}"
+                ax.plot(iters, acc_k[:, r], label=lbl, color=color, **kwargs)
+        else:
+            mean_k = acc_k.mean(axis=1)
+            std_k = acc_k.std(axis=1)
+            ax.plot(iters, mean_k, label=name, color=color, **kwargs)
+            ax.fill_between(iters, mean_k - std_k, mean_k + std_k,
+                            alpha=0.2, color=color)
+
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("acceptance rate")
+    ax.legend()
     return ax

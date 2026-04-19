@@ -378,7 +378,7 @@ class TestAdaptationCallCount:
                            n_samples, min_rate, max_rate, adjust_factor,
                            max_step_size, max_rounds):
             adapt_call_count[0] += 1
-            return step_size, jnp.array(0.5)
+            return step_size, jnp.array(0.5), jnp.zeros(4, dtype=jnp.int32)
 
         import unittest.mock as mock
         with mock.patch(
@@ -423,7 +423,7 @@ class TestAdaptationCallCount:
                            n_samples, min_rate, max_rate, adjust_factor,
                            max_step_size, max_rounds):
             adapt_call_count[0] += 1
-            return step_size, jnp.array(0.5)
+            return step_size, jnp.array(0.5), jnp.zeros(4, dtype=jnp.int32)
 
         import unittest.mock as mock
         with mock.patch(

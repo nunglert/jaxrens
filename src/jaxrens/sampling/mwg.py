@@ -172,6 +172,10 @@ def build_mwg(
             likelihood_constraint,
         )
 
+        # Inject the chosen move_idx so downstream consumers (ns_step scan)
+        # can attribute accepted/rejected counts to the correct move.
+        info = info._replace(move_idx=jnp.asarray(move_idx, dtype=jnp.int32))
+
         return new_state, info
 
     return init_fn, step_fn, wrapped_fns

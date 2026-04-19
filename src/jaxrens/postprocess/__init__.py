@@ -3,11 +3,13 @@
 from jaxrens.postprocess.collection import MonitorCollection
 from jaxrens.postprocess.monitor import Monitor
 from jaxrens.postprocess.plotting import (
+    plot_acceptance_rates,
     plot_energy_trace,
     plot_free_energy,
     plot_heat_capacity,
     plot_log_evidence_trace,
     plot_partition_function,
+    plot_step_sizes,
 )
 from jaxrens.postprocess.thermodynamics import (
     calc_log_weights,
@@ -24,11 +26,13 @@ __all__ = [
     "Monitor",
     "MonitorCollection",
     # Plotting helpers
+    "plot_acceptance_rates",
     "plot_energy_trace",
     "plot_free_energy",
     "plot_heat_capacity",
     "plot_log_evidence_trace",
     "plot_partition_function",
+    "plot_step_sizes",
     # Thermodynamics
     "calc_log_weights",
     "calc_log_weights_live",

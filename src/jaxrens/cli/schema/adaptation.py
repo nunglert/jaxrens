@@ -78,7 +78,7 @@ class AdaptationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     full_auto: bool = False
-    full_auto_steps: int = 0
+    full_auto_steps: int = 50
     adjust_n_samples: int = 50
     adjust_max_rounds: int = 15
     defaults: AdaptationPolicy = Field(default_factory=AdaptationPolicy)

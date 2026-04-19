@@ -16,6 +16,7 @@ import jax.numpy as jnp
 from jaxrens.backends.loader import load_backend
 from jaxrens.backends.ensemble import EnsembleBackend, make_ensemble_params
 from jaxrens.cli.monitor import (
+    AdaptationCallback,
     CheckpointCallback,
     EnergyCheckCallback,
     ProgressCallback,
@@ -244,6 +245,19 @@ def run_from_config(
         )
     )
 
+    # Wire adaptation logger when full_auto is active
+    if adaptation_config is not None and adaptation_config.full_auto and move_descriptors is not None:
+        from jaxrens.io.adaptation_log import AdaptationLogger
+
+        adapt_log_path = working_dir / f"{output_config.out_file_prefix}.adaptation.h5"
+        move_name_list = [d.name for d in move_descriptors]
+        adaptation_logger = AdaptationLogger(
+            path=adapt_log_path,
+            move_names=move_name_list,
+            n_runs=1,
+        )
+        callbacks.append(AdaptationCallback(adaptation_logger))
+
     first_mc = move_config[0] if isinstance(move_config, list) else move_config
 
     key = jax.random.key(ns_config.seed)
@@ -325,6 +339,22 @@ def run_from_config(
                 "The run-ns-skip path is deferred."
             )
 
+    full_auto_kwargs: dict[str, Any] = {}
+    if adaptation_config is not None and adaptation_config.full_auto:
+        adjust_factor = (
+            adaptation_config.defaults.adjust_factor
+            if adaptation_config.defaults.adjust_factor is not None
+            else 1.5
+        )
+        full_auto_kwargs = dict(
+            per_move_fns=per_move_fns,
+            move_descriptors=list(move_descriptors) if move_descriptors is not None else None,
+            adjust_interval=adaptation_config.full_auto_steps,
+            adjust_n_samples=adaptation_config.adjust_n_samples,
+            adjust_max_rounds=adaptation_config.adjust_max_rounds,
+            adjust_factor=adjust_factor,
+        )
+
     result = run_ns(
         positions=initial_positions,
         types=initial_types,
@@ -339,11 +369,11 @@ def run_from_config(
         convergence_threshold=ns_config.convergence_threshold,
         initial_step_size=first_mc.step_size,
         target_acceptance=first_mc.target_acceptance,
-        adapt_warmup=first_mc.adaptation_warmup,
         callbacks=callbacks,
         ensemble_params=ensemble_params,
         termination_criteria=termination_criteria,
         restart_state=restart_state,
+        **full_auto_kwargs,
     )
 
     return result

@@ -5,6 +5,7 @@ All functions are jit-compatible: no Python conditionals on traced values.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 
@@ -81,4 +82,6 @@ def transform_positions(
     positions_new = positions @ T where T = get_cell_transformation(new_cell, old_cell).
     """
     T = get_cell_transformation(new_cell, old_cell)
-    return positions @ T
+    # HIGHEST precision: TF32 (10-bit mantissa on GPU) corrupts positions@T
+    # by ~3.7e-3 even for identity T, spiking LJ energy at dense packing.
+    return jnp.einsum("ij,jk->ik", positions, T, precision=jax.lax.Precision.HIGHEST)

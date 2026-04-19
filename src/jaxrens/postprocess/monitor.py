@@ -43,6 +43,7 @@ class Monitor:
         symbol_map: Mapping from integer type codes to element symbols, or None.
         energy_trace: Per-iteration culled energy from .energies file, or None.
         iteration_trace: Iteration indices matching energy_trace, or None.
+        adaptation_trace: Per-move step sizes and acceptance rates, or None.
         label: Human-readable label for plots.
         path: Source directory, or None.
     """
@@ -136,6 +137,13 @@ class Monitor:
             energy_trace = log.energies
             iteration_trace = log.iterations
 
+        # Optional adaptation trace.
+        adaptation_trace = None
+        adaptation_path = path / f"{prefix}.adaptation.h5"
+        if adaptation_path.exists():
+            from jaxrens.io.adaptation_log import AdaptationLogger
+            adaptation_trace = AdaptationLogger.read(adaptation_path)
+
         return cls(
             dead_energies=dead_energies,
             dead_volumes=dead_volumes,
@@ -148,6 +156,7 @@ class Monitor:
             symbol_map=symbol_map,
             energy_trace=energy_trace,
             iteration_trace=iteration_trace,
+            adaptation_trace=adaptation_trace,
             label=label,
             path=path,
         )
@@ -166,6 +175,7 @@ class Monitor:
         symbol_map: dict[int, str] | None = None,
         energy_trace: np.ndarray | None = None,
         iteration_trace: np.ndarray | None = None,
+        adaptation_trace=None,
         label: str = "",
         path: Path | None = None,
     ) -> None:
@@ -196,6 +206,8 @@ class Monitor:
             if iteration_trace is not None
             else None
         )
+        # adaptation_trace is an AdaptationLog dataclass or None
+        self.adaptation_trace = adaptation_trace
         self.label = label
         self.path = Path(path) if path is not None else None
 

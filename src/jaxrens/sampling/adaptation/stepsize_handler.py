@@ -32,7 +32,7 @@ def _process_rate_jax(
     max_rate: float,
     adjust_factor: float,
     max_step_size: float,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Branchless rate processing for step size adjustment.
 
     Given an acceptance rate and the target window [min_rate, max_rate],
@@ -41,7 +41,13 @@ def _process_rate_jax(
     Uses rate_prev < 0 as sentinel for "no previous rate".
 
     Returns:
-        (new_step_size, converged) where converged is a bool scalar.
+        (new_step_size, converged, cap_hit, floor_hit, too_high, too_low)
+        where:
+          - converged: bool scalar, True iff within window or bracketed
+          - cap_hit: bool scalar, True iff the proposed adjusted ss hit max_step_size
+          - floor_hit: bool scalar, True iff the proposed adjusted ss hit the 1e-20 floor
+          - too_high: bool scalar, True iff rate >= max_rate (used to track bracket formation)
+          - too_low: bool scalar, True iff rate < min_rate (used to track bracket formation)
     """
     target = 0.5 * (min_rate + max_rate)
     in_window = (rate > min_rate) & (rate < max_rate)
@@ -57,12 +63,19 @@ def _process_rate_jax(
     bracket_ss = jnp.where(prev_closer, step_size_prev, step_size)
 
     # Direction: scale up if rate too high, down if too low
+    too_high = rate >= max_rate
+    too_low = rate < min_rate
     scale = jnp.where(
-        rate < min_rate,
+        too_low,
         1.0 / adjust_factor,
-        jnp.where(rate >= max_rate, adjust_factor, 1.0),
+        jnp.where(too_high, adjust_factor, 1.0),
     )
-    adjusted_ss = jnp.clip(step_size * scale, 1e-20, max_step_size)
+
+    # Check for cap/floor hits before clamp
+    proposed_ss = step_size * scale
+    cap_hit = proposed_ss >= max_step_size
+    floor_hit = proposed_ss <= 1e-20
+    adjusted_ss = jnp.clip(proposed_ss, 1e-20, max_step_size)
 
     # Pick result: in_window > brackets > adjusted
     new_ss = jnp.where(
@@ -70,7 +83,7 @@ def _process_rate_jax(
     )
     converged = in_window | brackets
 
-    return new_ss, converged
+    return new_ss, converged, cap_hit, floor_hit, too_high, too_low
 
 
 def adjust_step_size(
@@ -85,7 +98,10 @@ def adjust_step_size(
     adjust_factor: float,
     max_step_size: float,
     max_rounds: int,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[
+    jnp.ndarray, jnp.ndarray, jnp.ndarray,
+    jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray,
+]:
     """Adjust step size for one move type until acceptance rate is in window.
 
     Pure JAX function. JIT-compilable. Vmappable over runs.
@@ -109,17 +125,30 @@ def adjust_step_size(
         max_rounds: Maximum number of adjustment rounds (static).
 
     Returns:
-        (new_step_size, final_acceptance_rate) — both scalars.
+        (new_step_size, final_rate, final_counts, n_rounds, converged,
+         cap_hits, floor_hits, bracket_detected)
+        - new_step_size: scalar float — adjusted step size
+        - final_rate: scalar float — acceptance rate at final round
+        - final_counts: (4,) int32 — rejection reason counts from final round
+        - n_rounds: scalar int32 — number of bisection rounds executed
+        - converged: scalar bool — True iff loop converged within max_rounds
+        - cap_hits: scalar int32 — rounds where proposed ss hit max_step_size
+        - floor_hits: scalar int32 — rounds where proposed ss hit 1e-20 floor
+        - bracket_detected: scalar bool — True iff both too-high and too-low
+          rates were observed during bisection (proper bracket formed)
     """
     n_walkers = population.energy.shape[0]
 
-    # Carry: (step_size, step_size_prev, rate_prev, rng_key, round_idx, converged)
+    # Carry: (step_size, step_size_prev, rate_prev, rng_key, round_idx,
+    #         converged, reject_counts, cap_hits, floor_hits,
+    #         saw_too_high, saw_too_low)
     def cond_fn(carry):
-        _, _, _, _, round_idx, converged = carry
+        _, _, _, _, round_idx, converged, _, _, _, _, _ = carry
         return ~converged & (round_idx < max_rounds)
 
     def body_fn(carry):
-        ss, ss_prev, rate_prev, key, round_idx, converged = carry
+        (ss, ss_prev, rate_prev, key, round_idx, converged, _,
+         cap_hits, floor_hits, saw_too_high, saw_too_low) = carry
 
         # 1. Sample walkers
         key, key_sample, key_trials = jax.random.split(key, 3)
@@ -128,26 +157,52 @@ def adjust_step_size(
         )
         sample = jax.tree.map(lambda x: x[indices], population)
 
-        # 2. Inject test step size
-        sample = sample.set(step_size=jnp.full(n_samples, ss))
+        # 2. Inject test step size into both step_size (scalar) and step_sizes
+        # (per-move array).  The MWG wrapper reads state.step_sizes[move_idx]
+        # rather than state.step_size, so we must update the array as well.
+        # Broadcasting ss into all positions is safe because the trial
+        # function only calls one specific move kernel per adjust_step_size
+        # call, so only the target move_idx entry is read.
+        sample = sample.set(
+            step_size=jnp.full(n_samples, ss),
+            step_sizes=jnp.broadcast_to(
+                ss[None, None], (n_samples, sample.step_sizes.shape[-1])
+            ),
+        )
 
         # 3. Run trial moves (vmapped over sampled walkers)
         trial_keys = jax.random.split(key_trials, n_samples)
 
         def trial_one(state, trial_key):
             _, info = move_fn(state, trial_key, emax)
-            return info.accepted
+            return info.accepted, info.reject_reason
 
-        accepted = jax.vmap(trial_one)(sample, trial_keys)
+        accepted, reasons = jax.vmap(trial_one)(sample, trial_keys)
         rate = jnp.mean(accepted.astype(jnp.float32))
 
-        # 4. Process rate → new step size + convergence flag
-        new_ss, new_converged = _process_rate_jax(
+        # Per-reason counts (code 0=accepted, 1=energy, 2=cell, 3=prior)
+        counts = jnp.array([
+            jnp.sum(reasons == 0),
+            jnp.sum(reasons == 1),
+            jnp.sum(reasons == 2),
+            jnp.sum(reasons == 3),
+        ], dtype=jnp.int32)
+
+        # 4. Process rate → new step size + convergence flag + diagnostics
+        new_ss, new_converged, cap_hit, floor_hit, too_high, too_low = _process_rate_jax(
             rate, ss, ss_prev, rate_prev,
             min_rate, max_rate, adjust_factor, max_step_size,
         )
 
-        return (new_ss, ss, rate, key, round_idx + 1, converged | new_converged)
+        new_cap_hits = cap_hits + cap_hit.astype(jnp.int32)
+        new_floor_hits = floor_hits + floor_hit.astype(jnp.int32)
+        new_saw_too_high = saw_too_high | too_high
+        new_saw_too_low = saw_too_low | too_low
+
+        return (new_ss, ss, rate, key, round_idx + 1,
+                converged | new_converged, counts,
+                new_cap_hits, new_floor_hits,
+                new_saw_too_high, new_saw_too_low)
 
     init_carry = (
         step_size,
@@ -156,9 +211,18 @@ def adjust_step_size(
         rng_key,
         jnp.array(0, dtype=jnp.int32),
         jnp.array(False),
+        jnp.zeros(4, dtype=jnp.int32),
+        jnp.array(0, dtype=jnp.int32),   # cap_hits
+        jnp.array(0, dtype=jnp.int32),   # floor_hits
+        jnp.array(False),                 # saw_too_high
+        jnp.array(False),                 # saw_too_low
     )
 
     final = jax.lax.while_loop(cond_fn, body_fn, init_carry)
-    final_ss, _, final_rate, _, _, _ = final
+    (final_ss, _, final_rate, _, n_rounds, converged, final_counts,
+     cap_hits, floor_hits, saw_too_high, saw_too_low) = final
 
-    return final_ss, final_rate
+    bracket_detected = saw_too_high & saw_too_low
+
+    return (final_ss, final_rate, final_counts,
+            n_rounds, converged, cap_hits, floor_hits, bracket_detected)

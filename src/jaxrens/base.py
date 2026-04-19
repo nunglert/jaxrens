@@ -18,11 +18,29 @@ from jaxrens.types import Box, Params, Positions, Types
 
 
 class MoveInfo(NamedTuple):
-    """Metadata returned by every move step."""
+    """Metadata returned by every move step.
+
+    ``reject_reason`` is an int32 scalar:
+        0 = accepted
+        1 = rejected by likelihood constraint (energy >= emax)
+        2 = rejected by cell-geometry constraint (max/min vol, aspect)
+        3 = rejected by move-specific prior (e.g. volume V^N factor)
+
+    Moves that only reject by the likelihood constraint (random_walk,
+    galilean, etc.) may leave ``reject_reason`` at 0 (default) — callers
+    that want per-reason stats should rely on ``accepted`` for those moves.
+
+    ``move_idx`` is the integer index of the move type that was executed,
+    as assigned by the MWG wrapper (0-based, matching move_descriptors order).
+    Individual move kernels leave this at 0 (default); the MWG step_fn
+    overwrites it with the actual chosen index before returning.
+    """
 
     accepted: jnp.ndarray  # bool scalar
     log_likelihood: jnp.ndarray  # float scalar
     n_evaluations: int
+    reject_reason: jnp.ndarray = jnp.int32(0)
+    move_idx: jnp.ndarray = jnp.int32(0)
 
 
 class StepFn(Protocol):
