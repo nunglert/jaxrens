@@ -52,6 +52,20 @@ class BatchDescriptor(ABC):
     # Abstract interface
     # ------------------------------------------------------------------
 
+    @property
+    @abstractmethod
+    def is_batched(self) -> bool:
+        """True when this descriptor represents multiple parallel NS runs.
+
+        Used by ``_run_loop`` to attach ``info["_batch"]`` and by
+        ``_is_batched`` in ``cli/monitor.py`` to prefer a descriptor-based
+        check over the ndim-sniff fallback.
+
+        * ``SingleRun.is_batched``    → ``False``
+        * ``VmapRuns.is_batched``     → ``True``
+        * ``PmapVmapRuns.is_batched`` → ``True`` (stub, raises on use)
+        """
+
     @abstractmethod
     def wrap_step(
         self,
@@ -169,6 +183,11 @@ class SingleRun(BatchDescriptor):
     n_runs: int = 1
     shape_prefix: tuple[int, ...] = ()
 
+    @property
+    def is_batched(self) -> bool:
+        """Always ``False`` — single NS run, no batch dimension."""
+        return False
+
     def wrap_step(
         self,
         ns_step_fn,
@@ -227,6 +246,11 @@ class VmapRuns(BatchDescriptor):
     def __post_init__(self) -> None:
         # dataclass(frozen=True) requires object.__setattr__ for mutation
         object.__setattr__(self, "shape_prefix", (self.n_runs,))
+
+    @property
+    def is_batched(self) -> bool:
+        """Always ``True`` — multiple NS runs are stacked along axis 0."""
+        return True
 
     def wrap_step(
         self,
@@ -319,6 +343,11 @@ class PmapVmapRuns(BatchDescriptor):
     def __post_init__(self) -> None:
         object.__setattr__(self, "n_runs", self.n_gpu * self.n_per_gpu)
         object.__setattr__(self, "shape_prefix", (self.n_gpu, self.n_per_gpu))
+
+    @property
+    def is_batched(self) -> bool:
+        """Always ``True`` — stub for future multi-GPU multi-run NS."""
+        return True
 
     def wrap_step(self, ns_step_fn, step_fn, n_mcmc_steps: int, n_extra: int):
         raise NotImplementedError("pmap variant not yet implemented")

@@ -112,12 +112,29 @@ def _format_reject_breakdown(
     return "   reject: " + " ".join(parts)
 
 
-def _is_batched(ns_state: Any) -> bool:
+def _is_batched(ns_state: Any, info: "dict | None" = None) -> bool:
     """Return True when ns_state holds multiple parallel runs.
 
-    Detection: ``ns_state.log_evidence`` shape is () for single-run and
-    (n_runs,) for batched.  We check ndim > 0 on the JAX array.
+    Prefers ``info["_batch"].is_batched`` when the *info* dict is provided
+    and the key is present (commit 4+).  Falls back to the legacy ndim-sniff
+    on ``ns_state.log_evidence`` for backward compatibility with callers that
+    do not pass an info dict.
+
+    Args:
+        ns_state: ``NSState`` or result dict.
+        info: Optional info dict from the NS outer loop.  When present and
+            contains ``"_batch"``, the descriptor's ``is_batched`` property
+            is authoritative.
+
+    Returns:
+        ``True`` for multi-run (batched) NS runs.
     """
+    if info is not None:
+        batch = info.get("_batch")
+        if batch is not None:
+            return batch.is_batched
+
+    # Fallback: ndim-sniff on log_evidence (backward compat)
     if isinstance(ns_state, NSState):
         return jnp.asarray(ns_state.log_evidence).ndim > 0
     # dict form (run_ns_parallel result)
@@ -160,7 +177,7 @@ class ProgressCallback:
         dt = time.time() - self._last_print_time
         self._last_print_time = time.time()
 
-        batched = _is_batched(ns_state)
+        batched = _is_batched(ns_state, info)
 
         # ---- header line ------------------------------------------------
         # Evaluation counter suffix (backward-compat: absent for callers that

@@ -23,6 +23,13 @@ import numpy as np
 from jaxrens.base import NSCallback
 from jaxrens.sampling.adaptation.manager import AdaptationManager
 from jaxrens.sampling.batch_descriptor import SingleRun, VmapRuns
+from jaxrens.sampling.run_loop import (
+    _bump_cumulative_counters,
+    _dispatch_callbacks,
+    _inject_cumulative_into_info,
+    _pack_adjustment_info,
+    _run_loop,
+)
 from jaxrens.sampling.termination import (
     IterationTermination,
     PriorMassTermination,
@@ -415,147 +422,7 @@ def ns_step(
 
 
 # ---------------------------------------------------------------------------
-# Diagnostic helpers (private) — used by run_ns and run_ns_parallel
-# ---------------------------------------------------------------------------
-
-
-def _bump_cumulative_counters(
-    cumulative: dict,
-    info: dict,
-    *,
-    include_trial: bool = False,
-) -> None:
-    """Accumulate per-move evaluation counters from *info* into *cumulative*.
-
-    Mutates *cumulative* in place.  Works for both the single-run case
-    (shapes ``(n_moves,)``) and the parallel case (shapes
-    ``(n_runs, n_moves)``) because numpy broadcasting handles both.
-
-    Args:
-        cumulative: Mutable dict with keys
-            ``"n_evaluations"`` and ``"n_grad_evaluations"`` as
-            numpy int64 arrays.
-        info: Info dict emitted by ``ns_step`` (or the batched variant).
-            Must contain ``"n_evaluations_per_move"`` and
-            ``"n_grad_evaluations_per_move"``.
-        include_trial: When *True*, also accumulate
-            ``"trial_n_evaluations_per_move"`` and
-            ``"trial_n_grad_evaluations_per_move"`` from *info* (only
-            present on adjust-fired iterations).
-    """
-    cumulative["n_evaluations"] += np.asarray(
-        info["n_evaluations_per_move"], dtype=np.int64
-    )
-    cumulative["n_grad_evaluations"] += np.asarray(
-        info["n_grad_evaluations_per_move"], dtype=np.int64
-    )
-    if include_trial:
-        cumulative["n_evaluations"] += np.asarray(
-            info["trial_n_evaluations_per_move"], dtype=np.int64
-        )
-        cumulative["n_grad_evaluations"] += np.asarray(
-            info["trial_n_grad_evaluations_per_move"], dtype=np.int64
-        )
-
-
-def _inject_cumulative_into_info(info: dict, cumulative: dict) -> None:
-    """Write cumulative counter snapshots into *info* for downstream callbacks.
-
-    Sets ``info["cumulative_n_evaluations_per_move"]`` and
-    ``info["cumulative_n_grad_evaluations_per_move"]`` to copies of the
-    current cumulative arrays.  Mutates *info* in place.
-
-    Args:
-        info: Info dict to update.
-        cumulative: Dict with keys ``"n_evaluations"`` and
-            ``"n_grad_evaluations"`` (numpy int64 arrays).
-    """
-    info["cumulative_n_evaluations_per_move"] = cumulative["n_evaluations"].copy()
-    info["cumulative_n_grad_evaluations_per_move"] = (
-        cumulative["n_grad_evaluations"].copy()
-    )
-
-
-def _pack_adjustment_info(
-    info: dict,
-    *,
-    current_step_sizes,
-    per_move_rates: list,
-    per_move_counts: list,
-    per_move_n_rounds: list,
-    per_move_converged: list,
-    per_move_cap_hits: list,
-    per_move_floor_hits: list,
-    per_move_bracket_detected: list,
-    per_move_trial_n_evals: list,
-    per_move_trial_n_grad_evals: list,
-    move_descriptors: list,
-) -> None:
-    """Pack per-move adjustment diagnostics into *info*.
-
-    Mutates *info* in place.  Also sets the trial-phase evaluation
-    counter keys (``"trial_n_evaluations_per_move"`` /
-    ``"trial_n_grad_evaluations_per_move"``) that
-    ``_bump_cumulative_counters`` consumes when ``include_trial=True``.
-
-    Args:
-        info: Info dict to update.
-        current_step_sizes: Current per-move step sizes array ``(n_moves,)``.
-        per_move_rates: List of float acceptance rates, one per move.
-        per_move_counts: List of reject-count arrays, one per move.
-        per_move_n_rounds: List of bisection round counts, one per move.
-        per_move_converged: List of bool convergence flags, one per move.
-        per_move_cap_hits: List of int cap-hit counts, one per move.
-        per_move_floor_hits: List of int floor-hit counts, one per move.
-        per_move_bracket_detected: List of bool flags, one per move.
-        per_move_trial_n_evals: List of int trial eval counts, one per move.
-        per_move_trial_n_grad_evals: List of int trial grad-eval counts, one per move.
-        move_descriptors: MoveKernel descriptors (provide ``.name`` and
-            ``.reject_reasons``).
-    """
-    trial_n_evals_arr = np.array(
-        [int(v) for v in per_move_trial_n_evals], dtype=np.int64
-    )
-    trial_n_grad_evals_arr = np.array(
-        [int(v) for v in per_move_trial_n_grad_evals], dtype=np.int64
-    )
-    info["step_sizes_per_move"] = current_step_sizes
-    info["acceptance_rates_per_move"] = jnp.array(per_move_rates)
-    info["reject_counts_per_move"] = jnp.stack(per_move_counts, axis=0)
-    info["adjustment_n_rounds"] = jnp.array(per_move_n_rounds, dtype=jnp.int32)
-    info["adjustment_converged"] = jnp.array(per_move_converged)
-    info["adjustment_cap_hits"] = jnp.array(per_move_cap_hits, dtype=jnp.int32)
-    info["adjustment_floor_hits"] = jnp.array(per_move_floor_hits, dtype=jnp.int32)
-    info["adjustment_bracket_detected"] = jnp.array(per_move_bracket_detected)
-    info["trial_n_evaluations_per_move"] = trial_n_evals_arr
-    info["trial_n_grad_evaluations_per_move"] = trial_n_grad_evals_arr
-    info["move_names"] = [d.name for d in move_descriptors]
-    info["move_reject_reasons"] = tuple(
-        frozenset(d.reject_reasons) for d in move_descriptors
-    )
-
-
-def _dispatch_callbacks(
-    callbacks: list,
-    iteration: int,
-    ns_state,
-    info: dict,
-) -> None:
-    """Call ``on_iteration`` on every callback that exposes it.
-
-    Args:
-        callbacks: List of callback objects.
-        iteration: Current iteration index (Python int).
-        ns_state: Current ``NSState``.
-        info: Info dict for this iteration.
-    """
-    for cb in callbacks:
-        if hasattr(cb, "on_iteration"):
-            cb.on_iteration(iteration, ns_state, info)
-
-
-# ---------------------------------------------------------------------------
-# run_ns — outer Python loop (NOT JIT'd)
+# run_ns — thin wrapper around _run_loop
 # ---------------------------------------------------------------------------
 
 
@@ -613,32 +480,29 @@ def run_ns(
 ) -> dict:
     """Run a full nested sampling calculation.
 
-    Outer Python loop calling ns_step(). Handles adaptation, overflow
-    retry, termination, callbacks, logging.
+    Thin wrapper: validates args, initialises NSState, constructs
+    descriptor + AdaptationManager, delegates to ``_run_loop``, and
+    packages the result dict.
 
     Returns a backward-compatible result dict.
     """
     if callbacks is None:
         callbacks = []
-
     if n_walkers is None:
         n_walkers = positions.shape[0]
-
     if termination_criteria is None:
         termination_criteria = [
             IterationTermination(max_iterations),
             PriorMassTermination(n_walkers, convergence_threshold),
         ]
 
-    # Initialize NSState with batched MCState population.
-    # Size step_sizes per number of moves when known; falls back to length-1
-    # broadcast for legacy callers that don't pass per_move_fns / descriptors.
     if per_move_fns is not None:
         n_moves = len(per_move_fns)
     elif move_descriptors is not None:
         n_moves = len(move_descriptors)
     else:
         n_moves = 1
+
     ns_state = init_ns(
         init_fn, positions, types, energies, cells, rng_key,
         max_dead=max_iterations,
@@ -653,15 +517,7 @@ def run_ns(
         n_walkers, n_atoms, max_iterations, n_mcmc_steps,
     )
 
-    info_interval = max(1, max_iterations // 20)
-
-    # BatchDescriptor for single-run dispatch (wrap_step / reduce_for_termination).
     descriptor = SingleRun()
-    # JIT-compile ns_step with step_fn, n_mcmc_steps, n_extra as static args
-    jit_ns_step = descriptor.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
-
-    # AdaptationManager: owns per-move JIT'd adjust_step_size callables.
-    # is_active iff per_move_fns + move_descriptors + adjust_interval>0 are all set.
     adapt_mgr = AdaptationManager(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,
@@ -672,108 +528,31 @@ def run_ns(
         adjust_interval=adjust_interval,
     )
 
-    # Track per-move step sizes
-    pop = ns_state.population
-    current_step_sizes = pop.step_sizes[0]  # (n_move_types,) — same for all walkers
-
-    # Cumulative energy evaluation counters (Python-side, shape (n_moves,) int64)
-    _cumulative = {
-        "n_evaluations": np.zeros(n_moves, dtype=np.int64),
-        "n_grad_evaluations": np.zeros(n_moves, dtype=np.int64),
-    }
-
-    for i in range(max_iterations):
-        # Step size adaptation via bisection (AdaptationManager; fires every adjust_interval)
-        _adjust_fired = False
-        if adapt_mgr.fires(i):
-            pop = ns_state.population
-            emax = jnp.max(pop.energy)
-            current_step_sizes, per_move_outputs, rng_key = adapt_mgr.apply(
-                pop, emax, rng_key, current_step_sizes,
-            )
-            # Broadcast updated step sizes to all walkers: (n_moves,) -> (n_walkers, n_moves)
-            new_ss_pop = jnp.broadcast_to(
-                current_step_sizes, (n_walkers, current_step_sizes.shape[0]),
-            )
-            ns_state = ns_state.set(population=pop.set(step_sizes=new_ss_pop))
-            _adjust_fired = True
-
-        # Run one NS iteration (JIT'd)
-        new_ns_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps, n_extra)
-
-        # Overflow check — retry with larger neighbor list
-        pop = new_ns_state.population
-        if jnp.any(pop.overflow):
-            new_max = int(pop.max_neighbor_count.max() * 1.25) + 1
-            logger.warning(
-                "Overflow at iter %d: resizing max_neighbors %d -> %d",
-                i, pop.max_neighbors, new_max,
-            )
-            ns_state = ns_state.set(
-                population=ns_state.population.set(max_neighbors=new_max),
-            )
-            continue
-
-        ns_state = new_ns_state
-
-        # Accumulate per-move evaluation counters (chain-phase)
-        _bump_cumulative_counters(_cumulative, info)
-
-        # Populate per-move adaptation data into info dict for callbacks.
-        # Only present on iterations where AdaptationManager just fired.
-        if _adjust_fired:
-            _pack_adjustment_info(
-                info,
-                current_step_sizes=current_step_sizes,
-                per_move_rates=[float(v) for v in per_move_outputs["rate"]],
-                per_move_counts=list(per_move_outputs["counts"]),
-                per_move_n_rounds=list(per_move_outputs["n_rounds"]),
-                per_move_converged=list(per_move_outputs["converged"]),
-                per_move_cap_hits=list(per_move_outputs["cap_hits"]),
-                per_move_floor_hits=list(per_move_outputs["floor_hits"]),
-                per_move_bracket_detected=list(per_move_outputs["bracket_detected"]),
-                per_move_trial_n_evals=list(per_move_outputs["trial_n_evaluations"]),
-                per_move_trial_n_grad_evals=list(per_move_outputs["trial_n_grad_evaluations"]),
-                move_descriptors=move_descriptors,
-            )
-            # Also accumulate trial-phase evals into cumulative counters
-            _bump_cumulative_counters(_cumulative, info, include_trial=True)
-
-        # Inject cumulative evaluation counters for callbacks (shape (n_moves,) int64)
-        _inject_cumulative_into_info(info, _cumulative)
-
-        # The canonical periodic summary is printed by ProgressCallback;
-        # do NOT add a duplicate logger.info call here.
-
-        # Callbacks
-        _dispatch_callbacks(callbacks, i, ns_state, info)
-
-        # Reduce log_evidence / hmax to scalars via descriptor (identity for SingleRun)
-        ev_scalar, hmax_scalar = descriptor.reduce_for_termination(
-            ns_state.log_evidence, info["hmax"]
-        )
-
-        # Update evidence in PriorMassTermination if present
-        for criterion in termination_criteria:
-            if isinstance(criterion, PriorMassTermination):
-                criterion.update_evidence(ev_scalar)
-
-        # Termination check
-        should_stop, stop_msg = check_any(termination_criteria, i, hmax_scalar)
-        if should_stop:
-            logger.info(
-                "Terminated at iteration %d: %s (log_evidence=%.4f)",
-                i, stop_msg, float(ns_state.log_evidence),
-            )
-            break
+    ns_state, rng_key, _cumulative = _run_loop(
+        descriptor=descriptor,
+        adapt_mgr=adapt_mgr,
+        ns_state=ns_state,
+        step_fn=step_fn,
+        n_mcmc_steps=n_mcmc_steps,
+        n_extra=n_extra,
+        max_iterations=max_iterations,
+        termination_criteria=termination_criteria,
+        callbacks=callbacks,
+        n_moves=n_moves,
+        move_descriptors=move_descriptors,
+        rng_key=rng_key,
+        info_interval=max(1, max_iterations // 20),
+    )
 
     # Final evidence: add contribution from remaining live walkers
     remaining_potentials = ns_state.population.energy
     log_remaining_mass = -ns_state.iteration / n_walkers
     log_avg_likelihood = -jnp.mean(remaining_potentials)
-    log_final_contribution = log_remaining_mass + log_avg_likelihood
     ns_state = ns_state.set(
-        log_evidence=jnp.logaddexp(ns_state.log_evidence, log_final_contribution),
+        log_evidence=jnp.logaddexp(
+            ns_state.log_evidence,
+            log_remaining_mass + log_avg_likelihood,
+        ),
     )
 
     logger.info(
@@ -803,6 +582,7 @@ def init_ns_parallel(
     max_dead: int = 50000,
     step_sizes: jnp.ndarray | None = None,
     ensemble_params_per_run: list[dict] | None = None,
+    restart_states: list | None = None,
 ) -> NSState:
     """Create batched NSState for n_runs parallel NS runs.
 
@@ -815,21 +595,34 @@ def init_ns_parallel(
         max_dead: Max dead points per run
         step_sizes: Per-move step sizes (shared across runs)
         ensemble_params_per_run: List of per-run ensemble param dicts
+        restart_states: Optional list of ``RestartBundle`` objects, one per run.
+            When provided, ``init_ns`` for run *i* is seeded from
+            ``restart_states[i]`` (dead-point history, iteration counter,
+            and log-evidence from the checkpoint).  Pass ``None`` for any
+            run that should start fresh.  ``len(restart_states)`` must equal
+            ``n_runs`` when provided.
 
     Returns:
         NSState with (n_runs, ...) on all dynamic fields.
         Static fields shared: n_walkers, n_atoms, max_dead.
     """
     n_runs = positions.shape[0]
+    if restart_states is not None and len(restart_states) != n_runs:
+        raise ValueError(
+            f"restart_states length ({len(restart_states)}) must equal "
+            f"n_runs ({n_runs})"
+        )
     runs = []
     for i in range(n_runs):
         ep = ensemble_params_per_run[i] if ensemble_params_per_run else None
         run_types = types if types.ndim == 1 else types[i]
+        rs = restart_states[i] if restart_states is not None else None
         run_state = init_ns(
             init_fn,
             positions[i], run_types, energies[i],
             cells[i] if cells is not None else None,
             rng_keys[i], max_dead, step_sizes, ep,
+            restart_state=rs,
         )
         runs.append(run_state)
     return jax.tree.map(lambda *xs: jnp.stack(xs), *runs)
@@ -858,14 +651,13 @@ def run_ns_parallel(
     adjust_n_samples: int = 50,
     adjust_max_rounds: int = 15,
     adjust_factor: float = 1.5,
+    restart_states: list | None = None,
 ) -> dict:
     """Run multiple NS calculations in parallel via vmap(ns_step).
 
-    All runs share the same step_fn, n_mcmc_steps, and n_extra.
-    Each run has independent RNG and (optionally) ensemble parameters.
-    When per_move_fns / move_descriptors / adjust_interval are provided,
-    step sizes are adapted via vmapped adjust_step_size bisection.
-    Without them, step sizes remain at initial_step_size throughout.
+    Thin wrapper: validates args, initialises batched NSState, constructs
+    VmapRuns descriptor + AdaptationManager, delegates to ``_run_loop``,
+    and packages the result dict.
 
     Args:
         positions: (n_runs, n_walkers, n_atoms, 3)
@@ -891,6 +683,12 @@ def run_ns_parallel(
         adjust_n_samples: Walkers to sample per bisection trial round (static).
         adjust_max_rounds: Max bisection rounds per adjust call (static).
         adjust_factor: Multiplicative bisection factor (static).
+        restart_states: Optional list of ``RestartBundle`` objects, one per run.
+            When provided, run *i* resumes from the checkpoint at
+            ``restart_states[i]`` — dead-point history, iteration counter, and
+            log-evidence are seeded from the bundle.  Pass ``None`` entries for
+            any run that should start fresh.  ``len(restart_states)`` must equal
+            ``n_runs``.
 
     Returns:
         Dict with (n_runs, ...) shaped arrays on all fields.
@@ -898,31 +696,30 @@ def run_ns_parallel(
     n_runs = positions.shape[0]
     if n_walkers is None:
         n_walkers = positions.shape[1]
-
     if termination_criteria is None:
         termination_criteria = [
             IterationTermination(max_iterations),
             PriorMassTermination(n_walkers, convergence_threshold),
         ]
-
     if move_descriptors is not None:
         n_moves = len(move_descriptors)
     else:
         n_moves = 1
 
-    # Initialize batched NSState: (n_runs, ...) on all dynamic fields
     ns_states = init_ns_parallel(
         init_fn, positions, types, energies, cells, rng_keys,
         max_dead=max_iterations,
         step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params_per_run=ensemble_params_per_run,
+        restart_states=restart_states,
     )
 
-    # BatchDescriptor for parallel dispatch (wrap_step / reduce_for_termination).
-    descriptor = VmapRuns(n_runs=n_runs)
+    logger.info(
+        "Starting parallel NS: %d runs, %d walkers, max_iter=%d, n_mcmc=%d, n_extra=%d",
+        n_runs, n_walkers, max_iterations, n_mcmc_steps, n_extra,
+    )
 
-    # AdaptationManager: owns per-move JIT'd vmapped adjust_step_size callables.
-    # is_active iff per_move_fns + move_descriptors + adjust_interval>0 are all set.
+    descriptor = VmapRuns(n_runs=n_runs)
     adapt_mgr = AdaptationManager(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,
@@ -933,98 +730,35 @@ def run_ns_parallel(
         adjust_interval=adjust_interval,
     )
 
-    # (n_runs, n_moves) — current step sizes, one per run per move
-    current_step_sizes = ns_states.population.step_sizes[:, 0, :]  # (n_runs, n_moves)
-
-    # Per-run PRNG keys used during adaptation (independent of ns_states.rng_key)
+    # Per-run PRNG keys used during adaptation (independent of ns_states.rng_key).
+    # _run_loop will consume and advance these via adapt_mgr.
     adapt_keys = jax.vmap(lambda k: jax.random.split(k)[0])(rng_keys)  # (n_runs,)
 
-    logger.info(
-        "Starting parallel NS: %d runs, %d walkers, max_iter=%d, n_mcmc=%d, n_extra=%d",
-        n_runs, n_walkers, max_iterations, n_mcmc_steps, n_extra,
+    ns_states, adapt_keys, _cumulative = _run_loop(
+        descriptor=descriptor,
+        adapt_mgr=adapt_mgr,
+        ns_state=ns_states,
+        step_fn=step_fn,
+        n_mcmc_steps=n_mcmc_steps,
+        n_extra=n_extra,
+        max_iterations=max_iterations,
+        termination_criteria=termination_criteria,
+        callbacks=[],
+        n_moves=n_moves,
+        move_descriptors=move_descriptors,
+        rng_key=adapt_keys,
+        info_interval=max(1, max_iterations // 20),
     )
-
-    info_interval = max(1, max_iterations // 20)
-
-    # JIT-compile vmapped ns_step
-    jit_step = descriptor.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
-
-    # Cumulative evaluation counters — shape (n_runs, n_moves) int64
-    _cumulative_p = {
-        "n_evaluations": np.zeros((n_runs, n_moves), dtype=np.int64),
-        "n_grad_evaluations": np.zeros((n_runs, n_moves), dtype=np.int64),
-    }
-
-    for i in range(max_iterations):
-        # Step size adaptation via AdaptationManager (vmapped bisection; fires every adjust_interval)
-        if adapt_mgr.fires(i):
-            pop = ns_states.population
-            emax_per_run = jnp.max(pop.energy, axis=1)  # (n_runs,)
-            current_step_sizes, _, adapt_keys = adapt_mgr.apply(
-                pop, emax_per_run, adapt_keys, current_step_sizes,
-            )
-            # Broadcast (n_runs, n_moves) -> (n_runs, n_walkers, n_moves)
-            new_ss_pop = jnp.broadcast_to(
-                current_step_sizes[:, None, :],
-                (n_runs, n_walkers, n_moves),
-            )
-            ns_states = ns_states.set(population=pop.set(step_sizes=new_ss_pop))
-
-        # Batched NS step (all runs in parallel)
-        new_ns_states, infos = jit_step(ns_states)
-
-        # Overflow: check ANY run. Conservative — retries all runs.
-        if jnp.any(new_ns_states.population.overflow):
-            new_max = int(new_ns_states.population.max_neighbor_count.max() * 1.25) + 1
-            logger.warning(
-                "Overflow at iter %d: resizing max_neighbors -> %d", i, new_max,
-            )
-            ns_states = ns_states.set(
-                population=ns_states.population.set(max_neighbors=new_max),
-            )
-            continue
-
-        ns_states = new_ns_states
-
-        # Accumulate per-move evaluation counters (chain-phase, all runs)
-        # infos["n_evaluations_per_move"] shape: (n_runs, n_moves)
-        _bump_cumulative_counters(_cumulative_p, infos)
-        _inject_cumulative_into_info(infos, _cumulative_p)
-
-        # Periodic log
-        if i % info_interval == 0 or i == max_iterations - 1:
-            for r in range(n_runs):
-                logger.info(
-                    "run=%d iter=%d  Emax=%.6g  acc=%.2f  log_Z=%.4f",
-                    r, int(ns_states.iteration[r]),
-                    float(infos["emax"][r]),
-                    float(infos["acceptance_rate"][r]),
-                    float(ns_states.log_evidence[r]),
-                )
-
-        # Reduce log_evidence / hmax to worst-case scalars via descriptor (VmapRuns)
-        worst_evidence, worst_hmax = descriptor.reduce_for_termination(
-            ns_states.log_evidence, infos["hmax"]
-        )
-
-        # Update evidence in PriorMassTermination (use worst-case across runs)
-        for criterion in termination_criteria:
-            if isinstance(criterion, PriorMassTermination):
-                criterion.update_evidence(worst_evidence)
-
-        # Termination: use worst hmax across runs
-        should_stop, stop_msg = check_any(termination_criteria, i, worst_hmax)
-        if should_stop:
-            logger.info("Terminated at iteration %d: %s", i, stop_msg)
-            break
 
     # Final evidence: per-run contribution from remaining live walkers
     remaining_potentials = ns_states.population.energy  # (n_runs, n_walkers)
     log_remaining_mass = -ns_states.iteration / n_walkers  # (n_runs,)
     log_avg_likelihood = -jnp.mean(remaining_potentials, axis=-1)  # (n_runs,)
-    log_final = log_remaining_mass + log_avg_likelihood
     ns_states = ns_states.set(
-        log_evidence=jnp.logaddexp(ns_states.log_evidence, log_final),
+        log_evidence=jnp.logaddexp(
+            ns_states.log_evidence,
+            log_remaining_mass + log_avg_likelihood,
+        ),
     )
 
     for r in range(n_runs):
@@ -1033,7 +767,6 @@ def run_ns_parallel(
             r, int(ns_states.n_dead[r]), float(ns_states.log_evidence[r]),
         )
 
-    # Return dict with (n_runs, ...) shaped arrays
     pop = ns_states.population
     return {
         "positions": pop.positions,
