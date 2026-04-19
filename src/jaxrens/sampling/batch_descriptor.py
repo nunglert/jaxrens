@@ -1,0 +1,334 @@
+"""BatchDescriptor abstraction for the NS outer loop.
+
+Encapsulates the single-run vs. multi-run (vmap) vs. pmap dispatch so that
+``run_ns`` and ``run_ns_parallel`` can share the same three concerns without
+duplicating them:
+
+1. **wrap_step** — JIT-compiles (and optionally vmaps) ``ns_step``.
+2. **split_keys** — Splits a PRNG key appropriately for the batch shape.
+3. **reduce_for_termination** — Reduces batched scalars to a single scalar
+   for ``PriorMassTermination`` / ``IterationTermination``.
+
+Design intent
+-------------
+This module is commit 2 of the nested_sampling.py modularization plan.  The
+three concrete subclasses mirror the three execution modes:
+
+* ``SingleRun``      — ``run_ns``          uses this.
+* ``VmapRuns``       — ``run_ns_parallel`` uses this.
+* ``PmapVmapRuns``   — stub only; commit 4 (``run_loop.py``) will flesh it out.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+import jax
+import jax.numpy as jnp
+
+
+class BatchDescriptor(ABC):
+    """Encapsulates the single/vmap/pmap differences for the NS outer loop.
+
+    Single: identity wrap, scalar termination reductions.
+    Vmap:   jax.vmap wrap over n_runs, worst-of reductions.
+    Pmap:   pmap(vmap(...)) wrap, not implemented yet.
+
+    Attributes
+    ----------
+    n_runs : int
+        Total number of independent NS runs (1 for SingleRun).
+    shape_prefix : tuple[int, ...]
+        Leading shape of batched arrays:
+        ``()`` for SingleRun, ``(n_runs,)`` for VmapRuns,
+        ``(n_gpu, n_per_gpu)`` for PmapVmapRuns.
+    """
+
+    n_runs: int
+    shape_prefix: tuple[int, ...]
+
+    # ------------------------------------------------------------------
+    # Abstract interface
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def wrap_step(
+        self,
+        ns_step_fn,
+        step_fn,
+        n_mcmc_steps: int,
+        n_extra: int,
+    ):
+        """Return a JIT-compiled callable for the NS step.
+
+        Called *once* before the outer loop to produce ``jit_ns_step``.
+
+        Parameters
+        ----------
+        ns_step_fn : callable
+            The raw ``ns_step`` function (or any compatible replacement).
+        step_fn : callable
+            MCMC step function from ``build_mwg()``; passed as a static arg
+            to ``ns_step_fn``.
+        n_mcmc_steps : int
+            Number of MCMC steps per walker (static).
+        n_extra : int
+            Number of additional walkers to walk per iteration (static).
+
+        Returns
+        -------
+        callable
+            * **SingleRun** — ``jax.jit(ns_step_fn, static_argnums=(1, 2, 3))``
+              so the returned callable has signature
+              ``jit_step(ns_state, step_fn, n_mcmc_steps, n_extra)``.
+            * **VmapRuns** — ``jax.jit(lambda ns_states: jax.vmap(lambda s:
+              ns_step_fn(s, step_fn, n_mcmc_steps, n_extra))(ns_states))``
+              so the returned callable has signature
+              ``jit_step(ns_states)``.
+            * **PmapVmapRuns** — raises ``NotImplementedError``.
+        """
+
+    @abstractmethod
+    def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
+        """Split a PRNG key appropriate for this batch shape.
+
+        Called inside the outer loop whenever fresh sub-keys are needed
+        (e.g. for per-move adaptation key splitting).
+
+        Parameters
+        ----------
+        rng_key : jax.Array
+            * **SingleRun** — a scalar JAX key (shape ``(2,)`` for typed-key
+              arrays or ``()`` for new-style keys).
+            * **VmapRuns** — an ``(n_runs,)`` array of per-run keys.
+        n_sub_keys : int
+            Number of sub-keys to generate per run.
+
+        Returns
+        -------
+        jax.Array
+            * **SingleRun** — shape ``(n_sub_keys,)`` with typed-key dtype
+              (matches ``jax.random.split(rng_key, n_sub_keys)``).
+            * **VmapRuns** — shape ``(n_runs, n_sub_keys)`` with typed-key dtype
+              (``vmap(jax.random.split)`` applied to each run key).
+            * **PmapVmapRuns** — raises ``NotImplementedError``.
+        """
+
+    @abstractmethod
+    def reduce_for_termination(
+        self,
+        log_evidence: jax.Array,
+        hmax: jax.Array,
+    ) -> tuple[float, float]:
+        """Reduce batched scalars for the termination-check interface.
+
+        ``PriorMassTermination.update_evidence`` and
+        ``check_any`` / ``IterationTermination.check`` both require plain
+        Python floats.  This method performs any worst-case aggregation
+        and returns Python floats ready to pass to those interfaces.
+
+        Parameters
+        ----------
+        log_evidence : jax.Array
+            * **SingleRun** — scalar.
+            * **VmapRuns** — shape ``(n_runs,)``.
+        hmax : jax.Array
+            Same shape as ``log_evidence``.
+
+        Returns
+        -------
+        (log_evidence_scalar, hmax_scalar) : tuple[float, float]
+            * **SingleRun** — identity: ``(float(log_evidence), float(hmax))``.
+            * **VmapRuns** — worst-of:
+              ``(float(jnp.min(log_evidence)), float(jnp.max(hmax)))``.
+            * **PmapVmapRuns** — raises ``NotImplementedError``.
+        """
+
+
+# ---------------------------------------------------------------------------
+# Concrete implementations
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SingleRun(BatchDescriptor):
+    """Descriptor for a single NS run (no batching).
+
+    Used by ``run_ns``.  All three methods are identity / thin wrappers
+    around plain JAX primitives.
+
+    Attributes
+    ----------
+    n_runs : int
+        Always 1.
+    shape_prefix : tuple[int, ...]
+        Always ``()``.
+    """
+
+    n_runs: int = 1
+    shape_prefix: tuple[int, ...] = ()
+
+    def wrap_step(
+        self,
+        ns_step_fn,
+        step_fn,
+        n_mcmc_steps: int,
+        n_extra: int,
+    ):
+        """Return ``jax.jit(ns_step_fn, static_argnums=(1, 2, 3))``.
+
+        The caller uses the returned function as::
+
+            jit_step(ns_state, step_fn, n_mcmc_steps, n_extra)
+
+        which is exactly the current ``run_ns`` pattern.
+        """
+        return jax.jit(ns_step_fn, static_argnums=(1, 2, 3))
+
+    def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
+        """Delegate directly to ``jax.random.split``.
+
+        Returns shape ``(n_sub_keys,)`` with typed-key dtype.
+        """
+        return jax.random.split(rng_key, n_sub_keys)
+
+    def reduce_for_termination(
+        self,
+        log_evidence: jax.Array,
+        hmax: jax.Array,
+    ) -> tuple[float, float]:
+        """Identity reduction — single run has no worst-case to aggregate.
+
+        Returns
+        -------
+        (float(log_evidence), float(hmax))
+        """
+        return float(log_evidence), float(hmax)
+
+
+@dataclass(frozen=True)
+class VmapRuns(BatchDescriptor):
+    """Descriptor for n_runs independent NS runs batched via ``jax.vmap``.
+
+    Used by ``run_ns_parallel``.
+
+    Attributes
+    ----------
+    n_runs : int
+        Number of independent NS runs.
+    shape_prefix : tuple[int, ...]
+        ``(n_runs,)`` — leading dimension of all batched arrays.
+    """
+
+    n_runs: int
+    shape_prefix: tuple[int, ...] = ()  # overridden by __post_init__
+
+    def __post_init__(self) -> None:
+        # dataclass(frozen=True) requires object.__setattr__ for mutation
+        object.__setattr__(self, "shape_prefix", (self.n_runs,))
+
+    def wrap_step(
+        self,
+        ns_step_fn,
+        step_fn,
+        n_mcmc_steps: int,
+        n_extra: int,
+    ):
+        """Return a JIT-compiled vmapped NS step.
+
+        The closure captures ``step_fn``, ``n_mcmc_steps``, and ``n_extra``
+        as Python-level static values so vmap sees no dynamic static args.
+
+        The returned function has signature::
+
+            jit_step(ns_states)  ->  (ns_states, infos)
+
+        which matches the current ``run_ns_parallel`` inner step pattern.
+        """
+        def step_all_runs(ns_states):
+            return jax.vmap(
+                lambda s: ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)
+            )(ns_states)
+
+        return jax.jit(step_all_runs)
+
+    def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
+        """Vmap ``jax.random.split`` over the ``(n_runs,)`` key array.
+
+        Parameters
+        ----------
+        rng_key : jax.Array
+            Shape ``(n_runs,)`` — one key per run.
+        n_sub_keys : int
+            Number of sub-keys to produce per run.
+
+        Returns
+        -------
+        jax.Array
+            Shape ``(n_runs, n_sub_keys)`` with typed-key dtype.
+        """
+        return jax.vmap(
+            lambda k: jax.random.split(k, n_sub_keys)
+        )(rng_key)
+
+    def reduce_for_termination(
+        self,
+        log_evidence: jax.Array,
+        hmax: jax.Array,
+    ) -> tuple[float, float]:
+        """Worst-of reduction across all runs.
+
+        Matches the current ``run_ns_parallel`` termination logic::
+
+            worst_evidence = float(jnp.min(ns_states.log_evidence))
+            worst_hmax     = float(jnp.max(infos["hmax"]))
+
+        Returns
+        -------
+        (float(jnp.min(log_evidence)), float(jnp.max(hmax)))
+        """
+        return float(jnp.min(log_evidence)), float(jnp.max(hmax))
+
+
+@dataclass(frozen=True)
+class PmapVmapRuns(BatchDescriptor):
+    """Descriptor stub for pmap(vmap(...)) multi-GPU multi-run NS.
+
+    **Not yet implemented** — all methods raise ``NotImplementedError``.
+    The stub is present so that commit 4's ``run_loop.py`` can reference
+    the class without a ``if descriptor is not None`` guard on every branch.
+
+    Attributes
+    ----------
+    n_gpu : int
+        Number of GPU devices.
+    n_per_gpu : int
+        Number of NS runs per GPU.
+    n_runs : int
+        Total runs: ``n_gpu * n_per_gpu``.
+    shape_prefix : tuple[int, ...]
+        ``(n_gpu, n_per_gpu)``.
+    """
+
+    n_gpu: int
+    n_per_gpu: int
+    n_runs: int = 0           # set by __post_init__
+    shape_prefix: tuple[int, ...] = ()  # set by __post_init__
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "n_runs", self.n_gpu * self.n_per_gpu)
+        object.__setattr__(self, "shape_prefix", (self.n_gpu, self.n_per_gpu))
+
+    def wrap_step(self, ns_step_fn, step_fn, n_mcmc_steps: int, n_extra: int):
+        raise NotImplementedError("pmap variant not yet implemented")
+
+    def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
+        raise NotImplementedError("pmap variant not yet implemented")
+
+    def reduce_for_termination(
+        self,
+        log_evidence: jax.Array,
+        hmax: jax.Array,
+    ) -> tuple[float, float]:
+        raise NotImplementedError("pmap variant not yet implemented")

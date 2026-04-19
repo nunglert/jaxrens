@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from jaxrens.base import NSCallback
+from jaxrens.sampling.batch_descriptor import SingleRun, VmapRuns
 from jaxrens.sampling.termination import (
     IterationTermination,
     PriorMassTermination,
@@ -413,6 +414,146 @@ def ns_step(
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic helpers (private) — used by run_ns and run_ns_parallel
+# ---------------------------------------------------------------------------
+
+
+def _bump_cumulative_counters(
+    cumulative: dict,
+    info: dict,
+    *,
+    include_trial: bool = False,
+) -> None:
+    """Accumulate per-move evaluation counters from *info* into *cumulative*.
+
+    Mutates *cumulative* in place.  Works for both the single-run case
+    (shapes ``(n_moves,)``) and the parallel case (shapes
+    ``(n_runs, n_moves)``) because numpy broadcasting handles both.
+
+    Args:
+        cumulative: Mutable dict with keys
+            ``"n_evaluations"`` and ``"n_grad_evaluations"`` as
+            numpy int64 arrays.
+        info: Info dict emitted by ``ns_step`` (or the batched variant).
+            Must contain ``"n_evaluations_per_move"`` and
+            ``"n_grad_evaluations_per_move"``.
+        include_trial: When *True*, also accumulate
+            ``"trial_n_evaluations_per_move"`` and
+            ``"trial_n_grad_evaluations_per_move"`` from *info* (only
+            present on adjust-fired iterations).
+    """
+    cumulative["n_evaluations"] += np.asarray(
+        info["n_evaluations_per_move"], dtype=np.int64
+    )
+    cumulative["n_grad_evaluations"] += np.asarray(
+        info["n_grad_evaluations_per_move"], dtype=np.int64
+    )
+    if include_trial:
+        cumulative["n_evaluations"] += np.asarray(
+            info["trial_n_evaluations_per_move"], dtype=np.int64
+        )
+        cumulative["n_grad_evaluations"] += np.asarray(
+            info["trial_n_grad_evaluations_per_move"], dtype=np.int64
+        )
+
+
+def _inject_cumulative_into_info(info: dict, cumulative: dict) -> None:
+    """Write cumulative counter snapshots into *info* for downstream callbacks.
+
+    Sets ``info["cumulative_n_evaluations_per_move"]`` and
+    ``info["cumulative_n_grad_evaluations_per_move"]`` to copies of the
+    current cumulative arrays.  Mutates *info* in place.
+
+    Args:
+        info: Info dict to update.
+        cumulative: Dict with keys ``"n_evaluations"`` and
+            ``"n_grad_evaluations"`` (numpy int64 arrays).
+    """
+    info["cumulative_n_evaluations_per_move"] = cumulative["n_evaluations"].copy()
+    info["cumulative_n_grad_evaluations_per_move"] = (
+        cumulative["n_grad_evaluations"].copy()
+    )
+
+
+def _pack_adjustment_info(
+    info: dict,
+    *,
+    current_step_sizes,
+    per_move_rates: list,
+    per_move_counts: list,
+    per_move_n_rounds: list,
+    per_move_converged: list,
+    per_move_cap_hits: list,
+    per_move_floor_hits: list,
+    per_move_bracket_detected: list,
+    per_move_trial_n_evals: list,
+    per_move_trial_n_grad_evals: list,
+    move_descriptors: list,
+) -> None:
+    """Pack per-move adjustment diagnostics into *info*.
+
+    Mutates *info* in place.  Also sets the trial-phase evaluation
+    counter keys (``"trial_n_evaluations_per_move"`` /
+    ``"trial_n_grad_evaluations_per_move"``) that
+    ``_bump_cumulative_counters`` consumes when ``include_trial=True``.
+
+    Args:
+        info: Info dict to update.
+        current_step_sizes: Current per-move step sizes array ``(n_moves,)``.
+        per_move_rates: List of float acceptance rates, one per move.
+        per_move_counts: List of reject-count arrays, one per move.
+        per_move_n_rounds: List of bisection round counts, one per move.
+        per_move_converged: List of bool convergence flags, one per move.
+        per_move_cap_hits: List of int cap-hit counts, one per move.
+        per_move_floor_hits: List of int floor-hit counts, one per move.
+        per_move_bracket_detected: List of bool flags, one per move.
+        per_move_trial_n_evals: List of int trial eval counts, one per move.
+        per_move_trial_n_grad_evals: List of int trial grad-eval counts, one per move.
+        move_descriptors: MoveKernel descriptors (provide ``.name`` and
+            ``.reject_reasons``).
+    """
+    trial_n_evals_arr = np.array(
+        [int(v) for v in per_move_trial_n_evals], dtype=np.int64
+    )
+    trial_n_grad_evals_arr = np.array(
+        [int(v) for v in per_move_trial_n_grad_evals], dtype=np.int64
+    )
+    info["step_sizes_per_move"] = current_step_sizes
+    info["acceptance_rates_per_move"] = jnp.array(per_move_rates)
+    info["reject_counts_per_move"] = jnp.stack(per_move_counts, axis=0)
+    info["adjustment_n_rounds"] = jnp.array(per_move_n_rounds, dtype=jnp.int32)
+    info["adjustment_converged"] = jnp.array(per_move_converged)
+    info["adjustment_cap_hits"] = jnp.array(per_move_cap_hits, dtype=jnp.int32)
+    info["adjustment_floor_hits"] = jnp.array(per_move_floor_hits, dtype=jnp.int32)
+    info["adjustment_bracket_detected"] = jnp.array(per_move_bracket_detected)
+    info["trial_n_evaluations_per_move"] = trial_n_evals_arr
+    info["trial_n_grad_evaluations_per_move"] = trial_n_grad_evals_arr
+    info["move_names"] = [d.name for d in move_descriptors]
+    info["move_reject_reasons"] = tuple(
+        frozenset(d.reject_reasons) for d in move_descriptors
+    )
+
+
+def _dispatch_callbacks(
+    callbacks: list,
+    iteration: int,
+    ns_state,
+    info: dict,
+) -> None:
+    """Call ``on_iteration`` on every callback that exposes it.
+
+    Args:
+        callbacks: List of callback objects.
+        iteration: Current iteration index (Python int).
+        ns_state: Current ``NSState``.
+        info: Info dict for this iteration.
+    """
+    for cb in callbacks:
+        if hasattr(cb, "on_iteration"):
+            cb.on_iteration(iteration, ns_state, info)
+
+
+# ---------------------------------------------------------------------------
 # run_ns — outer Python loop (NOT JIT'd)
 # ---------------------------------------------------------------------------
 
@@ -513,8 +654,10 @@ def run_ns(
 
     info_interval = max(1, max_iterations // 20)
 
+    # BatchDescriptor for single-run dispatch (wrap_step / reduce_for_termination).
+    descriptor = SingleRun()
     # JIT-compile ns_step with step_fn, n_mcmc_steps, n_extra as static args
-    jit_ns_step = jax.jit(ns_step, static_argnums=(1, 2, 3))
+    jit_ns_step = descriptor.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
 
     # Determine adaptation mode
     use_full_auto = (
@@ -539,8 +682,10 @@ def run_ns(
     current_step_sizes = pop.step_sizes[0]  # (n_move_types,) — same for all walkers
 
     # Cumulative energy evaluation counters (Python-side, shape (n_moves,) int64)
-    cumulative_n_evaluations_per_move = np.zeros(n_moves, dtype=np.int64)
-    cumulative_n_grad_evaluations_per_move = np.zeros(n_moves, dtype=np.int64)
+    _cumulative = {
+        "n_evaluations": np.zeros(n_moves, dtype=np.int64),
+        "n_grad_evaluations": np.zeros(n_moves, dtype=np.int64),
+    }
 
     for i in range(max_iterations):
         # Step size adaptation via bisection (full_auto only; no fallback path)
@@ -609,61 +754,49 @@ def run_ns(
         ns_state = new_ns_state
 
         # Accumulate per-move evaluation counters (chain-phase)
-        cumulative_n_evaluations_per_move += np.asarray(
-            info["n_evaluations_per_move"], dtype=np.int64
-        )
-        cumulative_n_grad_evaluations_per_move += np.asarray(
-            info["n_grad_evaluations_per_move"], dtype=np.int64
-        )
+        _bump_cumulative_counters(_cumulative, info)
 
         # Populate per-move adaptation data into info dict for callbacks.
         # Only present on iterations where full_auto just fired (adjust_interval).
         if _adjust_fired:
-            info["step_sizes_per_move"] = current_step_sizes        # (n_moves,)
-            info["acceptance_rates_per_move"] = jnp.array(per_move_rates)  # (n_moves,)
-            info["reject_counts_per_move"] = jnp.stack(per_move_counts, axis=0)  # (n_moves, 4)
-            info["adjustment_n_rounds"] = jnp.array(per_move_n_rounds, dtype=jnp.int32)  # (n_moves,)
-            info["adjustment_converged"] = jnp.array(per_move_converged)        # (n_moves,)
-            info["adjustment_cap_hits"] = jnp.array(per_move_cap_hits, dtype=jnp.int32)  # (n_moves,)
-            info["adjustment_floor_hits"] = jnp.array(per_move_floor_hits, dtype=jnp.int32)  # (n_moves,)
-            info["adjustment_bracket_detected"] = jnp.array(per_move_bracket_detected)  # (n_moves,)
-            trial_n_evals_arr = np.array(
-                [int(v) for v in per_move_trial_n_evals], dtype=np.int64
-            )  # (n_moves,)
-            trial_n_grad_evals_arr = np.array(
-                [int(v) for v in per_move_trial_n_grad_evals], dtype=np.int64
-            )  # (n_moves,)
-            info["trial_n_evaluations_per_move"] = trial_n_evals_arr
-            info["trial_n_grad_evaluations_per_move"] = trial_n_grad_evals_arr
-            # Also accumulate trial-phase evals into cumulative counters
-            cumulative_n_evaluations_per_move += trial_n_evals_arr
-            cumulative_n_grad_evaluations_per_move += trial_n_grad_evals_arr
-            move_name_list = [d.name for d in move_descriptors]
-            info["move_names"] = move_name_list
-            info["move_reject_reasons"] = tuple(
-                frozenset(d.reject_reasons) for d in move_descriptors
+            _pack_adjustment_info(
+                info,
+                current_step_sizes=current_step_sizes,
+                per_move_rates=per_move_rates,
+                per_move_counts=per_move_counts,
+                per_move_n_rounds=per_move_n_rounds,
+                per_move_converged=per_move_converged,
+                per_move_cap_hits=per_move_cap_hits,
+                per_move_floor_hits=per_move_floor_hits,
+                per_move_bracket_detected=per_move_bracket_detected,
+                per_move_trial_n_evals=per_move_trial_n_evals,
+                per_move_trial_n_grad_evals=per_move_trial_n_grad_evals,
+                move_descriptors=move_descriptors,
             )
+            # Also accumulate trial-phase evals into cumulative counters
+            _bump_cumulative_counters(_cumulative, info, include_trial=True)
 
         # Inject cumulative evaluation counters for callbacks (shape (n_moves,) int64)
-        info["cumulative_n_evaluations_per_move"] = cumulative_n_evaluations_per_move.copy()
-        info["cumulative_n_grad_evaluations_per_move"] = cumulative_n_grad_evaluations_per_move.copy()
+        _inject_cumulative_into_info(info, _cumulative)
 
         # The canonical periodic summary is printed by ProgressCallback;
         # do NOT add a duplicate logger.info call here.
 
         # Callbacks
-        for cb in callbacks:
-            if hasattr(cb, "on_iteration"):
-                cb.on_iteration(i, ns_state, info)
+        _dispatch_callbacks(callbacks, i, ns_state, info)
+
+        # Reduce log_evidence / hmax to scalars via descriptor (identity for SingleRun)
+        ev_scalar, hmax_scalar = descriptor.reduce_for_termination(
+            ns_state.log_evidence, info["hmax"]
+        )
 
         # Update evidence in PriorMassTermination if present
         for criterion in termination_criteria:
             if isinstance(criterion, PriorMassTermination):
-                criterion.update_evidence(float(ns_state.log_evidence))
+                criterion.update_evidence(ev_scalar)
 
         # Termination check
-        emax = float(info["hmax"])
-        should_stop, stop_msg = check_any(termination_criteria, i, emax)
+        should_stop, stop_msg = check_any(termination_criteria, i, hmax_scalar)
         if should_stop:
             logger.info(
                 "Terminated at iteration %d: %s (log_evidence=%.4f)",
@@ -873,17 +1006,16 @@ def run_ns_parallel(
 
     info_interval = max(1, max_iterations // 20)
 
+    # BatchDescriptor for parallel dispatch (wrap_step / reduce_for_termination).
+    descriptor = VmapRuns(n_runs=n_runs)
     # JIT-compile vmapped ns_step
-    def step_all_runs(ns_states):
-        return jax.vmap(
-            lambda s: ns_step(s, step_fn, n_mcmc_steps, n_extra)
-        )(ns_states)
-
-    jit_step = jax.jit(step_all_runs)
+    jit_step = descriptor.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
 
     # Cumulative evaluation counters — shape (n_runs, n_moves) int64
-    cumulative_n_evaluations_per_move_p = np.zeros((n_runs, n_moves), dtype=np.int64)
-    cumulative_n_grad_evaluations_per_move_p = np.zeros((n_runs, n_moves), dtype=np.int64)
+    _cumulative_p = {
+        "n_evaluations": np.zeros((n_runs, n_moves), dtype=np.int64),
+        "n_grad_evaluations": np.zeros((n_runs, n_moves), dtype=np.int64),
+    }
 
     for i in range(max_iterations):
         # Step size adaptation via vmapped bisection (full_auto only)
@@ -936,14 +1068,8 @@ def run_ns_parallel(
 
         # Accumulate per-move evaluation counters (chain-phase, all runs)
         # infos["n_evaluations_per_move"] shape: (n_runs, n_moves)
-        cumulative_n_evaluations_per_move_p += np.asarray(
-            infos["n_evaluations_per_move"], dtype=np.int64
-        )
-        cumulative_n_grad_evaluations_per_move_p += np.asarray(
-            infos["n_grad_evaluations_per_move"], dtype=np.int64
-        )
-        infos["cumulative_n_evaluations_per_move"] = cumulative_n_evaluations_per_move_p.copy()
-        infos["cumulative_n_grad_evaluations_per_move"] = cumulative_n_grad_evaluations_per_move_p.copy()
+        _bump_cumulative_counters(_cumulative_p, infos)
+        _inject_cumulative_into_info(infos, _cumulative_p)
 
         # Periodic log
         if i % info_interval == 0 or i == max_iterations - 1:
@@ -956,14 +1082,17 @@ def run_ns_parallel(
                     float(ns_states.log_evidence[r]),
                 )
 
+        # Reduce log_evidence / hmax to worst-case scalars via descriptor (VmapRuns)
+        worst_evidence, worst_hmax = descriptor.reduce_for_termination(
+            ns_states.log_evidence, infos["hmax"]
+        )
+
         # Update evidence in PriorMassTermination (use worst-case across runs)
         for criterion in termination_criteria:
             if isinstance(criterion, PriorMassTermination):
-                worst_evidence = float(jnp.min(ns_states.log_evidence))
                 criterion.update_evidence(worst_evidence)
 
         # Termination: use worst hmax across runs
-        worst_hmax = float(jnp.max(infos["hmax"]))
         should_stop, stop_msg = check_any(termination_criteria, i, worst_hmax)
         if should_stop:
             logger.info("Terminated at iteration %d: %s", i, stop_msg)
