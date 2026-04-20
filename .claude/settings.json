@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/home/nunglert/miniconda3/envs/jaxrens/bin/python:*)",
+      "Bash(/home/nunglert/miniconda3/envs/jaxrens/bin/jaxrens:*)",
+      "Bash(/home/nunglert/miniconda3/envs/jaxrens/bin/pip list:*)",
+      "Bash(/home/nunglert/miniconda3/envs/jaxrens/bin/pip show:*)",
+      "Bash(/home/nunglert/miniconda3/envs/jaxrens/bin/pip install:*)",
+      "Bash(conda run:*)",
+
+      "Bash(grep:*)",
+      "Bash(awk:*)",
+      "Bash(wc:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(xargs:*)",
+      "Bash(basename:*)",
+      "Bash(tee:*)",
+      "Bash(echo:*)",
+      "Bash(nvidia-smi)",
+      "Bash(/usr/bin/time:*)",
+
+      "Bash(git -C /home/nunglert/code/jaxnest_refactor status)",
+      "Bash(git -C /home/nunglert/code/jaxnest_refactor diff:*)",
+      "Bash(git -C /home/nunglert/code/jaxnest_refactor log:*)",
+      "Bash(git -C /home/nunglert/code/jaxnest_refactor show:*)",
+      "Bash(git -C /home/nunglert/code/jaxnest_refactor blame:*)",
+      "Bash(git -C /home/nunglert/code/jaxnest_refactor/jaxrens status)",
+      "Bash(git -C /home/nunglert/code/jaxnest_refactor/jaxrens diff:*)",
+      "Bash(git -C /home/nunglert/code/jaxnest_refactor/jaxrens log:*)",
+      "Bash(git -C /home/nunglert/code/jaxnest_refactor/jaxrens show:*)",
+      "Bash(git -C /home/nunglert/code/jaxnest_refactor/jaxrens blame:*)"
+    ],
+    "deny": [
+      "Bash(git push *)"
+    ]
+  }
+}

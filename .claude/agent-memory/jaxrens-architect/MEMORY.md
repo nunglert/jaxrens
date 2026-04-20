@@ -1,0 +1,3 @@
+- [Config surface today](project_config_state.md) — current jaxrens config: 4 flat frozen dataclasses in state/config.py; parser is ad-hoc key=value reader in cli/parser.py
+- [Old parser scope](project_old_parser.md) — old jaxnest/input_parser.py had 9 SimpleNamespace groups and ~150+ parameters with cross-group interactions
+- [Two-layer config guidance](reference_config_guidance.md) — arch-comparison-matrix.md recommends library-layer dataclass configs + app-layer YAML/TOML parsed into those dataclasses
