@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *'  # nightly 04:00 UTC — full suite
+
+# Only one CI run at a time on the self-hosted runner — newer pushes
+# cancel in-flight runs of the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Smoke (fast, GPU)
+    if: github.event_name != 'schedule'
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CI image
+        run: docker build -f Dockerfile.ci -t jaxrens-ci:${{ github.sha }} .
+
+      - name: Run smoke checks
+        run: |
+          docker run --rm --gpus all \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            jaxrens-ci:${{ github.sha }} \
+            bash scripts/ci-checks.sh smoke
+
+  full:
+    name: Full suite (heavy, GPU)
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CI image
+        run: docker build -f Dockerfile.ci -t jaxrens-ci:${{ github.sha }} .
+
+      - name: Run full checks
+        run: |
+          docker run --rm --gpus all \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            jaxrens-ci:${{ github.sha }} \
+            bash scripts/ci-checks.sh full

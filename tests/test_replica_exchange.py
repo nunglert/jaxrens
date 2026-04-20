@@ -9,6 +9,8 @@ import jax.numpy as jnp
 import pytest
 
 from jaxrens.sampling.moves.replica_exchange import (
+    PressureRENSSwap,
+    SwapKernel,
     get_swap_pairs,
     perform_swap,
     replica_exchange_step,
@@ -361,6 +363,197 @@ class TestJITCompatibility:
         jitted = jax.jit(replica_exchange_step, static_argnames=("n_swap_cycles",))
         new_pos, _, new_ene, _, info = jitted(
             key, pos, types, ene, cells, emax, n_swap_cycles=1
+        )
+        assert new_pos.shape == pos.shape
+        assert int(info["n_attempted"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# SwapKernel abstraction
+# ---------------------------------------------------------------------------
+
+
+class TestSwapKernelABC:
+    """SwapKernel is an ABC; instantiating it directly should fail."""
+
+    def test_cannot_instantiate_abc(self):
+        with pytest.raises(TypeError):
+            SwapKernel()  # type: ignore[abstract]
+
+    def test_pressure_rens_swap_is_subclass(self):
+        assert issubclass(PressureRENSSwap, SwapKernel)
+
+
+# ---------------------------------------------------------------------------
+# PressureRENSSwap.accept — golden equivalence against perform_swap
+# ---------------------------------------------------------------------------
+
+
+class TestPressureRENSSwapAccept:
+    """PressureRENSSwap.accept must produce identical results to perform_swap."""
+
+    def _kernel_accept(self, energies, emax, volumes=None, pressures=None):
+        """Call PressureRENSSwap.accept with the same arguments as perform_swap."""
+        kernel = PressureRENSSwap()
+        proposed = {
+            "energy_a": energies[0],
+            "energy_b": energies[1],
+        }
+        if volumes is not None and pressures is not None:
+            # Build diagonal cell matrices so det == volume (same as perform_swap shim)
+            def _vol_to_cell(v):
+                side = jnp.cbrt(v)
+                return jnp.diag(jnp.array([side, side, side]))
+
+            proposed["cell_a"] = _vol_to_cell(volumes[0])
+            proposed["cell_b"] = _vol_to_cell(volumes[1])
+            ens_a = {"pressure": pressures[0]}
+            ens_b = {"pressure": pressures[1]}
+        else:
+            ens_a = {}
+            ens_b = {}
+        return kernel.accept(proposed, emax[0], emax[1], ens_a, ens_b)
+
+    def test_accept_matches_perform_swap_simple(self):
+        energies = jnp.array([1.0, 2.0])
+        emax = jnp.array([5.0, 5.0])
+        assert bool(self._kernel_accept(energies, emax)) == bool(
+            perform_swap(energies, emax)
+        )
+
+    def test_reject_matches_perform_swap_simple(self):
+        energies = jnp.array([10.0, 2.0])
+        emax = jnp.array([5.0, 5.0])
+        assert bool(self._kernel_accept(energies, emax)) == bool(
+            perform_swap(energies, emax)
+        )
+
+    def test_accept_matches_perform_swap_pressure(self):
+        energies = jnp.array([1.0, 1.0])
+        emax = jnp.array([5.0, 5.0])
+        volumes = jnp.array([1.0, 1.0])
+        pressures = jnp.array([1.0, 1.0])
+        assert bool(self._kernel_accept(energies, emax, volumes, pressures)) == bool(
+            perform_swap(energies, emax, volumes, pressures)
+        )
+
+    def test_reject_matches_perform_swap_pressure(self):
+        # H_A_in_j = 1.0 + 10.0*1.0 = 11.0 > 5.0 => reject
+        energies = jnp.array([1.0, 1.0])
+        emax = jnp.array([5.0, 5.0])
+        volumes = jnp.array([1.0, 1.0])
+        pressures = jnp.array([1.0, 10.0])
+        assert bool(self._kernel_accept(energies, emax, volumes, pressures)) == bool(
+            perform_swap(energies, emax, volumes, pressures)
+        )
+
+    def test_boundary_matches_perform_swap(self):
+        # Boundary: E_A == Emax_j should reject (strict <)
+        energies = jnp.array([5.0, 2.0])
+        emax = jnp.array([5.0, 5.0])
+        assert bool(self._kernel_accept(energies, emax)) == bool(
+            perform_swap(energies, emax)
+        )
+
+    def test_accept_returns_bool_scalar(self):
+        """accept must return a JAX boolean scalar (shape ())."""
+        kernel = PressureRENSSwap()
+        proposed = {"energy_a": jnp.array(1.0), "energy_b": jnp.array(2.0)}
+        result = kernel.accept(proposed, jnp.array(5.0), jnp.array(5.0), {}, {})
+        assert result.shape == ()
+        assert result.dtype == jnp.bool_
+
+    def test_accept_jit_compatible(self):
+        """PressureRENSSwap.accept must be JIT-compatible."""
+        kernel = PressureRENSSwap()
+
+        def _accept(e_a, e_b, emax_a, emax_b, cell_a, cell_b, p_a, p_b):
+            proposed = {"energy_a": e_a, "energy_b": e_b, "cell_a": cell_a, "cell_b": cell_b}
+            ens_a = {"pressure": p_a}
+            ens_b = {"pressure": p_b}
+            return kernel.accept(proposed, emax_a, emax_b, ens_a, ens_b)
+
+        jitted = jax.jit(_accept)
+        cell = jnp.eye(3)
+        result = jitted(
+            jnp.array(1.0), jnp.array(1.0),
+            jnp.array(5.0), jnp.array(5.0),
+            cell, cell,
+            jnp.array(1.0), jnp.array(1.0),
+        )
+        assert result.shape == ()
+
+
+# ---------------------------------------------------------------------------
+# replica_exchange_step with explicit swap_kernel parameter
+# ---------------------------------------------------------------------------
+
+
+class TestReplicaExchangeStepWithKernel:
+    """Explicit swap_kernel=PressureRENSSwap() must match the default."""
+
+    def test_explicit_kernel_matches_default(self):
+        """replica_exchange_step(..., swap_kernel=PressureRENSSwap()) == default."""
+        n_runs, n_walkers = 3, 2
+        pos, types, ene, cells = _make_re_data(n_runs, n_walkers)
+        emax = jnp.array([100.0, 100.0, 100.0])
+        key = jax.random.key(17)
+
+        # Default (no swap_kernel argument)
+        new_pos_default, _, new_ene_default, new_cells_default, info_default = (
+            replica_exchange_step(key, pos, types, ene, cells, emax)
+        )
+        # Explicit kernel
+        new_pos_explicit, _, new_ene_explicit, new_cells_explicit, info_explicit = (
+            replica_exchange_step(
+                key, pos, types, ene, cells, emax,
+                swap_kernel=PressureRENSSwap(),
+            )
+        )
+
+        assert jnp.allclose(new_pos_default, new_pos_explicit)
+        assert jnp.allclose(new_ene_default, new_ene_explicit)
+        assert jnp.allclose(new_cells_default, new_cells_explicit)
+        assert int(info_default["n_accepted"]) == int(info_explicit["n_accepted"])
+        assert int(info_default["n_attempted"]) == int(info_explicit["n_attempted"])
+
+    def test_explicit_kernel_pressure_matches_default(self):
+        """Same seed + pressures: explicit kernel matches default."""
+        n_runs, n_walkers = 3, 2
+        pos, types, ene, cells = _make_re_data(n_runs, n_walkers)
+        emax = jnp.array([100.0, 100.0, 100.0])
+        pressures = jnp.array([0.1, 0.5, 1.0])
+        key = jax.random.key(31)
+
+        default_result = replica_exchange_step(
+            key, pos, types, ene, cells, emax, pressures=pressures
+        )
+        explicit_result = replica_exchange_step(
+            key, pos, types, ene, cells, emax, pressures=pressures,
+            swap_kernel=PressureRENSSwap(),
+        )
+
+        assert jnp.allclose(default_result[0], explicit_result[0])  # positions
+        assert jnp.allclose(default_result[2], explicit_result[2])  # energies
+        assert int(default_result[4]["n_accepted"]) == int(
+            explicit_result[4]["n_accepted"]
+        )
+
+    def test_explicit_kernel_jit(self):
+        """replica_exchange_step with explicit swap_kernel is JIT-compatible."""
+        n_runs, n_walkers = 3, 2
+        pos, types, ene, cells = _make_re_data(n_runs, n_walkers)
+        emax = jnp.array([100.0, 100.0, 100.0])
+        key = jax.random.key(0)
+        kernel = PressureRENSSwap()
+
+        jitted = jax.jit(
+            replica_exchange_step,
+            static_argnames=("n_swap_cycles", "swap_kernel"),
+        )
+        new_pos, _, new_ene, _, info = jitted(
+            key, pos, types, ene, cells, emax,
+            n_swap_cycles=1, swap_kernel=kernel,
         )
         assert new_pos.shape == pos.shape
         assert int(info["n_attempted"]) > 0

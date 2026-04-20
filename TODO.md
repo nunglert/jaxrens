@@ -4,6 +4,35 @@ Deferred work items. Entries should be self-contained enough that a future sessi
 
 ---
 
+## Intra-RE (within-chain replica exchange)
+
+**Status:** deferred 2026-04-20. Design decision recorded.
+
+### Goal
+
+Replica exchange swaps *inside* the MCMC chain (i.e., between walkers within a single `run_one_chain` call). This is distinct from inter-RE (commit 2–5), which fires once per NS iteration after `ns_step` returns.
+
+### Design alternatives
+
+**Option A — `scan(vmap(...))`**: Restructure `run_one_chain` so the scan body operates on a *pool* of walkers and proposes inter-replica swaps at each step. Requires lifting `run_one_chain` to operate on `(n_pool, ...)` rather than a single walker; `vmap` handles parallel walks, `scan` steps through time. Compatible with the current `ns_step` shape. Principal cost: `run_one_chain` signature change propagates through `ns_step`, JIT, and all tests.
+
+**Option B — post-scan pool phase**: Keep `run_one_chain` as-is (single-walker scan). After the vmap-over-walkers scan in `ns_step`, introduce a second pool-phase scan that proposes swaps among the walked walkers. Requires adding a pool-swap step between the existing scan and the scatter-back at line `ns_step:7`. Less intrusive than Option A; no scan signature change. Downside: swaps happen only after the full MCMC chain for each walker, not interleaved.
+
+**Option C — deferred outer-loop mini-chains**: Expose an optional `n_intra_re_cycles` parameter in `_run_loop`. After each `ns_step`, run `n_intra_re_cycles` additional single-step MCMC walks with RE accepted in between. Closest to inter-RE mentally; requires `step_fn` to accept multiple walkers and a swap rule.
+
+### Recommended starting point
+
+Option B (post-scan pool phase) is the lowest-risk first implementation: no `run_one_chain` signature change, no new scan axes, and the pool-phase can reuse the existing `replica_exchange_step` logic with minor shape adaptation.
+
+### Touch points
+
+- `sampling/nested_sampling.py` — `ns_step`: add pool-swap phase after `jax.vmap(run_one_chain)`.
+- `sampling/moves/replica_exchange.py` — existing `replica_exchange_step`/`SwapKernel` reuse with walker-level (not run-level) indexing.
+- New parameter `intra_re_kernel: SwapKernel | None = None` in `ns_step`.
+- Tests: `tests/test_ns_step.py` + new `tests/test_intra_re.py`.
+
+---
+
 ## Optional MCMC-trajectory debug capture
 
 **Status:** deferred 2026-04-19. Design complete; implementation paused.

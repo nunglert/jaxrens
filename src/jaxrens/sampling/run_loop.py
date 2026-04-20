@@ -196,6 +196,7 @@ def _run_loop(
     move_descriptors: Any,
     rng_key,
     info_interval: int,
+    inter_re_mgr: Any = None,
 ) -> tuple[Any, Any, dict]:
     """Unified NS outer loop shared by ``run_ns`` and ``run_ns_parallel``.
 
@@ -224,6 +225,10 @@ def _run_loop(
             * ``VmapRuns``: shape ``(n_runs,)`` per-run keys.
         info_interval: Unused by this function (kept for forward-compat).
             Logging is handled entirely by callbacks (e.g. ProgressCallback).
+        inter_re_mgr: Optional :class:`InterREManager` instance.  When
+            provided and ``inter_re_mgr.is_active`` is True, a swap pass
+            fires after each ``ns_step`` call on iterations where
+            ``inter_re_mgr.fires(i)`` is True.  ``None`` → zero overhead.
 
     Returns:
         ``(ns_state, rng_key, cumulative)`` where:
@@ -278,6 +283,16 @@ def _run_loop(
             "n_evaluations": np.zeros(n_moves, dtype=np.int64),
             "n_grad_evaluations": np.zeros(n_moves, dtype=np.int64),
         }
+
+    # Dedicated scalar PRNG key for inter-RE swaps.
+    # The adaptation ``rng_key`` may be (n_runs,) shaped for VmapRuns; we need
+    # a single scalar key for replica_exchange_step.  Derive from rng_key once
+    # before the loop.  For SingleRun rng_key is already scalar; for batched
+    # descriptors we take the first per-run key.
+    inter_re_key = None
+    if inter_re_mgr is not None and inter_re_mgr.is_active:
+        rng_key_scalar = rng_key.reshape(-1)[0] if jnp.asarray(rng_key).ndim > 0 else rng_key
+        inter_re_key = jax.random.split(rng_key_scalar, 1)[0]
 
     for i in range(max_iterations):
         # ---- Adaptation ----
@@ -342,6 +357,25 @@ def _run_loop(
             continue
 
         ns_state = new_ns_state
+
+        # ---- Inter-RE phase ----
+        # Fires after ns_step, before cumulative counter bump and callbacks.
+        # Zero overhead when inter_re_mgr is None or is_active=False.
+        if inter_re_mgr is not None and inter_re_mgr.is_active and inter_re_mgr.fires(i):
+            inter_re_key, key_re = jax.random.split(inter_re_key)
+            ns_state, re_stats, _ = inter_re_mgr.apply(ns_state, key_re)
+            info["inter_re_stats"] = re_stats
+            # Roll RE energy evals into the cumulative counters so that the
+            # monitor's nE= / nG= tally stays accurate.
+            # PressureRENSSwap has zero eval counts; XRENSSwap will have non-zero.
+            # We add a scalar to all per-move counters (uniform distribution
+            # assumption — simplest approach that keeps the tally consistent).
+            re_n_evals = re_stats.get("n_energy_evals", 0)
+            re_n_grad = re_stats.get("n_grad_evals", 0)
+            if re_n_evals > 0:
+                cumulative["n_evaluations"] += np.int64(re_n_evals)
+            if re_n_grad > 0:
+                cumulative["n_grad_evaluations"] += np.int64(re_n_grad)
 
         # ---- Cumulative counters (chain phase) ----
         _bump_cumulative_counters(cumulative, info)

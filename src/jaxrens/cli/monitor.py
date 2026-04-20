@@ -305,6 +305,17 @@ class ProgressCallback:
                                 row += _format_reject_breakdown(rc[k], reasons_used=reasons_k)
                         lines.append(row)
 
+        # ---- inter-RE stats row (when present) ----
+        re_stats = info.get("inter_re_stats")
+        if re_stats is not None:
+            n_att = re_stats.get("n_swap_pairs_attempted", 0)
+            n_acc = re_stats.get("n_swap_pairs_accepted", 0)
+            acc = n_acc / max(n_att, 1)
+            re_evals = re_stats.get("n_energy_evals", 0)
+            lines.append(
+                f"  {'inter_re':<16}  n_pairs={n_att:>3d}  acc={acc:.2f}  evals={re_evals}"
+            )
+
         logger.info("\n".join(lines))
 
     def on_finish(self, ns_state: Any) -> None:

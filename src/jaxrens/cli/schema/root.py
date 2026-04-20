@@ -9,6 +9,7 @@ from jaxrens.cli.schema.backend import BackendSpec
 from jaxrens.cli.schema.cell import CellConfig
 from jaxrens.cli.schema.ensemble import EnsembleSpec, NVTEnsembleSpec, NPTEnsembleSpec
 from jaxrens.cli.schema.init import InitConfig
+from jaxrens.cli.schema.inter_re import InterREConfigSpec
 from jaxrens.cli.schema.moves import MoveSpec
 from jaxrens.cli.schema.output import OutputSchema
 from jaxrens.cli.schema.run import RunSchema
@@ -49,6 +50,8 @@ class RootConfig(BaseModel):
         default_factory=lambda: InitConfig(start_species="1 1")
     )
     cell: CellConfig = Field(default_factory=CellConfig)
+    # inter_re is optional; None → no replica-exchange swaps (zero overhead).
+    inter_re: InterREConfigSpec | None = None
 
     @field_validator("moves", mode="before")
     @classmethod

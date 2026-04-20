@@ -148,3 +148,83 @@ Format: one `## YYYY-MM-DD` heading per day; append bullets under it as the day 
   - Dead-array padding in `load_checkpoint` is only applied for scalar (single-run) checkpoints. Batched checkpoints carry full padded arrays; callers must manage padding size themselves.
 
 - **Next:** (a) `_pack_adjustment_info` vmap/pmap-aware refactor; (b) validate LJ-8 NPT longer re-run with monitor log column alignment.
+
+## 2026-04-20 (inter-RE plan — commit 1: SwapKernel abstraction)
+
+- **Commit 1 of inter-RE plan landed (2026-04-20):** Refactored `sampling/moves/replica_exchange.py` from procedural helpers into a `SwapKernel` ABC + `PressureRENSSwap` concrete implementation. Zero behaviour change: all existing paths unchanged; `perform_swap` retained as a back-compat shim (delegates to `PressureRENSSwap().accept` via diagonal-cell construction); `replica_exchange_step` gains a `swap_kernel: SwapKernel | None = None` parameter (defaults to `PressureRENSSwap()` for back-compat). `SwapKernel` and `PressureRENSSwap` re-exported from `sampling/moves/__init__.py`. Line delta on `replica_exchange.py`: 285 → ~420 (+135, all docstrings + ABC + shim wiring). New tests: `TestSwapKernelABC` (2), `TestPressureRENSSwapAccept` (7 — golden equivalence vs `perform_swap`, scalar bool return, JIT), `TestReplicaExchangeStepWithKernel` (3 — default/explicit parity, pressure parity, JIT). 79 scoped tests pass (test_replica_exchange, test_nested_sampling, test_moves, test_mwg).
+- **Note:** `perform_swap` shim constructs diagonal `(3,3)` cell matrices from supplied volumes so that `_get_volume(cell) == volume` round-trips exactly. No approximation; `jnp.cbrt(v)` is exact for the float64 values used in tests.
+- **Next:** Commit 2 — add `InterREManager` in `sampling/inter_re_manager.py` and wire it into `_run_loop` (pressure-RENS only). Add `NSConfig.inter_re: InterREConfig | None` field in `state/config.py`. New `tests/test_inter_re_integration.py`: two-run NS at different pressures, assert swaps happen, assert zero overhead when `inter_re=None`.
+
+## 2026-04-20 (inter-RE plan — commit 2: InterREManager + _run_loop wiring)
+
+- **Commit 2 of inter-RE plan landed (2026-04-20):** Wired inter-replica-exchange (pressure-RENS) into the NS outer loop. Key deliverables:
+  - **`state/config.py`**: New `InterREConfig` frozen dataclass (`flavor`, `every`, `n_swap_cycles`, `composition_targets`, `chemical_potentials`). `NSConfig` gains `inter_re: InterREConfig | None = None`.
+  - **`cli/schema/inter_re.py`** (new): `InterREConfigSpec` pydantic model; validates `flavor`; raises `NotImplementedError` for non-"pressure" flavors. `to_inter_re_config()` converts to dataclass.
+  - **`cli/schema/root.py`**: `inter_re: InterREConfigSpec | None = None` added to `RootConfig`.
+  - **`sampling/inter_re_manager.py`** (new, ~300 lines): `InterREManager` class. `is_active` False for `SingleRun` or `every=0`. `fires(i)` checks `i % every == 0`. `apply(ns_state, key)` → `(new_ns_state, swap_stats, new_key)`. Swap stats: `n_swap_pairs_attempted`, `n_swap_pairs_accepted`, `acceptance_rate`, `n_energy_evals`, `n_grad_evals`. Pressure extraction from `ensemble_params["pressure"]` handles ndim 1/2/3 shapes (VmapRuns stacks pressure as `(n_runs, n_walkers)` after init). JIT-compiled swap functions cached at init time.
+  - **`sampling/run_loop.py`**: Added `inter_re_mgr: Any = None` param to `_run_loop`. Dedicated scalar `inter_re_key` (avoids collision with VmapRuns' `(n_runs,)` adapt key). After `ns_step` and before cumulative counter bump: `inter_re_mgr.apply(ns_state, key_re)` fires on `inter_re_mgr.fires(i)` iterations; `info["inter_re_stats"]` populated; RE energy evals rolled into cumulative counters.
+  - **`sampling/nested_sampling.py`**: `run_ns_parallel` and `run_ns_multi_gpu` gain `inter_re_config=None, backend=None, callbacks=None` params. `InterREManager` constructed when config provided. `run_ns_parallel` now forwards `callbacks` to `_run_loop` (was hardcoded `[]`).
+  - **`cli/monitor.py`**: `ProgressCallback.on_iteration` appends inter-RE stats row when `info["inter_re_stats"]` is present: `inter_re  n_pairs=N  acc=X.XX  evals=N`.
+  - **Tests**: `tests/test_inter_re_manager.py` (21 tests: fires, is_active, apply no-op/vmap/pmap paths, JIT cache stability). `tests/test_inter_re_integration.py` (12 tests: end-to-end 5-iter two-run NS, SingleRun no-swap, PmapVmap smoke, zero overhead timing, flavor validation).
+  - **Demo**: `experiments/examples/lj8_npt/run_inter_re.py` — LJ-8 NPT, 2 runs at P=0.01 and P=0.1 eV/Å³, 100 iters. Observed `inter_re  n_pairs=1  acc=1.00  evals=0` in monitor every 20 iters. `|log_Z[0] - log_Z[1]| = 2.41` (expected > 0 for different pressures). Runtime ~9s on CPU.
+- **Key fix (shape bug):** `population.ensemble_params["pressure"]` after `init_ns_parallel` is shape `(n_runs, n_walkers)` (not `(n_runs,)`) because MCState vmapping stacks each walker's scalar pressure → `(n_walkers,)` before stacking runs. Fixed in `_extract_swap_inputs` with `arr[:, 0]` slice for ndim==2.
+- **Key fix (demo script):** `MoveKernel("galilean", ...)` requires `extra_state_fields={"direction": (jnp.ndarray, lambda pos, types: jnp.zeros_like(pos))}`. Missing this causes `AttributeError: 'MCState' object has no attribute 'direction'`. Also requires passing `move_descriptors=descriptors` to `run_ns_parallel` so `n_moves` is inferred correctly (default `n_moves=1` causes shape mismatch with `info["n_evaluations_per_move"]` shape `(n_moves,)` from MWG with 2 moves).
+- **46 scoped tests pass** (test_inter_re_manager, test_inter_re_integration, test_nested_sampling).
+- **Next:** Commit 3 of inter-RE plan — port `morph_types_to_composition` as standalone primitive in `sampling/morph.py`.
+
+## 2026-04-20 (inter-RE plan — commit 3: morph_types_to_composition primitive)
+
+- **Commit 3 of inter-RE plan landed (2026-04-20):** Ported `morph_types_to_composition` from `jaxns-devAS/src/jaxnest/replica_exchange.py` (lines 697-834) into `sampling/morph.py` as a standalone, pure-JAX, JIT/vmap/pmap-safe primitive. No integration with XRENS yet.
+  - **`sampling/morph.py`** (new): single public function `morph_types_to_composition(rng_key, types, target_composition, n_species)`. Three-phase `lax.scan` design (collect donors → fill receiver labels → apply reassignments). `n_species` is a static int; scan lengths are compile-time constants. `split_float` encoding dropped entirely; helper `_counts_from_types` flattened to module level.
+  - **`tests/test_morph.py`** (new, 34 tests): `TestCompositionInvariant` (3), `TestShapeInvariant` (2), `TestDeterminism` (2), `TestJIT` (3), `TestVmap` (2), `TestEdgeCases` (6), `TestPropertyBased` (16 parametrized). All JIT tests use `static_argnums=(3,)`.
+- **Deviations from legacy:**
+  - `_choose_k_without_replacement` not ported (unused by the morph kernel).
+  - `split_float` encoding removed (jaxrens uses plain int32/float32).
+  - `n_atoms = sum(target_composition)` invariant documented but not checked at trace time (JAX tracing constraint).
+- **113 scoped tests pass** (test_morph, test_replica_exchange, test_inter_re_manager, test_inter_re_integration) in 89s.
+- **Next:** Commit 4 — add `XRENSSwap` concrete `SwapKernel` + end-to-end test with composition morphing and energy re-evaluation path.
+
+## 2026-04-20 (inter-RE plan — commit 4: XRENSSwap + end-to-end XRENS)
+
+- **Commit 4 of inter-RE plan landed (2026-04-20):** `XRENSSwap` (composition-morphing replica exchange) implemented and wired end-to-end. All components were already in place from prior commits; this commit validates the full pipeline.
+  - **`sampling/moves/replica_exchange.py`**: `XRENSSwap(n_species)` concrete `SwapKernel`. `propose()` calls `morph_types_to_composition` on both directions (B's walker → A's target, A's walker → B's target), then re-evaluates energies via backend. Returns `(proposed, 2, 0)`. `accept()` delegates to `PressureRENSSwap.accept` (enthalpy check, optional pressure). `xrens_replica_exchange_step` standalone entry-point with `n_energy_evals` tracking in `swap_info`.
+  - **`state/config.py`**: `InterREConfig.composition_targets: tuple[tuple[int,...],...]|None` field was already present. No changes needed.
+  - **`cli/schema/inter_re.py`**: `InterREConfigSpec` validates `flavor="xrens"` requires `composition_targets`; checks row-length consistency (n_species) and row-sum consistency (n_atoms). `semi_grand` raises `NotImplementedError`.
+  - **`sampling/inter_re_manager.py`**: XRENS path dispatches to `xrens_replica_exchange_step`; `_extract_swap_inputs` handles `target_composition` extraction from `ensemble_params` for VmapRuns (ndim 2→1) and PmapVmapRuns (ndim 3→2).
+  - **`sampling/nested_sampling.py`**: `run_ns_parallel` constructs `XRENSSwap(n_species=len(targets[0]))` when `flavor="xrens"`; injects `target_composition` into `ensemble_params_per_run` and re-runs `init_ns_parallel` so walkers carry their target composition. Same pattern in `run_ns_multi_gpu`.
+  - **`tests/test_xrens.py`** (new, ~720 lines): 20 tests across 6 classes:
+    - `TestXRENSProposeMorphedTypes` (5): composition correctness for types_a and types_b, energy finiteness, positions swap direction, multi-seed invariant.
+    - `TestXRENSAccept` (5): bool return, low-energy accept, high-energy reject, JIT-compatible, matches PressureRENSSwap.
+    - `TestNSpeciesMismatch` (3): invalid n_species=0/-1 raises; width mismatch documented.
+    - `TestXRENSEndToEnd` (5): no errors, result shapes, n_energy_evals > 0, swap accepted with identical-weight backend, JIT xrens_replica_exchange_step.
+    - `TestXRENSSingleRunSkip` (1): n_runs=1 → no swaps, state unchanged.
+    - `TestInterREConfigSpecXRENS` (5): valid XRENS spec, missing targets raises, inconsistent row lengths raises, inconsistent sums raises, semi_grand raises.
+  - **Backend used for E2E:** `SpeciesHarmonicBackend` (defined inline in `test_xrens.py`). E = Σᵢ w[types[i]] · 0.5 · ||posᵢ||². Chosen over `lj.py` because it supports per-species weights with a single `jnp.ndarray` gather, requires no periodic/cutoff infrastructure, and makes energy explicitly depend on composition — ensuring the morph path exercises the re-evaluation branch with non-trivial results.
+  - **Observed acceptance rates:** With identical species weights (w₀=w₁=1.0), morphing does not change energy → 100% acceptance after morph. With w₀=1.0, w₁=1.5 and compositions [8,0]↔[4,4], acceptance is composition-energy-dependent (energies recomputed on morphed types; most walkers near origin accept). Direct `xrens_replica_exchange_step` test confirms `n_energy_evals > 0` and `n_attempted > 0`.
+  - **Example config:** `experiments/examples/xrens_toy/config.yaml` — two-run NVT, 8 atoms, compositions [8,0] and [4,4], two-component harmonic backend, `every=1`, `n_swap_cycles=1`.
+  - **138 scoped tests pass** (test_xrens, test_morph, test_inter_re_manager, test_replica_exchange, test_nested_sampling) in 143s.
+- **Next:** Commit 5 — add `SemiGrandSwap` (optional flavor: two runs at different μ, pure-arithmetic accept, zero backend calls).
+
+## 2026-04-20 (inter-RE plan — commit 5: SemiGrandSwap)
+
+- **Commit 5 of inter-RE plan landed (2026-04-20):** `SemiGrandSwap` (μVT/μPT chemical-potential replica exchange) implemented and wired end-to-end. Zero backend calls per swap; pure arithmetic on stored `E`, `types`, and μ.
+  - **`sampling/moves/replica_exchange.py`**: `SemiGrandSwap(n_species)` concrete `SwapKernel`. `propose()` computes `N_X = jnp.bincount(types_X, length=n_species)` for each walker, then grand-canonical energies `Ω_A = U_A - μ_B · N_A` and `Ω_B = U_B - μ_A · N_B`. Returns `(proposed, 0, 0)` — positions/types unchanged, only energy field updated. `accept()` checks `Ω_A < Emax_A AND Ω_B < Emax_B`. `semi_grand_replica_exchange_step` standalone entry-point (parallel to `xrens_replica_exchange_step`); `swap_info["n_energy_evals"]` always 0.
+  - **Sign convention:** Matches legacy `jaxns-devAS/src/jaxnest/replica_exchange.py::create_perform_semi_grand_swap` (lines 195-249). `state.energy` = raw potential U. Grand-canonical energy under swapped μ: `Ω = U - μ_new · N`. Acceptance: `Ω_A_new < Emax_A AND Ω_B_new < Emax_B`.
+  - **`state/config.py`**: `InterREConfig.chemical_potentials` field updated to `tuple[tuple[float,...],...]|None` (was `tuple[float,...]|None`). Docstring updated.
+  - **`cli/schema/inter_re.py`**: `"semi_grand"` added to `_IMPLEMENTED_FLAVORS`. `InterREConfigSpec` gains `chemical_potentials: Optional[List[List[float]]] = None`. `_check_flavor_fields` validates semi-grand path: `chemical_potentials` required, all rows same length. `to_inter_re_config()` converts rows to `tuple[tuple[float,...],...]`. Previous `test_semi_grand_raises` (expected `NotImplementedError`) updated to `test_semi_grand_missing_chemical_potentials_raises` (expects `ValueError`).
+  - **`sampling/inter_re_manager.py`**: `SemiGrandSwap` and `semi_grand_replica_exchange_step` imported. `_is_semi_grand` flag added. `_build_jit_fns` gains semi-grand branch (signature with `chemical_potentials` arg). Pmap body for semi-grand mirrors XRENS body. `_extract_swap_inputs` returns 8-tuple (added `chemical_potentials`). `_apply_vmap` / `_apply_pmap_vmap` dispatch to semi-grand path when `_is_semi_grand`.
+  - **`sampling/nested_sampling.py`**: `SemiGrandSwap` imported. `run_ns_parallel` and `run_ns_multi_gpu` gain `elif cfg.flavor == "semi_grand"` branch: constructs `SemiGrandSwap(n_species=len(cfg.chemical_potentials[0]))`, injects `chemical_potentials` into `ensemble_params_per_run` as JAX float32 arrays, re-runs init.
+  - **`tests/test_semigrand.py`** (new, ~420 lines): 26 tests across 6 classes:
+    - `TestSemiGrandProposeConvention` (4): hand-calculated Ω matches exactly, zero eval counts, positions/types unchanged, zero-μ identity.
+    - `TestSemiGrandAccept` (5): bool return, accept both-below, reject A-above, reject B-above, JIT-compatible.
+    - `TestSemiGrandNSpeciesMismatch` (4): n_species=0/-1 raises, width-mismatch raises, missing key raises.
+    - `TestSemiGrandStepFunction` (6): n_energy_evals=0, JIT-compatible, single-run no-swaps, attempted>0 for 2 runs, positions/types unchanged invariant, zero-μ always-accept case.
+    - `TestSemiGrandEndToEnd` (3): no errors, result shapes + finite log_evidence, direct n_energy_evals=0 assertion.
+    - `TestSemiGrandPmapVmapSmoke` (1): n_gpu=1×n_per_gpu=2, assert no error and (1,2) log_evidence.
+    - `TestInterREConfigSpecSemiGrand` (6): valid spec, missing μ raises, inconsistent row lengths raises, no-longer-raises test, pressure still valid, full roundtrip.
+  - **`tests/test_inter_re_integration.py`**: `test_semi_grand_raises_at_run_time` renamed to `test_semi_grand_missing_chemical_potentials_raises`; expects `(ValueError, NotImplementedError, Exception)` (the underlying error is now `ValueError`).
+  - **180 scoped tests pass** (test_semigrand, test_xrens, test_morph, test_inter_re_manager, test_inter_re_integration, test_replica_exchange, test_nested_sampling) in 190s.
+
+- **Inter-RE feature surface complete.** All three flavors (pressure, xrens, semi_grand) work end-to-end with `VmapRuns` and are smoke-tested with `PmapVmapRuns(n_gpu=1)`.
+
+- **Next:** Inter-RE plan complete — open items: (a) intra-RE deferred, (b) cross-device ppermute-based swaps for n_gpu>1, (c) adaptive swap frequency.

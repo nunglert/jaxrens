@@ -11,22 +11,6 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
-class NSConfig:
-    """Nested sampling run configuration."""
-
-    n_live: int = 500
-    max_iterations: int = 50_000
-    convergence_threshold: float = 0.1
-    n_mcmc_steps: int = 20
-    n_extra: int = 0
-    n_cull: int = 1
-    seed: int = 42
-
-    # Ensemble
-    pressure: float | None = None  # pressure for NPT ensemble (None = NVT)
-
-
-@dataclass(frozen=True)
 class MoveConfig:
     """Move-specific parameters."""
 
@@ -70,3 +54,58 @@ class OutputConfig:
     out_file_prefix: str = "ns"
     working_dir: Path = field(default_factory=lambda: Path("."))
     log_level: str = "info"  # "info" | "debug"
+
+
+@dataclass(frozen=True)
+class InterREConfig:
+    """Configuration for inter-replica-exchange (inter-RE) swaps.
+
+    When attached to ``NSConfig.inter_re``, ``run_ns_parallel`` and
+    ``run_ns_multi_gpu`` will perform replica-exchange swap passes after each
+    ``ns_step`` call.  ``run_ns`` (single run) silently ignores this field.
+
+    Attributes:
+        flavor: Swap kernel flavor.  ``"pressure"`` (pressure-RENS, identity
+            proposal), ``"xrens"`` (composition-morphing), or
+            ``"semi_grand"`` (chemical-potential assignment swap, zero backend
+            calls).
+        every: Fire a swap pass every this many NS iterations (1 = every iter).
+        n_swap_cycles: Number of even+odd swap phases per fire.
+        composition_targets: XRENS-only — per-run target compositions,
+            shape ``(n_runs, n_species)``.  ``None`` for other flavors.
+        chemical_potentials: Semi-grand-only — per-run per-species chemical
+            potentials, shape ``(n_runs, n_species)``.  Required when
+            ``flavor == "semi_grand"``; ``None`` for other flavors.
+    """
+
+    flavor: str = "pressure"
+    every: int = 1
+    n_swap_cycles: int = 1
+    # XRENS-only: per-run target compositions, shape (n_runs, n_species).
+    # Required when flavor == "xrens"; each row must sum to n_atoms and
+    # the number of rows must equal n_runs.
+    composition_targets: tuple[tuple[int, ...], ...] | None = None
+    # semi_grand-only: per-run per-species chemical potentials.
+    # Shape (n_runs, n_species) encoded as tuple-of-tuple.
+    # Required when flavor == "semi_grand".  All rows must have the same
+    # length (= n_species) and the row count must equal n_runs.
+    chemical_potentials: tuple[tuple[float, ...], ...] | None = None
+
+
+@dataclass(frozen=True)
+class NSConfig:
+    """Nested sampling run configuration."""
+
+    n_live: int = 500
+    max_iterations: int = 50_000
+    convergence_threshold: float = 0.1
+    n_mcmc_steps: int = 20
+    n_extra: int = 0
+    n_cull: int = 1
+    seed: int = 42
+
+    # Ensemble
+    pressure: float | None = None  # pressure for NPT ensemble (None = NVT)
+
+    # Inter-replica exchange (optional; None → disabled)
+    inter_re: InterREConfig | None = None

@@ -23,6 +23,8 @@ import numpy as np
 from jaxrens.base import NSCallback
 from jaxrens.sampling.adaptation.manager import AdaptationManager
 from jaxrens.sampling.batch_descriptor import PmapVmapRuns, SingleRun, VmapRuns
+from jaxrens.sampling.inter_re_manager import InterREManager
+from jaxrens.sampling.moves.replica_exchange import PressureRENSSwap, SemiGrandSwap, XRENSSwap
 from jaxrens.sampling.run_loop import (
     _bump_cumulative_counters,
     _dispatch_callbacks,
@@ -652,6 +654,9 @@ def run_ns_parallel(
     adjust_max_rounds: int = 15,
     adjust_factor: float = 1.5,
     restart_states: list | None = None,
+    inter_re_config=None,
+    backend=None,
+    callbacks: list | None = None,
 ) -> dict:
     """Run multiple NS calculations in parallel via vmap(ns_step).
 
@@ -730,6 +735,87 @@ def run_ns_parallel(
         adjust_interval=adjust_interval,
     )
 
+    # Construct InterREManager when inter_re_config is provided.
+    inter_re_mgr = None
+    if inter_re_config is not None:
+        from jaxrens.state.config import InterREConfig
+        cfg: InterREConfig = inter_re_config
+        if cfg.flavor == "pressure":
+            swap_kernel = PressureRENSSwap()
+        elif cfg.flavor == "xrens":
+            if cfg.composition_targets is None:
+                raise ValueError(
+                    "inter_re flavor 'xrens' requires composition_targets in "
+                    "InterREConfig. Each run must have a target composition."
+                )
+            n_species = len(cfg.composition_targets[0])
+            swap_kernel = XRENSSwap(n_species=n_species)
+            # Inject target_composition into ensemble_params for each run so
+            # InterREManager can extract them from ns_state.population.ensemble_params.
+            # Store as a JAX array (not a plain list) so that pytree stacking across
+            # walkers produces shape (n_walkers, n_species) rather than (n_species, n_walkers).
+            if ensemble_params_per_run is None:
+                ensemble_params_per_run = [
+                    {"target_composition": jnp.array(cfg.composition_targets[i], dtype=jnp.int32)}
+                    for i in range(n_runs)
+                ]
+            else:
+                ensemble_params_per_run = [
+                    dict(ensemble_params_per_run[i],
+                         target_composition=jnp.array(cfg.composition_targets[i], dtype=jnp.int32))
+                    for i in range(n_runs)
+                ]
+            # Re-initialize with updated ensemble_params_per_run now that we've
+            # injected target_composition. Re-run init_ns_parallel.
+            ns_states = init_ns_parallel(
+                init_fn, positions, types, energies, cells, rng_keys,
+                max_dead=max_iterations,
+                step_sizes=jnp.full(n_moves, initial_step_size),
+                ensemble_params_per_run=ensemble_params_per_run,
+                restart_states=restart_states,
+            )
+        elif cfg.flavor == "semi_grand":
+            if cfg.chemical_potentials is None:
+                raise ValueError(
+                    "inter_re flavor 'semi_grand' requires chemical_potentials in "
+                    "InterREConfig. Each run must have a per-species μ vector."
+                )
+            n_species = len(cfg.chemical_potentials[0])
+            swap_kernel = SemiGrandSwap(n_species=n_species)
+            # Inject chemical_potentials into ensemble_params for each run so
+            # InterREManager can extract them from ns_state.population.ensemble_params.
+            if ensemble_params_per_run is None:
+                ensemble_params_per_run = [
+                    {"chemical_potentials": jnp.array(cfg.chemical_potentials[i], dtype=jnp.float32)}
+                    for i in range(n_runs)
+                ]
+            else:
+                ensemble_params_per_run = [
+                    dict(ensemble_params_per_run[i],
+                         chemical_potentials=jnp.array(cfg.chemical_potentials[i], dtype=jnp.float32))
+                    for i in range(n_runs)
+                ]
+            # Re-initialize with updated ensemble_params_per_run.
+            ns_states = init_ns_parallel(
+                init_fn, positions, types, energies, cells, rng_keys,
+                max_dead=max_iterations,
+                step_sizes=jnp.full(n_moves, initial_step_size),
+                ensemble_params_per_run=ensemble_params_per_run,
+                restart_states=restart_states,
+            )
+        else:
+            raise NotImplementedError(
+                f"inter_re flavor {cfg.flavor!r} is not yet implemented. "
+                f"Supported flavors: 'pressure', 'xrens', 'semi_grand'."
+            )
+        inter_re_mgr = InterREManager(
+            swap_kernel=swap_kernel,
+            batch_descriptor=descriptor,
+            backend=backend,
+            every=cfg.every,
+            n_swap_cycles=cfg.n_swap_cycles,
+        )
+
     # Per-run PRNG keys used during adaptation (independent of ns_states.rng_key).
     # _run_loop will consume and advance these via adapt_mgr.
     adapt_keys = jax.vmap(lambda k: jax.random.split(k)[0])(rng_keys)  # (n_runs,)
@@ -743,11 +829,12 @@ def run_ns_parallel(
         n_extra=n_extra,
         max_iterations=max_iterations,
         termination_criteria=termination_criteria,
-        callbacks=[],
+        callbacks=callbacks or [],
         n_moves=n_moves,
         move_descriptors=move_descriptors,
         rng_key=adapt_keys,
         info_interval=max(1, max_iterations // 20),
+        inter_re_mgr=inter_re_mgr,
     )
 
     # Final evidence: per-run contribution from remaining live walkers
@@ -897,6 +984,8 @@ def run_ns_multi_gpu(
     adjust_max_rounds: int = 15,
     adjust_factor: float = 1.5,
     restart_states: list[list] | None = None,
+    inter_re_config=None,
+    backend=None,
 ) -> dict:
     """Run NS with ``pmap(vmap(ns_step))`` dispatch across G GPUs × P runs each.
 
@@ -1020,6 +1109,85 @@ def run_ns_multi_gpu(
         adjust_interval=adjust_interval,
     )
 
+    # Construct InterREManager when inter_re_config is provided.
+    inter_re_mgr = None
+    if inter_re_config is not None:
+        from jaxrens.state.config import InterREConfig
+        cfg: InterREConfig = inter_re_config
+        if cfg.flavor == "pressure":
+            swap_kernel_mg = PressureRENSSwap()
+        elif cfg.flavor == "xrens":
+            if cfg.composition_targets is None:
+                raise ValueError(
+                    "inter_re flavor 'xrens' requires composition_targets in "
+                    "InterREConfig."
+                )
+            n_species_mg = len(cfg.composition_targets[0])
+            swap_kernel_mg = XRENSSwap(n_species=n_species_mg)
+            # Inject target_composition into ensemble_params for each run.
+            # Store as a JAX array to ensure correct pytree stacking across walkers.
+            n_total_runs = n_gpu * n_per_gpu
+            if ensemble_params_per_run is None:
+                ensemble_params_per_run = [
+                    {"target_composition": jnp.array(cfg.composition_targets[i], dtype=jnp.int32)}
+                    for i in range(n_total_runs)
+                ]
+            else:
+                ensemble_params_per_run = [
+                    dict(ensemble_params_per_run[i],
+                         target_composition=jnp.array(cfg.composition_targets[i], dtype=jnp.int32))
+                    for i in range(n_total_runs)
+                ]
+            # Re-initialize with updated ensemble_params_per_run.
+            ns_states = init_ns_multi_gpu(
+                init_fn, positions, types, energies, cells,
+                rng_keys_flat, n_gpu, n_per_gpu,
+                max_dead=max_iterations,
+                step_sizes=jnp.full(n_moves, initial_step_size),
+                ensemble_params_per_run=ensemble_params_per_run,
+                restart_states=restart_states,
+            )
+        elif cfg.flavor == "semi_grand":
+            if cfg.chemical_potentials is None:
+                raise ValueError(
+                    "inter_re flavor 'semi_grand' requires chemical_potentials in "
+                    "InterREConfig."
+                )
+            n_species_mg = len(cfg.chemical_potentials[0])
+            swap_kernel_mg = SemiGrandSwap(n_species=n_species_mg)
+            n_total_runs = n_gpu * n_per_gpu
+            if ensemble_params_per_run is None:
+                ensemble_params_per_run = [
+                    {"chemical_potentials": jnp.array(cfg.chemical_potentials[i], dtype=jnp.float32)}
+                    for i in range(n_total_runs)
+                ]
+            else:
+                ensemble_params_per_run = [
+                    dict(ensemble_params_per_run[i],
+                         chemical_potentials=jnp.array(cfg.chemical_potentials[i], dtype=jnp.float32))
+                    for i in range(n_total_runs)
+                ]
+            ns_states = init_ns_multi_gpu(
+                init_fn, positions, types, energies, cells,
+                rng_keys_flat, n_gpu, n_per_gpu,
+                max_dead=max_iterations,
+                step_sizes=jnp.full(n_moves, initial_step_size),
+                ensemble_params_per_run=ensemble_params_per_run,
+                restart_states=restart_states,
+            )
+        else:
+            raise NotImplementedError(
+                f"inter_re flavor {cfg.flavor!r} is not yet implemented. "
+                f"Supported flavors: 'pressure', 'xrens', 'semi_grand'."
+            )
+        inter_re_mgr = InterREManager(
+            swap_kernel=swap_kernel_mg,
+            batch_descriptor=descriptor,
+            backend=backend,
+            every=cfg.every,
+            n_swap_cycles=cfg.n_swap_cycles,
+        )
+
     # Per-run PRNG keys for adaptation (shape (G, P)).
     # Derive from rng_keys_flat by splitting, then reshape to (G, P).
     adapt_keys_flat = jax.vmap(lambda k: jax.random.split(k)[0])(rng_keys_flat)
@@ -1039,6 +1207,7 @@ def run_ns_multi_gpu(
         move_descriptors=move_descriptors,
         rng_key=adapt_keys,
         info_interval=max(1, max_iterations // 20),
+        inter_re_mgr=inter_re_mgr,
     )
 
     # Final evidence: per-run contribution from remaining live walkers.
