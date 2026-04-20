@@ -23,8 +23,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-neuralil = ["neuralil"]
-mace = ["mace-jax"]
+neuralil = ["neuralil @ git+https://github.com/nunglert/neuralil-jaxrens.git@jaxrens"]
+mace = ["mace-jax @ git+https://github.com/ACEsuit/mace-jax.git@main"]
 dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.5",
