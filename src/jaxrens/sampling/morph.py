@@ -6,7 +6,7 @@ JIT/vmap/pmap safe; no Python-level indexing on traced values.
 
 Ported from jaxnest (jaxns-devAS/src/jaxnest/replica_exchange.py, ~line 697)
 with the following changes:
-  - `split_float` encoding dropped entirely (jaxrens uses plain int32/float32).
+  - legacy jaxnest's split-float trick is not ported; jaxrens uses plain int32/float32.
   - `_choose_k_without_replacement` helper not ported (unused in morph kernel).
   - `_counts_from_types` flattened to module level.
   - Public signature follows jaxrens snake_case conventions.

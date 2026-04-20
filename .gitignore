@@ -10,5 +10,8 @@ build/
 *.h5
 *.npz
 *.extxyz
+!tests/fixtures/**/*.npz
+!tests/fixtures/**/*.h5
+!tests/fixtures/**/*.extxyz
 .venv/
 experiments

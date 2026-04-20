@@ -22,7 +22,11 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures" / "neuralil_tiny"
 
 
 def fixture_available():
-    return FIXTURE_DIR.exists() and (FIXTURE_DIR / "model.pkl").exists()
+    return (
+        FIXTURE_DIR.exists()
+        and (FIXTURE_DIR / "model.pkl").exists()
+        and (FIXTURE_DIR / "reference.npz").exists()
+    )
 
 
 # ---------------------------------------------------------------------------

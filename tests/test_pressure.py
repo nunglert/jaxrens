@@ -213,19 +213,21 @@ class TestPartitionFunctionWithVolumes:
 
 class TestConfigPressure:
     def test_pressure_parsed_from_input(self, tmp_path):
-        from jaxrens.cli.parser import parse_input_file, raw_to_configs
+        from jaxrens.cli.parser import parse_input_file
+        from jaxrens.cli.migrate import migrate_ns_inp
 
         inp = tmp_path / "ns.inp"
         inp.write_text("n_walkers = 100\npressure = 0.05\n")
         raw = parse_input_file(inp)
-        ns_config, _, _, _ = raw_to_configs(raw)
-        assert ns_config.pressure == pytest.approx(0.05)
+        result = migrate_ns_inp(raw)
+        assert result["config"]["ensemble"]["pressure"] == pytest.approx(0.05)
 
     def test_no_pressure_in_input(self, tmp_path):
-        from jaxrens.cli.parser import parse_input_file, raw_to_configs
+        from jaxrens.cli.parser import parse_input_file
+        from jaxrens.cli.migrate import migrate_ns_inp
 
         inp = tmp_path / "ns.inp"
         inp.write_text("n_walkers = 100\n")
         raw = parse_input_file(inp)
-        ns_config, _, _, _ = raw_to_configs(raw)
-        assert ns_config.pressure is None
+        result = migrate_ns_inp(raw)
+        assert "pressure" not in result["config"].get("ensemble", {})

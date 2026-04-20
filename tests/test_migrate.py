@@ -13,7 +13,7 @@ import yaml
 from jaxrens.cli.migrate import migrate_ns_inp
 from jaxrens.cli.schema import RootConfig
 
-PYTHON = "/home/nunglert/miniconda3/envs/jaxrens/bin/python"
+PYTHON = sys.executable
 
 # ---------------------------------------------------------------------------
 # Helpers
