@@ -30,6 +30,7 @@ from jaxrens.sampling.run_loop import (
     _dispatch_callbacks,
     _inject_cumulative_into_info,
     _pack_adjustment_info,
+    _pick_next_bucket,
     _run_loop,
 )
 from jaxrens.sampling.termination import (
@@ -42,6 +43,28 @@ from jaxrens.state.ns import NSState
 from jaxrens.utils.cell import get_volume
 
 logger = logging.getLogger(__name__)
+
+
+def _choose_starting_bucket(
+    initial_max_neighbor_counts: jnp.ndarray | None,
+    ladder: tuple[int, ...],
+    offset: int,
+) -> int:
+    """Pick the smallest ladder entry that covers ``max(counts) + offset``.
+
+    When ``initial_max_neighbor_counts`` is None (no backend, or backend
+    that doesn't expose ``max_neighbors_for``), fall back to ``ladder[0]``
+    — the legacy "start small, grow on overflow" path.
+
+    When counts are available the starting bucket is chosen to accommodate
+    every walker's observed count plus ``offset``, so iter 0 compiles
+    against the right bucket and the overflow-retry loop only fires when
+    chain dynamics push counts past the current ladder entry.
+    """
+    if initial_max_neighbor_counts is None:
+        return ladder[0]
+    peak = int(jnp.max(initial_max_neighbor_counts))
+    return _pick_next_bucket(peak, 0, ladder, offset)
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +153,7 @@ def init_ns(
     ensemble_params: dict | None = None,
     restart_state=None,
     max_neighbors: int = 0,
+    max_neighbor_counts: jnp.ndarray | None = None,
 ) -> NSState:
     """Initialize NSState from walker data.
 
@@ -177,6 +201,9 @@ def init_ns(
             step_sizes=step_sizes,
             ensemble_params=ensemble_params,
             max_neighbors=max_neighbors,
+            max_neighbor_count_init=(
+                int(max_neighbor_counts[i]) if max_neighbor_counts is not None else 0
+            ),
         )
         walkers.append(w)
     population = jax.tree.map(lambda *xs: jnp.stack(xs), *walkers)
@@ -483,6 +510,7 @@ def run_ns(
     restart_state=None,
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
+    initial_max_neighbor_counts: jnp.ndarray | None = None,
 ) -> dict:
     """Run a full nested sampling calculation.
 
@@ -504,6 +532,9 @@ def run_ns(
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
         raise ValueError("max_neighbors_list must be non-empty.")
+    starting_bucket = _choose_starting_bucket(
+        initial_max_neighbor_counts, ladder, max_neighbors_offset,
+    )
 
     if per_move_fns is not None:
         n_moves = len(per_move_fns)
@@ -518,7 +549,8 @@ def run_ns(
         step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params=ensemble_params,
         restart_state=restart_state,
-        max_neighbors=ladder[0],
+        max_neighbors=starting_bucket,
+        max_neighbor_counts=initial_max_neighbor_counts,
     )
 
     n_atoms = positions.shape[1] if positions.ndim >= 2 else None
@@ -596,6 +628,7 @@ def init_ns_parallel(
     ensemble_params_per_run: list[dict] | None = None,
     restart_states: list | None = None,
     max_neighbors: int = 0,
+    max_neighbor_counts: jnp.ndarray | None = None,
 ) -> NSState:
     """Create batched NSState for n_runs parallel NS runs.
 
@@ -637,6 +670,9 @@ def init_ns_parallel(
             rng_keys[i], max_dead, step_sizes, ep,
             restart_state=rs,
             max_neighbors=max_neighbors,
+            max_neighbor_counts=(
+                max_neighbor_counts[i] if max_neighbor_counts is not None else None
+            ),
         )
         runs.append(run_state)
     return jax.tree.map(lambda *xs: jnp.stack(xs), *runs)
@@ -671,6 +707,7 @@ def run_ns_parallel(
     callbacks: list | None = None,
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
+    initial_max_neighbor_counts: jnp.ndarray | None = None,
 ) -> dict:
     """Run multiple NS calculations in parallel via vmap(ns_step).
 
@@ -728,6 +765,9 @@ def run_ns_parallel(
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
         raise ValueError("max_neighbors_list must be non-empty.")
+    starting_bucket = _choose_starting_bucket(
+        initial_max_neighbor_counts, ladder, max_neighbors_offset,
+    )
 
     ns_states = init_ns_parallel(
         init_fn, positions, types, energies, cells, rng_keys,
@@ -735,7 +775,8 @@ def run_ns_parallel(
         step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params_per_run=ensemble_params_per_run,
         restart_states=restart_states,
-        max_neighbors=ladder[0],
+        max_neighbors=starting_bucket,
+        max_neighbor_counts=initial_max_neighbor_counts,
     )
 
     logger.info(
@@ -792,7 +833,8 @@ def run_ns_parallel(
                 step_sizes=jnp.full(n_moves, initial_step_size),
                 ensemble_params_per_run=ensemble_params_per_run,
                 restart_states=restart_states,
-                max_neighbors=ladder[0],
+                max_neighbors=starting_bucket,
+                max_neighbor_counts=initial_max_neighbor_counts,
             )
         elif cfg.flavor == "semi_grand":
             if cfg.chemical_potentials is None:
@@ -822,7 +864,8 @@ def run_ns_parallel(
                 step_sizes=jnp.full(n_moves, initial_step_size),
                 ensemble_params_per_run=ensemble_params_per_run,
                 restart_states=restart_states,
-                max_neighbors=ladder[0],
+                max_neighbors=starting_bucket,
+                max_neighbor_counts=initial_max_neighbor_counts,
             )
         else:
             raise NotImplementedError(
@@ -913,6 +956,7 @@ def init_ns_multi_gpu(
     ensemble_params_per_run: list[dict] | None = None,
     restart_states: list[list] | None = None,
     max_neighbors: int = 0,
+    max_neighbor_counts: jnp.ndarray | None = None,
 ) -> NSState:
     """Initialize a ``(G, P, ...)``-shaped NSState for pmap(vmap) execution.
 
@@ -954,6 +998,10 @@ def init_ns_multi_gpu(
     positions_flat = _flatten_leading(positions)   # (G*P, K, A, 3)
     energies_flat = _flatten_leading(energies)      # (G*P, K)
     cells_flat = _flatten_leading(cells) if cells is not None else None
+    mnc_flat = (
+        _flatten_leading(max_neighbor_counts)
+        if max_neighbor_counts is not None else None
+    )
     rng_keys_flat = rng_keys.reshape(n_total) if rng_keys.ndim == 2 else rng_keys
 
     # Flatten restart_states from (G, P) nested list to flat list of G*P.
@@ -970,6 +1018,7 @@ def init_ns_multi_gpu(
         ensemble_params_per_run=ensemble_params_per_run,
         restart_states=rs_flat,
         max_neighbors=max_neighbors,
+        max_neighbor_counts=mnc_flat,
     )
 
     # Reshape all dynamic fields from (G*P, ...) to (G, P, ...).
@@ -1013,6 +1062,7 @@ def run_ns_multi_gpu(
     backend=None,
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
+    initial_max_neighbor_counts: jnp.ndarray | None = None,
 ) -> dict:
     """Run NS with ``pmap(vmap(ns_step))`` dispatch across G GPUs × P runs each.
 
@@ -1112,6 +1162,9 @@ def run_ns_multi_gpu(
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
         raise ValueError("max_neighbors_list must be non-empty.")
+    starting_bucket = _choose_starting_bucket(
+        initial_max_neighbor_counts, ladder, max_neighbors_offset,
+    )
 
     # Initialize (G, P, ...) state via init_ns_multi_gpu.
     ns_states = init_ns_multi_gpu(
@@ -1121,7 +1174,8 @@ def run_ns_multi_gpu(
         step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params_per_run=ensemble_params_per_run,
         restart_states=restart_states,
-        max_neighbors=ladder[0],
+        max_neighbors=starting_bucket,
+        max_neighbor_counts=initial_max_neighbor_counts,
     )
 
     logger.info(
@@ -1178,7 +1232,8 @@ def run_ns_multi_gpu(
                 step_sizes=jnp.full(n_moves, initial_step_size),
                 ensemble_params_per_run=ensemble_params_per_run,
                 restart_states=restart_states,
-                max_neighbors=ladder[0],
+                max_neighbors=starting_bucket,
+                max_neighbor_counts=initial_max_neighbor_counts,
             )
         elif cfg.flavor == "semi_grand":
             if cfg.chemical_potentials is None:
@@ -1207,7 +1262,8 @@ def run_ns_multi_gpu(
                 step_sizes=jnp.full(n_moves, initial_step_size),
                 ensemble_params_per_run=ensemble_params_per_run,
                 restart_states=restart_states,
-                max_neighbors=ladder[0],
+                max_neighbors=starting_bucket,
+                max_neighbor_counts=initial_max_neighbor_counts,
             )
         else:
             raise NotImplementedError(

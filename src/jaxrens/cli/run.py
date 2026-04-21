@@ -7,6 +7,7 @@ NS loop execution, and I/O callbacks.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from jaxrens.cli.monitor import (
     BatchedTrajectoryCallback,
     CheckpointCallback,
     EnergyCheckCallback,
+    MemProfileCallback,
     ProgressCallback,
     TrajectoryCallback,
 )
@@ -73,6 +75,30 @@ def _configure_file_logging(
         debug_h.setFormatter(logging.Formatter(_LOG_FORMAT))
         debug_h._jaxrens_managed = True  # type: ignore[attr-defined]
         root.addHandler(debug_h)
+
+
+def _recompute_max_neighbor_counts(
+    backend: Any,
+    positions: jnp.ndarray,
+    cells: jnp.ndarray | None,
+) -> jnp.ndarray | None:
+    """Refresh per-walker max neighbor counts after burn-in.
+
+    Burn-in drifts positions (and cells in NPT), so the resolver's
+    pre-burn-in counts no longer describe the state entering the NS
+    loop.  Recompute via ``backend.max_neighbors_for`` so the NS loop
+    picks the correct starting bucket.  Returns ``None`` for backends
+    without the helper (LJ / toy — they ignore ``max_neighbors`` anyway).
+
+    Handles any leading batch shape by flattening + a single vmap.
+    """
+    if cells is None or not hasattr(backend, "max_neighbors_for"):
+        return None
+    leading_shape = positions.shape[:-2]
+    flat_pos = positions.reshape(-1, *positions.shape[-2:])
+    flat_cells = cells.reshape(-1, 3, 3)
+    flat_counts = jax.vmap(backend.max_neighbors_for)(flat_pos, flat_cells)
+    return flat_counts.reshape(leading_shape)
 
 
 def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
@@ -162,6 +188,7 @@ def run_from_config(
     initial_types: jnp.ndarray,
     initial_energies: jnp.ndarray | None = None,
     initial_cells: jnp.ndarray | None = None,
+    initial_max_neighbor_counts: jnp.ndarray | None = None,
     symbol_map: dict[int, str] | None = None,
     termination_criteria: list | None = None,
     restart_state=None,
@@ -234,6 +261,9 @@ def run_from_config(
         )
     )
 
+    if (memprof := os.environ.get("JAXRENS_MEMPROF")):
+        callbacks.append(MemProfileCallback(working_dir / memprof))
+
     traj_path = working_dir / f"{output_config.out_file_prefix}.traj.{output_config.format}"
     writer = create_trajectory_writer(output_config.format, traj_path, symbol_map)
     energy_logger = EnergyLogger(
@@ -277,7 +307,10 @@ def run_from_config(
     )
     if do_burn_in:
         from jaxrens.init.burn_in import initial_walk
-        from jaxrens.sampling.nested_sampling import init_ns
+        from jaxrens.sampling.nested_sampling import (
+            _choose_starting_bucket,
+            init_ns,
+        )
 
         logger.info(
             "Running initial-walk burn-in: %d walks x %d steps/walk",
@@ -285,6 +318,12 @@ def run_from_config(
         )
 
         n_atoms = initial_positions.shape[1] if initial_positions.ndim >= 2 else 1
+
+        _ladder = tuple(int(x) for x in backend_config.max_neighbors_list)
+        _offset = int(backend_config.max_neighbors_offset)
+        starting_bucket = _choose_starting_bucket(
+            initial_max_neighbor_counts, _ladder, _offset,
+        )
 
         key, key_init, key_burn = jax.random.split(key, 3)
         ns_state_burn = init_ns(
@@ -296,6 +335,8 @@ def run_from_config(
             key_init,
             max_dead=ns_config.max_iterations,
             ensemble_params=ensemble_params,
+            max_neighbors=starting_bucket,
+            max_neighbor_counts=initial_max_neighbor_counts,
         )
 
         # Build per-move adaptation data if available.
@@ -331,6 +372,11 @@ def run_from_config(
         initial_positions = pop.positions
         initial_energies = pop.energy
         initial_cells = pop.cell
+
+        # Refresh counts for the NS loop — burn-in drifted positions/cells.
+        initial_max_neighbor_counts = _recompute_max_neighbor_counts(
+            backend, initial_positions, initial_cells,
+        )
 
         if burn_in_cfg.write_initial_walkers:
             logger.warning(
@@ -378,8 +424,9 @@ def run_from_config(
         ensemble_params=ensemble_params,
         termination_criteria=termination_criteria,
         restart_state=restart_state,
-        max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
-        max_neighbors_offset=resolved.backend.max_neighbors_offset,
+        max_neighbors_list=tuple(backend_config.max_neighbors_list),
+        max_neighbors_offset=backend_config.max_neighbors_offset,
+        initial_max_neighbor_counts=initial_max_neighbor_counts,
         **full_auto_kwargs,
     )
 
@@ -449,6 +496,17 @@ def run_multi_gpu_from_config(resolved) -> dict:
 
     key = jax.random.key(ns.seed)
 
+    # Starting bucket for burn-in and NS — derived from the per-walker
+    # neighbor counts captured in the resolver.  Without this, burn-in
+    # would run with max_neighbors=0 (static field default), causing
+    # MACE to evaluate on an edge-less graph and overwrite the correct
+    # post-resolver energies with garbage.
+    from jaxrens.sampling.nested_sampling import _choose_starting_bucket
+    _ladder = tuple(int(x) for x in resolved.backend.max_neighbors_list)
+    _offset = int(resolved.backend.max_neighbors_offset)
+    _init_counts = resolved.init.initial_max_neighbor_counts
+    starting_bucket = _choose_starting_bucket(_init_counts, _ladder, _offset)
+
     # --- Burn-in (batched=True) -------------------------------------------
     burn_in_cfg = resolved.initial_walk_config
     do_burn_in = burn_in_cfg is not None and burn_in_cfg.n_walks > 0
@@ -464,6 +522,8 @@ def run_multi_gpu_from_config(resolved) -> dict:
             max_dead=ns.max_iterations,
             step_sizes=step_sizes,
             ensemble_params_per_run=list(resolved.ensemble_params_per_run),
+            max_neighbors=starting_bucket,
+            max_neighbor_counts=_init_counts,
         )
         n_atoms = positions.shape[-2]
         adaptation_policies = resolved.adaptation_policies
@@ -490,6 +550,13 @@ def run_multi_gpu_from_config(resolved) -> dict:
         energies = pop.energy
         cells = pop.cell
 
+    # Refresh per-walker neighbor counts after burn-in — cells/positions
+    # have drifted and the resolver's pre-burn-in counts no longer
+    # describe the state that will enter the NS loop.
+    post_burn_in_counts = _recompute_max_neighbor_counts(
+        base_backend, positions, cells,
+    ) if do_burn_in else _init_counts
+
     # --- PRNG keys for the multi-GPU dispatch -----------------------------
     key, key_run = jax.random.split(key)
     rng_keys_flat = jax.random.split(key_run, n_total)
@@ -509,6 +576,9 @@ def run_multi_gpu_from_config(resolved) -> dict:
             symbol_map=symbol_map,
         )
     )
+
+    if (memprof := os.environ.get("JAXRENS_MEMPROF")):
+        callbacks.append(MemProfileCallback(working_dir / memprof))
 
     n_atoms = positions.shape[-2]
     writers = []
@@ -594,6 +664,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
         backend=base_backend,
         max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
         max_neighbors_offset=resolved.backend.max_neighbors_offset,
+        initial_max_neighbor_counts=post_burn_in_counts,
         **full_auto_kwargs,
     )
     return result

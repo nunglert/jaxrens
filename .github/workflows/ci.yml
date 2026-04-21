@@ -6,11 +6,9 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-  schedule:
-    - cron: '0 4 * * *'  # nightly 04:00 UTC — full suite
 
-# Only one CI run at a time on the self-hosted runner — newer pushes
-# cancel in-flight runs of the same ref.
+# Cancel superseded runs on the same ref to avoid racking up ephemeral
+# RunsOn GPU instances when pushes land in quick succession.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -19,7 +17,7 @@ jobs:
   smoke:
     name: Smoke (fast, GPU)
     if: github.event_name != 'schedule'
-    runs-on: [self-hosted, gpu]
+    runs-on: runs-on=${{ github.run_id }}/family=g4dn.xlarge/image=ubuntu24-gpu-x64
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +35,7 @@ jobs:
   full:
     name: Full suite (heavy, GPU)
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: [self-hosted, gpu]
+    runs-on: runs-on=${{ github.run_id }}/family=g5.xlarge/image=ubuntu24-gpu-x64
     steps:
       - uses: actions/checkout@v4
 

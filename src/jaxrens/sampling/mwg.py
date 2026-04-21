@@ -114,6 +114,7 @@ def build_mwg(
         step_size: float | None = None,
         ensemble_params: dict | None = None,
         max_neighbors: int = 0,
+        max_neighbor_count_init: int | jnp.ndarray = 0,
     ) -> Any:  # returns MCStateClass instance
         """Create initial MCState from walker data.
 
@@ -128,6 +129,12 @@ def build_mwg(
                 ns_step to overflow immediately (wasteful first retry);
                 pass a value from ``BackendConfig.max_neighbors_list[0]``
                 to avoid that.  Ignored by backends that don't use buckets.
+            max_neighbor_count_init: Observed per-walker max neighbor
+                count at init time (from ``backend.max_neighbors_for``).
+                Seeds the dynamic ``max_neighbor_count`` field so the
+                outer-loop overflow retry sees accurate counts from iter
+                0 instead of zeros that falsely suggest "nothing observed
+                yet".  Default 0 preserves legacy behaviour.
         """
         if cell is None:
             cell = jnp.zeros((3, 3))
@@ -148,7 +155,7 @@ def build_mwg(
             step_sizes=jnp.asarray(step_sizes),
             n_accepted=jnp.zeros(n_moves, dtype=jnp.int32),
             n_proposed=jnp.zeros(n_moves, dtype=jnp.int32),
-            max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
+            max_neighbor_count=jnp.asarray(max_neighbor_count_init, dtype=jnp.int32),
             overflow=jnp.asarray(False),
             ensemble_params=ensemble_params,
             max_neighbors=int(max_neighbors),

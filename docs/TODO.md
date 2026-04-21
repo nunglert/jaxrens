@@ -1,0 +1,1 @@
+- In the nested-sampling loop page: The inner loop should be inside the outer loop box. The overflow box should have an additional error that points to the inner loop again. The inner loop box should have a differen background color. the Termination should be at the bottom

@@ -71,8 +71,8 @@ class TestSupercellEdges:
         image_offsets = jnp.array(_make_image_offsets(2, 2, 2), dtype=jnp.int32)
         max_edges = 100
 
-        senders, receivers, shifts, n_actual, overflow = _supercell_edges(
-            positions, cell, r_cutoff, max_edges, image_offsets,
+        senders, receivers, shifts, n_actual, overflow, true_max = (
+            _supercell_edges(positions, cell, r_cutoff, max_edges, image_offsets)
         )
 
         # In a 5A box with cutoff 2A, atom 0 and atom 1 are 1.5A apart
@@ -84,6 +84,8 @@ class TestSupercellEdges:
         # So we expect exactly 2 edges
         assert int(n_actual) == 2
         assert not overflow
+        # Each atom has exactly one in-cutoff neighbor (the other atom).
+        assert int(true_max) == 1
 
     def test_overflow_detected(self):
         """Too few max_edges -> overflow."""
@@ -92,11 +94,14 @@ class TestSupercellEdges:
         r_cutoff = 2.0
         image_offsets = jnp.array(_make_image_offsets(2, 2, 2), dtype=jnp.int32)
 
-        _, _, _, n_actual, overflow = _supercell_edges(
+        _, _, _, n_actual, overflow, true_max = _supercell_edges(
             positions, cell, r_cutoff, max_edges=1, image_offsets=image_offsets,
         )
         # At least 2 edges exist, but max_edges=1
         assert overflow
+        # true_max is computed from the full mask before truncation, so it
+        # reflects the real neighbor count even when the edge buffer overflows.
+        assert int(true_max) >= 1
 
     def test_no_overflow_with_budget(self):
         """Sufficient max_edges -> no overflow."""
@@ -105,7 +110,7 @@ class TestSupercellEdges:
         r_cutoff = 2.0
         image_offsets = jnp.array(_make_image_offsets(2, 2, 2), dtype=jnp.int32)
 
-        _, _, _, _, overflow = _supercell_edges(
+        _, _, _, _, overflow, _ = _supercell_edges(
             positions, cell, r_cutoff, max_edges=100, image_offsets=image_offsets,
         )
         assert not overflow
@@ -117,11 +122,12 @@ class TestSupercellEdges:
         image_offsets = jnp.array(_make_image_offsets(2, 2, 2), dtype=jnp.int32)
 
         jit_fn = jax.jit(_supercell_edges, static_argnums=(2, 3))
-        senders, receivers, shifts, n_actual, overflow = jit_fn(
+        senders, receivers, shifts, n_actual, overflow, true_max = jit_fn(
             positions, cell, 2.0, 100, image_offsets,
         )
         assert int(n_actual) == 2
         assert not overflow
+        assert int(true_max) == 1
 
     def test_shifts_are_correct(self):
         """Edge shift vectors should reconstruct correct distances."""
@@ -130,7 +136,7 @@ class TestSupercellEdges:
         r_cutoff = 2.0
         image_offsets = jnp.array(_make_image_offsets(2, 2, 2), dtype=jnp.int32)
 
-        senders, receivers, shifts, n_actual, _ = _supercell_edges(
+        senders, receivers, shifts, n_actual, _, _ = _supercell_edges(
             positions, cell, r_cutoff, 100, image_offsets,
         )
 

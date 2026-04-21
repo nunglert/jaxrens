@@ -506,6 +506,13 @@ class CheckpointCallback:
         self.prefix = prefix
         self.symbol_map = symbol_map
 
+    def on_start(self, ns_state: Any) -> None:
+        from jaxrens.io.checkpoint import save_checkpoint
+
+        path = self.working_dir / f"{self.prefix}.initial.checkpoint.h5"
+        state_dict = _ns_state_to_checkpoint_dict(ns_state) if isinstance(ns_state, NSState) else ns_state
+        save_checkpoint(path, state_dict, self.symbol_map)
+
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
         if iteration > 0 and iteration % self.interval == 0:
             from jaxrens.io.checkpoint import save_checkpoint
@@ -520,6 +527,47 @@ class CheckpointCallback:
         path = self.working_dir / f"{self.prefix}.final.checkpoint.h5"
         state_dict = _ns_state_to_checkpoint_dict(ns_state) if isinstance(ns_state, NSState) else ns_state
         save_checkpoint(path, state_dict, self.symbol_map)
+
+
+class MemProfileCallback:
+    """One-shot device-memory snapshot on the first post-compile iteration.
+
+    Intended as a debug aid when the NS loop OOMs or when you want to see
+    which HLO op owns the peak allocation (typically the vmap'd backward
+    pass through the energy backend inside the galilean/HMC kernels).
+
+    Enabled only when the ``JAXRENS_MEMPROF`` env var names the output
+    filename; otherwise the callback is not constructed and the run pays
+    nothing.  Inspect the result with ``pprof -top -cum <file.prof.gz>``.
+
+    Fires twice at most: once from ``on_start`` with the ``.baseline``
+    suffix (captures post-init state before any NS compile) and once from
+    the first ``on_iteration`` after the first step completes (captures
+    the steady-state live set).  The baseline snapshot is the only one
+    that survives when iter 0 itself OOMs — which is the common failure
+    mode we're trying to diagnose.
+    """
+
+    def __init__(self, out_path: Path | str):
+        self.out_path = str(out_path)
+        self.iter_done = False
+
+    def _baseline_path(self) -> str:
+        p = Path(self.out_path)
+        return str(p.with_name(p.stem + ".baseline" + p.suffix))
+
+    def on_start(self, ns_state: Any) -> None:
+        import jax
+
+        jax.profiler.save_device_memory_profile(self._baseline_path())
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        if self.iter_done:
+            return
+        import jax
+
+        jax.profiler.save_device_memory_profile(self.out_path)
+        self.iter_done = True
 
 
 class TrajectoryCallback:

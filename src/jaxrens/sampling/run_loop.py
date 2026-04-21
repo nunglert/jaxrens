@@ -325,6 +325,14 @@ def _run_loop(
         rng_key_scalar = rng_key.reshape(-1)[0] if jnp.asarray(rng_key).ndim > 0 else rng_key
         inter_re_key = jax.random.split(rng_key_scalar, 1)[0]
 
+    # ---- on_start callbacks (fired once, post-init, pre-loop) ----
+    # CheckpointCallback uses this hook to snapshot the fully-initialised
+    # NSState before iteration 0, giving a reproducible entry point for
+    # post-hoc debugging of init/overflow issues.
+    for cb in callbacks:
+        if hasattr(cb, "on_start"):
+            cb.on_start(ns_state)
+
     for i in range(max_iterations):
         # ---- Adaptation ----
         adjust_info = None

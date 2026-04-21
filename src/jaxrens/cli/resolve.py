@@ -67,6 +67,7 @@ class ResolvedInit:
     initial_types: Any       # shape: (n_atoms,) dtype int32 or None
     initial_cells: Any       # shape: (n_live, 3, 3) or None
     initial_energies: Any    # shape: (n_live,) or None — None until evaluated
+    initial_max_neighbor_counts: Any = None  # shape: (n_live,) int32 or None
     symbol_map: dict[int, str] | None = None
     restart_state: RestartBundle | None = None
 
@@ -180,6 +181,51 @@ def _validate_cells(
             )
 
 
+def _finalise_initial_energies_and_counts(
+    energy_backend: EnergyBackend | None,
+    positions: jnp.ndarray,
+    types: jnp.ndarray,
+    cells: jnp.ndarray,
+) -> tuple[jnp.ndarray | None, jnp.ndarray | None]:
+    """Compute per-walker initial ``(energies, max_neighbor_counts)``.
+
+    For backends that expose ``max_neighbors_for`` (currently MACE), this
+    computes each walker's true max neighbor count from geometry alone and
+    then evaluates the backend once per walker with ``max_neighbors`` sized
+    to the global max.  That avoids the degenerate case where the resolver
+    previously passed ``max_neighbors=0`` — causing MACE to run on an
+    edge-less graph and return isolated-atom energies — and gives the NS
+    loop a correctly-sized starting bucket plus accurate per-walker
+    ``max_neighbor_count`` without a separate config parameter.
+
+    For backends without ``max_neighbors_for`` (LJ, toy), the bucket is
+    irrelevant: ``max_neighbors=0`` is passed through and counts returned
+    as ``None``.
+
+    Returns ``(energies, counts)``; either or both may be ``None``.
+    """
+    if energy_backend is None:
+        return None, None
+
+    if types.ndim == 1:
+        types_b = jnp.broadcast_to(types[None, :], (positions.shape[0],) + types.shape)
+    else:
+        types_b = types
+
+    if hasattr(energy_backend, "max_neighbors_for"):
+        counts = jax.vmap(energy_backend.max_neighbors_for)(positions, cells)
+        init_bucket = int(jnp.max(counts))
+        energies = jax.vmap(
+            lambda p, t, c: energy_backend(p, t, c, init_bucket)[0]
+        )(positions, types_b, cells)
+        return energies, counts
+
+    energies = jax.vmap(
+        lambda p, t, c: energy_backend(p, t, c, 0)[0]
+    )(positions, types_b, cells)
+    return energies, None
+
+
 def _sample_per_walker_positions(
     init: InitConfig,
     n_live: int,
@@ -251,18 +297,16 @@ def _resolve_init_walker_set(
 
     _validate_cells(walker_set.cells, n_atoms, cell_cfg)
 
-    if energy_backend is not None:
-        energies = jax.vmap(
-            lambda pos, typs, cel: energy_backend(pos, typs, cel, 0)[0]
-        )(walker_set.positions, walker_set.types, walker_set.cells)
-    else:
-        energies = None
+    energies, counts = _finalise_initial_energies_and_counts(
+        energy_backend, walker_set.positions, walker_set.types, walker_set.cells,
+    )
 
     return ResolvedInit(
         initial_positions=walker_set.positions,
         initial_types=walker_set.types,
         initial_cells=walker_set.cells,
         initial_energies=energies,
+        initial_max_neighbor_counts=counts,
         symbol_map=walker_set.symbol_map,
     )
 
@@ -285,18 +329,16 @@ def _resolve_init_restart(
 
     _validate_cells(walker_set.cells, n_atoms, cell_cfg)
 
-    if energy_backend is not None:
-        energies = jax.vmap(
-            lambda pos, typs, cel: energy_backend(pos, typs, cel, 0)[0]
-        )(walker_set.positions, walker_set.types, walker_set.cells)
-    else:
-        energies = None
+    energies, counts = _finalise_initial_energies_and_counts(
+        energy_backend, walker_set.positions, walker_set.types, walker_set.cells,
+    )
 
     return ResolvedInit(
         initial_positions=walker_set.positions,
         initial_types=walker_set.types,
         initial_cells=walker_set.cells,
         initial_energies=energies,
+        initial_max_neighbor_counts=counts,
         symbol_map=walker_set.symbol_map,
         restart_state=restart_bundle,
     )
@@ -438,22 +480,20 @@ def _resolve_init_species(
             init, n_live, pos_key, initial_cells, initial_types, n_atoms, energy_backend
         )
 
-    if energies_list is not None:
-        initial_energies = jnp.stack(energies_list, axis=0)
-    elif energy_backend is not None and not init.random_initialise_pos:
-        e_list = []
-        for wi in range(n_live):
-            e, _, _ = energy_backend(initial_positions[wi], initial_types, initial_cells[wi], 0)
-            e_list.append(e)
-        initial_energies = jnp.stack(e_list, axis=0)
-    else:
-        initial_energies = None
+    # Finalise initial energies with a correctly sized neighbor bucket.
+    # The per-walker values collected during sampling (``energies_list``) were
+    # computed with ``max_neighbors=0`` — fine for rejection-sampling ceiling
+    # checks but wrong for the MCState's initial energy on GNN backends.
+    initial_energies, initial_counts = _finalise_initial_energies_and_counts(
+        energy_backend, initial_positions, initial_types, initial_cells,
+    )
 
     return ResolvedInit(
         initial_positions=initial_positions,
         initial_types=initial_types,
         initial_cells=initial_cells,
         initial_energies=initial_energies,
+        initial_max_neighbor_counts=initial_counts,
         symbol_map=symbol_map,
     )
 
@@ -489,27 +529,21 @@ def _resolve_init_config_file(
         initial_positions = jnp.broadcast_to(
             positions_single[None], (n_live, n_atoms, 3)
         )
-        if energy_backend is not None:
-            e_list = []
-            for wi in range(n_live):
-                e, _, _ = energy_backend(
-                    initial_positions[wi], types_single, initial_cells[wi], 0
-                )
-                e_list.append(e)
-            initial_energies: jnp.ndarray | None = jnp.stack(e_list, axis=0)
-        else:
-            initial_energies = None
     else:
-        initial_positions, energies_list = _sample_per_walker_positions(
+        initial_positions, _ = _sample_per_walker_positions(
             init, n_live, pos_key, initial_cells, types_single, n_atoms, energy_backend
         )
-        initial_energies = jnp.stack(energies_list, axis=0) if energies_list is not None else None
+
+    initial_energies, initial_counts = _finalise_initial_energies_and_counts(
+        energy_backend, initial_positions, types_single, initial_cells,
+    )
 
     return ResolvedInit(
         initial_positions=initial_positions,
         initial_types=types_single,
         initial_cells=initial_cells,
         initial_energies=initial_energies,
+        initial_max_neighbor_counts=initial_counts,
         symbol_map=symbol_map,
     )
 
@@ -984,6 +1018,10 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
         jnp.stack([x.initial_energies for x in per_run_init], axis=0)
         if per_run_init[0].initial_energies is not None else None
     )
+    initial_max_neighbor_counts = (
+        jnp.stack([x.initial_max_neighbor_counts for x in per_run_init], axis=0)
+        if per_run_init[0].initial_max_neighbor_counts is not None else None
+    )
     # Types are identical across replicas (same start_species).
     initial_types = per_run_init[0].initial_types
 
@@ -994,6 +1032,7 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
         initial_types=initial_types,
         initial_cells=initial_cells,
         initial_energies=initial_energies,
+        initial_max_neighbor_counts=initial_max_neighbor_counts,
         symbol_map=symbol_map,
         restart_state=None,  # multi-run restart is a follow-up; see plan.
     )

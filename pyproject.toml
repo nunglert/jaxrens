@@ -44,6 +44,8 @@ docs = [
     "ipykernel>=6.29",
     "pypandoc_binary>=1.13",
     "matplotlib>=3.8",
+    "squarify>=0.4",
+    "plotly>=5.20",
 ]
 
 [project.scripts]

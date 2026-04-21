@@ -128,3 +128,18 @@ As far as I understand, this requires the max_neighbors being properlly set. And
 ## Energy degeneracies
 
 In practice of NS simulations at 32bit float precision, we often face the problem of degenerate walkers. If the highest energy walker happens to be degenerate with another walker, it needs a statistically sound way of deciding which one to cull. I think uniform sampling is required here, but at some point we need to carefully think about this.
+
+## Streamline single, vmap, pmapvmap
+We have the batch descriptor, but still our _run_loop and other places are full of case switches like:
+
+```python
+    if is_pmap_vmap:
+        emax = jnp.max(pop.energy, axis=2)  # (G, P) — walker axis is 2
+    elif is_vmap:
+        emax = jnp.max(pop.energy, axis=1)  # (n_runs,)
+    else:
+        emax = jnp.max(pop.energy)  # scalar
+```
+
+Couldn't we somehow streamline this better?
+

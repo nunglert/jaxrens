@@ -63,6 +63,49 @@ def _make_image_offsets(sc_a: int, sc_b: int, sc_c: int) -> np.ndarray:
     return grid.reshape(-1, 3)
 
 
+def _max_neighbor_count_from_mask(mask: jnp.ndarray) -> jnp.ndarray:
+    """Return the per-atom max neighbor count from a (N, sc_dim*N) mask."""
+    return jnp.max(jnp.sum(mask, axis=1))
+
+
+def _neighbor_mask(
+    positions: jnp.ndarray,
+    cell: jnp.ndarray,
+    r_cutoff: float,
+    image_offsets: jnp.ndarray,
+) -> jnp.ndarray:
+    """Build the per-atom neighbor boolean mask, shape (N, sc_dim*N).
+
+    Extracted from ``_supercell_edges`` so init-time bucket sizing can
+    compute true neighbor counts without allocating the edge buffer or
+    running the GNN forward.
+    """
+    cart_shifts = image_offsets @ cell
+    super_positions = (
+        positions[None, :, :] + cart_shifts[:, None, :]
+    ).reshape(-1, 3)
+    delta = super_positions[None, :, :] - positions[:, None, :]
+    distances = jnp.linalg.norm(delta, axis=-1)
+    return (distances > 1e-10) & (distances < r_cutoff)
+
+
+def _compute_true_max_neighbors(
+    positions: jnp.ndarray,
+    cell: jnp.ndarray,
+    r_cutoff: float,
+    image_offsets: jnp.ndarray,
+) -> jnp.ndarray:
+    """Per-atom max neighbor count for one walker, geometry-only.
+
+    Cheap enough to vmap over the full walker array at init time so the
+    NS loop can start with a correctly-sized bucket and accurate
+    per-walker ``max_neighbor_count``.
+    """
+    return _max_neighbor_count_from_mask(
+        _neighbor_mask(positions, cell, r_cutoff, image_offsets)
+    )
+
+
 def _supercell_edges(
     positions: jnp.ndarray,
     cell: jnp.ndarray,
@@ -92,31 +135,18 @@ def _supercell_edges(
     n_atoms = positions.shape[0]
     sc_dim = image_offsets.shape[0]
 
-    # Cartesian shift for each image: (sc_dim, 3)
+    # Cartesian shift for each image: (sc_dim, 3).  Rebuilt below alongside
+    # the mask; kept out of _neighbor_mask so it's available for edge shifts.
     cart_shifts = image_offsets @ cell
 
-    # Supercell positions: (sc_dim * N, 3)
-    # For each image s and atom j: pos_j + cart_shifts[s]
-    super_positions = (
-        positions[None, :, :] + cart_shifts[:, None, :]
-    ).reshape(-1, 3)
-
-    # Displacements: receiver_pos - sender_pos
-    # delta[i, k] = super_positions[k] - positions[i] for sender i, supercell atom k
-    # shape: (N, sc_dim * N, 3)
-    delta = super_positions[None, :, :] - positions[:, None, :]
-
-    # Distances: (N, sc_dim * N)
-    distances = jnp.linalg.norm(delta, axis=-1)
-
-    # Edge mask: within cutoff and not self-interaction
-    mask = (distances > 1e-10) & (distances < r_cutoff)
+    # Edge mask: (N, sc_dim * N), within cutoff and not self-interaction.
+    mask = _neighbor_mask(positions, cell, r_cutoff, image_offsets)
 
     # True max neighbor count per atom — derived from the full mask BEFORE
     # the flat-nonzero truncation below.  The outer NS loop escalates
     # max_neighbors based on this value; using the post-truncation count
     # would saturate at the current bucket and stall escalation.
-    true_max_per_atom = jnp.max(jnp.sum(mask, axis=1))
+    true_max_per_atom = _max_neighbor_count_from_mask(mask)
 
     # Static-shape edge extraction
     flat_mask = mask.ravel()
@@ -304,6 +334,21 @@ class MACEBackend:
         energy = out["energy"][0]  # scalar energy for the real graph
 
         return energy, true_max_per_atom, overflow
+
+    def max_neighbors_for(
+        self,
+        positions: jnp.ndarray,
+        cell: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """Per-atom max neighbor count for ``(positions, cell)``, geometry only.
+
+        Used at init time so the NS loop can start with a correctly-sized
+        neighbor bucket and accurate per-walker ``max_neighbor_count``,
+        without probing the GNN forward pass.  vmap-friendly.
+        """
+        return _compute_true_max_neighbors(
+            positions, cell, self.r_cutoff, self.image_offsets,
+        )
 
 
 # ---------------------------------------------------------------------------
