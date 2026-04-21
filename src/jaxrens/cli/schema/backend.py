@@ -135,7 +135,6 @@ class NeuralILBackendSpec(BaseBackendSpec):
 class MACEBackendSpec(BaseBackendSpec):
     type: Literal["mace"] = "mace"
     checkpoint_path: str
-    dtype: str = "float64"
     supercell_trafo: tuple[int, int, int] = (2, 2, 2)
 
     def to_backend_config(self) -> BackendConfig:
@@ -150,7 +149,6 @@ class MACEBackendSpec(BaseBackendSpec):
         from jaxrens.backends.mace import create_mace
         return create_mace(
             model_path=self.checkpoint_path,
-            dtype=self.dtype,
             supercell_trafo=self.supercell_trafo,
         )
 

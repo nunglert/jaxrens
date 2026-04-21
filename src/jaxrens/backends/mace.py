@@ -307,7 +307,6 @@ class MACEBackend:
 
 def create_mace(
     model_path: str | None = None,
-    dtype: str = "float64",
     supercell_trafo: tuple[int, int, int] = (2, 2, 2),
     **kwargs: Any,
 ) -> MACEBackend:
@@ -316,9 +315,13 @@ def create_mace(
     Loads a pre-trained MACE model from a bundle directory
     (config.json + params.msgpack) or a .ckpt checkpoint file.
 
+    The backend always runs in float32.  mace-jax's bundle loader toggles
+    ``jax_enable_x64`` based on the ``dtype`` passed to ``load_model_bundle``;
+    we pin it to float32 so the rest of jaxrens (cells / positions / energies
+    are all float32 by construction) doesn't get silently promoted.
+
     Args:
         model_path: Path to model bundle directory or checkpoint file.
-        dtype: "float32" or "float64".
         supercell_trafo: (sc_a, sc_b, sc_c) supercell expansion for
             neighbor finding. Must satisfy min(cell_diag * sc) >= 2 * r_cutoff.
 
@@ -330,7 +333,7 @@ def create_mace(
     if model_path is None:
         raise ValueError("model_path is required for the MACE backend.")
 
-    bundle = load_model_bundle(model_path, dtype=dtype)
+    bundle = load_model_bundle(model_path, dtype="float32")
 
     # Build the NNX module and split into graphdef + state
     from mace_jax.tools import model_builder

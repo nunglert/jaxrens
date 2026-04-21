@@ -6,6 +6,7 @@
       "Bash(/home/nunglert/miniconda3/envs/jaxrens/bin/pip list:*)",
       "Bash(/home/nunglert/miniconda3/envs/jaxrens/bin/pip show:*)",
       "Bash(/home/nunglert/miniconda3/envs/jaxrens/bin/pip install:*)",
+      "Bash(/home/nico.unglert/miniconda3/envs/jaxrens/bin/python -m pytest:*)",
       "Bash(conda run:*)",
 
       "Bash(grep:*)",

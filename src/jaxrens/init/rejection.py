@@ -182,5 +182,6 @@ def rejection_sample_positions(
         "n_atoms_too_close": n_atoms_too_close,
     }
     raise RuntimeError(
-        f"Rejection sampling failed after {max_tries} attempts: {counters}"
+        f"Rejection sampling failed after {max_tries} attempts: {counters}."
+        ""
     )

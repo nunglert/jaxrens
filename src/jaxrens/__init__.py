@@ -2,6 +2,17 @@
 
 __version__ = "0.1.0"
 
+# Pin float32 precision globally.  jaxrens represents positions, cells and
+# energies in float32 throughout; enabling x64 would silently promote some
+# operations and break dtype invariants (e.g. ``lax.cond`` branches in
+# ``init/cells.py::cell_shape_walk`` mismatching).  Some third-party backends
+# (notably mace-jax) toggle this flag at construction time — running this
+# update at jaxrens import makes sure the default is off, and ``create_mace``
+# is pinned to ``dtype="float32"`` so no backend can flip it back on through
+# the CLI path.
+import jax as _jax
+_jax.config.update("jax_enable_x64", False)
+
 # High-level API
 from jaxrens.backends.base import EnergyBackend
 from jaxrens.backends.ensemble import EnsembleBackend, make_ensemble_params

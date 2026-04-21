@@ -159,7 +159,6 @@ class TestMACEBackend:
 
         return create_mace(
             model_path=str(FIXTURE_DIR),
-            dtype="float64",
             supercell_trafo=(4, 4, 4),  # SrTiO3 a=3.9A, r_cutoff=6A -> need sc>=4
         )
 
@@ -238,7 +237,6 @@ class TestMACENSStep:
         ref = np.load(FIXTURE_DIR / "reference.npz")
         backend = create_mace(
             model_path=str(FIXTURE_DIR),
-            dtype="float64",
             supercell_trafo=(4, 4, 4),
         )
 

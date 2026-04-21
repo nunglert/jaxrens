@@ -714,7 +714,12 @@ class TestValidateCohortSize:
             main(["validate", "-c", str(_DATA / "npt_sweep.yaml")])
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
-        assert "cohort size: 2" in captured.out
+        # A 2-pressure list now routes to the multi-run dispatch
+        # (single replica axis → n_total=2 replicas, split across
+        # detected devices).  The legacy sequential "cohort" wording
+        # only appears when n_total == 1.
+        assert "multi-run dispatch" in captured.out
+        assert "2 replica" in captured.out
 
 
 # ---------------------------------------------------------------------------
