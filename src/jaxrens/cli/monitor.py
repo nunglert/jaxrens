@@ -22,10 +22,24 @@ logger = logging.getLogger(__name__)
 
 
 def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
-    """Convert NSState to a dict suitable for save_checkpoint."""
+    """Convert NSState to a dict suitable for save_checkpoint.
+
+    Handles single-run scalar shapes (``iteration`` / ``n_dead`` as Python
+    ints) and batched multi-run shapes (``(G, P)`` or ``(n_runs,)``) by
+    keeping batched scalars as arrays; ``save_checkpoint`` is batched-safe
+    since WORKLOG 2026-04-18 Task A.
+    """
     pop = ns_state.population
     ep = ns_state.population.ensemble_params if hasattr(ns_state.population, "ensemble_params") else {}
     is_npt = isinstance(ep, dict) and "pressure" in ep
+
+    it_arr = jnp.asarray(ns_state.iteration)
+    nd_arr = jnp.asarray(ns_state.n_dead)
+    # Cast to Python ints only for scalar single-run case; keep as arrays for
+    # batched runs so save_checkpoint stores them as HDF5 datasets.
+    iteration = int(it_arr) if it_arr.ndim == 0 else it_arr
+    n_dead = int(nd_arr) if nd_arr.ndim == 0 else nd_arr
+
     result = {
         "positions": pop.positions,
         "types": pop.types,
@@ -35,12 +49,16 @@ def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
         "dead_positions": ns_state.dead_positions,
         "dead_volumes": ns_state.dead_volumes if is_npt else None,
         "log_evidence": ns_state.log_evidence,
-        "iteration": int(ns_state.iteration),
-        "n_dead": int(ns_state.n_dead),
+        "iteration": iteration,
+        "n_dead": n_dead,
         "n_walkers": ns_state.n_walkers,
     }
     if is_npt:
-        result["live_volumes"] = jax.vmap(get_volume)(pop.cell)
+        # Vectorized volume: vmap over all leading axes by flattening then reshape.
+        cell = pop.cell
+        flat = cell.reshape(-1, 3, 3)
+        vols = jax.vmap(get_volume)(flat)
+        result["live_volumes"] = vols.reshape(cell.shape[:-2])
     else:
         result["live_volumes"] = None
     return result
@@ -450,13 +468,19 @@ class AdaptationCallback:
 
 
 class EnergyCheckCallback:
-    """Warns if energy is not decreasing as expected."""
+    """Warns if energy is not decreasing as expected.
+
+    ndim-agnostic: reduces batched ``info["emax"]`` to a scalar via ``max``
+    before comparing to the previous iteration.
+    """
 
     def __init__(self):
         self._prev_emax = float("inf")
 
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
-        emax = float(info.get("emax", 0))
+        emax_raw = info.get("emax", 0)
+        emax_arr = jnp.asarray(emax_raw)
+        emax = float(emax_arr if emax_arr.ndim == 0 else jnp.max(emax_arr))
         if emax > self._prev_emax and iteration > 0:
             logger.warning(
                 "iter=%d: Emax increased (%.6f > %.6f)", iteration, emax, self._prev_emax
@@ -553,3 +577,114 @@ class TrajectoryCallback:
         self.writer.close()
         if self.energy_logger is not None:
             self.energy_logger.close()
+
+
+class BatchedTrajectoryCallback:
+    """Trajectory + energy logging for multi-run NS.
+
+    Holds one writer and one (optional) energy logger per replica.  On each
+    iteration, iterates flat replica indices and writes the per-replica dead
+    walker + energy entry.  Snapshots follow the same pattern.
+
+    For ``PmapVmapRuns`` the state arrays have leading axes ``(G, P, ...)``;
+    this callback flattens them to ``(G*P, ...)`` for per-replica slicing.
+    """
+
+    def __init__(
+        self,
+        writers: list,
+        energy_loggers: list | None = None,
+        traj_interval: int = 1,
+        snapshot_interval: int = 100,
+    ):
+        self.writers = list(writers)
+        self.energy_loggers = list(energy_loggers) if energy_loggers is not None else None
+        if self.energy_loggers is not None and len(self.energy_loggers) != len(self.writers):
+            raise ValueError(
+                f"BatchedTrajectoryCallback: len(writers)={len(self.writers)} vs "
+                f"len(energy_loggers)={len(self.energy_loggers)}."
+            )
+        self.traj_interval = traj_interval
+        self.snapshot_interval = snapshot_interval
+
+    @staticmethod
+    def _flatten_leading(x: jnp.ndarray, n_batch_axes: int) -> jnp.ndarray:
+        if n_batch_axes == 1:
+            return x
+        return x.reshape((-1,) + x.shape[n_batch_axes:])
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        # Detect batch axes from ns_state.log_evidence shape.  The
+        # PmapVmapRuns dispatch stores (G, P, ...) arrays; VmapRuns stores
+        # (n_runs, ...).  Flatten leading axes to n_runs for replica slicing.
+        le = jnp.asarray(ns_state.log_evidence)
+        n_batch_axes = max(1, int(le.ndim))
+        n_runs = int(np.prod(le.shape)) if le.ndim >= 1 else 1
+        if n_runs != len(self.writers):
+            raise RuntimeError(
+                f"BatchedTrajectoryCallback: ns_state has {n_runs} replicas "
+                f"but {len(self.writers)} writers were registered."
+            )
+
+        pop = ns_state.population
+        dead_positions = self._flatten_leading(ns_state.dead_positions, n_batch_axes)
+        n_dead = self._flatten_leading(jnp.asarray(ns_state.n_dead), n_batch_axes)
+        dead_energies = self._flatten_leading(ns_state.dead_energies, n_batch_axes)
+        types = self._flatten_leading(pop.types, n_batch_axes)
+        cells = self._flatten_leading(pop.cell, n_batch_axes)
+
+        # info["emax"] is (G, P) or (n_runs,) when batched; flatten.
+        emax_arr = jnp.asarray(info.get("emax", 0.0))
+        emax_flat = (
+            emax_arr.reshape(-1) if emax_arr.ndim >= 1 else emax_arr[None]
+        )
+
+        if iteration % self.traj_interval == 0:
+            for r in range(n_runs):
+                nd_r = int(n_dead[r]) if n_dead.ndim >= 1 else int(n_dead)
+                if nd_r <= 0:
+                    continue
+                dead_walker = {
+                    "positions": dead_positions[r, nd_r - 1],
+                    "types": types[r, 0] if types.ndim >= 2 else types[0],
+                    "energy": float(emax_flat[r]),
+                }
+                cell_r = cells[r, 0] if cells.ndim >= 3 else cells[0]
+                if jnp.any(cell_r != 0):
+                    dead_walker["box"] = cell_r
+                self.writers[r].write_dead_point(
+                    iteration, dead_walker, float(emax_flat[r]),
+                )
+
+        if self.energy_loggers is not None:
+            for r in range(n_runs):
+                self.energy_loggers[r].write_entry(
+                    iteration, float(emax_flat[r]),
+                )
+
+        if (
+            self.snapshot_interval
+            and iteration > 0
+            and iteration % self.snapshot_interval == 0
+        ):
+            positions_flat = self._flatten_leading(pop.positions, n_batch_axes)
+            energies_flat = self._flatten_leading(pop.energy, n_batch_axes)
+            for r in range(n_runs):
+                snap = {
+                    "positions": positions_flat[r],
+                    "types": types[r] if types.ndim >= 2 else types,
+                    "energies": energies_flat[r],
+                    "cells": cells[r] if cells.ndim >= 3 else cells,
+                    "dead_energies": dead_energies[r],
+                    "dead_positions": dead_positions[r],
+                    "n_dead": int(n_dead[r]) if n_dead.ndim >= 1 else int(n_dead),
+                    "iteration": iteration,
+                }
+                self.writers[r].write_walker_snapshot(iteration, snap)
+
+    def on_finish(self, ns_state: Any) -> None:
+        for w in self.writers:
+            w.close()
+        if self.energy_loggers is not None:
+            for e in self.energy_loggers:
+                e.close()

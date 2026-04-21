@@ -109,3 +109,11 @@ class NSConfig:
 
     # Inter-replica exchange (optional; None → disabled)
     inter_re: InterREConfig | None = None
+
+    # Multi-run / multi-GPU topology (populated by the resolver, not the YAML).
+    # Both default to 1; values > 1 indicate that the CLI dispatched through
+    # ``run_ns_multi_gpu`` with ``(n_gpu, n_per_gpu)`` replicas.  n_gpu comes
+    # from ``len(jax.local_devices())``; n_per_gpu is derived from the
+    # replica-axis list length.
+    n_gpu: int = 1
+    n_per_gpu: int = 1

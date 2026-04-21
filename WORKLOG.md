@@ -228,3 +228,25 @@ Format: one `## YYYY-MM-DD` heading per day; append bullets under it as the day 
 - **Inter-RE feature surface complete.** All three flavors (pressure, xrens, semi_grand) work end-to-end with `VmapRuns` and are smoke-tested with `PmapVmapRuns(n_gpu=1)`.
 
 - **Next:** Inter-RE plan complete — open items: (a) intra-RE deferred, (b) cross-device ppermute-based swaps for n_gpu>1, (c) adaptive swap frequency.
+
+## 2026-04-20 (CLI extension — multi-GPU RENS + MACE via YAML)
+
+Plan `~/.claude/plans/extend-the-cli-properly-velvety-ocean.md`. Landed in three logical chunks; everything in one branch.
+
+- **Commit 1 — backend-aware species mapping.** Added `EnsembleBackend.__getattr__` pass-through so wrapped backends expose `atomic_numbers` transparently (`src/jaxrens/backends/ensemble.py`). Extended `_resolve_init_species` (`src/jaxrens/cli/resolve.py:297-343`) to consult `energy_backend.atomic_numbers` when present: Sr→37, Ti→21, O→7 for the mace_mp fixture; LJ/toy backends keep the existing 0-based unique-Z mapping. `symbol_map` now uses the backend-native index keys so trajectory writers keep working. New test class `TestBackendAwareSpeciesMapping` (4 tests) in `tests/test_resolve.py` using a `_FakeZTableBackend` — no mace-jax dependency.
+
+- **Commit 2 — multi-GPU CLI dispatch.** New design: the YAML carries NO device-topology knobs; `n_gpu = len(jax.local_devices())` at resolve time, `n_per_gpu = n_total // n_gpu`, replica count `n_total` comes from the replica-differentiating list (`ensemble.pressure`, `inter_re.composition_targets`, or `inter_re.chemical_potentials`). Key changes:
+  - `state/config.py::NSConfig` gains `n_gpu: int = 1`, `n_per_gpu: int = 1` (resolver-populated).
+  - `cli/resolve.py` gains `ResolvedMultiRunConfig` + `_derive_replica_axes` + `_resolve_multi_run` + `expand_multi_run_or_cohort`. The dispatcher keeps `expand_cohort` for the single-run path; multi-run path stacks per-replica ResolvedInit via per-replica EnsembleBackend wrappers (correct initial +P·V per replica).
+  - `cli/cli.py::_cmd_run` and `_cmd_validate` branch on `isinstance(resolved, ResolvedMultiRunConfig)`.
+  - `cli/run.py::run_multi_gpu_from_config` mirrors `run_from_config`: wraps base backend once in `EnsembleBackend(pressure=0.0)` (per-call override), runs `initial_walk(batched=True)` burn-in on the `(n_total, K, ...)` state, then `run_ns_multi_gpu(...)` with `ensemble_params_per_run` + `inter_re_config`.
+  - `cli/monitor.py`: `_ns_state_to_checkpoint_dict` keeps `iteration`/`n_dead` as arrays for batched shapes; `EnergyCheckCallback` is now ndim-agnostic; new `BatchedTrajectoryCallback` holds one writer + one `EnergyLogger` per replica (flat-index suffix `.run{NN}`).
+  - New tests `tests/test_cli_multi_run.py` (13 tests) cover `_derive_replica_axes` edge cases (scalar, list, divisibility, clamping), `_resolve_multi_run` per-replica shapes + per-pressure energy differentiation + inter_re propagation, and end-to-end `run_multi_gpu_from_config` (with and without pressure-RENS) — all exercised on CPU by monkey-patching `_local_device_count`.
+
+- **Commit 3 — experiments migration.** Deleted the standalone `run.py` launchers from the previous session; replaced with pure-YAML configs and SLURM submit scripts that call `jaxrens validate -c config.yaml && jaxrens run -c config.yaml`. `experiments/lj_rens_2gpu` → `experiments/lj_rens` (the 2-GPU part is a SLURM decision, not a config decision). `experiments/mace_srtio3` keeps its name and gains a pre-built `srtio3_222.extxyz` starting structure for Mode-B init (ASE-generated 2×2×2 perovskite supercell). `config.yaml` + `submit.slurm` + updated `README.md` for each.
+
+- **Verification:** 210 passed, 3 skipped across `test_cli, test_resolve, test_cli_multi_run, test_io, test_postprocess_monitor`. Full scoped regression across `test_nested_sampling, test_pmap_vmap, test_inter_re_integration, test_io` (165 + 30) passed after edits. End-to-end smoke: `jaxrens run -c lj_rens/config.yaml` with tiny overrides (`n_live=8, max_iter=5, n_extra=3, inter_re.every=1`) ran to completion on CPU with 2 replicas; monitor emitted `inter_re n_pairs=1 acc=...` rows every iteration; per-replica traj + energies + checkpoint artifacts created. MACE path not end-to-end tested (mace-jax not importable on the login node; run on GPU node via `sbatch`).
+
+- **Known limitations (documented in the plan):** NeuralIL species mapping still uses the 0-based fallback (NeuralIL lacks `atomic_numbers`). Multi-GPU restart via `init.restart_file` not yet wired. `_pack_adjustment_info` vmap/pmap-aware refactor still open. Same-condition replicas are expressible only as repeated pressures for now (shortcut field can be added if needed).
+
+- **Next:** Verify on GPU — submit `experiments/lj_rens/submit.slurm` (2-GPU a40) and `experiments/mace_srtio3/submit.slurm`. Expected artifacts: per-replica extxyz under `output/`, monitor log showing `inter_re` rows, batched `.checkpoint.h5`.

@@ -124,3 +124,7 @@ During run initialization, we compute the energies via
 ```
 
 As far as I understand, this requires the max_neighbors being properlly set. And at that stage, the backend hasnt seen the dataset yet. So I think we would have to "calibrate" the mach_neigbhors first, before we evaluate.
+
+## Energy degeneracies
+
+In practice of NS simulations at 32bit float precision, we often face the problem of degenerate walkers. If the highest energy walker happens to be degenerate with another walker, it needs a statistically sound way of deciding which one to cull. I think uniform sampling is required here, but at some point we need to carefully think about this.

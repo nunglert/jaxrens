@@ -84,6 +84,13 @@ class EnsembleBackend:
 
         return H, count, overflow
 
+    def __getattr__(self, name: str) -> Any:
+        # Called only when normal lookup fails, so this does not shadow
+        # ``base`` / ``pressure`` / ``chemical_potentials`` / ``r_cutoff``.
+        # Lets resolver code read e.g. ``wrapped.atomic_numbers`` through
+        # the wrapper without special-casing.
+        return getattr(self.__dict__["base"], name)
+
 
 def make_ensemble_params(
     pressure: float = 0.0,

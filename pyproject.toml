@@ -24,7 +24,9 @@ dependencies = [
 
 [project.optional-dependencies]
 neuralil = ["neuralil @ git+https://github.com/nunglert/neuralil-jaxrens.git@jaxrens"]
-mace = ["mace-jax @ git+https://github.com/ACEsuit/mace-jax.git@main"]
+mace = [
+    "mace-jax[gpu,torch] @ git+https://github.com/nunglert/mace-jax.git@fix_install"
+]
 dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.5",

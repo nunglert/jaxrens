@@ -1,0 +1,17 @@
+Obtaining file:///home/nico.unglert/code/jaxrens
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Checking if build backend supports build_editable: started
+  Checking if build backend supports build_editable: finished with status 'done'
+  Getting requirements to build editable: started
+  Getting requirements to build editable: finished with status 'done'
+  Preparing editable metadata (pyproject.toml): started
+  Preparing editable metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: jax>=0.9.0 in /home/nico.unglert/miniconda3/envs/jaxrens/lib/python3.13/site-packages (from jax[cuda12]>=0.9.0->jaxrens==0.1.0) (0.10.0)
+Requirement already satisfied: jaxlib>=0.9.0 in /home/nico.unglert/miniconda3/envs/jaxrens/lib/python3.13/site-packages (from jaxrens==0.1.0) (0.10.0)
+Requirement already satisfied: numpy>=1.26 in /home/nico.unglert/miniconda3/envs/jaxrens/lib/python3.13/site-packages (from jaxrens==0.1.0) (2.4.4)
+Requirement already satisfied: h5py>=3.10 in /home/nico.unglert/miniconda3/envs/jaxrens/lib/python3.13/site-packages (from jaxrens==0.1.0) (3.16.0)
+Requirement already satisfied: ase>=3.22 in /home/nico.unglert/miniconda3/envs/jaxrens/lib/python3.13/site-packages (from jaxrens==0.1.0) (3.28.0)
+Requirement already satisfied: pydantic>=2.0 in /home/nico.unglert/miniconda3/envs/jaxrens/lib/python3.13/site-packages (from jaxrens==0.1.0) (2.13.2)
+Requirement already satisfied: pyyaml>=6.0 in /home/nico.unglert/miniconda3/envs/jaxrens/lib/python3.13/site-packages (from jaxrens==0.1.0) (6.0.3)
+Collecting mace-jax @ git+git@github.com:nunglert/mace-jax.git@fix_install (from mace-jax[gpu,torch] @ git+git@github.com:nunglert/mace-jax.git@fix_install ; extra == "mace"->jaxrens==0.1.0)

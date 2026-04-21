@@ -1200,3 +1200,104 @@ class TestInitConfigResolverPartB:
         assert result.initial_energies is not None
         assert result.initial_energies.shape == (3,)
         assert jnp.all(jnp.isfinite(result.initial_energies))
+
+
+# ---------------------------------------------------------------------------
+# Backend-aware species mapping
+#
+# Model-based backends (MACE, future NeuralIL) expose an ``atomic_numbers``
+# attribute defining the z-table the model was trained on. Species indices
+# must match that table; the default 0-based unique mapping gives wrong
+# one-hot encodings for multi-element systems.
+# ---------------------------------------------------------------------------
+
+class _FakeZTableBackend:
+    """Stand-in for MACE: exposes ``atomic_numbers`` and a dummy __call__.
+
+    Covers the resolver's backend-aware species mapping without needing
+    mace-jax installed.
+    """
+
+    r_cutoff = 5.0
+
+    def __init__(self, atomic_numbers: list[int]):
+        self.atomic_numbers = list(atomic_numbers)
+
+    def __call__(self, positions, species, cell, max_neighbors, ensemble_params=None):
+        import jax.numpy as jnp
+        return jnp.float32(0.0), jnp.int32(0), jnp.bool_(False)
+
+
+class TestBackendAwareSpeciesMapping:
+    """Resolver respects ``energy_backend.atomic_numbers`` when present."""
+
+    def test_no_atomic_numbers_keeps_zero_based_mapping(self):
+        import jax.numpy as jnp
+        from jaxrens.backends.toy import create_harmonic
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+
+        cfg = InitConfig(
+            start_species="8 3, 22 1, 38 1",
+            random_initialise_pos=False,
+            random_initialise_cell=False,
+        )
+        result = _resolve_init(
+            cfg, n_live=2, seed=0, energy_backend=create_harmonic(),
+        )
+        # Sorted unique Z = [8, 22, 38] → 0-based indices [0, 1, 2].
+        # types_list order is sorted-by-Z: O O O Ti Sr → idx [0,0,0,1,2].
+        assert list(map(int, result.initial_types)) == [0, 0, 0, 1, 2]
+        assert result.symbol_map == {0: "O", 1: "Ti", 2: "Sr"}
+
+    def test_backend_z_table_overrides_mapping(self):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+
+        # Mimic mace_mp's 89-element z-table (Z=1..89).
+        backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
+        cfg = InitConfig(
+            start_species="8 3, 22 1, 38 1",
+            random_initialise_pos=False,
+            random_initialise_cell=False,
+        )
+        result = _resolve_init(
+            cfg, n_live=2, seed=0, energy_backend=backend,
+        )
+        # Z=8→idx 7 (O), Z=22→idx 21 (Ti), Z=38→idx 37 (Sr).
+        assert list(map(int, result.initial_types)) == [7, 7, 7, 21, 37]
+        assert result.symbol_map == {7: "O", 21: "Ti", 37: "Sr"}
+
+    def test_missing_z_in_backend_table_raises(self):
+        import pytest
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+
+        # Backend supports only a small subset (no Sr, Z=38).
+        backend = _FakeZTableBackend(atomic_numbers=[1, 8, 22])
+        cfg = InitConfig(
+            start_species="8 1, 22 1, 38 1",
+            random_initialise_pos=False,
+            random_initialise_cell=False,
+        )
+        with pytest.raises(ValueError, match="atomic numbers"):
+            _resolve_init(cfg, n_live=2, seed=0, energy_backend=backend)
+
+    def test_ensemble_wrapper_passes_atomic_numbers_through(self):
+        from jaxrens.backends.ensemble import EnsembleBackend
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitConfig
+
+        backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
+        wrapped = EnsembleBackend(backend, pressure=0.1)
+        assert wrapped.atomic_numbers == list(range(1, 90))
+
+        cfg = InitConfig(
+            start_species="8 3, 22 1, 38 1",
+            random_initialise_pos=False,
+            random_initialise_cell=False,
+        )
+        result = _resolve_init(
+            cfg, n_live=2, seed=0, energy_backend=wrapped,
+        )
+        assert list(map(int, result.initial_types)) == [7, 7, 7, 21, 37]

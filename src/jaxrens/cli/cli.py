@@ -120,22 +120,70 @@ def _run_one(resolved, *, cohort_label: str = "") -> None:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     root = _load_and_validate(args.config, args.set)
-    cohort = expand_cohort(root)
-    n = len(cohort)
 
+    from jaxrens.cli.resolve import (
+        ResolvedMultiRunConfig,
+        expand_multi_run_or_cohort,
+    )
+    from jaxrens.cli.run import run_multi_gpu_from_config
+
+    resolved_any = expand_multi_run_or_cohort(root)
+
+    if isinstance(resolved_any, ResolvedMultiRunConfig):
+        print(
+            f"[multi-run] n_gpu={resolved_any.ns.n_gpu} "
+            f"n_per_gpu={resolved_any.ns.n_per_gpu} "
+            f"n_total={resolved_any.ns.n_gpu * resolved_any.ns.n_per_gpu} "
+            f"pressures="
+            + ", ".join(
+                f"{p.get('pressure'):.4g}"
+                if p.get('pressure') is not None else "—"
+                for p in resolved_any.ensemble_params_per_run
+            )
+        )
+        run_multi_gpu_from_config(resolved_any)
+        return 0
+
+    cohort = resolved_any
+    n = len(cohort)
     if n == 1:
         _run_one(cohort[0])
     else:
         for i, resolved in enumerate(cohort):
-            print(f"[cohort {i + 1}/{n}] pressure={resolved.ensemble_params.get('pressure')} seed={resolved.ns.seed}")
+            print(
+                f"[cohort {i + 1}/{n}] pressure={resolved.ensemble_params.get('pressure')} "
+                f"seed={resolved.ns.seed}"
+            )
             _run_one(resolved, cohort_label=f"{i + 1}/{n}")
-
     return 0
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
     root = _load_and_validate(args.config, args.set)
-    cohort = expand_cohort(root)
+    from jaxrens.cli.resolve import (
+        ResolvedMultiRunConfig,
+        expand_multi_run_or_cohort,
+    )
+    resolved_any = expand_multi_run_or_cohort(root)
+    if isinstance(resolved_any, ResolvedMultiRunConfig):
+        n_moves = len(resolved_any.moves)
+        move_types = ", ".join(m.move_type for m in resolved_any.moves)
+        n_atoms = int(resolved_any.init.initial_positions.shape[-2])
+        print(
+            f"OK — multi-run dispatch\n"
+            f"  topology: n_gpu={resolved_any.ns.n_gpu} × "
+            f"n_per_gpu={resolved_any.ns.n_per_gpu} = "
+            f"{resolved_any.ns.n_gpu * resolved_any.ns.n_per_gpu} replica(s)\n"
+            f"  run:     n_live={resolved_any.ns.n_live}, "
+            f"max_iterations={resolved_any.ns.max_iterations}\n"
+            f"  moves:   {n_moves} move(s) [{move_types}]\n"
+            f"  backend: {resolved_any.backend.backend_type}, n_atoms={n_atoms}\n"
+            f"  output:  format={resolved_any.output.format}, "
+            f"prefix={resolved_any.output.out_file_prefix}"
+        )
+        return 0
+
+    cohort = resolved_any
     n = len(cohort)
     resolved = cohort[0]
     n_moves = len(resolved.moves)

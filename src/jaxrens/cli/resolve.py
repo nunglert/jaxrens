@@ -311,14 +311,36 @@ def _resolve_init_species(
     n_atoms = len(types_list)
 
     unique_z = sorted(set(types_list))
-    z_to_idx = {z: i for i, z in enumerate(unique_z)}
+    from ase.data import chemical_symbols
+
+    # Backend-aware species mapping. Model-based backends (MACE, and in the
+    # future NeuralIL) expose an ``atomic_numbers`` attribute that defines the
+    # order the model expects species indices in (one-hot over the z-table).
+    # The default path (LJ, toy) uses contiguous 0-based indices over the
+    # sorted unique Z-numbers.
+    backend_table: list[int] | None = None
+    if energy_backend is not None and hasattr(energy_backend, "atomic_numbers"):
+        try:
+            backend_table = [int(z) for z in energy_backend.atomic_numbers]
+        except (TypeError, ValueError):
+            backend_table = None
+
+    if backend_table is not None:
+        missing = [z for z in unique_z if z not in backend_table]
+        if missing:
+            raise ValueError(
+                f"start_species references atomic numbers {missing} not in the "
+                f"backend z-table (atomic_numbers length {len(backend_table)})."
+            )
+        z_to_idx = {z: backend_table.index(z) for z in unique_z}
+    else:
+        z_to_idx = {z: i for i, z in enumerate(unique_z)}
+
     type_indices = [z_to_idx[z] for z in types_list]
     initial_types = jnp.array(type_indices, dtype=jnp.int32)
 
-    # Build a symbol_map from atomic numbers for Mode A.
-    from ase.data import chemical_symbols
     symbol_map: dict[int, str] = {
-        idx: chemical_symbols[z] for idx, z in enumerate(unique_z)
+        z_to_idx[z]: chemical_symbols[z] for z in unique_z
     }
 
     key = jax.random.key(seed)
@@ -686,3 +708,348 @@ def resolve(root: RootConfig) -> ResolvedConfig:
         "Use expand_cohort() instead."
     )
     return cohort[0]
+
+
+# ---------------------------------------------------------------------------
+# Multi-run resolution (multi-GPU pressure-RENS, XRENS, semi_grand)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ResolvedMultiRunConfig:
+    """Resolved library dataclasses for a multi-run (multi-GPU) NS dispatch.
+
+    Produced by :func:`_resolve_multi_run` when the YAML implies more than one
+    replica (e.g. ``ensemble.pressure`` is a list or an inter-RE flavor has a
+    replica-axis list).  Consumed by ``run_multi_gpu_from_config`` in
+    ``cli/run.py``.
+
+    Shape convention: ``n_total = n_gpu * n_per_gpu`` replicas, with arrays
+    flat along the replica axis (``(n_total, n_walkers, ...)``).  The target
+    dispatcher reshapes to ``(n_gpu, n_per_gpu, n_walkers, ...)``.
+    """
+
+    ns: NSConfig
+    moves: tuple[MoveConfig, ...]
+    move_descriptors: tuple[MoveKernel, ...]
+    backend: BackendConfig
+    # Unwrapped base backend; EnsembleBackend wrapping happens once inside
+    # run_multi_gpu_from_config with a default pressure overridden per-call
+    # via ensemble_params_per_run.
+    base_backend: EnergyBackend
+    output: OutputConfig
+    termination: tuple[TerminationCriterion, ...]
+    adaptation_policies: tuple[ResolvedAdaptationPolicy, ...]
+    init: ResolvedInit
+    cell: CellConfig
+    # Per-replica ensemble_params, flat list of length n_total.  Ordering is
+    # ``flat_idx = g * n_per_gpu + p`` — matches ``init_ns_multi_gpu``.
+    ensemble_params_per_run: tuple[dict, ...]
+    initial_walk_config: Any = None
+    adaptation_cfg: Any = None
+    inter_re_config: Any = None  # InterREConfig | None
+
+
+def _local_device_count() -> int:
+    """Read jax.local_devices() at resolve time (lazy: module-level jax import)."""
+    return len(jax.local_devices())
+
+
+def _derive_replica_axes(
+    root: RootConfig,
+) -> tuple[int, int, int, list[dict]]:
+    """Compute (n_total, n_gpu, n_per_gpu, ensemble_params_per_run).
+
+    Rules:
+        * Single replica-axis list drives n_total: pressure list, composition
+          targets, or chemical potentials.
+        * If more than one list is present, lengths must agree.
+        * ``n_gpu = len(jax.local_devices())``, clamped to ``n_total`` with a
+          warning when the device count exceeds replica count.
+        * ``n_total % n_gpu == 0`` must hold → ``n_per_gpu = n_total // n_gpu``.
+        * Returns an empty list of per-run params if n_total == 1 (caller uses
+          single-run path).
+
+    Raises:
+        ValueError: On any inconsistency described above.
+    """
+    # ---- Gather per-replica axis lengths ------------------------------------
+    pressure_list: list[float] | None = None
+    if isinstance(root.ensemble, NPTEnsembleSpec):
+        plist = root.ensemble._pressure_list()
+        if len(plist) > 1:
+            pressure_list = plist
+
+    comp_targets: list[list[int]] | None = None
+    chem_pots: list[list[float]] | None = None
+    if root.inter_re is not None:
+        if root.inter_re.flavor == "xrens":
+            comp_targets = list(root.inter_re.composition_targets or [])
+        elif root.inter_re.flavor == "semi_grand":
+            chem_pots = list(root.inter_re.chemical_potentials or [])
+        elif root.inter_re.flavor == "pressure" and pressure_list is None:
+            raise ValueError(
+                "inter_re.flavor='pressure' requires a list-valued "
+                "ensemble.pressure with at least 2 entries (one per replica)."
+            )
+
+    lengths: list[tuple[str, int]] = []
+    if pressure_list is not None:
+        lengths.append(("ensemble.pressure", len(pressure_list)))
+    if comp_targets:
+        lengths.append(("inter_re.composition_targets", len(comp_targets)))
+    if chem_pots:
+        lengths.append(("inter_re.chemical_potentials", len(chem_pots)))
+
+    if not lengths:
+        # Single replica.  No per-run params.
+        return 1, 1, 1, []
+
+    # All replica-axis lists must have the same length.
+    n_total = lengths[0][1]
+    for name, n in lengths[1:]:
+        if n != n_total:
+            raise ValueError(
+                f"Multi-run axis length mismatch: {lengths[0][0]}={n_total} "
+                f"vs {name}={n}."
+            )
+
+    # ---- Device topology ----------------------------------------------------
+    n_detected = _local_device_count()
+    if n_detected > n_total:
+        logger.warning(
+            "jax.local_devices() reports %d device(s) but only %d replicas "
+            "requested; clamping n_gpu=%d (extra devices sit idle).",
+            n_detected, n_total, n_total,
+        )
+        n_gpu = n_total
+    else:
+        n_gpu = max(1, n_detected)
+    if n_total % n_gpu != 0:
+        raise ValueError(
+            f"Multi-run replica count ({n_total}) is not divisible by the "
+            f"detected device count ({n_gpu}). Either adjust the replica "
+            f"list length or the SLURM --gres=gpu:N allocation so that "
+            f"n_total % n_gpu == 0."
+        )
+    n_per_gpu = n_total // n_gpu
+
+    # ---- Build per-replica ensemble_params dicts ----------------------------
+    # Pressures (scalar fallback: if pressure is scalar, broadcast).
+    if pressure_list is not None:
+        pressures = pressure_list
+    elif isinstance(root.ensemble, NPTEnsembleSpec):
+        # Scalar pressure broadcast to all replicas.
+        pressures = root.ensemble._pressure_list() * n_total
+    else:
+        pressures = None
+
+    # For list-valued pressure, honour pressure_units from the spec.
+    if pressures is not None and isinstance(root.ensemble, NPTEnsembleSpec):
+        if root.ensemble.pressure_units == "gpa":
+            _GPA_TO_EVA3 = 0.006241509
+            pressures = [p * _GPA_TO_EVA3 for p in pressures]
+
+    params_per_run: list[dict] = []
+    for r in range(n_total):
+        params: dict = {}
+        if pressures is not None:
+            params["pressure"] = float(pressures[r])
+        if comp_targets:
+            params["target_composition"] = jnp.asarray(comp_targets[r], dtype=jnp.int32)
+        if chem_pots:
+            params["chemical_potentials"] = jnp.asarray(chem_pots[r], dtype=jnp.float32)
+        params_per_run.append(params)
+
+    return n_total, n_gpu, n_per_gpu, params_per_run
+
+
+def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
+    """Resolve ``root`` into a ``ResolvedMultiRunConfig``.
+
+    Builds per-replica initial positions / cells / energies by calling
+    ``_resolve_init`` once per replica with its own seed and EnsembleBackend
+    (so initial energies already include the replica's P·V term).  Stacks the
+    per-replica arrays along axis 0 to produce ``(n_total, K, ...)`` pytrees.
+
+    This intentionally mirrors the single-run :func:`_resolve_one` — the two
+    paths diverge only in the init loop.
+    """
+    n_total, n_gpu, n_per_gpu, params_per_run = _derive_replica_axes(root)
+    if n_total < 2:
+        raise ValueError(
+            "_resolve_multi_run called without a multi-replica axis — "
+            "use expand_cohort() for single-run configs instead."
+        )
+
+    # Base (unwrapped) backend — the multi-GPU dispatch wraps it once.
+    base_backend = root.backend.build_backend()
+    backend_cfg = root.backend.to_backend_config()
+
+    # Build a per-replica EnsembleBackend for initial-energy evaluation.
+    from jaxrens.backends.ensemble import EnsembleBackend
+
+    per_run_init: list[ResolvedInit] = []
+    for r in range(n_total):
+        p = params_per_run[r].get("pressure", None)
+        per_run_backend = (
+            EnsembleBackend(base_backend, pressure=float(p))
+            if p is not None
+            else base_backend
+        )
+        # Seed policy mirrors _resolve_one's `seed + cohort_index`.
+        seed_r = root.run.seed + r
+        init_r = _resolve_init(
+            root.init,
+            n_live=root.run.n_live,
+            seed=seed_r,
+            energy_backend=per_run_backend,
+            cell_cfg=root.cell,
+        )
+        per_run_init.append(init_r)
+
+    # Validate shapes and stack along axis 0.
+    ref = per_run_init[0]
+    for r, init_r in enumerate(per_run_init):
+        for field_name in ("initial_positions", "initial_types", "initial_cells", "initial_energies"):
+            a = getattr(ref, field_name)
+            b = getattr(init_r, field_name)
+            if a is None or b is None:
+                if (a is None) != (b is None):
+                    raise RuntimeError(
+                        f"Per-replica init disagreement at r={r}, field {field_name}: "
+                        f"one is None, the other isn't."
+                    )
+            elif a.shape != b.shape:
+                raise RuntimeError(
+                    f"Per-replica init shape mismatch at r={r}, field "
+                    f"{field_name}: ref={a.shape} vs r={b.shape}."
+                )
+
+    initial_positions = jnp.stack([x.initial_positions for x in per_run_init], axis=0)
+    initial_cells = (
+        jnp.stack([x.initial_cells for x in per_run_init], axis=0)
+        if per_run_init[0].initial_cells is not None else None
+    )
+    initial_energies = (
+        jnp.stack([x.initial_energies for x in per_run_init], axis=0)
+        if per_run_init[0].initial_energies is not None else None
+    )
+    # Types are identical across replicas (same start_species).
+    initial_types = per_run_init[0].initial_types
+
+    # symbol_map, restart_state from ref (must be identical across replicas).
+    symbol_map = per_run_init[0].symbol_map
+    stacked_init = ResolvedInit(
+        initial_positions=initial_positions,
+        initial_types=initial_types,
+        initial_cells=initial_cells,
+        initial_energies=initial_energies,
+        symbol_map=symbol_map,
+        restart_state=None,  # multi-run restart is a follow-up; see plan.
+    )
+
+    # ns_config with derived topology fields.
+    ns = NSConfig(
+        n_live=root.run.n_live,
+        max_iterations=root.run.max_iterations,
+        convergence_threshold=root.run.convergence_threshold,
+        n_mcmc_steps=root.run.n_mcmc_steps,
+        n_extra=root.run.n_extra,
+        n_cull=root.run.n_cull,
+        seed=root.run.seed,
+        pressure=None,  # per-replica pressure lives in ensemble_params_per_run.
+        inter_re=(
+            root.inter_re.to_inter_re_config() if root.inter_re is not None else None
+        ),
+        n_gpu=n_gpu,
+        n_per_gpu=n_per_gpu,
+    )
+
+    output = OutputConfig(
+        format=root.output.format,
+        traj_interval=root.output.traj_interval,
+        snapshot_interval=root.output.snapshot_interval,
+        checkpoint_interval=root.output.checkpoint_interval,
+        info_interval=root.output.info_interval,
+        out_file_prefix=root.output.out_file_prefix,
+        working_dir=Path(root.output.working_dir),
+        log_level=root.output.log_level,
+    )
+    _warn_unused_output_fields(root.output)
+
+    if root.termination is not None:
+        termination = tuple(
+            spec.to_criterion(n_live=ns.n_live, n_cull=ns.n_cull)
+            for spec in root.termination
+        )
+    else:
+        termination = (
+            IterationTermination(ns.max_iterations),
+            PriorMassTermination(ns.n_live, ns.convergence_threshold),
+        )
+
+    adaptation_policies = tuple(
+        root.adaptation.resolve_for(m._effective_name())
+        for m in root.moves
+    )
+
+    n_atoms = int(stacked_init.initial_positions.shape[-2])
+    import dataclasses as _dc
+
+    moves = tuple(m.to_move_config() for m in root.moves)
+    move_descriptors = tuple(
+        _dc.replace(
+            m.to_descriptor(n_atoms=n_atoms, cell_cfg=root.cell),
+            min_rate=policy.min_rate,
+            max_rate=policy.max_rate,
+            step_size_max=policy.step_size_max,
+        )
+        for m, policy in zip(root.moves, adaptation_policies)
+    )
+
+    return ResolvedMultiRunConfig(
+        ns=ns,
+        moves=moves,
+        move_descriptors=move_descriptors,
+        backend=backend_cfg,
+        base_backend=base_backend,
+        output=output,
+        termination=termination,
+        adaptation_policies=adaptation_policies,
+        init=stacked_init,
+        cell=root.cell,
+        ensemble_params_per_run=tuple(params_per_run),
+        initial_walk_config=root.init.initial_walk,
+        adaptation_cfg=root.adaptation,
+        inter_re_config=(
+            root.inter_re.to_inter_re_config() if root.inter_re is not None else None
+        ),
+    )
+
+
+def expand_multi_run_or_cohort(
+    root: RootConfig,
+) -> list[ResolvedConfig] | ResolvedMultiRunConfig:
+    """Dispatch between multi-run and single-run (cohort) resolution.
+
+    Returns a :class:`ResolvedMultiRunConfig` when the YAML implies more than
+    one replica via a replica-axis list (pressure list, composition_targets,
+    chemical_potentials).  Otherwise returns a list of :class:`ResolvedConfig`
+    from :func:`expand_cohort` — same output shape as before (single-element
+    list for scalar configs, multi-element for cohort sweeps).
+    """
+    # Cheap pre-check to avoid building per-run init when we don't need it.
+    has_multi_axis = False
+    if isinstance(root.ensemble, NPTEnsembleSpec):
+        if len(root.ensemble._pressure_list()) > 1:
+            has_multi_axis = True
+    if root.inter_re is not None:
+        if (root.inter_re.composition_targets and len(root.inter_re.composition_targets) > 1) or (
+            root.inter_re.chemical_potentials and len(root.inter_re.chemical_potentials) > 1
+        ):
+            has_multi_axis = True
+        # Pressure-RENS with scalar pressure gets caught by _derive_replica_axes.
+
+    if has_multi_axis:
+        return _resolve_multi_run(root)
+    return expand_cohort(root)

@@ -17,6 +17,7 @@ from jaxrens.backends.loader import load_backend
 from jaxrens.backends.ensemble import EnsembleBackend, make_ensemble_params
 from jaxrens.cli.monitor import (
     AdaptationCallback,
+    BatchedTrajectoryCallback,
     CheckpointCallback,
     EnergyCheckCallback,
     ProgressCallback,
@@ -26,7 +27,11 @@ from jaxrens.io.energy_log import EnergyLogger
 from jaxrens.io.trajectory import create_trajectory_writer
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.mwg import build_mwg
-from jaxrens.sampling.nested_sampling import run_ns
+from jaxrens.sampling.nested_sampling import (
+    init_ns_parallel,
+    run_ns,
+    run_ns_multi_gpu,
+)
 from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
 
 logger = logging.getLogger(__name__)
@@ -376,6 +381,217 @@ def run_from_config(
         **full_auto_kwargs,
     )
 
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Multi-run (multi-GPU) dispatch
+# ---------------------------------------------------------------------------
+
+
+def run_multi_gpu_from_config(resolved) -> dict:
+    """Execute a multi-run NS dispatch from a ``ResolvedMultiRunConfig``.
+
+    Mirrors :func:`run_from_config` but ends in ``run_ns_multi_gpu`` with
+    per-replica ``ensemble_params_per_run``.  Wires all five callbacks with
+    batched-aware variants where needed:
+
+    * ``ProgressCallback``, ``AdaptationCallback``, ``EnergyCheckCallback`` —
+      already (G, P)-safe (see WORKLOG 2026-04-18 Task A/B).
+    * ``CheckpointCallback`` — saves HDF5 with batched shapes via the
+      already-batched-safe ``io/checkpoint.py`` path.
+    * ``BatchedTrajectoryCallback`` — one writer + energy logger per replica,
+      file suffix ``.run{r:02d}``.
+
+    Burn-in runs via ``initial_walk(batched=True)`` on the stacked
+    ``(n_total, K, ...)``-shaped NSState, before entering
+    ``run_ns_multi_gpu``.
+    """
+    from jaxrens.io.adaptation_log import AdaptationLogger
+    from jaxrens.sampling.termination import IterationTermination, PriorMassTermination
+    from jaxrens.state.ns import NSState as _NSState  # for isinstance
+
+    ns = resolved.ns
+    n_gpu = ns.n_gpu
+    n_per_gpu = ns.n_per_gpu
+    n_total = n_gpu * n_per_gpu
+
+    # --- Backend: one base, wrapped once with EnsembleBackend --------------
+    # Per-call ``ensemble_params`` dicts override the wrapper's closured
+    # defaults (see backends/ensemble.py __call__).
+    base_backend = resolved.base_backend
+    backend = EnsembleBackend(base_backend, pressure=0.0)
+
+    init_fn, step_fn, per_move_fns = build_mwg(backend, list(resolved.move_descriptors))
+
+    working_dir = resolved.output.working_dir
+    working_dir.mkdir(parents=True, exist_ok=True)
+
+    _configure_file_logging(
+        working_dir=working_dir,
+        prefix=resolved.output.out_file_prefix,
+        level=resolved.output.log_level,
+    )
+
+    n_live = ns.n_live
+    positions = resolved.init.initial_positions  # (n_total, K, A, 3)
+    types = resolved.init.initial_types          # (A,)
+    cells = resolved.init.initial_cells          # (n_total, K, 3, 3) | None
+    energies = resolved.init.initial_energies    # (n_total, K)
+
+    if positions.shape[0] != n_total:
+        raise RuntimeError(
+            f"run_multi_gpu_from_config: init positions axis 0 is "
+            f"{positions.shape[0]} but n_total={n_total}."
+        )
+
+    key = jax.random.key(ns.seed)
+
+    # --- Burn-in (batched=True) -------------------------------------------
+    burn_in_cfg = resolved.initial_walk_config
+    do_burn_in = burn_in_cfg is not None and burn_in_cfg.n_walks > 0
+    if do_burn_in:
+        from jaxrens.init.burn_in import initial_walk
+
+        key, key_init, key_burn = jax.random.split(key, 3)
+        rng_keys = jax.random.split(key_init, n_total)
+        step_sizes = jnp.full(len(resolved.move_descriptors), resolved.moves[0].step_size)
+        ns_state_burn = init_ns_parallel(
+            init_fn,
+            positions, types, energies, cells, rng_keys,
+            max_dead=ns.max_iterations,
+            step_sizes=step_sizes,
+            ensemble_params_per_run=list(resolved.ensemble_params_per_run),
+        )
+        n_atoms = positions.shape[-2]
+        adaptation_policies = resolved.adaptation_policies
+        burn_per_move_fns = per_move_fns
+        ns_state_burn = initial_walk(
+            key=key_burn,
+            ns_state=ns_state_burn,
+            step_fn=step_fn,
+            n_walks=burn_in_cfg.n_walks,
+            walklength=burn_in_cfg.walklength,
+            adjust_interval=burn_in_cfg.adjust_interval,
+            emax_offset_per_atom=burn_in_cfg.emax_offset_per_atom,
+            n_atoms=n_atoms,
+            batched=True,
+            walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
+            run_batch_size=getattr(burn_in_cfg, "run_batch_size", None),
+            per_move_fns=burn_per_move_fns,
+            adaptation_policies=adaptation_policies,
+            adjust_n_samples=getattr(resolved.adaptation_cfg, "adjust_n_samples", 50),
+            adjust_max_rounds=getattr(resolved.adaptation_cfg, "adjust_max_rounds", 15),
+        )
+        pop = ns_state_burn.population
+        positions = pop.positions
+        energies = pop.energy
+        cells = pop.cell
+
+    # --- PRNG keys for the multi-GPU dispatch -----------------------------
+    key, key_run = jax.random.split(key)
+    rng_keys_flat = jax.random.split(key_run, n_total)
+
+    # --- Callbacks ---------------------------------------------------------
+    callbacks: list[Any] = [
+        ProgressCallback(info_interval=resolved.output.info_interval),
+        EnergyCheckCallback(),
+    ]
+
+    symbol_map = resolved.init.symbol_map
+    callbacks.append(
+        CheckpointCallback(
+            working_dir=working_dir,
+            interval=resolved.output.checkpoint_interval,
+            prefix=resolved.output.out_file_prefix,
+            symbol_map=symbol_map,
+        )
+    )
+
+    n_atoms = positions.shape[-2]
+    writers = []
+    energy_loggers = []
+    for r in range(n_total):
+        traj_path = (
+            working_dir
+            / f"{resolved.output.out_file_prefix}.run{r:02d}.traj.{resolved.output.format}"
+        )
+        writers.append(
+            create_trajectory_writer(resolved.output.format, traj_path, symbol_map)
+        )
+        energy_path = working_dir / f"{resolved.output.out_file_prefix}.run{r:02d}.energies"
+        energy_loggers.append(
+            EnergyLogger(energy_path, n_walkers=n_live, n_atoms=n_atoms)
+        )
+    callbacks.append(
+        BatchedTrajectoryCallback(
+            writers=writers,
+            energy_loggers=energy_loggers,
+            traj_interval=resolved.output.traj_interval,
+            snapshot_interval=resolved.output.snapshot_interval,
+        )
+    )
+
+    if resolved.adaptation_cfg is not None and resolved.adaptation_cfg.full_auto:
+        adapt_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.adaptation.h5"
+        )
+        move_name_list = [d.name for d in resolved.move_descriptors]
+        adaptation_logger = AdaptationLogger(
+            path=adapt_log_path,
+            move_names=move_name_list,
+            n_runs=n_total,
+        )
+        callbacks.append(AdaptationCallback(adaptation_logger))
+
+    first_mc = resolved.moves[0]
+    full_auto_kwargs: dict[str, Any] = {}
+    if resolved.adaptation_cfg is not None and resolved.adaptation_cfg.full_auto:
+        adjust_factor = (
+            resolved.adaptation_cfg.defaults.adjust_factor
+            if resolved.adaptation_cfg.defaults.adjust_factor is not None
+            else 1.5
+        )
+        full_auto_kwargs = dict(
+            per_move_fns=per_move_fns,
+            adjust_interval=resolved.adaptation_cfg.full_auto_steps,
+            adjust_n_samples=resolved.adaptation_cfg.adjust_n_samples,
+            adjust_max_rounds=resolved.adaptation_cfg.adjust_max_rounds,
+            adjust_factor=adjust_factor,
+        )
+
+    logger.info(
+        "Starting multi-GPU NS: n_gpu=%d, n_per_gpu=%d (n_total=%d), "
+        "n_walkers=%d, n_mcmc=%d, max_iter=%d",
+        n_gpu, n_per_gpu, n_total, n_live,
+        ns.n_mcmc_steps, ns.max_iterations,
+    )
+
+    result = run_ns_multi_gpu(
+        positions=positions,
+        types=types,
+        energies=energies,
+        cells=cells,
+        init_fn=init_fn,
+        step_fn=step_fn,
+        rng_keys=rng_keys_flat,
+        n_gpu=n_gpu,
+        n_per_gpu=n_per_gpu,
+        n_walkers=n_live,
+        max_iterations=ns.max_iterations,
+        n_mcmc_steps=ns.n_mcmc_steps,
+        n_extra=ns.n_extra,
+        convergence_threshold=ns.convergence_threshold,
+        initial_step_size=first_mc.step_size,
+        target_acceptance=first_mc.target_acceptance,
+        callbacks=callbacks,
+        termination_criteria=list(resolved.termination),
+        ensemble_params_per_run=list(resolved.ensemble_params_per_run),
+        move_descriptors=list(resolved.move_descriptors),
+        inter_re_config=resolved.inter_re_config,
+        backend=base_backend,
+        **full_auto_kwargs,
+    )
     return result
 
 
