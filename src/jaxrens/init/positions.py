@@ -70,7 +70,9 @@ def grid_positions_in_cell(
     if n_grid < n_atoms:
         raise ValueError(
             f"grid too coarse: {n_grid} sites available ({na}x{nb}x{nc}), "
-            f"{n_atoms} atoms requested; increase cell volume or decrease grid_distance"
+            f"{n_atoms} atoms requested; increase cell volume via cell. "
+            "min_volume_per_atom (and cell.max_volume_per_atom) or decrease "
+            "init.grid_distance."
         )
 
     # Build fractional grid using numpy index ranges (Python-side, not traced).

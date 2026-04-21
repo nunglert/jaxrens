@@ -113,6 +113,7 @@ def build_mwg(
         step_sizes: jnp.ndarray | None = None,
         step_size: float | None = None,
         ensemble_params: dict | None = None,
+        max_neighbors: int = 0,
     ) -> Any:  # returns MCStateClass instance
         """Create initial MCState from walker data.
 
@@ -122,6 +123,11 @@ def build_mwg(
             step_size: Scalar step size — broadcast to all moves.
             ensemble_params: Ensemble parameters dict (e.g. {"pressure": 0.01}).
                 Stored on the MCState for use by EnsembleBackend.
+            max_neighbors: Initial neighbor-bucket size for GNN-style
+                backends.  0 is the legacy default and causes the first
+                ns_step to overflow immediately (wasteful first retry);
+                pass a value from ``BackendConfig.max_neighbors_list[0]``
+                to avoid that.  Ignored by backends that don't use buckets.
         """
         if cell is None:
             cell = jnp.zeros((3, 3))
@@ -145,6 +151,7 @@ def build_mwg(
             max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
             overflow=jnp.asarray(False),
             ensemble_params=ensemble_params,
+            max_neighbors=int(max_neighbors),
         )
 
         # Initialize move-specific fields

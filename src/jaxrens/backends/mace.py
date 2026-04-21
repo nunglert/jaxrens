@@ -85,6 +85,9 @@ def _supercell_edges(
         shifts: (max_edges, 3) Cartesian shift vectors.
         n_actual: Scalar, actual number of edges found.
         overflow: Bool, True if n_actual > max_edges.
+        true_max_per_atom: Scalar, max neighbor count per atom computed from
+            the full mask (before truncation to ``max_edges``).  Safe to use
+            for outer-loop overflow escalation.
     """
     n_atoms = positions.shape[0]
     sc_dim = image_offsets.shape[0]
@@ -108,6 +111,12 @@ def _supercell_edges(
 
     # Edge mask: within cutoff and not self-interaction
     mask = (distances > 1e-10) & (distances < r_cutoff)
+
+    # True max neighbor count per atom — derived from the full mask BEFORE
+    # the flat-nonzero truncation below.  The outer NS loop escalates
+    # max_neighbors based on this value; using the post-truncation count
+    # would saturate at the current bucket and stall escalation.
+    true_max_per_atom = jnp.max(jnp.sum(mask, axis=1))
 
     # Static-shape edge extraction
     flat_mask = mask.ravel()
@@ -137,7 +146,7 @@ def _supercell_edges(
     receivers = jnp.where(is_ghost, n_atoms, receivers)
     shifts = jnp.where(is_ghost[:, None], 0.0, shifts)
 
-    return senders, receivers, shifts, n_actual, overflow
+    return senders, receivers, shifts, n_actual, overflow, true_max_per_atom
 
 
 # ---------------------------------------------------------------------------
@@ -272,9 +281,14 @@ class MACEBackend:
         n_atoms = positions.shape[0]
         max_edges = n_atoms * max_neighbors
 
-        # 1. Find edges via supercell expansion
-        senders, receivers, shifts, n_actual, overflow = _supercell_edges(
-            positions, cell, self.r_cutoff, max_edges, self.image_offsets,
+        # 1. Find edges via supercell expansion.  ``true_max_per_atom`` is the
+        # actual max neighbor count per atom computed from the pre-truncation
+        # mask; the outer-loop overflow retry relies on this being independent
+        # of ``max_edges`` so that escalation doesn't saturate at the bucket.
+        senders, receivers, shifts, n_actual, overflow, true_max_per_atom = (
+            _supercell_edges(
+                positions, cell, self.r_cutoff, max_edges, self.image_offsets,
+            )
         )
 
         # 2. Build data dict for mace-jax
@@ -289,15 +303,7 @@ class MACEBackend:
         out = model._energy_fn(data)
         energy = out["energy"][0]  # scalar energy for the real graph
 
-        # 4. Compute max neighbor count per atom
-        counts = jnp.zeros(n_atoms, dtype=jnp.int32)
-        # Only count real edges (not ghost)
-        real_senders = jnp.where(senders < n_atoms, senders, 0)
-        is_real = senders < n_atoms
-        counts = counts.at[real_senders].add(is_real.astype(jnp.int32))
-        neighbor_count = jnp.max(counts)
-
-        return energy, neighbor_count, overflow
+        return energy, true_max_per_atom, overflow
 
 
 # ---------------------------------------------------------------------------

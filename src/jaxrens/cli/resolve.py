@@ -35,7 +35,7 @@ from jaxrens.sampling.termination import (
     TerminationCriterion,
 )
 from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
-from jaxrens.utils.cell import check_cell_shape
+from jaxrens.utils.cell import get_volume, min_aspect_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +108,62 @@ def _build_cells(
         return jnp.broadcast_to(base_cell[None], (n_live, 3, 3))
 
 
+def _describe_cell_violation(
+    cell: jnp.ndarray,
+    n_atoms: int,
+    cell_cfg: CellConfig,
+) -> str | None:
+    """Return a human-readable reason why ``cell`` fails ``check_cell_shape``.
+
+    Returns ``None`` if the cell satisfies all constraints. The checks mirror
+    ``check_cell_shape`` exactly: min/max volume per atom and min aspect ratio.
+    """
+    volume = float(get_volume(cell))
+    vol_per_atom = volume / n_atoms
+    if vol_per_atom < cell_cfg.min_volume_per_atom:
+        return (
+            f"volume/atom = {vol_per_atom:.4f} A^3 is below "
+            f"cell.min_volume_per_atom = {cell_cfg.min_volume_per_atom}"
+        )
+    if vol_per_atom > cell_cfg.max_volume_per_atom:
+        return (
+            f"volume/atom = {vol_per_atom:.4f} A^3 exceeds "
+            f"cell.max_volume_per_atom = {cell_cfg.max_volume_per_atom}"
+        )
+    aspect = float(min_aspect_ratio(cell, jnp.asarray(volume)))
+    if aspect < cell_cfg.min_aspect_ratio:
+        return (
+            f"min aspect ratio = {aspect:.4f} is below "
+            f"cell.min_aspect_ratio = {cell_cfg.min_aspect_ratio}"
+        )
+    return None
+
+
+def _validate_input_cell(
+    cell: jnp.ndarray,
+    n_atoms: int,
+    cell_cfg: CellConfig,
+    source: str,
+) -> None:
+    """Reject a user-provided base cell that already violates ``cell_cfg``.
+
+    ``cell_shape_walk`` is volume-preserving, so a volume-violating input
+    cannot be rescued by init-time equilibration — the failure would only
+    surface later in ``_validate_cells`` with a misleading "Walker produced
+    an invalid cell" message. Fail fast with a message pointing at the input.
+    """
+    reason = _describe_cell_violation(cell, n_atoms, cell_cfg)
+    if reason is None:
+        return
+    raise RuntimeError(
+        f"Input structure {source!r} has a cell that violates the configured "
+        f"cell bounds: {reason}. Init-time cell_shape_walk is volume-preserving "
+        f"and cannot fix volume violations; adjust the cell.* bounds in the "
+        f"config or provide a structure whose cell satisfies them.\n"
+        f"Cell:\n{cell}"
+    )
+
+
 def _validate_cells(
     cells: jnp.ndarray,
     n_atoms: int,
@@ -116,18 +172,10 @@ def _validate_cells(
     """Raise ``RuntimeError`` if any walker cell fails check_cell_shape."""
     n_live = cells.shape[0]
     for wi in range(n_live):
-        cell_valid = bool(
-            check_cell_shape(
-                cells[wi],
-                n_atoms=n_atoms,
-                max_vol_per_atom=cell_cfg.max_volume_per_atom,
-                min_vol_per_atom=cell_cfg.min_volume_per_atom,
-                min_aspect=cell_cfg.min_aspect_ratio,
-            )
-        )
-        if not cell_valid:
+        reason = _describe_cell_violation(cells[wi], n_atoms, cell_cfg)
+        if reason is not None:
             raise RuntimeError(
-                f"Walker {wi} produced an invalid cell (failed check_cell_shape). "
+                f"Walker {wi} produced an invalid cell: {reason}.\n"
                 f"Cell:\n{cells[wi]}"
             )
 
@@ -422,6 +470,8 @@ def _resolve_init_config_file(
         init.start_config_file
     )
     n_atoms = positions_single.shape[0]
+
+    _validate_input_cell(cell_single, n_atoms, cell_cfg, init.start_config_file)
 
     key = jax.random.key(seed)
     key, shape_key, pos_key = jax.random.split(key, 3)

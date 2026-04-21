@@ -181,6 +181,35 @@ def _dispatch_callbacks(
 # ---------------------------------------------------------------------------
 
 
+def _pick_next_bucket(
+    true_max: int,
+    current: int,
+    ladder: tuple[int, ...],
+    offset: int,
+) -> int:
+    """Return the smallest ladder entry that accommodates the observed need.
+
+    The target size is ``true_max + offset`` — adding headroom prevents the
+    very next MCMC step from tripping the same overflow after a trivial cell
+    fluctuation.  Restricting the choice to ``ladder`` bounds the number of
+    distinct JIT recompilations to ``len(ladder)`` over a whole run.
+
+    Raises ``RuntimeError`` when the ladder is exhausted or cannot make
+    progress; both conditions are user-actionable (extend the list).
+    """
+    target = int(true_max) + int(offset)
+    for b in ladder:
+        if b >= target and b > current:
+            return b
+    raise RuntimeError(
+        f"Overflow retry cannot make progress: observed max neighbor count "
+        f"{int(true_max)} (+ offset {offset}) requires bucket >= {target}, "
+        f"but no entry in max_neighbors_list={list(ladder)} satisfies both "
+        f"> current bucket {int(current)} and >= {target}. "
+        f"Extend backend.max_neighbors_list to cover this regime."
+    )
+
+
 def _run_loop(
     *,
     descriptor: BatchDescriptor,
@@ -197,6 +226,8 @@ def _run_loop(
     rng_key,
     info_interval: int,
     inter_re_mgr: Any = None,
+    max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
+    max_neighbors_offset: int = 5,
 ) -> tuple[Any, Any, dict]:
     """Unified NS outer loop shared by ``run_ns`` and ``run_ns_parallel``.
 
@@ -347,9 +378,16 @@ def _run_loop(
         # For PmapVmapRuns, any overflow across any (G, P) shard triggers a retry.
         # TODO: for multi-GPU, consider per-shard retry rather than stop-the-world.
         if jnp.any(new_ns_state.population.overflow):
-            new_max = int(new_ns_state.population.max_neighbor_count.max() * 1.25) + 1
+            true_max = int(new_ns_state.population.max_neighbor_count.max())
+            current = int(ns_state.population.max_neighbors)
+            new_max = _pick_next_bucket(
+                true_max, current, max_neighbors_list, max_neighbors_offset,
+            )
             logger.warning(
-                "Overflow at iter %d: resizing max_neighbors -> %d", i, new_max,
+                "Overflow at iter %d: observed max_neighbors=%d, "
+                "resizing bucket %d -> %d (ladder=%s, offset=%d)",
+                i, true_max, current, new_max,
+                list(max_neighbors_list), max_neighbors_offset,
             )
             ns_state = ns_state.set(
                 population=ns_state.population.set(max_neighbors=new_max),

@@ -1,0 +1,19 @@
+# Sphinx HTML output and doctree cache.
+_build/
+
+# Auto-generated autosummary API stubs.  Sphinx regenerates these from
+# the ``:toctree: api/`` directive in docs/reference/index.rst on every
+# build, so they would cause huge diffs if committed.
+reference/api/
+
+# Everything under docs/tutorials/ is generated at build time from
+# examples/tutorials/*.py.  The .ipynb files come from jupytext; any
+# other file (e.g. *.energies, *.log) is a runtime side effect of the
+# tutorial notebook executing in this directory under nbsphinx.  The
+# only source-of-truth file here is the hand-written index.rst.
+tutorials/*
+!tutorials/index.rst
+
+# Ipynb checkpoint scratch created by Jupyter / nbsphinx if someone
+# opens a committed notebook in the browser.
+**/.ipynb_checkpoints/

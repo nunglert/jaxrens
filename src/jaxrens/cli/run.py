@@ -378,6 +378,8 @@ def run_from_config(
         ensemble_params=ensemble_params,
         termination_criteria=termination_criteria,
         restart_state=restart_state,
+        max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
+        max_neighbors_offset=resolved.backend.max_neighbors_offset,
         **full_auto_kwargs,
     )
 
@@ -590,6 +592,8 @@ def run_multi_gpu_from_config(resolved) -> dict:
         move_descriptors=list(resolved.move_descriptors),
         inter_re_config=resolved.inter_re_config,
         backend=base_backend,
+        max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
+        max_neighbors_offset=resolved.backend.max_neighbors_offset,
         **full_auto_kwargs,
     )
     return result
