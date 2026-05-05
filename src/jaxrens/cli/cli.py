@@ -116,10 +116,50 @@ def _run_one(resolved, *, cohort_label: str = "") -> None:
         initial_walk_config=resolved.initial_walk_config,
         adaptation_config=resolved.adaptation_cfg,
         termination_criteria=list(resolved.termination),
+        base_backend=resolved.base_backend,
     )
 
 
+def _assert_n_gpus(expected: int | None) -> int:
+    """Assert that JAX exposes exactly ``expected`` local GPU devices.
+
+    Returns ``0`` on success.  When the count mismatches, prints a multi-line
+    diagnostic to stderr (likely cause: SLURM allocation, CUDA_VISIBLE_DEVICES,
+    login-node execution) and returns a non-zero exit code suitable for
+    ``sys.exit``.  When ``expected`` is ``None`` the check is skipped — preserves
+    the original silently-use-what's-available behaviour for interactive runs.
+    """
+    if expected is None:
+        return 0
+    import os
+    import jax
+    devices = jax.local_devices()
+    n_visible = len(devices)
+    if n_visible == expected:
+        return 0
+    print(
+        f"jaxrens run: --n-gpus={expected} but JAX sees {n_visible} local "
+        f"device(s): {devices}.  Aborting before the resolver runs.\n"
+        f"Likely causes:\n"
+        f"  (1) SLURM downgraded the GPU allocation silently — verify with "
+        f"`nvidia-smi -L` and `scontrol show job $SLURM_JOB_ID | grep -E "
+        f"'Gres|Tres'`.\n"
+        f"  (2) CUDA_VISIBLE_DEVICES is set in your environment "
+        f"(currently: {os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')!r}).\n"
+        f"  (3) Running on a login node or in an `srun` allocation that did not "
+        f"request `--gres=gpu:{expected}`.\n"
+        f"Pass --n-gpus=$SLURM_GPUS_ON_NODE in your sbatch script (the standard "
+        f"SLURM env var; not $SLURM_N_GPUS) so the job fails fast on downgrade.",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
+    rc = _assert_n_gpus(args.n_gpus)
+    if rc != 0:
+        return rc
+
     root = _load_and_validate(args.config, args.set)
 
     from jaxrens.cli.resolve import (
@@ -295,6 +335,15 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Path to YAML config file.")
     p_run.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                        help="Override a config value (may be repeated; later wins).")
+    p_run.add_argument(
+        "--n-gpus", type=int, default=None, dest="n_gpus", metavar="N",
+        help=(
+            "Assert that JAX sees exactly N local GPU devices; exit non-zero "
+            "with a diagnostic on mismatch.  Typically passed from SLURM as "
+            "--n-gpus $SLURM_GPUS_ON_NODE so jobs fail fast when the scheduler "
+            "downgrades the GPU allocation silently."
+        ),
+    )
 
     # -- validate --
     p_val = sub.add_parser("validate", help="Validate a YAML config without running.")

@@ -94,10 +94,17 @@ class InterREConfig:
 
 @dataclass(frozen=True)
 class NSConfig:
-    """Nested sampling run configuration."""
+    """Nested sampling run configuration.
+
+    ``max_iterations`` is optional — when ``None``, the resolver does not add
+    an ``IterationTermination`` to the default termination tuple, and the loop
+    runs until another criterion (e.g. ``PriorMassTermination``) fires.  No
+    static dead-array cap exists: dead-point history is streamed to disk by
+    per-iteration callbacks, never held in memory.
+    """
 
     n_live: int = 500
-    max_iterations: int = 50_000
+    max_iterations: int | None = None
     convergence_threshold: float = 0.1
     n_mcmc_steps: int = 20
     n_extra: int = 0

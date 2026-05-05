@@ -690,3 +690,82 @@ class TestCombinedChunking:
         assert result.population.positions.shape == (n_runs, n_walkers, n_atoms, 3)
         assert result.population.energy.shape == (n_runs, n_walkers)
         assert jnp.all(jnp.isfinite(result.population.positions))
+
+
+# ---------------------------------------------------------------------------
+# Adaptation chunking: trial vmap (walker_batch_size) and run vmap
+# (run_batch_size) inside _apply_adaptation must give the same answer as the
+# unchunked vmaps when the chunk evenly divides the source axis.
+# ---------------------------------------------------------------------------
+
+
+class TestAdaptationChunking:
+    def _run_with(
+        self,
+        *,
+        walker_batch_size: int | None,
+        run_batch_size: int | None,
+    ):
+        from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
+
+        n_runs, n_walkers, n_atoms = 4, 4, 2
+        ns_states, step_fn, per_move_fns, _ = _build_batched_ns_state(
+            n_runs=n_runs, n_walkers=n_walkers, n_atoms=n_atoms,
+        )
+        policy = ResolvedAdaptationPolicy(
+            min_rate=0.25, max_rate=0.75, adjust_factor=1.5, step_size_max=10.0,
+        )
+        result = initial_walk(
+            jax.random.key(2026),
+            ns_states,
+            step_fn,
+            n_walks=3,
+            walklength=4,
+            adjust_interval=1,
+            emax_offset_per_atom=2.0,
+            n_atoms=n_atoms,
+            batched=True,
+            walker_batch_size=walker_batch_size,
+            run_batch_size=run_batch_size,
+            per_move_fns=per_move_fns,
+            adaptation_policies=(policy,),
+            adjust_n_samples=8,
+            adjust_max_rounds=4,
+        )
+        return result
+
+    def test_walker_batch_size_matches_full_vmap(self):
+        """trial_batch_size=walker_batch_size vs None must match exactly.
+
+        Same PRNG key on both sides; the trial vmap inside adjust_step_size
+        switches between vmap and lax.map(batch_size=...) but the operation is
+        independent per trial so outputs are bit-identical.
+        """
+        baseline = self._run_with(walker_batch_size=None, run_batch_size=None)
+        chunked = self._run_with(walker_batch_size=2, run_batch_size=None)
+        np.testing.assert_array_equal(
+            np.array(baseline.population.step_sizes),
+            np.array(chunked.population.step_sizes),
+        )
+
+    def test_run_batch_size_matches_full_vmap(self):
+        """run_batch_size set vs None must produce the same step sizes.
+
+        Replaces vmap-over-runs with lax.map(batch_size=...); per-run
+        independence makes the outputs identical.
+        """
+        baseline = self._run_with(walker_batch_size=None, run_batch_size=None)
+        chunked = self._run_with(walker_batch_size=None, run_batch_size=2)
+        np.testing.assert_array_equal(
+            np.array(baseline.population.step_sizes),
+            np.array(chunked.population.step_sizes),
+        )
+
+    def test_combined_chunking_matches_full_vmap(self):
+        """walker_batch_size + run_batch_size both set must still match."""
+        baseline = self._run_with(walker_batch_size=None, run_batch_size=None)
+        chunked = self._run_with(walker_batch_size=2, run_batch_size=2)
+        np.testing.assert_array_equal(
+            np.array(baseline.population.step_sizes),
+            np.array(chunked.population.step_sizes),
+        )

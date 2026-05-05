@@ -218,7 +218,6 @@ def _run_loop(
     step_fn,
     n_mcmc_steps: int,
     n_extra: int,
-    max_iterations: int,
     termination_criteria: list,
     callbacks: list,
     n_moves: int,
@@ -235,6 +234,13 @@ def _run_loop(
     encapsulated by *descriptor*; ``_run_loop`` contains no ``isinstance``
     checks on *descriptor*.
 
+    Per-iteration culled walker data lives only in the ``info`` dict —
+    callbacks that need it (``EnergyLogger``, ``TrajectoryCallback``) read
+    ``info["dead_energy"]`` / ``info["dead_position"]`` / ``info["dead_volume"]``
+    directly and persist to disk on the spot.  No host-side history buffer
+    is accumulated; the canonical record of dead points lives on disk via
+    those callbacks.
+
     Args:
         descriptor: ``BatchDescriptor`` instance controlling JIT-compilation,
             key splitting, and termination reduction.
@@ -244,8 +250,10 @@ def _run_loop(
         step_fn: MCMC step function from ``build_mwg()``.
         n_mcmc_steps: Number of MCMC steps per walker (static under JIT).
         n_extra: Number of extra walkers to walk per iteration (static).
-        max_iterations: Maximum number of NS iterations to run.
-        termination_criteria: List of ``TerminationCriterion`` objects.
+        termination_criteria: List of ``TerminationCriterion`` objects.  The
+            loop runs until any one of these fires; there is no static
+            iteration cap.  Pass an ``IterationTermination(N)`` to bound the
+            run by iteration count.
         callbacks: List of callback objects with optional ``on_iteration``
             methods.
         n_moves: Number of move types (determines counter array shapes).
@@ -333,7 +341,8 @@ def _run_loop(
         if hasattr(cb, "on_start"):
             cb.on_start(ns_state)
 
-    for i in range(max_iterations):
+    i = 0
+    while True:
         # ---- Adaptation ----
         adjust_info = None
         if adapt_mgr.fires(i):
@@ -469,6 +478,8 @@ def _run_loop(
         if should_stop:
             logger.info("NS terminated at iter %d: %s", i, reason)
             break
+
+        i += 1
 
     return ns_state, rng_key, cumulative
 

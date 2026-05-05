@@ -104,19 +104,53 @@ class Monitor:
         n_dead: int = int(state["n_dead"])
         n_live: int = int(state["n_walkers"])
 
-        # Slice to actual dead points (checkpoint pads dead arrays).
-        dead_energies = np.asarray(state["dead_energies"][:n_dead], dtype=np.float64)
         live_energies = np.asarray(state["energies"], dtype=np.float64)
-
-        dead_volumes = None
-        if state.get("dead_volumes") is not None:
-            dead_volumes = np.asarray(
-                state["dead_volumes"][:n_dead], dtype=np.float64
-            )
 
         live_volumes = None
         if state.get("live_volumes") is not None:
             live_volumes = np.asarray(state["live_volumes"], dtype=np.float64)
+
+        # Source for dead arrays: prefer HDF5 (legacy / future write paths
+        # that include them), fall back to the streamed ``.energies`` text
+        # file (the canonical record under the current architecture, where
+        # dead arrays no longer live in HDF5).
+        de_h5 = state.get("dead_energies")
+        dv_h5 = state.get("dead_volumes")
+        h5_has_dead = (
+            de_h5 is not None and np.asarray(de_h5).size > 0
+        )
+        energies_path = path / f"{prefix}.energies"
+        # Pre-load the energies log when present — used for both the dead-
+        # array fallback and the iteration trace below.
+        energies_log = (
+            EnergyLogger.read(energies_path) if energies_path.exists() else None
+        )
+
+        if h5_has_dead:
+            # Prefer HDF5 dead arrays when present — preserves behaviour for
+            # checkpoints written by older jaxrens versions.
+            dead_energies = np.asarray(de_h5[:n_dead], dtype=np.float64)
+            dead_volumes = (
+                np.asarray(dv_h5[:n_dead], dtype=np.float64)
+                if dv_h5 is not None else None
+            )
+        elif energies_log is not None:
+            # New canonical path: read dead_energies (and dead_volumes when
+            # NPT) from the per-iteration ``.energies`` log written by
+            # ``EnergyLogger``.  The volume column is zero for NVT runs;
+            # drop it when ``live_volumes`` is also absent (NVT signal).
+            dead_energies = np.asarray(energies_log.energies, dtype=np.float64)
+            if live_volumes is not None:
+                dead_volumes = np.asarray(energies_log.volumes, dtype=np.float64)
+            else:
+                dead_volumes = None
+        else:
+            raise FileNotFoundError(
+                f"Checkpoint {ckpt_path} has no dead_* arrays and "
+                f"{energies_path} is missing — cannot reconstruct dead-point "
+                f"trace.  Re-run with EnergyLogger enabled or restore an "
+                f"older checkpoint that included dead arrays in HDF5."
+            )
 
         # symbol_map stored as JSON string in HDF5 attrs; we need to re-read it
         # because load_checkpoint does not expose it.
@@ -128,14 +162,13 @@ class Monitor:
                 raw = f.attrs["symbol_map"]
                 symbol_map = {int(k): v for k, v in json.loads(raw).items()}
 
-        # Optional energy log for the iteration trace.
-        energy_trace = None
-        iteration_trace = None
-        energies_path = path / f"{prefix}.energies"
-        if energies_path.exists():
-            log = EnergyLogger.read(energies_path)
-            energy_trace = log.energies
-            iteration_trace = log.iterations
+        # Iteration trace from the same energies log we used above (if any).
+        if energies_log is not None:
+            energy_trace = energies_log.energies
+            iteration_trace = energies_log.iterations
+        else:
+            energy_trace = None
+            iteration_trace = None
 
         # Optional adaptation trace.
         adaptation_trace = None

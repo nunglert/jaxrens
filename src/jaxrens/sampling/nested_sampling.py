@@ -148,7 +148,6 @@ def init_ns(
     energies: jnp.ndarray,
     cells: jnp.ndarray | None,
     rng_key: jax.Array,
-    max_dead: int = 50000,
     step_sizes: jnp.ndarray | None = None,
     ensemble_params: dict | None = None,
     restart_state=None,
@@ -170,13 +169,13 @@ def init_ns(
         energies: Initial walker energies, shape (n_walkers,).
         cells: Unit cells, shape (n_walkers, 3, 3) or None.
         rng_key: JAX PRNG key.
-        max_dead: Maximum number of dead points to collect.
         step_sizes: Per-move step size array. None = use descriptor defaults.
         ensemble_params: Ensemble parameters dict for MCState.
         restart_state: Optional RestartBundle from load_restart(). When
-            provided, seeds NSState dead-point history and bookkeeping
-            scalars from the checkpoint instead of zero-initializing.
-            The live-walker side is always taken from positions/energies.
+            provided, seeds NSState bookkeeping scalars (iteration,
+            log_evidence) from the checkpoint.  Dead-point history is not
+            re-seeded — the canonical record on disk (``.energies`` /
+            ``.traj``) is append-only and survives across restart.
 
     Returns:
         Initialized NSState with batched MCState population.
@@ -209,53 +208,25 @@ def init_ns(
     population = jax.tree.map(lambda *xs: jnp.stack(xs), *walkers)
 
     if restart_state is None:
-        dead_energies = jnp.full(max_dead, jnp.inf)
-        dead_positions = jnp.zeros((max_dead, n_atoms, 3))
-        dead_volumes = jnp.zeros(max_dead)
         log_evidence = jnp.array(-jnp.inf)
         iteration = jnp.array(0, dtype=jnp.int32)
-        n_dead = jnp.array(0, dtype=jnp.int32)
     else:
         rs = restart_state
-        nd = rs.n_dead
-
-        dead_energies = jnp.full(max_dead, jnp.inf)
-        dead_energies = dead_energies.at[:nd].set(jnp.asarray(rs.dead_energies[:nd]))
-
-        dead_positions = jnp.zeros((max_dead, n_atoms, 3))
-        dead_positions = dead_positions.at[:nd].set(
-            jnp.asarray(rs.dead_positions[:nd])
-        )
-
-        if rs.dead_volumes is not None:
-            dead_volumes = jnp.zeros(max_dead)
-            dead_volumes = dead_volumes.at[:nd].set(
-                jnp.asarray(rs.dead_volumes[:nd])
-            )
-        else:
-            dead_volumes = jnp.zeros(max_dead)
-
         log_evidence = jnp.array(rs.log_evidence)
         iteration = jnp.array(rs.iteration, dtype=jnp.int32)
-        n_dead = jnp.array(nd, dtype=jnp.int32)
 
     state = NSState(
         population=population,
-        dead_energies=dead_energies,
-        dead_positions=dead_positions,
-        dead_volumes=dead_volumes,
         log_evidence=log_evidence,
         iteration=iteration,
-        n_dead=n_dead,
         rng_key=rng_key,
         n_walkers=n_walkers,
         n_atoms=n_atoms,
-        max_dead=max_dead,
     )
 
     logger.debug(
-        "NS state initialized: %d walkers, energy range [%.4g, %.4g], max_dead=%d%s",
-        n_walkers, float(jnp.min(energies)), float(jnp.max(energies)), max_dead,
+        "NS state initialized: %d walkers, energy range [%.4g, %.4g]%s",
+        n_walkers, float(jnp.min(energies)), float(jnp.max(energies)),
         f" (restart from iteration {restart_state.iteration})" if restart_state is not None else "",
     )
     return state
@@ -300,14 +271,15 @@ def ns_step(
         potentials, rng_key=key_worst, n_atoms=ns_state.n_atoms,
     )
 
-    # 2. Record dead point
-    n_dead = ns_state.n_dead
-    dead_energies = ns_state.dead_energies.at[n_dead].set(potential_max)
-    dead_positions = ns_state.dead_positions.at[n_dead].set(
-        pop.positions[worst_idx]
-    )
+    # 2. Identify dead point.  We no longer write it onto NSState — the
+    # values are surfaced via the ``info`` dict instead, and the
+    # per-iteration callbacks (``EnergyLogger``, ``TrajectoryCallback``)
+    # persist them straight to disk.  Inside JIT, the dead point only
+    # matters for the log-evidence accumulator below; the rest is pure
+    # history / output.
     volumes = jax.vmap(get_volume)(pop.cell)  # (n_walkers,)
-    dead_volumes = ns_state.dead_volumes.at[n_dead].set(volumes[worst_idx])
+    dead_position = pop.positions[worst_idx]
+    dead_volume = volumes[worst_idx]
 
     # 3. Update evidence estimate
     n_walkers = ns_state.n_walkers
@@ -410,15 +382,12 @@ def ns_step(
         pop, finals,
     )
 
-    # 8. Build new state
+    # 8. Build new state — algorithm fields only; dead-point history is
+    # handled host-side by ``_run_loop`` via the info dict below.
     new_ns_state = ns_state.set(
         population=new_pop,
-        dead_energies=dead_energies,
-        dead_positions=dead_positions,
-        dead_volumes=dead_volumes,
         log_evidence=log_evidence,
         iteration=ns_state.iteration + 1,
-        n_dead=n_dead + 1,
         rng_key=key,
     )
 
@@ -438,6 +407,12 @@ def ns_step(
         "worst_idx": worst_idx,
         "clone_idx": clone_idx,
         "acceptance_rate": total_accepted / total_steps,
+        # Per-iteration culled-walker (the "dead point").  Read by
+        # ``EnergyLogger`` / ``TrajectoryCallback`` for streaming-to-disk;
+        # not stored anywhere on NSState.
+        "dead_energy": potential_max,
+        "dead_position": dead_position,
+        "dead_volume": dead_volume,
         # Chain-level per-move statistics (raw counts; let consumers compute rates).
         # Bucket convention: reject_reason_counts_per_move[:, 0] = accepted,
         #   [:, 1] = energy reject, [:, 2] = cell reject, [:, 3] = prior reject.
@@ -457,8 +432,20 @@ def ns_step(
 # ---------------------------------------------------------------------------
 
 
-def _ns_state_to_result_dict(ns_state: NSState) -> dict:
-    """Convert NSState to backward-compatible result dict."""
+def _ns_state_to_result_dict(ns_state: NSState, n_dead: int | jnp.ndarray = 0) -> dict:
+    """Convert NSState to a result dict (live-walker state + scalars only).
+
+    Dead-point history is *not* in the return value — it's persisted to disk
+    by the callbacks (``EnergyLogger``, ``TrajectoryCallback``,
+    ``CheckpointCallback``) during the run.  Postprocessing reads it from
+    disk via ``postprocess.Monitor.from_directory(...)`` rather than from
+    the result dict, so carrying the full arrays in the return would
+    duplicate persisted data and waste memory.
+
+    ``n_dead`` is taken from ``len(history)`` at call time and forwarded
+    here as a small scalar / batched scalar for log lines and for
+    interactive callers that just want the count.
+    """
     pop = ns_state.population
     ep = pop.ensemble_params if hasattr(pop, "ensemble_params") else {}
     is_npt = isinstance(ep, dict) and "pressure" in ep
@@ -467,12 +454,9 @@ def _ns_state_to_result_dict(ns_state: NSState) -> dict:
         "types": pop.types,
         "energies": pop.energy,
         "cells": pop.cell,
-        "dead_energies": ns_state.dead_energies,
-        "dead_positions": ns_state.dead_positions,
-        "dead_volumes": ns_state.dead_volumes if is_npt else None,
         "log_evidence": ns_state.log_evidence,
         "iteration": int(ns_state.iteration),
-        "n_dead": int(ns_state.n_dead),
+        "n_dead": n_dead,
         "n_walkers": ns_state.n_walkers,
         "rng_key": ns_state.rng_key,
     }
@@ -492,7 +476,7 @@ def run_ns(
     step_fn: Callable,
     rng_key: jax.Array,
     n_walkers: int | None = None,
-    max_iterations: int = 10000,
+    max_iterations: int | None = None,
     n_mcmc_steps: int = 20,
     n_extra: int = 0,
     convergence_threshold: float = 0.1,
@@ -516,7 +500,14 @@ def run_ns(
 
     Thin wrapper: validates args, initialises NSState, constructs
     descriptor + AdaptationManager, delegates to ``_run_loop``, and
-    packages the result dict.
+    packages the result dict (live state + scalars only — dead-point
+    history is persisted to disk by the per-iteration callbacks, not
+    returned).
+
+    ``max_iterations`` is optional; when ``None`` the loop runs until
+    another termination criterion fires (typically ``PriorMassTermination``).
+    Pass an explicit integer to add an ``IterationTermination`` to the
+    default criteria.
 
     Returns a backward-compatible result dict.
     """
@@ -526,9 +517,10 @@ def run_ns(
         n_walkers = positions.shape[0]
     if termination_criteria is None:
         termination_criteria = [
-            IterationTermination(max_iterations),
             PriorMassTermination(n_walkers, convergence_threshold),
         ]
+        if max_iterations is not None:
+            termination_criteria.append(IterationTermination(max_iterations))
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
         raise ValueError("max_neighbors_list must be non-empty.")
@@ -545,7 +537,6 @@ def run_ns(
 
     ns_state = init_ns(
         init_fn, positions, types, energies, cells, rng_key,
-        max_dead=max_iterations,
         step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params=ensemble_params,
         restart_state=restart_state,
@@ -554,8 +545,9 @@ def run_ns(
     )
 
     n_atoms = positions.shape[1] if positions.ndim >= 2 else None
+
     logger.info(
-        "Starting NS run: %d walkers, %s atoms, max_iter=%d, n_mcmc=%d",
+        "Starting NS run: %d walkers, %s atoms, max_iter=%s, n_mcmc=%d",
         n_walkers, n_atoms, max_iterations, n_mcmc_steps,
     )
 
@@ -577,13 +569,12 @@ def run_ns(
         step_fn=step_fn,
         n_mcmc_steps=n_mcmc_steps,
         n_extra=n_extra,
-        max_iterations=max_iterations,
         termination_criteria=termination_criteria,
         callbacks=callbacks,
         n_moves=n_moves,
         move_descriptors=move_descriptors,
         rng_key=rng_key,
-        info_interval=max(1, max_iterations // 20),
+        info_interval=max(1, (max_iterations or 1000) // 20),
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
     )
@@ -601,14 +592,14 @@ def run_ns(
 
     logger.info(
         "NS complete: %d dead points, log_Z=%.4f",
-        int(ns_state.n_dead), float(ns_state.log_evidence),
+        int(ns_state.iteration), float(ns_state.log_evidence),
     )
 
     for cb in callbacks:
         if hasattr(cb, "on_finish"):
             cb.on_finish(ns_state)
 
-    return _ns_state_to_result_dict(ns_state)
+    return _ns_state_to_result_dict(ns_state, n_dead=int(ns_state.iteration))
 
 
 # ---------------------------------------------------------------------------
@@ -623,7 +614,6 @@ def init_ns_parallel(
     energies: jnp.ndarray,
     cells: jnp.ndarray | None,
     rng_keys: jax.Array,
-    max_dead: int = 50000,
     step_sizes: jnp.ndarray | None = None,
     ensemble_params_per_run: list[dict] | None = None,
     restart_states: list | None = None,
@@ -638,19 +628,20 @@ def init_ns_parallel(
         energies: (n_runs, n_walkers)
         cells: (n_runs, n_walkers, 3, 3) or None
         rng_keys: (n_runs,) per-run PRNG keys
-        max_dead: Max dead points per run
         step_sizes: Per-move step sizes (shared across runs)
         ensemble_params_per_run: List of per-run ensemble param dicts
         restart_states: Optional list of ``RestartBundle`` objects, one per run.
             When provided, ``init_ns`` for run *i* is seeded from
-            ``restart_states[i]`` (dead-point history, iteration counter,
-            and log-evidence from the checkpoint).  Pass ``None`` for any
-            run that should start fresh.  ``len(restart_states)`` must equal
+            ``restart_states[i]`` (iteration counter and log-evidence from
+            the checkpoint).  Dead-point history is not re-seeded — the
+            canonical disk record (``.energies`` / ``.traj``) is append-only
+            and survives across restart.  Pass ``None`` for any run that
+            should start fresh.  ``len(restart_states)`` must equal
             ``n_runs`` when provided.
 
     Returns:
         NSState with (n_runs, ...) on all dynamic fields.
-        Static fields shared: n_walkers, n_atoms, max_dead.
+        Static fields shared: n_walkers, n_atoms.
     """
     n_runs = positions.shape[0]
     if restart_states is not None and len(restart_states) != n_runs:
@@ -667,7 +658,7 @@ def init_ns_parallel(
             init_fn,
             positions[i], run_types, energies[i],
             cells[i] if cells is not None else None,
-            rng_keys[i], max_dead, step_sizes, ep,
+            rng_keys[i], step_sizes, ep,
             restart_state=rs,
             max_neighbors=max_neighbors,
             max_neighbor_counts=(
@@ -754,9 +745,10 @@ def run_ns_parallel(
         n_walkers = positions.shape[1]
     if termination_criteria is None:
         termination_criteria = [
-            IterationTermination(max_iterations),
             PriorMassTermination(n_walkers, convergence_threshold),
         ]
+        if max_iterations is not None:
+            termination_criteria.append(IterationTermination(max_iterations))
     if move_descriptors is not None:
         n_moves = len(move_descriptors)
     else:
@@ -771,7 +763,6 @@ def run_ns_parallel(
 
     ns_states = init_ns_parallel(
         init_fn, positions, types, energies, cells, rng_keys,
-        max_dead=max_iterations,
         step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params_per_run=ensemble_params_per_run,
         restart_states=restart_states,
@@ -829,7 +820,6 @@ def run_ns_parallel(
             # injected target_composition. Re-run init_ns_parallel.
             ns_states = init_ns_parallel(
                 init_fn, positions, types, energies, cells, rng_keys,
-                max_dead=max_iterations,
                 step_sizes=jnp.full(n_moves, initial_step_size),
                 ensemble_params_per_run=ensemble_params_per_run,
                 restart_states=restart_states,
@@ -860,7 +850,6 @@ def run_ns_parallel(
             # Re-initialize with updated ensemble_params_per_run.
             ns_states = init_ns_parallel(
                 init_fn, positions, types, energies, cells, rng_keys,
-                max_dead=max_iterations,
                 step_sizes=jnp.full(n_moves, initial_step_size),
                 ensemble_params_per_run=ensemble_params_per_run,
                 restart_states=restart_states,
@@ -891,13 +880,12 @@ def run_ns_parallel(
         step_fn=step_fn,
         n_mcmc_steps=n_mcmc_steps,
         n_extra=n_extra,
-        max_iterations=max_iterations,
         termination_criteria=termination_criteria,
         callbacks=callbacks or [],
         n_moves=n_moves,
         move_descriptors=move_descriptors,
         rng_key=adapt_keys,
-        info_interval=max(1, max_iterations // 20),
+        info_interval=max(1, (max_iterations or 1000) // 20),
         inter_re_mgr=inter_re_mgr,
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
@@ -917,21 +905,20 @@ def run_ns_parallel(
     for r in range(n_runs):
         logger.info(
             "Run %d complete: %d dead points, log_Z=%.4f",
-            r, int(ns_states.n_dead[r]), float(ns_states.log_evidence[r]),
+            r, int(ns_states.iteration[r]), float(ns_states.log_evidence[r]),
         )
 
+    # Dead-point history is persisted to disk by the callbacks; not in
+    # the return.  ``n_dead`` ≡ ``iteration`` (both increment per ns_step).
     pop = ns_states.population
     return {
         "positions": pop.positions,
         "types": pop.types,
         "energies": pop.energy,
         "cells": pop.cell,
-        "dead_energies": ns_states.dead_energies,
-        "dead_positions": ns_states.dead_positions,
-        "dead_volumes": ns_states.dead_volumes,
         "log_evidence": ns_states.log_evidence,
         "iteration": ns_states.iteration,
-        "n_dead": ns_states.n_dead,
+        "n_dead": ns_states.iteration,
         "n_walkers": n_walkers,
         "n_runs": n_runs,
     }
@@ -951,7 +938,6 @@ def init_ns_multi_gpu(
     rng_keys: jax.Array,
     n_gpu: int,
     n_per_gpu: int,
-    max_dead: int = 50000,
     step_sizes: jnp.ndarray | None = None,
     ensemble_params_per_run: list[dict] | None = None,
     restart_states: list[list] | None = None,
@@ -973,12 +959,15 @@ def init_ns_multi_gpu(
         rng_keys: Shape ``(G*P,)`` or ``(G, P)`` — one key per run.
         n_gpu: Number of GPU devices (G).
         n_per_gpu: Number of NS runs per GPU (P).
-        max_dead: Max dead points per run.
         step_sizes: Per-move step sizes (shared across all runs).
         ensemble_params_per_run: Flat list of ``G*P`` dicts, or ``None``.
         restart_states: ``(G, P)`` nested list of ``RestartBundle | None``, or
             ``None`` for a fresh start on all runs.  Mixed restart (some runs
-            fresh, some from checkpoint) is supported.
+            fresh, some from checkpoint) is supported.  Dead-point history
+            is not re-seeded — the disk record (``.energies`` / ``.traj``)
+            is append-only and survives across restart.  Only the
+            bookkeeping scalars (iteration, log_evidence) are seeded into
+            NSState here.
 
     Returns:
         NSState with shape ``(G, P, ...)`` on all dynamic fields.
@@ -1014,7 +1003,7 @@ def init_ns_multi_gpu(
     # Build flat (G*P, ...) NSState via init_ns_parallel.
     flat_states = init_ns_parallel(
         init_fn, positions_flat, types, energies_flat, cells_flat,
-        rng_keys_flat, max_dead, step_sizes,
+        rng_keys_flat, step_sizes,
         ensemble_params_per_run=ensemble_params_per_run,
         restart_states=rs_flat,
         max_neighbors=max_neighbors,
@@ -1146,9 +1135,10 @@ def run_ns_multi_gpu(
 
     if termination_criteria is None:
         termination_criteria = [
-            IterationTermination(max_iterations),
             PriorMassTermination(n_walkers, convergence_threshold),
         ]
+        if max_iterations is not None:
+            termination_criteria.append(IterationTermination(max_iterations))
     if move_descriptors is not None:
         n_moves = len(move_descriptors)
     elif per_move_fns is not None:
@@ -1162,25 +1152,41 @@ def run_ns_multi_gpu(
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
         raise ValueError("max_neighbors_list must be non-empty.")
+    logger.debug(
+        "[stage] run_ns_multi_gpu: choose_starting_bucket "
+        "(initial_max_neighbor_counts shape=%s, ladder=%s, offset=%d)",
+        None if initial_max_neighbor_counts is None
+        else initial_max_neighbor_counts.shape,
+        ladder, max_neighbors_offset,
+    )
     starting_bucket = _choose_starting_bucket(
         initial_max_neighbor_counts, ladder, max_neighbors_offset,
     )
+    logger.debug(
+        "[stage] run_ns_multi_gpu: starting_bucket=%d", starting_bucket,
+    )
 
     # Initialize (G, P, ...) state via init_ns_multi_gpu.
+    logger.debug("[stage] run_ns_multi_gpu: init_ns_multi_gpu — starting")
     ns_states = init_ns_multi_gpu(
         init_fn, positions, types, energies, cells,
         rng_keys_flat, n_gpu, n_per_gpu,
-        max_dead=max_iterations,
         step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params_per_run=ensemble_params_per_run,
         restart_states=restart_states,
         max_neighbors=starting_bucket,
         max_neighbor_counts=initial_max_neighbor_counts,
     )
+    if logger.isEnabledFor(logging.DEBUG):
+        try:
+            jax.block_until_ready(ns_states.population.positions)
+        except Exception:
+            pass
+        logger.debug("[stage] run_ns_multi_gpu: init_ns_multi_gpu — done")
 
     logger.info(
         "Starting multi-GPU NS: n_gpu=%d, n_per_gpu=%d (%d total runs), "
-        "n_walkers=%d, max_iter=%d, n_mcmc=%d, n_extra=%d",
+        "n_walkers=%d, max_iter=%s, n_mcmc=%d, n_extra=%d",
         n_gpu, n_per_gpu, n_total, n_walkers, max_iterations, n_mcmc_steps, n_extra,
     )
 
@@ -1228,7 +1234,6 @@ def run_ns_multi_gpu(
             ns_states = init_ns_multi_gpu(
                 init_fn, positions, types, energies, cells,
                 rng_keys_flat, n_gpu, n_per_gpu,
-                max_dead=max_iterations,
                 step_sizes=jnp.full(n_moves, initial_step_size),
                 ensemble_params_per_run=ensemble_params_per_run,
                 restart_states=restart_states,
@@ -1258,7 +1263,6 @@ def run_ns_multi_gpu(
             ns_states = init_ns_multi_gpu(
                 init_fn, positions, types, energies, cells,
                 rng_keys_flat, n_gpu, n_per_gpu,
-                max_dead=max_iterations,
                 step_sizes=jnp.full(n_moves, initial_step_size),
                 ensemble_params_per_run=ensemble_params_per_run,
                 restart_states=restart_states,
@@ -1290,13 +1294,12 @@ def run_ns_multi_gpu(
         step_fn=step_fn,
         n_mcmc_steps=n_mcmc_steps,
         n_extra=n_extra,
-        max_iterations=max_iterations,
         termination_criteria=termination_criteria,
         callbacks=callbacks,
         n_moves=n_moves,
         move_descriptors=move_descriptors,
         rng_key=adapt_keys,
-        info_interval=max(1, max_iterations // 20),
+        info_interval=max(1, (max_iterations or 1000) // 20),
         inter_re_mgr=inter_re_mgr,
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
@@ -1318,7 +1321,7 @@ def run_ns_multi_gpu(
         for p in range(n_per_gpu):
             logger.info(
                 "GPU %d run %d complete: %d dead points, log_Z=%.4f",
-                g, p, int(ns_states.n_dead[g, p]),
+                g, p, int(ns_states.iteration[g, p]),
                 float(ns_states.log_evidence[g, p]),
             )
 
@@ -1326,18 +1329,17 @@ def run_ns_multi_gpu(
         if hasattr(cb, "on_finish"):
             cb.on_finish(ns_states)
 
+    # Dead-point history is persisted to disk by the callbacks; not in the
+    # return.  ``n_dead`` ≡ ``iteration`` (both increment per ns_step).
     pop = ns_states.population
     return {
         "positions": pop.positions,
         "types": pop.types,
         "energies": pop.energy,
         "cells": pop.cell,
-        "dead_energies": ns_states.dead_energies,
-        "dead_positions": ns_states.dead_positions,
-        "dead_volumes": ns_states.dead_volumes,
         "log_evidence": ns_states.log_evidence,    # (G, P)
         "iteration": ns_states.iteration,           # (G, P)
-        "n_dead": ns_states.n_dead,                 # (G, P)
+        "n_dead": ns_states.iteration,              # (G, P) — same as iteration
         "n_walkers": n_walkers,
         "n_gpu": n_gpu,
         "n_per_gpu": n_per_gpu,

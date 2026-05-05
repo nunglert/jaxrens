@@ -24,6 +24,14 @@ logger = logging.getLogger(__name__)
 def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
     """Convert NSState to a dict suitable for save_checkpoint.
 
+    Live-walker state + scalars only.  Dead-point history is *not* in the
+    checkpoint — the canonical record lives in ``<prefix>.energies`` (text
+    file appended each iteration by ``EnergyLogger``) and
+    ``<prefix>.traj.<format>`` (per-iter dead-point trajectory written by
+    ``TrajectoryCallback`` / ``BatchedTrajectoryCallback``).  Postprocessing
+    (``postprocess.Monitor.from_directory``) reads from those streamed
+    artifacts; the HDF5 checkpoint is the restart anchor for live state.
+
     Handles single-run scalar shapes (``iteration`` / ``n_dead`` as Python
     ints) and batched multi-run shapes (``(G, P)`` or ``(n_runs,)``) by
     keeping batched scalars as arrays; ``save_checkpoint`` is batched-safe
@@ -34,20 +42,16 @@ def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
     is_npt = isinstance(ep, dict) and "pressure" in ep
 
     it_arr = jnp.asarray(ns_state.iteration)
-    nd_arr = jnp.asarray(ns_state.n_dead)
-    # Cast to Python ints only for scalar single-run case; keep as arrays for
-    # batched runs so save_checkpoint stores them as HDF5 datasets.
     iteration = int(it_arr) if it_arr.ndim == 0 else it_arr
-    n_dead = int(nd_arr) if nd_arr.ndim == 0 else nd_arr
+    # n_dead ≡ iteration (both increment per ns_step) — kept as a separate
+    # field for backward compat with consumers that read it.
+    n_dead = iteration
 
     result = {
         "positions": pop.positions,
         "types": pop.types,
         "energies": pop.energy,
         "cells": pop.cell,
-        "dead_energies": ns_state.dead_energies,
-        "dead_positions": ns_state.dead_positions,
-        "dead_volumes": ns_state.dead_volumes if is_npt else None,
         "log_evidence": ns_state.log_evidence,
         "iteration": iteration,
         "n_dead": n_dead,
@@ -510,7 +514,10 @@ class CheckpointCallback:
         from jaxrens.io.checkpoint import save_checkpoint
 
         path = self.working_dir / f"{self.prefix}.initial.checkpoint.h5"
-        state_dict = _ns_state_to_checkpoint_dict(ns_state) if isinstance(ns_state, NSState) else ns_state
+        state_dict = (
+            _ns_state_to_checkpoint_dict(ns_state)
+            if isinstance(ns_state, NSState) else ns_state
+        )
         save_checkpoint(path, state_dict, self.symbol_map)
 
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
@@ -518,14 +525,20 @@ class CheckpointCallback:
             from jaxrens.io.checkpoint import save_checkpoint
 
             path = self.working_dir / f"{self.prefix}.checkpoint.h5"
-            state_dict = _ns_state_to_checkpoint_dict(ns_state) if isinstance(ns_state, NSState) else ns_state
+            state_dict = (
+                _ns_state_to_checkpoint_dict(ns_state)
+                if isinstance(ns_state, NSState) else ns_state
+            )
             save_checkpoint(path, state_dict, self.symbol_map)
 
     def on_finish(self, ns_state: Any) -> None:
         from jaxrens.io.checkpoint import save_checkpoint
 
         path = self.working_dir / f"{self.prefix}.final.checkpoint.h5"
-        state_dict = _ns_state_to_checkpoint_dict(ns_state) if isinstance(ns_state, NSState) else ns_state
+        state_dict = (
+            _ns_state_to_checkpoint_dict(ns_state)
+            if isinstance(ns_state, NSState) else ns_state
+        )
         save_checkpoint(path, state_dict, self.symbol_map)
 
 
@@ -587,21 +600,29 @@ class TrajectoryCallback:
 
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
         if iteration % self.traj_interval == 0:
+            # Latest culled walker: read directly from info (set by ns_step).
+            # No need to look it up in any history buffer.
+            worst_idx = int(info.get("worst_idx", 0))
             if isinstance(ns_state, NSState):
                 dead_walker = {
-                    "positions": ns_state.dead_positions[ns_state.n_dead - 1],
+                    "positions": info["dead_position"],
                     "types": ns_state.population.types[0],
                     "energy": float(info.get("emax", 0)),
                 }
-                # cell is always present on MCState (zeros for non-periodic)
-                worst_idx = int(info.get("worst_idx", 0))
                 cell = ns_state.population.cell[worst_idx]
                 if jnp.any(cell != 0):
                     dead_walker["box"] = cell
             else:
-                worst_idx = int(info.get("worst_idx", 0))
+                # Dict-fallback path for non-NSState callers.  Latest dead point
+                # comes from info if available, else falls back to the legacy
+                # state["dead_positions"][n_dead-1] read.
+                if "dead_position" in info:
+                    pos_latest = info["dead_position"]
+                else:
+                    n_dead_local = int(ns_state.get("n_dead", 0))
+                    pos_latest = ns_state["dead_positions"][n_dead_local - 1]
                 dead_walker = {
-                    "positions": ns_state["dead_positions"][ns_state["n_dead"] - 1],
+                    "positions": pos_latest,
                     "types": ns_state["types"][0],
                     "energy": float(info.get("emax", 0)),
                 }
@@ -610,8 +631,13 @@ class TrajectoryCallback:
             self.writer.write_dead_point(iteration, dead_walker, float(info["emax"]))
 
         if self.energy_logger is not None:
+            # Write the culled-walker energy and volume so postprocess can
+            # reconstruct the dead-point trace from this single file.
+            dead_v = info.get("dead_volume", 0.0)
             self.energy_logger.write_entry(
-                iteration, float(info.get("emax", 0))
+                iteration,
+                float(info.get("emax", 0)),
+                volume=float(np.asarray(dead_v)),
             )
 
         if self.snapshot_interval and iteration > 0 and iteration % self.snapshot_interval == 0:
@@ -675,9 +701,6 @@ class BatchedTrajectoryCallback:
             )
 
         pop = ns_state.population
-        dead_positions = self._flatten_leading(ns_state.dead_positions, n_batch_axes)
-        n_dead = self._flatten_leading(jnp.asarray(ns_state.n_dead), n_batch_axes)
-        dead_energies = self._flatten_leading(ns_state.dead_energies, n_batch_axes)
         types = self._flatten_leading(pop.types, n_batch_axes)
         cells = self._flatten_leading(pop.cell, n_batch_axes)
 
@@ -686,14 +709,22 @@ class BatchedTrajectoryCallback:
         emax_flat = (
             emax_arr.reshape(-1) if emax_arr.ndim >= 1 else emax_arr[None]
         )
+        # Latest culled position per replica — sourced from info, batched the
+        # same way as emax.  Shape is (*batch, n_atoms, 3); flatten leading
+        # batch dims to (n_runs, n_atoms, 3) for per-replica indexing.
+        latest_pos = np.asarray(info["dead_position"])
+        latest_pos_flat = (
+            latest_pos.reshape((-1,) + latest_pos.shape[n_batch_axes:])
+            if n_batch_axes > 1 or latest_pos.ndim > 2
+            else latest_pos
+        )
+        # For SingleRun (n_batch_axes=0 effectively but we set min 1), the
+        # batched callback shouldn't be used; assume we always have a batch.
 
         if iteration % self.traj_interval == 0:
             for r in range(n_runs):
-                nd_r = int(n_dead[r]) if n_dead.ndim >= 1 else int(n_dead)
-                if nd_r <= 0:
-                    continue
                 dead_walker = {
-                    "positions": dead_positions[r, nd_r - 1],
+                    "positions": latest_pos_flat[r],
                     "types": types[r, 0] if types.ndim >= 2 else types[0],
                     "energy": float(emax_flat[r]),
                 }
@@ -705,9 +736,17 @@ class BatchedTrajectoryCallback:
                 )
 
         if self.energy_loggers is not None:
+            # Per-replica volume of the culled walker, sourced from info.
+            dv_arr = np.asarray(info.get("dead_volume", 0.0))
+            dv_flat = (
+                dv_arr.reshape(-1) if dv_arr.ndim >= 1
+                else np.broadcast_to(dv_arr, (n_runs,))
+            )
             for r in range(n_runs):
                 self.energy_loggers[r].write_entry(
-                    iteration, float(emax_flat[r]),
+                    iteration,
+                    float(emax_flat[r]),
+                    volume=float(dv_flat[r]),
                 )
 
         if (
@@ -718,15 +757,15 @@ class BatchedTrajectoryCallback:
             positions_flat = self._flatten_leading(pop.positions, n_batch_axes)
             energies_flat = self._flatten_leading(pop.energy, n_batch_axes)
             for r in range(n_runs):
+                # Live-walker snapshot only.  Dead-point history lives on
+                # disk via the per-iteration writers above.
                 snap = {
                     "positions": positions_flat[r],
                     "types": types[r] if types.ndim >= 2 else types,
                     "energies": energies_flat[r],
                     "cells": cells[r] if cells.ndim >= 3 else cells,
-                    "dead_energies": dead_energies[r],
-                    "dead_positions": dead_positions[r],
-                    "n_dead": int(n_dead[r]) if n_dead.ndim >= 1 else int(n_dead),
                     "iteration": iteration,
+                    "n_dead": iteration,
                 }
                 self.writers[r].write_walker_snapshot(iteration, snap)
 

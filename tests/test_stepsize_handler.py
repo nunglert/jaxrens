@@ -304,6 +304,59 @@ class TestAdjustStepSize:
         assert results[3].shape == (3,)  # n_rounds
         assert results[3].dtype == jnp.int32
 
+    def test_trial_batch_size_matches_full_vmap(self, harmonic_mwg):
+        """trial_batch_size set vs None must produce identical outputs.
+
+        ``lax.map(batch_size=N)`` is scan-of-vmap; for a pure ``trial_one``
+        with independent per-walker keys the result is equivalent to a
+        full ``jax.vmap``.  Same key, same population, same n_samples →
+        bit-identical step size and counts.
+        """
+        s = harmonic_mwg
+        pop = s["ns_state"].population
+        emax = jnp.max(pop.energy)
+        common_kwargs = dict(
+            population=pop,
+            move_fn=s["per_move_fns"][0],
+            step_size=jnp.array(0.3),
+            emax=emax,
+            rng_key=jax.random.key(2026),
+            n_samples=20,
+            min_rate=0.2,
+            max_rate=0.7,
+            adjust_factor=1.5,
+            max_step_size=5.0,
+            max_rounds=10,
+        )
+        # Reference: full vmap (trial_batch_size=None)
+        full = adjust_step_size(**common_kwargs)
+        # Chunked: 20 samples in 4 chunks of 5
+        chunked = adjust_step_size(**common_kwargs, trial_batch_size=5)
+        # First two scalars (new_ss, final_rate) should match exactly
+        assert jnp.allclose(full[0], chunked[0])
+        assert jnp.allclose(full[1], chunked[1])
+        # Rejection counts match exactly
+        assert jnp.array_equal(full[2], chunked[2])
+
+    def test_trial_batch_size_jit(self, harmonic_mwg):
+        """adjust_step_size with trial_batch_size must JIT cleanly."""
+        s = harmonic_mwg
+        pop = s["ns_state"].population
+        emax = jnp.max(pop.energy)
+
+        # Wrap so the kwarg is closed over (mirrors how initial_walk uses it).
+        def _wrapped(*args):
+            return adjust_step_size(*args, trial_batch_size=4)
+        jit_fn = jax.jit(_wrapped, static_argnums=(1, 5, 6, 7, 8, 9, 10))
+        new_ss, rate, _, n_rounds, *_ = jit_fn(
+            pop, s["per_move_fns"][0],
+            jnp.array(0.3), emax, jax.random.key(7),
+            20, 0.2, 0.7, 1.5, 5.0, 10,
+        )
+        assert float(new_ss) > 0.0
+        assert int(n_rounds) >= 0
+        assert n_rounds.dtype == jnp.int32
+
     def test_run_ns_with_full_auto(self, harmonic_mwg):
         """run_ns with per_move_fns + adjust_interval should complete."""
         s = harmonic_mwg

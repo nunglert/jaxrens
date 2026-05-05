@@ -88,6 +88,10 @@ def _build_cells(
     _CELL_SHAPE_EQUIL_STEPS = 50
 
     if init.random_initialise_cell:
+        logger.info(
+            "[resolve] cell-shape random walk: n_walkers=%d, n_steps=%d",
+            n_live, _CELL_SHAPE_EQUIL_STEPS,
+        )
         walker_shape_keys = jax.random.split(shape_key, n_live)
 
         def _walk_one(k):
@@ -212,14 +216,29 @@ def _finalise_initial_energies_and_counts(
     else:
         types_b = types
 
+    backend_label = type(energy_backend).__name__
     if hasattr(energy_backend, "max_neighbors_for"):
+        logger.info(
+            "[resolve] computing per-walker initial neighbor counts and energies "
+            "(%s, n_walkers=%d, n_atoms=%d)",
+            backend_label, positions.shape[0], positions.shape[1],
+        )
         counts = jax.vmap(energy_backend.max_neighbors_for)(positions, cells)
         init_bucket = int(jnp.max(counts))
+        logger.info(
+            "[resolve] initial neighbor counts: max=%d → init bucket=%d; "
+            "evaluating backend energies",
+            init_bucket, init_bucket,
+        )
         energies = jax.vmap(
             lambda p, t, c: energy_backend(p, t, c, init_bucket)[0]
         )(positions, types_b, cells)
         return energies, counts
 
+    logger.info(
+        "[resolve] computing initial energies (%s, n_walkers=%d, n_atoms=%d)",
+        backend_label, positions.shape[0], positions.shape[1],
+    )
     energies = jax.vmap(
         lambda p, t, c: energy_backend(p, t, c, 0)[0]
     )(positions, types_b, cells)
@@ -243,6 +262,11 @@ def _sample_per_walker_positions(
           - energies_list: list of n_live energy scalars if energy_backend is
             not None; otherwise None.
     """
+    logger.info(
+        "[resolve] sampling per-walker positions: n_walkers=%d, n_atoms=%d, "
+        "mode=%s, max_tries=%d",
+        n_live, n_atoms, init.pos_randomization_mode, init.random_init_max_n_tries,
+    )
     start_energy_ceiling = init.start_energy_ceiling_per_atom * n_atoms
     walker_pos_keys = jax.random.split(pos_key, n_live)
     positions_list = []
@@ -286,6 +310,10 @@ def _resolve_init_walker_set(
     energy_backend: EnergyBackend | None,
 ) -> ResolvedInit:
     """Mode C: load a pre-computed set of N walker configurations from disk."""
+    logger.info(
+        "[resolve] init mode C: loading walker set from %s (n_live=%d)",
+        init.start_walker_set, n_live,
+    )
     if init.random_initialise_pos or init.random_initialise_cell:
         logger.warning(
             "start_walker_set: ignoring random_initialise_pos/cell=True. "
@@ -318,6 +346,10 @@ def _resolve_init_restart(
     energy_backend: EnergyBackend | None,
 ) -> ResolvedInit:
     """Mode D: resume an NS run from a checkpoint file (restart_file)."""
+    logger.info(
+        "[resolve] init mode D: restarting from checkpoint %s (n_live=%d)",
+        init.restart_file, n_live,
+    )
     if init.random_initialise_pos or init.random_initialise_cell:
         logger.warning(
             "restart_file: ignoring random_initialise_pos/cell=True. "
@@ -394,6 +426,10 @@ def _resolve_init_species(
     """Mode A: initialise from a species string (start_species)."""
     species_counts = init.parsed_species()
     assert species_counts is not None
+    logger.info(
+        "[resolve] init mode A: start_species=%r (n_live=%d, seed=%d)",
+        init.start_species, n_live, seed,
+    )
 
     types_list: list[int] = []
     for z, count in sorted(species_counts.items()):
@@ -506,6 +542,10 @@ def _resolve_init_config_file(
     cell_cfg: CellConfig,
 ) -> ResolvedInit:
     """Mode B: initialise from a founder structure file (start_config_file)."""
+    logger.info(
+        "[resolve] init mode B: loading structure from %s (n_live=%d, seed=%d)",
+        init.start_config_file, n_live, seed,
+    )
     positions_single, types_single, cell_single, symbol_map = load_structure(
         init.start_config_file
     )
@@ -594,13 +634,21 @@ def _warn_unused_output_fields(output_schema: Any) -> None:
 
 @dataclass(frozen=True)
 class ResolvedConfig:
-    """Holds all library dataclasses produced by ``resolve``."""
+    """Holds all library dataclasses produced by ``resolve``.
+
+    ``base_backend`` is the unwrapped backend produced by
+    ``BackendSpec.build_backend()`` (e.g. the raw MACE / NeuralIL / LJ
+    instance with no ensemble correction).  The runtime wraps it into an
+    ``EnsembleBackend`` if needed; the resolver applies the same wrapping
+    locally just to compute initial energies on the right scale, then
+    discards the wrapper.
+    """
 
     ns: NSConfig
     moves: tuple[MoveConfig, ...]
     move_descriptors: tuple[MoveKernel, ...]
     backend: BackendConfig
-    energy_backend: EnergyBackend
+    base_backend: EnergyBackend
     output: OutputConfig
     termination: tuple[TerminationCriterion, ...]
     adaptation_policies: tuple[ResolvedAdaptationPolicy, ...]
@@ -647,16 +695,20 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
     )
 
     backend = root.backend.to_backend_config()
-    energy_backend = root.backend.build_backend()
+    base_backend = root.backend.build_backend()
 
-    # Wrap with ensemble corrections so that initial energies are computed on
-    # the same scale as the NS loop (U + P*V for NPT).  Without this, walkers
-    # are initialized with bare LJ energies while the MWG step_fn returns
-    # ensemble-corrected energies — causing systematic emax < new_energy for
-    # all cell moves and 100% rejection from the first adapt call.
+    # For initial-energy evaluation, locally wrap with EnsembleBackend so the
+    # resolver's energies match the NS-loop scale (U + P*V for NPT) — without
+    # this, walkers are initialized with bare LJ energies while the MWG
+    # step_fn returns ensemble-corrected energies, causing systematic
+    # emax < new_energy for all cell moves and 100% rejection from the first
+    # adapt call.  Discarded after _resolve_init returns; only ``base_backend``
+    # crosses the resolver boundary, leaving wrapping to the runtime.
     if pressure is not None:
         from jaxrens.backends.ensemble import EnsembleBackend
-        energy_backend = EnsembleBackend(energy_backend, pressure=float(pressure))
+        init_energy_backend = EnsembleBackend(base_backend, pressure=float(pressure))
+    else:
+        init_energy_backend = base_backend
 
     output = OutputConfig(
         format=root.output.format,
@@ -671,6 +723,11 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
 
     _warn_unused_output_fields(root.output)
 
+    # Build termination criteria.  ``IterationTermination`` is only added
+    # when the user explicitly set ``run.max_iterations`` — when ``None``
+    # the loop is bounded only by the user's other criteria (e.g.
+    # prior_mass).  Dead-point history is host-side and unbounded by JAX
+    # static-shape constraints, so there is no separate storage cap.
     if root.termination is not None:
         termination = tuple(
             spec.to_criterion(n_live=ns.n_live, n_cull=ns.n_cull)
@@ -678,9 +735,10 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
         )
     else:
         termination = (
-            IterationTermination(ns.max_iterations),
             PriorMassTermination(ns.n_live, ns.convergence_threshold),
         )
+    if ns.max_iterations is not None:
+        termination = termination + (IterationTermination(ns.max_iterations),)
 
     adaptation_policies = tuple(
         root.adaptation.resolve_for(m._effective_name())
@@ -691,7 +749,7 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
         root.init,
         n_live=ns.n_live,
         seed=seed,
-        energy_backend=energy_backend,
+        energy_backend=init_energy_backend,
         cell_cfg=root.cell,
     )
 
@@ -717,7 +775,7 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
         moves=moves,
         move_descriptors=move_descriptors,
         backend=backend,
-        energy_backend=energy_backend,
+        base_backend=base_backend,
         output=output,
         termination=termination,
         adaptation_policies=adaptation_policies,
@@ -964,8 +1022,13 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
             "_resolve_multi_run called without a multi-replica axis — "
             "use expand_cohort() for single-run configs instead."
         )
+    logger.info(
+        "[resolve] multi-run topology: n_total=%d replicas across n_gpu=%d "
+        "device(s), n_per_gpu=%d", n_total, n_gpu, n_per_gpu,
+    )
 
     # Base (unwrapped) backend — the multi-GPU dispatch wraps it once.
+    logger.info("[resolve] building base backend (%s)", root.backend.__class__.__name__)
     base_backend = root.backend.build_backend()
     backend_cfg = root.backend.to_backend_config()
 
@@ -982,6 +1045,11 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
         )
         # Seed policy mirrors _resolve_one's `seed + cohort_index`.
         seed_r = root.run.seed + r
+        logger.info(
+            "[resolve] replica %d/%d: seed=%d%s",
+            r + 1, n_total, seed_r,
+            f", pressure={p:.4g}" if p is not None else "",
+        )
         init_r = _resolve_init(
             root.init,
             n_live=root.run.n_live,
@@ -1066,6 +1134,8 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
     )
     _warn_unused_output_fields(root.output)
 
+    # Same termination logic as the single-run path: default to PriorMass
+    # only; append IterationTermination only when max_iterations is set.
     if root.termination is not None:
         termination = tuple(
             spec.to_criterion(n_live=ns.n_live, n_cull=ns.n_cull)
@@ -1073,9 +1143,10 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
         )
     else:
         termination = (
-            IterationTermination(ns.max_iterations),
             PriorMassTermination(ns.n_live, ns.convergence_threshold),
         )
+    if ns.max_iterations is not None:
+        termination = termination + (IterationTermination(ns.max_iterations),)
 
     adaptation_policies = tuple(
         root.adaptation.resolve_for(m._effective_name())

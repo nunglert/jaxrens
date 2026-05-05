@@ -89,11 +89,13 @@ def _apply_adaptation(
     adjust_max_rounds: int,
     jit_adjust_fns: list[Callable],
     batched: bool,
+    run_batch_size: int | None = None,
 ) -> tuple[NSState, jnp.ndarray]:
     """Update step sizes for all move types.
 
     When batched=False: operates on a single run.
-    When batched=True: vmaps over the leading run axis for each move.
+    When batched=True: vmaps (or chunked-vmaps) over the leading run axis
+    for each move.
 
     Args:
         ns_state: Current NSState (single-run or batched).
@@ -104,8 +106,17 @@ def _apply_adaptation(
         current_step_sizes: (n_move_types,) for single-run, (n_runs, n_move_types) batched.
         adjust_n_samples: Trial walker count per adaptation round.
         adjust_max_rounds: Max bisection rounds.
-        jit_adjust_fns: Pre-JIT'd adjust functions, one per move.
+        jit_adjust_fns: Pre-JIT'd adjust functions, one per move.  These should
+            already close over ``trial_batch_size`` (set in :func:`initial_walk`)
+            so each per-run call internally chunks its trial vmap.
         batched: Whether ns_state has a leading run axis.
+        run_batch_size: Optional chunk size for the run-axis vmap (batched
+            only).  ``None`` preserves the original full ``jax.vmap`` over
+            n_runs.  When set, replaced with
+            ``jax.lax.map(..., batch_size=run_batch_size)`` so peak memory
+            scales with the chunk rather than n_runs — needed when the
+            per-run trial cost (e.g. galilean MACE backward tape) makes the
+            full run vmap exceed device memory.
 
     Returns:
         (new_ns_state, new_step_sizes)
@@ -164,12 +175,19 @@ def _apply_adaptation(
                 )
                 return new_ss
 
-            per_run_ss = jax.vmap(adjust_one_run)(
-                population,
-                current_step_sizes[:, move_idx],
-                emax,
-                run_keys,
-            )
+            if run_batch_size is None:
+                per_run_ss = jax.vmap(adjust_one_run)(
+                    population,
+                    current_step_sizes[:, move_idx],
+                    emax,
+                    run_keys,
+                )
+            else:
+                per_run_ss = jax.lax.map(
+                    lambda x: adjust_one_run(x[0], x[1], x[2], x[3]),
+                    (population, current_step_sizes[:, move_idx], emax, run_keys),
+                    batch_size=run_batch_size,
+                )
             current_step_sizes = current_step_sizes.at[:, move_idx].set(per_run_ss)
 
         # Broadcast: (n_runs, n_move_types) -> (n_runs, n_walkers, n_move_types)
@@ -291,10 +309,25 @@ def initial_walk(
 
     if use_adaptation:
         n_moves = len(per_move_fns)
-        jit_adjust_fns = [
-            jax.jit(adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10))
-            for _ in range(n_moves)
-        ]
+        # Close over walker_batch_size as trial_batch_size: when set, the inner
+        # trial vmap inside adjust_step_size becomes a chunked-vmap so peak
+        # memory tracks the chunk rather than adjust_n_samples.  The closed-over
+        # value is captured at JIT-trace time, so different walker_batch_size
+        # values produce distinct compilation traces (correct cache behaviour).
+        # When walker_batch_size is None we call adjust_step_size with the
+        # original positional-only signature — preserves the call shape
+        # observed by existing test mocks of adjust_step_size.
+        if walker_batch_size is None:
+            jit_adjust_fns = [
+                jax.jit(adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10))
+                for _ in range(n_moves)
+            ]
+        else:
+            def _make_adjust_fn(_trial_chunk=walker_batch_size):
+                def _wrapped(*args):
+                    return adjust_step_size(*args, trial_batch_size=_trial_chunk)
+                return jax.jit(_wrapped, static_argnums=(1, 5, 6, 7, 8, 9, 10))
+            jit_adjust_fns = [_make_adjust_fn() for _ in range(n_moves)]
         if not batched:
             current_step_sizes = population.step_sizes[0]  # (n_move_types,)
         else:
@@ -350,6 +383,7 @@ def initial_walk(
                 adjust_max_rounds=adjust_max_rounds,
                 jit_adjust_fns=jit_adjust_fns,
                 batched=batched,
+                run_batch_size=run_batch_size if batched else None,
             )
 
         key, sub = jax.random.split(key)

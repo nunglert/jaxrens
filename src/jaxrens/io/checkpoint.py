@@ -107,30 +107,38 @@ def save_checkpoint(
         if ns_state.get("cells") is not None:
             f.create_dataset("cells", data=_to_np(ns_state["cells"]))
 
+        # Dead-point arrays are optional — current `_ns_state_to_checkpoint_dict`
+        # omits them entirely (the canonical record lives in `.energies` /
+        # `.traj`).  Older callers / tests that still populate them keep
+        # working: write the array when present, skip otherwise.
         if is_scalar_run:
-            # Compact storage: only store the live dead entries.
             n_dead_int = int(n_dead_arr)
-            f.create_dataset(
-                "dead_energies",
-                data=_to_np(ns_state["dead_energies"][:n_dead_int]),
-            )
-            f.create_dataset(
-                "dead_positions",
-                data=_to_np(ns_state["dead_positions"][:n_dead_int]),
-            )
+            if ns_state.get("dead_energies") is not None:
+                f.create_dataset(
+                    "dead_energies",
+                    data=_to_np(ns_state["dead_energies"][:n_dead_int]),
+                )
+            if ns_state.get("dead_positions") is not None:
+                f.create_dataset(
+                    "dead_positions",
+                    data=_to_np(ns_state["dead_positions"][:n_dead_int]),
+                )
             if ns_state.get("dead_volumes") is not None:
                 f.create_dataset(
                     "dead_volumes",
                     data=_to_np(ns_state["dead_volumes"][:n_dead_int]),
                 )
         else:
-            # Batched run: save full padded arrays; batch dims preserved.
-            f.create_dataset(
-                "dead_energies", data=_to_np(ns_state["dead_energies"])
-            )
-            f.create_dataset(
-                "dead_positions", data=_to_np(ns_state["dead_positions"])
-            )
+            # Batched run: save full padded arrays when present; batch dims
+            # preserved.
+            if ns_state.get("dead_energies") is not None:
+                f.create_dataset(
+                    "dead_energies", data=_to_np(ns_state["dead_energies"])
+                )
+            if ns_state.get("dead_positions") is not None:
+                f.create_dataset(
+                    "dead_positions", data=_to_np(ns_state["dead_positions"])
+                )
             if ns_state.get("dead_volumes") is not None:
                 f.create_dataset(
                     "dead_volumes", data=_to_np(ns_state["dead_volumes"])
@@ -208,8 +216,17 @@ def load_checkpoint(
         energies = jnp.array(f["energies"][()])
         cells = jnp.array(f["cells"][()]) if "cells" in f else None
 
-        dead_energies_raw = jnp.array(f["dead_energies"][()])
-        dead_positions_raw = jnp.array(f["dead_positions"][()])
+        # dead_* are optional in the new HDF5 format (the canonical record
+        # lives in `.energies` / `.traj`).  Treat missing fields as empty
+        # so callers that only need live state work transparently; callers
+        # that rely on dead-point data should source it from the streamed
+        # files (see ``postprocess.Monitor.from_directory``).
+        dead_energies_raw = (
+            jnp.array(f["dead_energies"][()]) if "dead_energies" in f else None
+        )
+        dead_positions_raw = (
+            jnp.array(f["dead_positions"][()]) if "dead_positions" in f else None
+        )
 
         # log_evidence: stored as dataset (batched) or attr (scalar).
         log_evidence_raw = _read_field(f, "log_evidence")
@@ -229,22 +246,26 @@ def load_checkpoint(
     iteration_np = np.asarray(iteration_raw)
 
     if is_scalar_run:
-        # Single-run: pad dead arrays to max_dead.
         n_dead = int(n_dead_np)
         iteration = int(iteration_np)
-        max_dead = max(n_dead * 2, 50000)
-
-        dead_energies = jnp.full(max_dead, jnp.inf)
-        dead_energies = dead_energies.at[:n_dead].set(dead_energies_raw)
-
-        dead_positions = jnp.zeros((max_dead, *positions.shape[1:]))
-        dead_positions = dead_positions.at[:n_dead].set(dead_positions_raw)
-
-        if dead_volumes_raw is not None:
-            dead_volumes = jnp.zeros(max_dead)
-            dead_volumes = dead_volumes.at[:n_dead].set(dead_volumes_raw)
-        else:
+        if dead_energies_raw is None:
+            # New format: dead_* not in HDF5; consumer should read .energies.
+            dead_energies = None
+            dead_positions = None
             dead_volumes = None
+        else:
+            # Legacy format: pad dead arrays to a comfortable size for callers
+            # that previously relied on padded shapes.
+            max_dead = max(n_dead * 2, 50000)
+            dead_energies = jnp.full(max_dead, jnp.inf)
+            dead_energies = dead_energies.at[:n_dead].set(dead_energies_raw)
+            dead_positions = jnp.zeros((max_dead, *positions.shape[1:]))
+            dead_positions = dead_positions.at[:n_dead].set(dead_positions_raw)
+            if dead_volumes_raw is not None:
+                dead_volumes = jnp.zeros(max_dead)
+                dead_volumes = dead_volumes.at[:n_dead].set(dead_volumes_raw)
+            else:
+                dead_volumes = None
     else:
         # Batched run: return stored arrays directly (no padding).
         n_dead = n_dead_np          # shape (n_runs,) or (G, P)

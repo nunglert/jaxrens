@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +78,28 @@ def _configure_file_logging(
         root.addHandler(debug_h)
 
 
+def _barrier(label: str, *arrays: Any) -> None:
+    """Force materialisation on JAX arrays and log timing under ``label``.
+
+    Use as a stage boundary in the multi-GPU dispatcher: any OOM during the
+    just-completed stage's compile/execute will surface inside this call,
+    not deferred to the next materialisation point.  No-op for non-array
+    inputs and ``None``.  Only emits at DEBUG level — zero cost when the
+    debug log handler is not attached.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    t0 = time.perf_counter()
+    for a in arrays:
+        if a is None:
+            continue
+        if hasattr(a, "block_until_ready"):
+            a.block_until_ready()
+        else:
+            jax.block_until_ready(a)
+    logger.debug("[barrier] %s (%.2fs)", label, time.perf_counter() - t0)
+
+
 def _recompute_max_neighbor_counts(
     backend: Any,
     positions: jnp.ndarray,
@@ -90,14 +113,22 @@ def _recompute_max_neighbor_counts(
     picks the correct starting bucket.  Returns ``None`` for backends
     without the helper (LJ / toy — they ignore ``max_neighbors`` anyway).
 
-    Handles any leading batch shape by flattening + a single vmap.
+    Handles any leading batch shape by flattening + a sequential
+    ``jax.lax.map``.  Sequential (not vmap) bounds peak memory at one
+    walker's pairwise tensor — vmapping would allocate
+    ``(W, N, sc_dim*N, 3)`` and OOM on MACE-sized systems.
     """
     if cells is None or not hasattr(backend, "max_neighbors_for"):
         return None
     leading_shape = positions.shape[:-2]
     flat_pos = positions.reshape(-1, *positions.shape[-2:])
     flat_cells = cells.reshape(-1, 3, 3)
-    flat_counts = jax.vmap(backend.max_neighbors_for)(flat_pos, flat_cells)
+
+    def _per_walker(args):
+        pos, cell = args
+        return backend.max_neighbors_for(pos, cell)
+
+    flat_counts = jax.lax.map(_per_walker, (flat_pos, flat_cells))
     return flat_counts.reshape(leading_shape)
 
 
@@ -195,19 +226,34 @@ def run_from_config(
     initial_walk_config=None,
     adaptation_config=None,
     move_descriptors=None,
+    base_backend: Any = None,
 ) -> dict:
-    """Run NS from typed config objects."""
+    """Run NS from typed config objects.
+
+    ``base_backend`` (preferred): a pre-built ``EnergyBackend``, e.g. the one
+    populated on ``ResolvedConfig.energy_backend`` by the resolver via
+    ``BackendSpec.build_backend()``.  When provided, it's used directly —
+    avoids rebuilding via ``load_backend(backend_type, **backend_kwargs)`` from
+    the flat ``BackendConfig``, whose ``checkpoint_path -> pickle_file``
+    translation does not match every backend's ``create_*`` kwargs (MACE
+    expects ``model_path``, not ``pickle_file``).  The fallback path is kept
+    for legacy callers that only have a ``BackendConfig``.
+    """
     if symbol_map is None:
         symbol_map = {0: "X"}
 
-    # Load backend
-    backend_kwargs = {}
-    if backend_config.checkpoint_path:
-        backend_kwargs["pickle_file"] = backend_config.checkpoint_path
-    if backend_config.cutoff is not None:
-        backend_kwargs["cutoff"] = backend_config.cutoff
+    if base_backend is None:
+        # Legacy path: rebuild from the flat BackendConfig.  Note: the
+        # checkpoint_path -> pickle_file mapping below is correct for NeuralIL
+        # but wrong for MACE (which expects model_path).  Prefer passing
+        # ``base_backend`` directly from the resolver.
+        backend_kwargs = {}
+        if backend_config.checkpoint_path:
+            backend_kwargs["pickle_file"] = backend_config.checkpoint_path
+        if backend_config.cutoff is not None:
+            backend_kwargs["cutoff"] = backend_config.cutoff
 
-    base_backend = load_backend(backend_config.backend_type, **backend_kwargs)
+        base_backend = load_backend(backend_config.backend_type, **backend_kwargs)
 
     # Wrap with ensemble corrections if needed
     ensemble_params = None
@@ -333,7 +379,6 @@ def run_from_config(
             initial_energies,
             initial_cells,
             key_init,
-            max_dead=ns_config.max_iterations,
             ensemble_params=ensemble_params,
             max_neighbors=starting_bucket,
             max_neighbor_counts=initial_max_neighbor_counts,
@@ -372,8 +417,14 @@ def run_from_config(
         initial_positions = pop.positions
         initial_energies = pop.energy
         initial_cells = pop.cell
+        logger.info("Burn-in complete")
 
         # Refresh counts for the NS loop — burn-in drifted positions/cells.
+        if hasattr(backend, "max_neighbors_for"):
+            logger.info(
+                "Recomputing post-burn-in max neighbor counts (n_walkers=%d)",
+                initial_positions.shape[0],
+            )
         initial_max_neighbor_counts = _recompute_max_neighbor_counts(
             backend, initial_positions, initial_cells,
         )
@@ -506,6 +557,12 @@ def run_multi_gpu_from_config(resolved) -> dict:
     _offset = int(resolved.backend.max_neighbors_offset)
     _init_counts = resolved.init.initial_max_neighbor_counts
     starting_bucket = _choose_starting_bucket(_init_counts, _ladder, _offset)
+    logger.debug(
+        "[stage] resolver -> dispatcher: positions=%s cells=%s energies=%s "
+        "starting_bucket=%d ladder=%s offset=%d",
+        positions.shape, None if cells is None else cells.shape,
+        energies.shape, starting_bucket, _ladder, _offset,
+    )
 
     # --- Burn-in (batched=True) -------------------------------------------
     burn_in_cfg = resolved.initial_walk_config
@@ -516,18 +573,33 @@ def run_multi_gpu_from_config(resolved) -> dict:
         key, key_init, key_burn = jax.random.split(key, 3)
         rng_keys = jax.random.split(key_init, n_total)
         step_sizes = jnp.full(len(resolved.move_descriptors), resolved.moves[0].step_size)
+
+        logger.debug("[stage] init_ns_parallel (burn-in NSState): starting")
         ns_state_burn = init_ns_parallel(
             init_fn,
             positions, types, energies, cells, rng_keys,
-            max_dead=ns.max_iterations,
             step_sizes=step_sizes,
             ensemble_params_per_run=list(resolved.ensemble_params_per_run),
             max_neighbors=starting_bucket,
             max_neighbor_counts=_init_counts,
         )
+        _barrier("init_ns_parallel", ns_state_burn.population.positions)
+
         n_atoms = positions.shape[-2]
         adaptation_policies = resolved.adaptation_policies
         burn_per_move_fns = per_move_fns
+
+        logger.info(
+            "Starting initial burn-in: n_walks=%d, walklength=%d, "
+            "adjust_interval=%d, walker_batch_size=%s, run_batch_size=%s, "
+            "n_atoms=%d",
+            burn_in_cfg.n_walks, burn_in_cfg.walklength,
+            burn_in_cfg.adjust_interval,
+            getattr(burn_in_cfg, "walker_batch_size", None),
+            getattr(burn_in_cfg, "run_batch_size", None),
+            n_atoms,
+        )
+
         ns_state_burn = initial_walk(
             key=key_burn,
             ns_state=ns_state_burn,
@@ -549,13 +621,21 @@ def run_multi_gpu_from_config(resolved) -> dict:
         positions = pop.positions
         energies = pop.energy
         cells = pop.cell
+        _barrier("initial_walk", positions, energies, cells)
+        logger.info("Burn-in complete")
 
     # Refresh per-walker neighbor counts after burn-in — cells/positions
     # have drifted and the resolver's pre-burn-in counts no longer
     # describe the state that will enter the NS loop.
+    if do_burn_in:
+        logger.info(
+            "Recomputing post-burn-in max neighbor counts (n_walkers_total=%d)",
+            positions.reshape(-1, *positions.shape[-2:]).shape[0],
+        )
     post_burn_in_counts = _recompute_max_neighbor_counts(
         base_backend, positions, cells,
     ) if do_burn_in else _init_counts
+    _barrier("_recompute_max_neighbor_counts", post_burn_in_counts)
 
     # --- PRNG keys for the multi-GPU dispatch -----------------------------
     key, key_run = jax.random.split(key)

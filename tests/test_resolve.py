@@ -406,35 +406,35 @@ class TestBuildBackend:
 # ---------------------------------------------------------------------------
 
 class TestResolveEnergyBackend:
-    def test_resolve_has_energy_backend(self):
+    def test_resolve_has_base_backend(self):
         root = RootConfig.model_validate(_minimal_dict())
         resolved = resolve(root)
-        assert hasattr(resolved, "energy_backend")
-        assert resolved.energy_backend is not None
+        assert hasattr(resolved, "base_backend")
+        assert resolved.base_backend is not None
 
-    def test_resolve_energy_backend_is_harmonic(self):
+    def test_resolve_base_backend_is_harmonic(self):
         from jaxrens.backends.toy import HarmonicBackend
         root = RootConfig.model_validate(_minimal_dict())
         resolved = resolve(root)
-        assert isinstance(resolved.energy_backend, HarmonicBackend)
+        assert isinstance(resolved.base_backend, HarmonicBackend)
 
-    def test_resolve_energy_backend_is_callable(self):
+    def test_resolve_base_backend_is_callable(self):
         import jax.numpy as jnp
         root = RootConfig.model_validate(_minimal_dict())
         resolved = resolve(root)
         positions = jnp.zeros((1, 3))
         types = jnp.zeros((1,), dtype=jnp.int32)
         cell = jnp.zeros((3, 3))
-        energy, _, _ = resolved.energy_backend(positions, types, cell, 0)
+        energy, _, _ = resolved.base_backend(positions, types, cell, 0)
         assert jnp.isfinite(energy)
 
-    def test_resolve_energy_backend_lj(self):
+    def test_resolve_base_backend_lj(self):
         from jaxrens.backends.lj import LJBackend
         with open(_LJ_BACKEND_YAML) as fh:
             raw = yaml.safe_load(fh)
         root = RootConfig.model_validate(raw)
         resolved = resolve(root)
-        assert isinstance(resolved.energy_backend, LJBackend)
+        assert isinstance(resolved.base_backend, LJBackend)
 
 
 # ---------------------------------------------------------------------------

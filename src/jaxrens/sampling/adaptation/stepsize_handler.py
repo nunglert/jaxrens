@@ -98,6 +98,8 @@ def adjust_step_size(
     adjust_factor: float,
     max_step_size: float,
     max_rounds: int,
+    *,
+    trial_batch_size: int | None = None,
 ) -> tuple[
     jnp.ndarray, jnp.ndarray, jnp.ndarray,
     jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray,
@@ -124,6 +126,14 @@ def adjust_step_size(
         adjust_factor: Multiplicative factor for step size scaling (static).
         max_step_size: Upper bound on step size (static).
         max_rounds: Maximum number of adjustment rounds (static).
+        trial_batch_size: Optional chunk size for the trial vmap (kwarg-only,
+            static).  ``None`` (default) preserves the original behaviour:
+            ``jax.vmap(trial_one)`` over all ``n_samples`` walkers.  When
+            set to an int, the trial vmap is replaced by
+            ``jax.lax.map(..., batch_size=trial_batch_size)`` so peak memory
+            scales with the chunk rather than ``n_samples`` — needed when the
+            move's backward tape (e.g. galilean ``value_and_grad`` × n_reflect
+            on MACE) makes the full vmap exceed device memory.
 
     Returns:
         (new_step_size, final_rate, final_counts, n_rounds, converged,
@@ -178,14 +188,24 @@ def adjust_step_size(
             ),
         )
 
-        # 3. Run trial moves (vmapped over sampled walkers)
+        # 3. Run trial moves (vmapped over sampled walkers; optionally chunked)
         trial_keys = jax.random.split(key_trials, n_samples)
 
         def trial_one(state, trial_key):
             _, info = move_fn(state, trial_key, emax)
             return info.accepted, info.reject_reason, info.n_evaluations, info.n_grad_evaluations
 
-        accepted, reasons, n_evals_per_sample, n_grad_evals_per_sample = jax.vmap(trial_one)(sample, trial_keys)
+        if trial_batch_size is None:
+            accepted, reasons, n_evals_per_sample, n_grad_evals_per_sample = jax.vmap(trial_one)(sample, trial_keys)
+        else:
+            # Chunked-vmap: lax.map vmaps within a chunk and scans across
+            # chunks.  Bounds peak memory at trial_batch_size × per-trial
+            # backward tape, regardless of n_samples.  Equivalent output.
+            accepted, reasons, n_evals_per_sample, n_grad_evals_per_sample = jax.lax.map(
+                lambda x: trial_one(x[0], x[1]),
+                (sample, trial_keys),
+                batch_size=trial_batch_size,
+            )
         rate = jnp.mean(accepted.astype(jnp.float32))
 
         # Per-reason counts (code 0=accepted, 1=energy, 2=cell, 3=prior)
