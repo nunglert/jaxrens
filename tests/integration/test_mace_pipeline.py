@@ -110,25 +110,6 @@ output:
 """
 
 
-def _gpu_available() -> bool:
-    """True iff JAX sees at least one GPU device."""
-    try:
-        import jax
-
-        return any(d.platform.lower() == "gpu" for d in jax.devices())
-    except Exception:
-        return False
-
-
-def _device_count() -> int:
-    try:
-        import jax
-
-        return len(jax.local_devices())
-    except Exception:
-        return 0
-
-
 @pytest.mark.mace
 @pytest.mark.gpu
 @pytest.mark.heavy
@@ -149,10 +130,6 @@ def test_mace_full_pipeline(tmp_path: Path) -> None:
       global HDF5 checkpoints.
     """
     pytest.importorskip("mace_jax")
-    if not _FIXTURE.exists():
-        pytest.skip(f"missing MACE fixture at {_FIXTURE}")
-    if not _gpu_available():
-        pytest.skip("no GPU available; MACE on CPU is too slow for integration")
 
     from jaxrens.cli.resolve import (
         ResolvedMultiRunConfig,
@@ -307,12 +284,6 @@ def test_mace_multi_gpu_pipeline(tmp_path: Path) -> None:
     mode that drove the earlier debugging.
     """
     pytest.importorskip("mace_jax")
-    if not _FIXTURE.exists():
-        pytest.skip(f"missing MACE fixture at {_FIXTURE}")
-    if _device_count() < _REQUIRED_DEVICES:
-        pytest.skip(
-            f"need {_REQUIRED_DEVICES} JAX devices, got {_device_count()}"
-        )
 
     from jaxrens.cli.resolve import (
         ResolvedMultiRunConfig,

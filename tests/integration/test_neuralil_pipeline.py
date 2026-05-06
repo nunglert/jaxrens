@@ -136,8 +136,6 @@ def test_neuralil_full_pipeline(tmp_path: Path) -> None:
       global HDF5 checkpoints.
     """
     pytest.importorskip("neuralil")
-    if not _MODEL_PKL.exists():
-        pytest.skip(f"missing NeuralIL fixture at {_MODEL_PKL}")
 
     from jaxrens.cli.resolve import (
         ResolvedMultiRunConfig,
@@ -208,15 +206,6 @@ def test_neuralil_full_pipeline(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 _REQUIRED_DEVICES = 4
-
-
-def _device_count() -> int:
-    try:
-        import jax
-
-        return len(jax.local_devices())
-    except Exception:
-        return 0
 
 
 _NEURALIL_MULTI_GPU_CONFIG_YAML = """
@@ -306,12 +295,6 @@ def test_neuralil_multi_gpu_pipeline(tmp_path: Path) -> None:
     and dispatched across devices via the resolver's ``base_backend``.
     """
     pytest.importorskip("neuralil")
-    if not _MODEL_PKL.exists():
-        pytest.skip(f"missing NeuralIL fixture at {_MODEL_PKL}")
-    if _device_count() < _REQUIRED_DEVICES:
-        pytest.skip(
-            f"need {_REQUIRED_DEVICES} JAX devices, got {_device_count()}"
-        )
 
     from jaxrens.cli.resolve import (
         ResolvedMultiRunConfig,

@@ -257,15 +257,6 @@ def test_lj_pipeline_smoke_variants(tmp_path: Path, missing: str) -> None:
 _REQUIRED_DEVICES = 4
 
 
-def _device_count() -> int:
-    try:
-        import jax
-
-        return len(jax.local_devices())
-    except Exception:
-        return 0
-
-
 _LJ_MULTI_GPU_CONFIG_YAML = """
 run:
   n_live: 16
@@ -356,11 +347,6 @@ def test_lj_multi_gpu_pipeline(tmp_path: Path) -> None:
     ``n_per_gpu=1`` case.  Hits cross-device pmap communication for
     pressure-RENS swaps and ``full_auto`` bisection adaptation.
     """
-    if _device_count() < _REQUIRED_DEVICES:
-        pytest.skip(
-            f"need {_REQUIRED_DEVICES} JAX devices, got {_device_count()}"
-        )
-
     from jaxrens.cli.resolve import (
         ResolvedMultiRunConfig,
         expand_multi_run_or_cohort,

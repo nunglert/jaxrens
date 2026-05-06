@@ -83,4 +83,3 @@ jobs:
             -w /workspace \
             jaxrens-ci:${{ github.sha }} \
             pytest tests/integration -v --tb=short -m multi_gpu -o addopts=""
-

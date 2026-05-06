@@ -56,11 +56,11 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not heavy'"
+addopts = "-m 'not heavy and not mace and not neuralil'"
 markers = [
     "heavy: marks tests as heavy/slow (run with '-m heavy' or '-m \"\"' to include)",
     "gpu: marks tests requiring GPU",
     "multi_gpu: marks tests requiring multiple GPUs",
-    "mace: marks tests that exercise the MACE backend (needs mace_jax + GPU)",
-    "neuralil: marks tests that exercise the NeuralIL backend (needs neuralil)",
+    "mace: marks tests that exercise the MACE backend; opt-in only via '-m mace' (needs mace_jax + GPU)",
+    "neuralil: marks tests that exercise the NeuralIL backend; opt-in only via '-m neuralil' (needs neuralil)",
 ]
