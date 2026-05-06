@@ -27,7 +27,7 @@ neuralil = ["neuralil @ git+https://github.com/nunglert/neuralil-jaxrens.git@jax
 mace = [
     "mace-jax[gpu,torch] @ git+https://github.com/nunglert/mace-jax.git@fix_install"
 ]
-nequix = ["nequix @ file:///home/nico.unglert/code/nequix"]
+nequix = ["nequix @ https://github.com/atomicarchitects/nequix.git@main"]
 dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.5",
