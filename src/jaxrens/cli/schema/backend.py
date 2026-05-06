@@ -165,6 +165,24 @@ class MACEBackendSpec(BaseBackendSpec):
         )
 
 
+class NequixBackendSpec(BaseBackendSpec):
+    type: Literal["nequix"] = "nequix"
+    # Either a path to a local ``.nqx`` checkpoint or a bundled-model name
+    # (e.g. ``"nequix-mp-1"``, auto-downloaded by the nequix package).
+    checkpoint_path: str
+    supercell_trafo: tuple[int, int, int] = (1, 1, 1)
+
+    def _backend_config_extras(self) -> dict:
+        return {"checkpoint_path": self.checkpoint_path, "cutoff": None}
+
+    def build_backend(self) -> EnergyBackend:
+        from jaxrens.backends.nequix import create_nequix
+        return create_nequix(
+            checkpoint_path=self.checkpoint_path,
+            supercell_trafo=self.supercell_trafo,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Discriminated union
 # ---------------------------------------------------------------------------
@@ -177,6 +195,7 @@ BackendSpec = Annotated[
         LJBackendSpec,
         NeuralILBackendSpec,
         MACEBackendSpec,
+        NequixBackendSpec,
     ],
     Field(discriminator="type"),
 ]

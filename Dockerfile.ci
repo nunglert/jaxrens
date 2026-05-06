@@ -19,7 +19,7 @@ WORKDIR /workspace
 COPY pyproject.toml ./
 RUN touch README.md
 COPY src ./src
-RUN pip install -e ".[dev,mace,neuralil]"
+RUN pip install -e ".[dev,mace,neuralil,nequix]"
 
 # Repo code is mounted at /workspace at runtime by the CI workflow,
 # which always overrides the parent image's default CMD with its own

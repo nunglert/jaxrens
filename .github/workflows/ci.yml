@@ -27,7 +27,11 @@ jobs:
     if: |
       (github.event_name == 'push' && github.ref != 'refs/heads/main')
       || github.event_name == 'workflow_dispatch'
-    runs-on: runs-on=${{ github.run_id }}/family=g4dn.xlarge/image=ubuntu24-gpu-x64
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - family=g4dn.xlarge
+      - image=ubuntu24-gpu-x64
+      - spot=price-capacity-optimized
     steps:
       - uses: actions/checkout@v4
 
@@ -48,20 +52,37 @@ jobs:
       github.event_name == 'pull_request'
       || github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    runs-on: runs-on=${{ github.run_id }}/family=g5.xlarge/image=ubuntu24-gpu-x64
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - family=g5.xlarge
+      - image=ubuntu24-gpu-x64
+      - spot=price-capacity-optimized
     steps:
       - uses: actions/checkout@v4
 
       - name: Build CI image
         run: docker build -f Dockerfile.ci -t jaxrens-ci:${{ github.sha }} .
 
-      - name: pytest tests
+      - name: pytest tests (with coverage)
         run: |
           docker run --rm --gpus all \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             jaxrens-ci:${{ github.sha }} \
-            pytest tests -v --tb=short -m "not multi_gpu" -o addopts=""
+            pytest tests -v --tb=short -m "not multi_gpu" -o addopts="" \
+              --cov=jaxrens \
+              --cov-branch \
+              --cov-report=term-missing \
+              --cov-report=xml \
+              --cov-fail-under=50
+
+      - name: Upload coverage to Codecov
+        if: ${{ always() }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          fail_ci_if_error: false
 
   multi_gpu:
     name: Multi-GPU integration (4× T4)
@@ -69,7 +90,11 @@ jobs:
       github.event_name == 'pull_request'
       || github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    runs-on: runs-on=${{ github.run_id }}/family=g4dn.12xlarge/image=ubuntu24-gpu-x64
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - family=g4dn.12xlarge
+      - image=ubuntu24-gpu-x64
+      - spot=price-capacity-optimized
     steps:
       - uses: actions/checkout@v4
 

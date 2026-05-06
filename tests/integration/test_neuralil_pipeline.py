@@ -228,6 +228,13 @@ ensemble:
   pressure: [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75]
   pressure_units: gpa
 
+# RE every 2 iters → 2 swap rounds during the run, exercising the
+# cross-device gather + accept/reject path.
+inter_re:
+  flavor: pressure
+  every: 2
+  n_swap_cycles: 1
+
 moves:
   - type: galilean
     n_reflect: 2
