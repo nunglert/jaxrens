@@ -111,6 +111,7 @@ def _run_one(resolved, *, cohort_label: str = "") -> None:
         initial_energies=resolved.init.initial_energies,
         initial_cells=resolved.init.initial_cells,
         initial_max_neighbor_counts=resolved.init.initial_max_neighbor_counts,
+        symbol_map=resolved.init.symbol_map,
         restart_state=resolved.init.restart_state,
         move_descriptors=list(resolved.move_descriptors),
         initial_walk_config=resolved.initial_walk_config,

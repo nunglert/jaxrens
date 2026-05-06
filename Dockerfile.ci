@@ -18,4 +18,5 @@ COPY src ./src
 RUN pip install -e ".[dev]"
 
 # Repo code is mounted at /workspace at runtime by the CI workflow.
-CMD ["bash", "scripts/ci-checks.sh", "smoke"]
+# The default CMD runs the smoke tier; the workflow overrides it per job.
+CMD ["pytest", "tests/smoke", "-v", "--tb=short"]

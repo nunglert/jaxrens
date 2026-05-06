@@ -61,4 +61,6 @@ markers = [
     "heavy: marks tests as heavy/slow (run with '-m heavy' or '-m \"\"' to include)",
     "gpu: marks tests requiring GPU",
     "multi_gpu: marks tests requiring multiple GPUs",
+    "mace: marks tests that exercise the MACE backend (needs mace_jax + GPU)",
+    "neuralil: marks tests that exercise the NeuralIL backend (needs neuralil)",
 ]
