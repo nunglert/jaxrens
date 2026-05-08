@@ -536,7 +536,6 @@ class TestParallelVmappedAdjustJIT:
         from jaxrens.sampling.nested_sampling import init_ns_parallel
         ns_states = init_ns_parallel(
             init_fn, positions, types, energies, None, keys,
-            max_dead=200,
             step_sizes=jnp.full(1, 0.1),
         )
 

@@ -98,6 +98,94 @@ sizes are clamped to `[floor=1e-20, step_size_max]`.
 The green band shows the acceptance window; rates outside it
 trigger a bisection round.
 
+### How `AdaptationManager.apply` dispatches the bisection
+
+Same construction-time-cache pattern as the
+{class}`~jaxrens.sampling.inter_re_manager.InterREManager`: the
+manager is built once before the loop and stores one
+`jax.jit`-compiled `adjust_step_size` callable per move type;
+`_run_loop` only calls `fires(i)` and (on a fire) `apply(...)`.
+Inside `apply`, the work iterates over moves in Python and
+dispatches each to a JIT'd `adjust_step_size` whose `lax.while_loop`
+body runs the bisection.
+
+```{mermaid}
+flowchart TB
+    LOOP["NS outer loop<br/>iteration i"]
+    LOOP --> FIRES{"manager.fires(i)<br/>i &gt; 0  ∧  i mod adjust_interval == 0"}
+    FIRES -- no --> CONT["continue NS step"]
+    FIRES -- yes --> APPLY["manager.apply(pop, emax, key, step_sizes)"]
+
+    APPLY --> LOOPK{"for each move k<br/>in move_descriptors"}
+    LOOPK --> DESC{"BatchDescriptor"}
+    DESC -- SingleRun --> SR["adjust_step_size(...)<br/>scalar ss"]
+    DESC -- VmapRuns --> VR["jax.vmap(adjust_step_size)<br/>(R, ...)"]
+    DESC -- PmapVmapRuns --> PR["jax.pmap(jax.vmap(adjust_step_size))<br/>(G, P, ...)"]
+
+    subgraph jit_box["adjust_step_size — JIT + lax.while_loop"]
+        direction TB
+        SAMPLE["sample n_samples walkers<br/>jax.random.choice"]
+        TRIAL["run trial moves<br/>(vmap or chunked lax.map)"]
+        RATE["rate = mean(accepted)<br/>+ reject-reason counts"]
+        PROC{"_process_rate_jax<br/>rate ∈ [min_rate, max_rate]?"}
+        UP["new_ss = ss × adjust_factor<br/>(rate too low — too small steps)<br/>clamp to step_size_max"]
+        DN["new_ss = ss / adjust_factor<br/>(rate too high — too big steps)<br/>clamp to floor 1e-20"]
+        CONV(["converged ✓<br/>or bracket detected"])
+        NEXT{"round &lt; max_rounds<br/>and not converged?"}
+
+        SAMPLE --> TRIAL --> RATE --> PROC
+        PROC -- yes --> CONV
+        PROC -- "no, too low" --> UP --> NEXT
+        PROC -- "no, too high" --> DN --> NEXT
+        NEXT -- yes --> SAMPLE
+        NEXT -- no --> CONV
+    end
+
+    SR --> SAMPLE
+    VR --> SAMPLE
+    PR --> SAMPLE
+
+    CONV --> WRITE["update step_sizes[k] ← new_ss<br/>+ collect 9 diagnostics<br/>(rate, n_rounds, cap_hits, …)"]
+    WRITE --> NEXTK{"more moves?"}
+    NEXTK -- yes --> LOOPK
+    NEXTK -- no --> RET["return (new_step_sizes,<br/>per_move_outputs, key)"]
+
+    classDef decision fill:#fff7e0,stroke:#a07000,color:#222
+    classDef path fill:#eef5ff,stroke:#1565c0,color:#222
+    classDef jitBox fill:#fff7e0,stroke:#a07000,color:#5a3a00
+    classDef io fill:#f5f5f5,stroke:#444,color:#222
+
+    class FIRES,LOOPK,DESC,PROC,NEXT,NEXTK decision
+    class SR,VR,PR,SAMPLE,TRIAL,RATE,UP,DN path
+    class jit_box jitBox
+    class LOOP,APPLY,CONT,WRITE,RET,CONV io
+```
+
+A few invariants:
+
+- **Cached compilation.** `_build_jit_fns` runs once in
+  `__init__` and stores one `jax.jit`-compiled `adjust_step_size`
+  per move type. Each subsequent `apply` hits the cache; no
+  per-iteration retracing.
+- **Move-by-move Python loop, JIT'd inner.** `apply` iterates over
+  moves in plain Python so `step_sizes[k]` can be updated
+  one entry at a time and per-move diagnostics can be logged at
+  `DEBUG` level. The hot work — the bisection — happens inside the
+  JIT'd callable.
+- **`lax.while_loop` bisection.** Each round samples
+  `adjust_n_samples` walkers, runs trial moves through the same
+  move kernel that NS uses (so acceptance is measured against the
+  same `Emax`), and updates `ss` by `adjust_factor` based on
+  whether the rate is below `min_rate` or above `max_rate`.
+  Convergence flags are set once the rate enters
+  `[min_rate, max_rate]` *or* a proper bracket forms (one round
+  too-low, one too-high) — the latter prevents oscillation when
+  the optimum lies between the discrete `factor`-spaced rungs.
+- **Optional chunked-vmap.** `trial_batch_size` toggles
+  `jax.vmap` vs `jax.lax.map` for the trial-move evaluation; the
+  latter caps peak memory at `trial_batch_size × per-trial tape`,
+  matters for HMC at large `n_samples`.
+
 ## Adding a new kernel
 
 A move kernel is anything that:

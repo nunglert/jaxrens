@@ -247,7 +247,7 @@ class TestNPTRestart:
 # ---------------------------------------------------------------------------
 
 class TestInitNsRestart:
-    def test_init_ns_with_restart_state_seeds_n_dead(self, tmp_path):
+    def test_init_ns_with_restart_state_seeds_iteration(self, tmp_path):
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns
@@ -268,11 +268,9 @@ class TestInitNsRestart:
 
         ns_state = init_ns(
             init_fn, positions, types, energies, ws.cells, key,
-            max_dead=200,
             restart_state=bundle,
         )
 
-        assert int(ns_state.n_dead) == 7
         assert int(ns_state.iteration) == bundle.iteration
 
     def test_init_ns_with_restart_state_seeds_log_evidence(self, tmp_path):
@@ -297,7 +295,6 @@ class TestInitNsRestart:
 
         ns_state = init_ns(
             init_fn, positions, types, energies, ws.cells, key,
-            max_dead=200,
             restart_state=bundle,
         )
 
@@ -323,42 +320,10 @@ class TestInitNsRestart:
         key = jax.random.key(5)
 
         ns_state = init_ns(
-            init_fn, positions, types, energies, ws.cells, key, max_dead=200,
-        )
-
-        assert int(ns_state.n_dead) == 0
-        assert int(ns_state.iteration) == 0
-
-    def test_init_ns_restart_dead_arrays_padded_to_max_dead(self, tmp_path):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import init_ns
-
-        n_dead = 4
-        state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=n_dead)
-        p = _write_checkpoint(tmp_path, state)
-        ws, bundle = load_restart(p)
-
-        backend = create_harmonic()
-        init_fn, _, _ = build_mwg(backend, [_rw_descriptor()])
-
-        positions = ws.positions
-        types = ws.types[0]
-        energies = jax.vmap(
-            lambda pos, typs, cel: backend(pos, typs, cel, 0)[0]
-        )(positions, ws.types, ws.cells)
-        key = jax.random.key(5)
-        max_dead = 50
-
-        ns_state = init_ns(
             init_fn, positions, types, energies, ws.cells, key,
-            max_dead=max_dead,
-            restart_state=bundle,
         )
 
-        assert ns_state.dead_energies.shape == (max_dead,)
-        assert ns_state.dead_positions.shape == (max_dead, 1, 3)
-        assert float(jnp.min(ns_state.dead_energies[n_dead:])) == float(jnp.inf)
+        assert int(ns_state.iteration) == 0
 
     def test_init_ns_restart_under_jit(self, tmp_path):
         """init_ns with restart_state: the produced NSState must survive ns_step under jit."""
@@ -382,14 +347,12 @@ class TestInitNsRestart:
 
         ns_state = init_ns(
             init_fn, positions, types, energies, ws.cells, key,
-            max_dead=100,
             restart_state=bundle,
         )
 
         jit_ns_step = jax.jit(ns_step, static_argnames=("step_fn", "n_mcmc_steps"))
         new_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps=3)
 
-        assert int(new_state.n_dead) == bundle.n_dead + 1
         assert int(new_state.iteration) == bundle.iteration + 1
         assert jnp.isfinite(info["emax"])
 
@@ -632,17 +595,14 @@ class TestInitConfigResolverModeD:
             result.initial_energies,
             cells=result.initial_cells,
             rng_key=key,
-            max_dead=200,
             restart_state=result.restart_state,
         )
 
-        assert int(ns_state.n_dead) == n_dead_checkpoint
         assert int(ns_state.iteration) == n_dead_checkpoint
 
         jit_ns_step = jax.jit(ns_step, static_argnames=("step_fn", "n_mcmc_steps"))
         new_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps=3)
 
-        assert int(new_state.n_dead) == n_dead_checkpoint + 1
         assert int(new_state.iteration) == n_dead_checkpoint + 1
         assert jnp.isfinite(info["emax"])
 

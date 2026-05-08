@@ -76,7 +76,7 @@ def _build_ns_state(
     )(positions)
 
     ns_state = init_ns(
-        init_fn, positions, types, energies, cells, key, max_dead=200
+        init_fn, positions, types, energies, cells, key
     )
     return ns_state, step_fn, per_move_fns, backend
 
@@ -119,7 +119,7 @@ def _build_batched_ns_state(
 
     rng_keys = jax.random.split(key, n_runs)
     ns_states = init_ns_parallel(
-        init_fn, positions, types, energies, cells, rng_keys, max_dead=200
+        init_fn, positions, types, energies, cells, rng_keys
     )
     return ns_states, step_fn, per_move_fns, backend
 
@@ -176,7 +176,6 @@ class TestNoOp:
             n_atoms=2,
         )
         assert int(result.iteration) == int(ns_state.iteration)
-        assert int(result.n_dead) == int(ns_state.n_dead)
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +225,8 @@ class TestShapeInvariance:
         )
         assert result.population.step_sizes.shape == ns_state.population.step_sizes.shape
 
-    def test_dead_point_arrays_untouched(self):
+    def test_iteration_counter_unchanged(self):
+        """Burn-in does not advance the NS iteration counter."""
         ns_state, step_fn, _, _ = _build_ns_state(n_walkers=4, n_atoms=2)
         result = initial_walk(
             jax.random.key(42),
@@ -238,11 +238,6 @@ class TestShapeInvariance:
             emax_offset_per_atom=0.0,
             n_atoms=2,
         )
-        np.testing.assert_array_equal(
-            np.array(result.dead_energies),
-            np.array(ns_state.dead_energies),
-        )
-        assert int(result.n_dead) == int(ns_state.n_dead)
         assert int(result.iteration) == int(ns_state.iteration)
 
 

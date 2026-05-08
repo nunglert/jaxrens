@@ -117,16 +117,11 @@ class TestNSStatePytree:
         )
         return NSState(
             population=population,
-            dead_energies=jnp.full(1000, jnp.inf),
-            dead_positions=jnp.zeros((1000, 3, 3)),
-            dead_volumes=jnp.zeros(1000),
             log_evidence=jnp.array(-jnp.inf),
             iteration=jnp.array(0, dtype=jnp.int32),
-            n_dead=jnp.array(0, dtype=jnp.int32),
             rng_key=jax.random.key(0),
             n_walkers=10,
             n_atoms=3,
-            max_dead=1000,
         )
 
     def test_tree_flatten_unflatten(self):
@@ -167,7 +162,7 @@ class TestConfigs:
         from jaxrens.state.config import NSConfig
         config = NSConfig()
         assert config.n_live == 500
-        assert config.max_iterations == 50_000
+        assert config.max_iterations is None
         assert config.n_mcmc_steps == 20
 
     def test_backend_config_max_neighbors(self):

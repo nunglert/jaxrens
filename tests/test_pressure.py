@@ -130,12 +130,12 @@ class TestNSStepPressure:
         state = init_ns(
             s["init_fn"],
             s["positions"], s["types"], s["energies"],
-            cells=s["cells"], rng_key=s["key"], max_dead=100,
+            cells=s["cells"], rng_key=s["key"],
         )
 
         new_state, info = ns_step(state, s["step_fn"], n_mcmc_steps=5)
 
-        dv = float(new_state.dead_volumes[0])
+        dv = float(info["dead_volume"])
         assert dv > 0, "Dead volume should be recorded"
         assert dv == pytest.approx(125.0, abs=1e-3)
 

@@ -44,6 +44,17 @@ extensions = (
 
 mermaid_output_format = "raw"
 mermaid_init_js = "mermaid.initialize({startOnLoad:true, theme:'default'});"
+# Inline pan/zoom is provided by docs/_static/mermaid-zoom.{js,css}
+# (visible toolbar + wheel/drag handlers). Fullscreen modal stays on
+# (sphinxcontrib-mermaid v1.0+ default, "⛶" button per diagram).
+
+# Register the ELK layout plugin so per-diagram `layout: elk` frontmatter
+# actually engages the ELK engine (mermaid.live bundles it by default; the
+# bare mermaid CDN doesn't). Without this flag, `layout: elk` is silently
+# ignored and dagre is used, which is why the docs build differs from the
+# live editor.
+mermaid_include_elk = True
+mermaid_elk_version = "0.2.0"
 
 templates_path = ["_templates"]
 exclude_patterns = ["Thumbs.db", ".DS_Store", "_build", "test*.py"]
@@ -119,7 +130,8 @@ python_use_unqualified_type_names = True
 
 language = "en"
 html_static_path = ["_static"]
-html_css_files: list[str] = []
+html_css_files: list[str] = ["mermaid-zoom.css"]
+html_js_files: list[str] = ["mermaid-zoom.js"]
 
 html_theme = "furo"
 html_theme_options = {

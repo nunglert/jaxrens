@@ -226,7 +226,7 @@ def pmap_harmonic_setup():
 
     flat_states = init_ns_parallel(
         init_fn, pos_batch, types, en_batch,
-        cells=None, rng_keys=rng_keys_flat, max_dead=200,
+        cells=None, rng_keys=rng_keys_flat,
     )
 
     # Reshape (G*P, K, ...) -> (G, P, K, ...).
@@ -394,12 +394,10 @@ class TestInitNsMultiGpu:
             setup["init_fn"], pos_flat, setup["types"], en_flat,
             cells=None, rng_keys=rng_keys_flat,
             n_gpu=n_gpu, n_per_gpu=n_per_gpu,
-            max_dead=50,
         )
 
         # Check leading shape
         assert state.log_evidence.shape == (n_gpu, n_per_gpu)
-        assert state.n_dead.shape == (n_gpu, n_per_gpu)
         assert state.iteration.shape == (n_gpu, n_per_gpu)
         assert state.population.energy.shape[:2] == (n_gpu, n_per_gpu)
 

@@ -71,7 +71,7 @@ def harmonic_setup():
 
     ns_state = init_ns(
         init_fn, positions, types, energies,
-        cells=None, rng_key=key, max_dead=500,
+        cells=None, rng_key=key,
     )
     # Run a few NS steps to tighten the population
     for _ in range(20):
@@ -86,7 +86,7 @@ def harmonic_setup():
     energies_batch = jnp.broadcast_to(energies[None, :], (n_runs, n_walkers))
     ns_states_batch = init_ns_parallel(
         init_fn, pos_batch, types, energies_batch,
-        cells=None, rng_keys=run_keys, max_dead=500,
+        cells=None, rng_keys=run_keys,
     )
     pop_batched = ns_states_batch.population
 

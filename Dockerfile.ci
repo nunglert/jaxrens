@@ -21,6 +21,12 @@ RUN touch README.md
 COPY src ./src
 RUN pip install -e ".[dev,mace,neuralil,nequix]"
 
+# Fail the build if any optional backend installed but doesn't import.
+# Without this, ``pytest.importorskip(...)`` would silently skip the
+# corresponding integration tests and CI would report green on a broken
+# install (ABI mismatch, missing native deps, upstream pin drift, etc.).
+RUN python -c "import mace_jax, neuralil, nequix; print('optional backends import OK:', mace_jax, neuralil, nequix)"
+
 # Repo code is mounted at /workspace at runtime by the CI workflow,
 # which always overrides the parent image's default CMD with its own
 # `pytest …` invocation.

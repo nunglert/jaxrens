@@ -935,12 +935,14 @@ class TestMonitorCollection:
 _LJ8_NPT_OUTPUT = Path(__file__).parent.parent / "experiments" / "examples" / "lj8_npt" / "output"
 
 
-@pytest.mark.skipif(
-    not _LJ8_NPT_OUTPUT.exists(),
-    reason="lj8_npt example output not present",
-)
 class TestSmokeRealRun:
-    """Load the pre-computed lj8_npt example artefacts and exercise the full stack."""
+    """Load the pre-computed lj8_npt example artefacts and exercise the full stack.
+
+    The artefacts under ``experiments/examples/lj8_npt/output/`` are
+    committed to the repo and produced by running ``jaxrens run -c
+    experiments/examples/lj8_npt/config.yaml`` (a sub-second 8-atom LJ NPT
+    NS, 200 iterations).
+    """
 
     def test_from_directory_lj8_npt(self):
         m = Monitor.from_directory(_LJ8_NPT_OUTPUT, prefix="lj8_npt", label="lj8_smoke")

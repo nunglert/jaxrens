@@ -1,0 +1,48 @@
+/* Inline pan/zoom controls for sphinxcontrib-mermaid SVGs. Toolbar lives
+ * top-LEFT to leave the upstream "⛶" fullscreen button (top-RIGHT) alone. */
+pre.mermaid, div.mermaid {
+    position: relative;
+}
+.mermaid-zoom-toolbar {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    display: flex;
+    gap: 4px;
+    z-index: 10;
+    opacity: 0.55;
+    transition: opacity 0.15s ease-in-out;
+    user-select: none;
+}
+pre.mermaid:hover .mermaid-zoom-toolbar,
+div.mermaid:hover .mermaid-zoom-toolbar {
+    opacity: 1;
+}
+.mermaid-zoom-toolbar button {
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid rgba(0, 0, 0, 0.3);
+    border-radius: 4px;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    font-size: 14px;
+    line-height: 1;
+    color: #333;
+    cursor: pointer;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+    transition: transform 0.1s ease-in-out;
+}
+.mermaid-zoom-toolbar button:hover {
+    background: white;
+    transform: scale(1.08);
+}
+@media (prefers-color-scheme: dark) {
+    .mermaid-zoom-toolbar button {
+        background: rgba(50, 50, 50, 0.95);
+        color: #e0e0e0;
+        border-color: rgba(255, 255, 255, 0.3);
+    }
+    .mermaid-zoom-toolbar button:hover {
+        background: rgba(60, 60, 60, 1);
+    }
+}

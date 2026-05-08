@@ -128,16 +128,6 @@ class TestInitNS:
         assert state.population.positions.shape == s["positions"].shape
         assert state.population.energy.shape == (s["n_walkers"],)
         assert state.iteration == 0
-        assert state.n_dead == 0
-
-    def test_init_dead_points_buffer(self, harmonic_setup):
-        s = harmonic_setup
-        state = init_ns(
-            s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"], max_dead=100,
-        )
-        assert state.dead_energies.shape == (100,)
 
     def test_init_population_is_batched_mcstate(self, harmonic_setup):
         s = harmonic_setup
@@ -169,7 +159,6 @@ class TestNSStep:
         new_state, info = jit_step(state, s["step_fn"], 10, 0)
 
         assert new_state.iteration == 1
-        assert new_state.n_dead == 1
         assert 0 <= info["acceptance_rate"] <= 1.0
 
     def test_multiple_steps_reduce_emax(self, harmonic_setup, jit_step):
@@ -211,7 +200,6 @@ class TestNSStep:
         new_state, info = jit_step(state, s["step_fn"], 10, 5)
 
         assert new_state.iteration == 1
-        assert new_state.n_dead == 1
         assert 0 <= info["acceptance_rate"] <= 1.0
 
     def test_n_extra_reduces_emax(self, harmonic_setup, jit_step):
@@ -240,7 +228,7 @@ class TestVmapNsStep:
         s = parallel_setup
         ns_states = init_ns_parallel(
             s["init_fn"], s["positions"], s["types"], s["energies"],
-            cells=None, rng_keys=s["rng_keys"], max_dead=100,
+            cells=None, rng_keys=s["rng_keys"],
         )
 
         vmapped = jax.jit(jax.vmap(
@@ -256,7 +244,7 @@ class TestVmapNsStep:
         s = parallel_setup
         ns_states = init_ns_parallel(
             s["init_fn"], s["positions"], s["types"], s["energies"],
-            cells=None, rng_keys=s["rng_keys"], max_dead=100,
+            cells=None, rng_keys=s["rng_keys"],
         )
 
         vmapped = jax.jit(jax.vmap(
@@ -275,7 +263,7 @@ class TestVmapNsStep:
         s = parallel_setup
         ns_states = init_ns_parallel(
             s["init_fn"], s["positions"], s["types"], s["energies"],
-            cells=None, rng_keys=s["rng_keys"], max_dead=100,
+            cells=None, rng_keys=s["rng_keys"],
         )
 
         vmapped = jax.jit(jax.vmap(
@@ -495,7 +483,7 @@ class TestPerMoveCounters:
         s = parallel_setup
         ns_states = init_ns_parallel(
             s["init_fn"], s["positions"], s["types"], s["energies"],
-            cells=None, rng_keys=s["rng_keys"], max_dead=100,
+            cells=None, rng_keys=s["rng_keys"],
         )
 
         vmapped = jax.jit(jax.vmap(

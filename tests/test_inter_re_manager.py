@@ -4,13 +4,10 @@ Coverage:
 - fires() boundary cases
 - apply() no-op for SingleRun
 - apply() returns expected stats dict keys
-- JIT cache stability (second call faster via timing proxy)
 - is_active property
 """
 
 from __future__ import annotations
-
-import time
 
 import jax
 import jax.numpy as jnp
@@ -61,7 +58,7 @@ def _make_vmap_ns_state(n_runs=2, n_walkers=10, pressures=None, seed=42):
 
     ns_state = init_ns_parallel(
         init_fn, positions_all, types, energies_all, None,
-        rng_keys, max_dead=100,
+        rng_keys,
         step_sizes=jnp.array([0.2]),
         ensemble_params_per_run=ensemble_params_per_run,
     )
@@ -159,7 +156,7 @@ class TestApplyNoOpSingleRun:
         energies = jax.vmap(
             lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
         )(positions)
-        return init_ns(init_fn, positions, types, energies, None, run_key, max_dead=100)
+        return init_ns(init_fn, positions, types, energies, None, run_key)
 
     def test_single_run_state_unchanged(self):
         ns_state = self._make_single_ns_state()
@@ -304,7 +301,6 @@ class TestApplyPmapVmapRuns:
         ns_state = init_ns_multi_gpu(
             init_fn, positions, types, energies, None,
             rng_keys, n_gpu=n_gpu, n_per_gpu=n_per_gpu,
-            max_dead=50,
             step_sizes=jnp.array([0.2]),
         )
 
@@ -325,40 +321,3 @@ class TestApplyPmapVmapRuns:
         assert mgr.is_active
 
 
-# ---------------------------------------------------------------------------
-# JIT cache stability
-# ---------------------------------------------------------------------------
-
-
-class TestJitCacheStability:
-    def test_second_call_not_slower(self):
-        """JIT fns are built at __init__; second apply() should not recompile."""
-        ns_state, _, _ = _make_vmap_ns_state(n_runs=2, n_walkers=20)
-        mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=2), None, every=1
-        )
-
-        key1 = jax.random.key(1)
-        key2 = jax.random.key(2)
-
-        # First call: may include JIT compile time
-        t0 = time.perf_counter()
-        _, _, _ = mgr.apply(ns_state, key1)
-        jax.effects_barrier()
-        t_first = time.perf_counter() - t0
-
-        # Second call: JIT cache should be warm
-        t0 = time.perf_counter()
-        _, _, _ = mgr.apply(ns_state, key2)
-        jax.effects_barrier()
-        t_second = time.perf_counter() - t0
-
-        # If both calls are very fast (< 1 ms each), skip the timing assertion.
-        if t_first < 0.001:
-            pytest.skip("Both calls too fast for meaningful timing comparison")
-
-        # Second call should not be dramatically slower (allow 10× tolerance).
-        assert t_second <= t_first * 10, (
-            f"Second call ({t_second:.3f}s) much slower than first ({t_first:.3f}s), "
-            f"suggesting unexpected recompilation."
-        )

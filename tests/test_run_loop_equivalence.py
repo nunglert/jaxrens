@@ -123,10 +123,6 @@ class TestGoldenEquivalence:
             f"log_evidence not deterministic: {r1['log_evidence']} vs {r2['log_evidence']}"
         )
         assert r1["n_dead"] == r2["n_dead"]
-        np.testing.assert_array_equal(
-            np.asarray(r1["dead_energies"][:r1["n_dead"]]),
-            np.asarray(r2["dead_energies"][:r2["n_dead"]]),
-        )
 
     def test_golden_log_evidence_finite(self):
         """log_evidence after 10 iters must be finite."""
@@ -140,14 +136,10 @@ class TestGoldenEquivalence:
         r = self._run_short_ns(seed=42, n_iter=10)
         assert r["n_dead"] == 10, f"Expected n_dead=10, got {r['n_dead']}"
 
-    def test_golden_dead_energies_nonincreasing(self):
-        """Dead energies are collected largest-first (NS removes worst each iter),
-        so the sequence should be non-increasing."""
-        r = self._run_short_ns(seed=42, n_iter=10)
-        de = np.asarray(r["dead_energies"][:r["n_dead"]])
-        assert np.all(np.diff(de) <= 1e-7), (
-            f"Dead energies not non-increasing (NS removes worst first): {de}"
-        )
+    # NOTE: ``test_golden_dead_energies_nonincreasing`` removed — result
+    # dicts no longer carry ``dead_energies`` (canonical record is the
+    # streamed ``.energies`` file via ``EnergyLogger`` callback, exercised
+    # by the integration suite).
 
     # ------------------------------------------------------------------
     # Parallel parity: run_ns_parallel(n_runs=1) vs run_ns
@@ -320,7 +312,6 @@ class TestOverflowRetry:
         ns_state = init_ns(
             init_fn, s["positions"], s["types"], s["energies"],
             cells=None, rng_key=s["key"],
-            max_dead=50,
             step_sizes=jnp.full(1, 0.3),
         )
 
@@ -370,7 +361,6 @@ class TestOverflowRetry:
             step_fn=s["step_fn"],
             n_mcmc_steps=3,
             n_extra=0,
-            max_iterations=n_iter,
             termination_criteria=termination_criteria,
             callbacks=[],
             n_moves=1,
@@ -379,14 +369,19 @@ class TestOverflowRetry:
             info_interval=10,
         )
 
-        # Total calls = n_iter (one overflow call + 5 successful).
-        assert call_count[0] == n_iter, (
-            f"Expected {n_iter} calls (one overflow + 5 successful), got {call_count[0]}"
+        # New ``_run_loop`` semantics: on overflow, ``continue`` retries the
+        # same ``i`` (no advance), so the overflow adds one extra step call
+        # on top of the n_iter successful steps. Old ``for i in range(...)``
+        # semantics consumed the ``i`` slot regardless.
+        assert call_count[0] == n_iter + 1, (
+            f"Expected {n_iter + 1} calls ({n_iter} successful + 1 overflow), "
+            f"got {call_count[0]}"
         )
-        # Final ns_state.iteration = n_iter - 1 = 5 (one successful step lost to overflow).
-        # IterationTermination(6) fires at i >= 5 (after i=5 the 5th successful step).
-        assert int(final_state.iteration) == n_iter - 1, (
-            f"Expected iteration={n_iter - 1} (5 successful steps), got {int(final_state.iteration)}"
+        # ``IterationTermination(n_iter)`` fires at i >= n_iter - 1 (i.e. after
+        # the n_iter-th successful step), and ``ns_state.iteration`` advances
+        # once per successful step → final iteration == n_iter.
+        assert int(final_state.iteration) == n_iter, (
+            f"Expected iteration={n_iter}, got {int(final_state.iteration)}"
         )
 
     def test_overflow_retry_increases_max_neighbors(self):
@@ -402,7 +397,6 @@ class TestOverflowRetry:
         ns_state = init_ns(
             init_fn, s["positions"], s["types"], s["energies"],
             cells=None, rng_key=s["key"],
-            max_dead=50,
             step_sizes=jnp.full(1, 0.3),
         )
 
@@ -454,7 +448,6 @@ class TestOverflowRetry:
             step_fn=s["step_fn"],
             n_mcmc_steps=3,
             n_extra=0,
-            max_iterations=5,
             termination_criteria=termination_criteria,
             callbacks=[],
             n_moves=1,

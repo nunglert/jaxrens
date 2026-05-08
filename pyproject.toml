@@ -58,11 +58,11 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not heavy and not mace and not neuralil and not nequix'"
+addopts = "-m 'not heavy and not mace and not neuralil and not nequix and not multi_gpu'"
 markers = [
     "heavy: marks tests as heavy/slow (run with '-m heavy' or '-m \"\"' to include)",
     "gpu: marks tests requiring GPU",
-    "multi_gpu: marks tests requiring multiple GPUs",
+    "multi_gpu: marks tests requiring multiple GPUs (opt-in via '-m multi_gpu'; needs >=2 local devices)",
     "mace: marks tests that exercise the MACE backend; opt-in only via '-m mace' (needs mace_jax + GPU)",
     "neuralil: marks tests that exercise the NeuralIL backend; opt-in only via '-m neuralil' (needs neuralil)",
     "nequix: marks tests that exercise the nequix backend; opt-in only via '-m nequix' (needs nequix package + bundled or path-loaded model)",

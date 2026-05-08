@@ -506,6 +506,9 @@ class TestToCriterion:
 
     def test_two_criteria_resolve_to_two_element_tuple(self):
         d = _minimal_dict()
+        # Drop run.max_iterations so the resolver doesn't auto-append a
+        # third IterationTermination on top of the explicit list.
+        d["run"].pop("max_iterations", None)
         d["termination"] = [
             {"type": "iteration", "max_iterations": 50},
             {"type": "energy", "min_energy": -99.0},

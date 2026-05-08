@@ -50,7 +50,7 @@ def harmonic_mwg():
 
     ns_state = init_ns(
         init_fn, positions, types, energies,
-        cells=None, rng_key=key, max_dead=500,
+        cells=None, rng_key=key,
     )
 
     # Tighten population

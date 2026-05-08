@@ -21,14 +21,6 @@ neuralil_required = pytest.mark.skipif(
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "neuralil_tiny"
 
 
-def fixture_available():
-    return (
-        FIXTURE_DIR.exists()
-        and (FIXTURE_DIR / "model.pkl").exists()
-        and (FIXTURE_DIR / "reference.npz").exists()
-    )
-
-
 # ---------------------------------------------------------------------------
 # Always-run tests (not skipped)
 # ---------------------------------------------------------------------------
@@ -65,8 +57,6 @@ class TestNeuralILImport:
 class TestNeuralILBackend:
     @pytest.fixture
     def backend(self):
-        if not fixture_available():
-            pytest.skip("NeuralIL fixture not found. Run train_neuralil_fixture.py.")
         from jaxrens.backends.neuralil import create_neuralil
 
         return create_neuralil(
@@ -76,8 +66,6 @@ class TestNeuralILBackend:
 
     @pytest.fixture
     def reference(self):
-        if not fixture_available():
-            pytest.skip("NeuralIL fixture not found.")
         return np.load(FIXTURE_DIR / "reference.npz", allow_pickle=True)
 
     def test_protocol_compliance(self, backend):
@@ -124,8 +112,6 @@ class TestNeuralILNSStep:
 
     @pytest.fixture
     def neuralil_ns_setup(self):
-        if not fixture_available():
-            pytest.skip("NeuralIL fixture not found.")
         from jaxrens.backends.neuralil import create_neuralil
         from jaxrens.sampling.move_kernel import MoveKernel
         from jaxrens.sampling.moves import random_walk
@@ -182,6 +168,5 @@ class TestNeuralILNSStep:
         new_state, info = jit_step(s["state"], s["step_fn"], 3, 0)
 
         assert new_state.iteration == 1
-        assert new_state.n_dead == 1
         assert jnp.isfinite(info["emax"])
         assert 0 <= info["acceptance_rate"] <= 1.0
