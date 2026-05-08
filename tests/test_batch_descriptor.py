@@ -350,3 +350,155 @@ class TestPmapVmapRuns:
         out_states, out_infos = jit_step(batched_state)
         assert isinstance(out_states, _FakeState)
         assert out_states.value.shape == (n_gpu, n_per_gpu)
+
+
+# ---------------------------------------------------------------------------
+# Derived helpers (walker_axis, flatten/unflatten, extract_step_sizes,
+# broadcast_step_sizes, reduce_emax) — shared across all three descriptors.
+# ---------------------------------------------------------------------------
+
+
+class _FakePop:
+    """Stand-in for ``WalkerState`` carrying just ``step_sizes``."""
+
+    def __init__(self, step_sizes: jnp.ndarray):
+        self.step_sizes = step_sizes
+
+
+_DESCRIPTOR_CASES = [
+    pytest.param(SingleRun(),                        id="single"),
+    pytest.param(VmapRuns(n_runs=3),                 id="vmap_R3"),
+    pytest.param(PmapVmapRuns(n_gpu=2, n_per_gpu=3), id="pmap_G2P3"),
+]
+
+
+class TestWalkerAxis:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_matches_shape_prefix_length(self, descriptor):
+        assert descriptor.walker_axis == len(descriptor.shape_prefix)
+
+
+class TestFlattenUnflatten:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_roundtrip(self, descriptor):
+        trailing = (4, 5)
+        shape = descriptor.shape_prefix + trailing
+        arr = jnp.arange(int(np.prod(shape)), dtype=jnp.float32).reshape(shape)
+        out = descriptor.unflatten(descriptor.flatten(arr))
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(arr))
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_flatten_shape(self, descriptor):
+        trailing = (7,)
+        shape = descriptor.shape_prefix + trailing
+        arr = jnp.zeros(shape)
+        flat = descriptor.flatten(arr)
+        assert flat.shape == (descriptor.n_runs,) + trailing
+
+
+class TestExtractStepSizes:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_shape(self, descriptor):
+        K, n_moves = 5, 3
+        shape = descriptor.shape_prefix + (K, n_moves)
+        pop = _FakePop(jnp.zeros(shape))
+        ss = descriptor.extract_step_sizes(pop)
+        assert ss.shape == descriptor.shape_prefix + (n_moves,)
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_picks_walker_zero(self, descriptor):
+        K, n_moves = 4, 2
+        shape = descriptor.shape_prefix + (K, n_moves)
+        # Fill with the walker index along the K axis so we can verify
+        # extract_step_sizes pulls walker 0 specifically.
+        walker_idx = jnp.broadcast_to(
+            jnp.arange(K, dtype=jnp.float32).reshape(
+                (1,) * len(descriptor.shape_prefix) + (K, 1)
+            ),
+            shape,
+        )
+        pop = _FakePop(walker_idx)
+        ss = descriptor.extract_step_sizes(pop)
+        np.testing.assert_array_equal(np.asarray(ss), np.zeros(ss.shape))
+
+
+class TestBroadcastStepSizes:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_shape(self, descriptor):
+        K, n_moves = 6, 4
+        per_move_ss = jnp.ones(descriptor.shape_prefix + (n_moves,))
+        out = descriptor.broadcast_step_sizes(per_move_ss, K)
+        assert out.shape == descriptor.shape_prefix + (K, n_moves)
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_value_replicated(self, descriptor):
+        K, n_moves = 3, 2
+        per_move_ss = jnp.arange(
+            int(np.prod(descriptor.shape_prefix + (n_moves,))),
+            dtype=jnp.float32,
+        ).reshape(descriptor.shape_prefix + (n_moves,))
+        out = descriptor.broadcast_step_sizes(per_move_ss, K)
+        # Pull walker w; should equal per_move_ss for every w.
+        for w in range(K):
+            slicer = (slice(None),) * len(descriptor.shape_prefix) + (w,)
+            np.testing.assert_array_equal(
+                np.asarray(out[slicer]), np.asarray(per_move_ss)
+            )
+
+
+class TestReduceEmax:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_shape(self, descriptor):
+        K = 5
+        energy = jnp.zeros(descriptor.shape_prefix + (K,))
+        out = descriptor.reduce_emax(energy)
+        assert out.shape == descriptor.shape_prefix
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_value(self, descriptor):
+        K = 4
+        # Energy with the maximum sitting at walker K-1 in every replica.
+        ramp = jnp.arange(K, dtype=jnp.float32)
+        energy = jnp.broadcast_to(
+            ramp.reshape((1,) * len(descriptor.shape_prefix) + (K,)),
+            descriptor.shape_prefix + (K,),
+        )
+        out = descriptor.reduce_emax(energy)
+        expected = jnp.full(descriptor.shape_prefix, K - 1, dtype=jnp.float32)
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
+
+
+class TestDerivedHelpersJIT:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_extract_and_broadcast_jit(self, descriptor):
+        K, n_moves = 3, 2
+        ss_shape = descriptor.shape_prefix + (K, n_moves)
+        ss = jnp.ones(ss_shape)
+
+        @jax.jit
+        def _roundtrip(step_sizes):
+            pop = _FakePop(step_sizes)
+            per_move = descriptor.extract_step_sizes(pop)
+            return descriptor.broadcast_step_sizes(per_move, K)
+
+        out = _roundtrip(ss)
+        assert out.shape == ss.shape
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_reduce_emax_jit(self, descriptor):
+        K = 5
+        energy = jnp.ones(descriptor.shape_prefix + (K,))
+        emax = jax.jit(descriptor.reduce_emax)(energy)
+        assert emax.shape == descriptor.shape_prefix
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_flatten_unflatten_jit(self, descriptor):
+        trailing = (4,)
+        arr = jnp.ones(descriptor.shape_prefix + trailing)
+
+        @jax.jit
+        def _round(x):
+            return descriptor.unflatten(descriptor.flatten(x))
+
+        out = _round(arr)
+        assert out.shape == arr.shape

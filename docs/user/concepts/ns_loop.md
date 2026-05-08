@@ -9,18 +9,18 @@ load-bearing.
 
 ## What NS computes
 
-For a prior $\pi(\theta)$ and likelihood $L(\theta) = e^{-H(\theta)}$,
+For a prior $\pi(r)$ and likelihood $L(r) = e^{-H(r)}$,
 the evidence is
 
 $$
-Z = \int L(\theta)\,\pi(\theta)\,\mathrm{d}\theta
+Z = \int L(r)\,\pi(r)\,\mathrm{d}r
   = \int_0^1 L(X)\,\mathrm{d}X,
 $$
 
 where the transformation
 
 $$
-X(L^\star) = \int_{L(\theta) > L^\star} \pi(\theta)\,\mathrm{d}\theta
+X(L^\star) = \int_{L(r) > L^\star} \pi(r)\,\mathrm{d}r
 $$
 
 collapses every equi-likelihood shell into a scalar *prior mass*
@@ -178,7 +178,7 @@ accumulates per-move acceptance counts.
 Concretely, at iteration $i$ the worst walker's energy $E_i$
 becomes the new *energy maximum* $E_\mathrm{max}$, and all MCMC
 steps in the next iteration run under the constraint
-$H(\theta) < E_\mathrm{max}$. Over many iterations, $E_\mathrm{max}$
+$H(r) < E_\mathrm{max}$. Over many iterations, $E_\mathrm{max}$
 decreases monotonically — nesting the likelihood shells — and the
 walker distribution concentrates toward the ground state of $H$.
 

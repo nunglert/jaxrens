@@ -55,18 +55,18 @@ flowchart LR
 ## Acceptance at the NS constraint
 
 NS enforces a hard likelihood threshold instead of a
-Metropolis-style temperature criterion. A proposed move is
-accepted iff
+Metropolis-style temperature criterion. A proposed move from
+configuration $r$ to $r'$ is accepted iff
 
 $$
-H(y) < E_\mathrm{max},
+H(r') < E_\mathrm{max},
 $$
 
-where $y$ is the proposed configuration and $E_\mathrm{max}$ is
-the current likelihood constraint. Equivalently,
+where $E_\mathrm{max}$ is the current likelihood constraint.
+Equivalently,
 
 $$
-\alpha(x \to y) = \mathbf{1}\bigl[H(y) < E_\mathrm{max}\bigr].
+\alpha(r \to r') = \mathbf{1}\bigl[H(r') < E_\mathrm{max}\bigr].
 $$
 
 Each kernel must satisfy detailed balance *on the constrained

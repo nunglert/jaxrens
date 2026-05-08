@@ -47,9 +47,10 @@ class AdaptationManager:
         per_move_fns: Sequence of move step functions, one per move.
             When ``None`` (or empty), adaptation is inactive — ``is_active``
             returns ``False`` and ``apply`` raises ``RuntimeError``.
-        batch_descriptor: ``BatchDescriptor`` instance (``SingleRun`` or
-            ``VmapRuns``) that determines whether to use plain calls or
-            ``jax.vmap`` over the run dimension.
+        batcher: ``BatchDescriptor`` instance (``SingleRun`` / ``VmapRuns`` /
+            ``PmapVmapRuns``) that determines whether to use plain calls,
+            ``jax.vmap``, or ``jax.pmap(jax.vmap(...))`` for the per-move
+            adaptation kernels.
         adjust_n_samples: Number of walkers to sample per bisection trial round.
             Static under JIT.
         adjust_factor: Multiplicative scaling factor for step size adjustment.
@@ -64,7 +65,7 @@ class AdaptationManager:
         self,
         move_descriptors: Sequence,
         per_move_fns: Sequence[Callable] | None,
-        batch_descriptor: BatchDescriptor,
+        batcher: BatchDescriptor,
         adjust_n_samples: int,
         adjust_factor: float,
         adjust_max_rounds: int,
@@ -72,7 +73,7 @@ class AdaptationManager:
     ) -> None:
         self._move_descriptors = list(move_descriptors) if move_descriptors else []
         self._per_move_fns = list(per_move_fns) if per_move_fns else []
-        self._batch_descriptor = batch_descriptor
+        self._batcher = batcher
         self._adjust_n_samples = adjust_n_samples
         self._adjust_factor = adjust_factor
         self._adjust_max_rounds = adjust_max_rounds
@@ -163,8 +164,8 @@ class AdaptationManager:
                 "Check that per_move_fns, move_descriptors, and adjust_interval>0 are set."
             )
 
-        is_vmap = isinstance(self._batch_descriptor, VmapRuns)
-        is_pmap_vmap = isinstance(self._batch_descriptor, PmapVmapRuns)
+        is_vmap = isinstance(self._batcher, VmapRuns)
+        is_pmap_vmap = isinstance(self._batcher, PmapVmapRuns)
 
         # Collect per-move outputs as lists (one item per move).
         # For SingleRun:    each item is a scalar/array.
@@ -252,8 +253,8 @@ class AdaptationManager:
             Outer pmap over G (GPU) axis; inner vmap over P (per-GPU runs) axis.
             pmap is self-JIT-compiling so no additional jax.jit is added.
         """
-        is_pmap_vmap = isinstance(self._batch_descriptor, PmapVmapRuns)
-        is_vmap = isinstance(self._batch_descriptor, VmapRuns)
+        is_pmap_vmap = isinstance(self._batcher, PmapVmapRuns)
+        is_vmap = isinstance(self._batcher, VmapRuns)
         fns = []
         for move_idx, desc in enumerate(self._move_descriptors):
             move_fn = self._per_move_fns[move_idx]

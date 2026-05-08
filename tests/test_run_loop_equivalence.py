@@ -225,18 +225,18 @@ class TestGoldenEquivalence:
 
 
 class TestBatchDescriptorInInfo:
-    """Verify info["_batch"] is attached and has correct is_batched property."""
+    """Verify info["_batcher"] is attached and has correct is_batched property."""
 
     def test_single_run_info_batch_is_single(self):
-        """run_ns attaches a SingleRun descriptor as info['_batch']."""
+        """run_ns attaches a SingleRun descriptor as info['_batcher']."""
         s = _build_harmonic_setup(seed=10, n_walkers=15)
 
         captured_batches = []
 
         class _Capture:
             def on_iteration(self, iteration, ns_state, info):
-                if "_batch" in info:
-                    captured_batches.append(info["_batch"])
+                if "_batcher" in info:
+                    captured_batches.append(info["_batcher"])
             def on_finish(self, ns_state):
                 pass
 
@@ -338,11 +338,11 @@ class TestOverflowRetry:
             def wrap_step(self, ns_step_fn, step_fn_inner, n_mcmc_steps, n_extra):
                 return lambda state, sfn, nm, ne: patched_step_fn(state, sfn, nm, ne)
 
-        descriptor = _PatchedSingleRun()
+        batcher = _PatchedSingleRun()
         adapt_mgr = AdaptationManager(
             move_descriptors=[],
             per_move_fns=None,
-            batch_descriptor=descriptor,
+            batcher=batcher,
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -355,7 +355,7 @@ class TestOverflowRetry:
         ]
 
         final_state, _, _ = _run_loop(
-            descriptor=descriptor,
+            batcher=batcher,
             adapt_mgr=adapt_mgr,
             ns_state=ns_state,
             step_fn=s["step_fn"],
@@ -426,11 +426,11 @@ class TestOverflowRetry:
             def wrap_step(self, ns_step_fn, step_fn_inner, n_mcmc_steps, n_extra):
                 return lambda state, sfn, nm, ne: patched_step_fn(state, sfn, nm, ne)
 
-        descriptor = _PatchedSingleRun()
+        batcher = _PatchedSingleRun()
         adapt_mgr = AdaptationManager(
             move_descriptors=[],
             per_move_fns=None,
-            batch_descriptor=descriptor,
+            batcher=batcher,
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -442,7 +442,7 @@ class TestOverflowRetry:
         ]
 
         _run_loop(
-            descriptor=descriptor,
+            batcher=batcher,
             adapt_mgr=adapt_mgr,
             ns_state=ns_state,
             step_fn=s["step_fn"],

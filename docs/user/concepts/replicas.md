@@ -227,24 +227,24 @@ A few invariants worth pinning down:
 ### Pressure-RENS
 
 The two replicas keep their configurations; only the *thermodynamic
-context* is swapped. Configuration $x_i$ from replica $i$ is
+context* is swapped. Configuration $r_i$ from replica $i$ is
 evaluated under replica $j$'s ensemble:
 
 $$
-\alpha_{ij} = \mathbf{1}\bigl[H_j(x_i) < E_{\max, j}\bigr] \cdot
-              \mathbf{1}\bigl[H_i(x_j) < E_{\max, i}\bigr],
+\alpha_{ij} = \mathbf{1}\bigl[H_j(r_i) < E_{\max, j}\bigr] \cdot
+              \mathbf{1}\bigl[H_i(r_j) < E_{\max, i}\bigr],
 $$
 
 where $H_j$ includes replica $j$'s pressure. Zero backend calls —
-the energies $U(x)$ are already stored; only the $+PV$ term
+the energies $U(r)$ are already stored; only the $+PV$ term
 recomputes.
 
 ### XRENS (composition morphing)
 
 Each replica $i$ holds a target composition vector
 $\mathbf c_i \in \mathbb Z_{\ge 0}^{S}$ with $\sum_s c_{i,s} = N$.
-Let $\mathcal{M}_{\mathbf c}(\tau, \xi)$ denote the random
-*morph operator*: it permutes the species labels of $\tau$ to a
+Let $\mathcal{M}_{\mathbf c}(\sigma, \xi)$ denote the random
+*morph operator*: it permutes the species labels of $\sigma$ to a
 new label vector with composition exactly $\mathbf c$, with
 randomness $\xi$ choosing which atoms swap species
 (see {func}`jaxrens.sampling.morph.morph_types_to_composition`).
@@ -252,15 +252,15 @@ randomness $\xi$ choosing which atoms swap species
 A swap of replicas $(i, j)$ proposes the morphed exchange
 
 $$
-\tilde x_i = \bigl(r_j,\; \mathcal{M}_{\mathbf c_i}(\tau_j, \xi_i),\; h_j\bigr),
+\tilde r_i = \bigl(\mathbf q_j,\; \mathcal{M}_{\mathbf c_i}(\sigma_j, \xi_i),\; h_j\bigr),
 \qquad
-\tilde x_j = \bigl(r_i,\; \mathcal{M}_{\mathbf c_j}(\tau_i, \xi_j),\; h_i\bigr),
+\tilde r_j = \bigl(\mathbf q_i,\; \mathcal{M}_{\mathbf c_j}(\sigma_i, \xi_j),\; h_i\bigr),
 $$
 
 so the configuration arriving at replica $i$ has run-$i$'s target
 composition but is built from run-$j$'s positions and cell. The
-morphed potential energies $\tilde U_i = U(\tilde x_i)$ and
-$\tilde U_j = U(\tilde x_j)$ are recomputed by the backend
+morphed potential energies $\tilde U_i = U(\tilde r_i)$ and
+$\tilde U_j = U(\tilde r_j)$ are recomputed by the backend
 (2 evaluations per attempted pair). Acceptance follows the same
 cross-bound enthalpy form as Pressure-RENS, applied to the new
 energies:
@@ -276,16 +276,16 @@ $\tilde U_i < E_{\max,j} \,\wedge\, \tilde U_j < E_{\max,i}$.
 ### Semi-grand swap
 
 Each replica $i$ carries a per-species chemical-potential vector
-$\boldsymbol\mu_i \in \mathbb R^{S}$. Walkers, cells, and types
+$\boldsymbol\mu_i \in \mathbb R^{S}$. Walkers, cells, and species
 stay put — only the $\boldsymbol\mu$ assignment is exchanged. Let
-$\mathbf N(\tau)_s = \#\{a : \tau_a = s\}$ be the species-count
-vector of walker $\tau$. The grand-canonical energy under the
+$\mathbf N(\sigma)_s = \#\{a : \sigma_a = s\}$ be the species-count
+vector of walker $\sigma$. The grand-canonical energy under the
 *new* chemical-potential vector after the swap is
 
 $$
-\Omega_i^{\text{new}} = U_i \;-\; \boldsymbol\mu_j \cdot \mathbf N(\tau_i),
+\Omega_i^{\text{new}} = U_i \;-\; \boldsymbol\mu_j \cdot \mathbf N(\sigma_i),
 \qquad
-\Omega_j^{\text{new}} = U_j \;-\; \boldsymbol\mu_i \cdot \mathbf N(\tau_j),
+\Omega_j^{\text{new}} = U_j \;-\; \boldsymbol\mu_i \cdot \mathbf N(\sigma_j),
 $$
 
 and because nothing moves, each replica simply checks its own NS

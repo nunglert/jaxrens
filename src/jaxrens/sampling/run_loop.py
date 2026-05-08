@@ -12,7 +12,7 @@ them from here.
 Design invariants
 -----------------
 - ``_run_loop`` is pure-Python control flow; every JAX call inside it is
-  either already JIT-compiled (``jit_ns_step`` from ``descriptor.wrap_step``)
+  either already JIT-compiled (``jit_ns_step`` from ``batcher.wrap_step``)
   or is a Python-level numpy / host operation.
 - The descriptor carries all shape differences (single vs. vmap); there is NO
   ``isinstance`` sniffing inside ``_run_loop``.
@@ -30,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from jaxrens.sampling.adaptation.manager import AdaptationManager
-from jaxrens.sampling.batch_descriptor import BatchDescriptor, PmapVmapRuns, VmapRuns
+from jaxrens.sampling.batch_descriptor import BatchDescriptor
 from jaxrens.sampling.termination import PriorMassTermination, check_any
 
 logger = logging.getLogger(__name__)
@@ -212,7 +212,7 @@ def _pick_next_bucket(
 
 def _run_loop(
     *,
-    descriptor: BatchDescriptor,
+    batcher: BatchDescriptor,
     adapt_mgr: AdaptationManager,
     ns_state: Any,
     step_fn,
@@ -231,8 +231,8 @@ def _run_loop(
     """Unified NS outer loop shared by ``run_ns`` and ``run_ns_parallel``.
 
     All shape differences between single-run and multi-run execution are
-    encapsulated by *descriptor*; ``_run_loop`` contains no ``isinstance``
-    checks on *descriptor*.
+    encapsulated by *batcher*; ``_run_loop`` contains no ``isinstance``
+    checks on *batcher*.
 
     Per-iteration culled walker data lives only in the ``info`` dict —
     callbacks that need it (``EnergyLogger``, ``TrajectoryCallback``) read
@@ -242,7 +242,7 @@ def _run_loop(
     those callbacks.
 
     Args:
-        descriptor: ``BatchDescriptor`` instance controlling JIT-compilation,
+        batcher: ``BatchDescriptor`` instance controlling JIT-compilation,
             key splitting, and termination reduction.
         adapt_mgr: ``AdaptationManager`` instance. May be inactive
             (``is_active=False``) when no step-size adaptation is configured.
@@ -282,46 +282,23 @@ def _run_loop(
     from jaxrens.sampling.nested_sampling import ns_step  # avoid circular at module level
 
     # JIT-compile ns_step once before the loop.
-    jit_ns_step = descriptor.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
+    jit_ns_step = batcher.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
 
-    # Classify the descriptor for shape-dispatch below.
-    # PmapVmapRuns: (G, P, K, ...)  — two leading batch dims.
-    # VmapRuns:     (n_runs, K, ...) — one leading batch dim.
-    # SingleRun:    (K, ...)          — no leading batch dim.
-    is_pmap_vmap = isinstance(descriptor, PmapVmapRuns)
-    is_vmap = isinstance(descriptor, VmapRuns)
-
-    # Extract current step sizes from population.
-    # SingleRun:    pop.step_sizes shape (K, n_moves)       -> take [0]       -> (n_moves,)
-    # VmapRuns:     pop.step_sizes shape (R, K, n_moves)    -> take [:, 0, :] -> (R, n_moves)
-    # PmapVmapRuns: pop.step_sizes shape (G, P, K, n_moves) -> take [:,:,0,:] -> (G, P, n_moves)
+    # Per-replica step sizes: pop.step_sizes is (*shape_prefix, K, n_moves).
+    # The descriptor drops the walker axis to give (*shape_prefix, n_moves).
     pop = ns_state.population
-    if is_pmap_vmap:
-        current_step_sizes = pop.step_sizes[:, :, 0, :]  # (G, P, n_moves)
-    elif is_vmap:
-        current_step_sizes = pop.step_sizes[:, 0, :]  # (n_runs, n_moves)
-    else:
-        current_step_sizes = pop.step_sizes[0]  # (n_moves,)
+    current_step_sizes = batcher.extract_step_sizes(pop)
 
-    # Cumulative evaluation counters.
-    # Shape: (n_moves,) for SingleRun, (R, n_moves) for VmapRuns,
-    #        (G, P, n_moves) for PmapVmapRuns.
-    if is_pmap_vmap:
-        cumulative: dict = {
-            "n_evaluations": np.zeros(descriptor.shape_prefix + (n_moves,), dtype=np.int64),
-            "n_grad_evaluations": np.zeros(descriptor.shape_prefix + (n_moves,), dtype=np.int64),
-        }
-    elif is_vmap:
-        n_runs = descriptor.n_runs
-        cumulative = {
-            "n_evaluations": np.zeros((n_runs, n_moves), dtype=np.int64),
-            "n_grad_evaluations": np.zeros((n_runs, n_moves), dtype=np.int64),
-        }
-    else:
-        cumulative = {
-            "n_evaluations": np.zeros(n_moves, dtype=np.int64),
-            "n_grad_evaluations": np.zeros(n_moves, dtype=np.int64),
-        }
+    # Cumulative evaluation counters: shape (*shape_prefix, n_moves).
+    # Empty prefix collapses to (n_moves,) for SingleRun.
+    cumulative: dict = {
+        "n_evaluations": np.zeros(
+            batcher.shape_prefix + (n_moves,), dtype=np.int64,
+        ),
+        "n_grad_evaluations": np.zeros(
+            batcher.shape_prefix + (n_moves,), dtype=np.int64,
+        ),
+    }
 
     # Dedicated scalar PRNG key for inter-RE swaps.
     # The adaptation ``rng_key`` may be (n_runs,) shaped for VmapRuns; we need
@@ -347,46 +324,24 @@ def _run_loop(
         adjust_info = None
         if adapt_mgr.fires(i):
             pop = ns_state.population
-            if is_pmap_vmap:
-                emax = jnp.max(pop.energy, axis=2)  # (G, P) — walker axis is 2
-            elif is_vmap:
-                emax = jnp.max(pop.energy, axis=1)  # (n_runs,)
-            else:
-                emax = jnp.max(pop.energy)  # scalar
+            emax = batcher.reduce_emax(pop.energy)
             # adapt_mgr.apply does its own key splitting internally;
             # pass rng_key directly and get back the advanced carry.
             current_step_sizes, per_move_outputs, rng_key = adapt_mgr.apply(
                 pop, emax, rng_key, current_step_sizes,
             )
-            # Broadcast updated step sizes back into population.
-            if is_pmap_vmap:
-                # current_step_sizes: (G, P, n_moves)
-                # pop.step_sizes: (G, P, K, n_moves) — insert axis 2 for K.
-                n_walkers = pop.step_sizes.shape[2]
-                new_ss_pop = jnp.broadcast_to(
-                    current_step_sizes[:, :, None, :],
-                    descriptor.shape_prefix + (n_walkers, n_moves),
-                )
-            elif is_vmap:
-                n_runs_local = descriptor.n_runs
-                n_walkers = pop.step_sizes.shape[1]
-                new_ss_pop = jnp.broadcast_to(
-                    current_step_sizes[:, None, :],
-                    (n_runs_local, n_walkers, n_moves),
-                )
-            else:
-                n_walkers = pop.step_sizes.shape[0]
-                new_ss_pop = jnp.broadcast_to(
-                    current_step_sizes,
-                    (n_walkers, current_step_sizes.shape[0]),
-                )
+            # Re-broadcast updated step sizes across the walker axis.
+            n_walkers = pop.step_sizes.shape[batcher.walker_axis]
+            new_ss_pop = batcher.broadcast_step_sizes(
+                current_step_sizes, n_walkers,
+            )
             ns_state = ns_state.set(population=pop.set(step_sizes=new_ss_pop))
             adjust_info = per_move_outputs
 
         # ---- NS step ----
-        # PmapVmapRuns and VmapRuns: the callable already closed over step_fn etc.
-        # SingleRun: the callable is a plain jit'd function expecting explicit args.
-        if is_pmap_vmap or is_vmap:
+        # Batched callables (vmap / pmap-vmap) close over step_fn etc.;
+        # the SingleRun callable is a plain jit'd fn expecting explicit args.
+        if batcher.is_batched:
             new_ns_state, info = jit_ns_step(ns_state)
         else:
             new_ns_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps, n_extra)
@@ -436,10 +391,9 @@ def _run_loop(
         _bump_cumulative_counters(cumulative, info)
 
         # ---- Pack adjustment info (only when fires this iter, single-run only) ----
-        # VmapRuns/PmapVmapRuns: per_move_outputs have shape (n_runs, n_moves, ...) or
-        # (G, P, n_moves, ...) which is incompatible with the scalar-per-move pattern
-        # of _pack_adjustment_info.  Only SingleRun invokes it.
-        if adjust_info is not None and not is_vmap and not is_pmap_vmap:
+        # Batched per_move_outputs have shape (*shape_prefix, n_moves, ...) which
+        # is incompatible with the scalar-per-move pattern of _pack_adjustment_info.
+        if adjust_info is not None and not batcher.is_batched:
             _pack_adjustment_info(
                 info,
                 current_step_sizes=current_step_sizes,
@@ -460,14 +414,14 @@ def _run_loop(
         # ---- Inject cumulative snapshot ----
         _inject_cumulative_into_info(info, cumulative)
 
-        # ---- Attach descriptor so callbacks can introspect ----
-        info["_batch"] = descriptor
+        # ---- Attach the batcher so callbacks can introspect ----
+        info["_batcher"] = batcher
 
         # ---- Callback dispatch ----
         _dispatch_callbacks(callbacks, i, ns_state, info)
 
         # ---- Termination ----
-        log_z_scalar, hmax_scalar = descriptor.reduce_for_termination(
+        log_z_scalar, hmax_scalar = batcher.reduce_for_termination(
             ns_state.log_evidence, info.get("hmax", jnp.inf),
         )
         for criterion in termination_criteria:

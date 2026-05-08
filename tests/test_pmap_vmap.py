@@ -256,7 +256,7 @@ class TestAdaptationManagerPmapVmap:
         return AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=setup["per_move_fns"],
-            batch_descriptor=PmapVmapRuns(
+            batcher=PmapVmapRuns(
                 n_gpu=setup["n_gpu"], n_per_gpu=setup["n_per_gpu"]
             ),
             adjust_n_samples=10,
@@ -663,7 +663,7 @@ class TestRunNsMultiGpuCallbacks:
         )
 
     def test_callbacks_info_has_batch_key(self):
-        """Each on_iteration info dict carries '_batch' key."""
+        """Each on_iteration info dict carries '_batcher' key."""
         _require_gpu()
         n_gpu, n_per_gpu = 1, 2
         n_total = n_gpu * n_per_gpu
@@ -694,12 +694,12 @@ class TestRunNsMultiGpuCallbacks:
         )
 
         for _iter, _state, info in cb.calls:
-            assert "_batch" in info, (
-                f"'_batch' missing from info at iteration {_iter}"
+            assert "_batcher" in info, (
+                f"'_batcher' missing from info at iteration {_iter}"
             )
 
     def test_callbacks_batch_descriptor_is_batched(self):
-        """info['_batch'].is_batched is True for all calls."""
+        """info['_batcher'].is_batched is True for all calls."""
         _require_gpu()
         n_gpu, n_per_gpu = 1, 2
         n_total = n_gpu * n_per_gpu
@@ -731,7 +731,7 @@ class TestRunNsMultiGpuCallbacks:
 
         assert len(cb.calls) == n_iters
         for _iter, _state, info in cb.calls:
-            assert info["_batch"].is_batched is True, (
+            assert info["_batcher"].is_batched is True, (
                 f"is_batched should be True at iter {_iter}, "
-                f"got {info['_batch'].is_batched}"
+                f"got {info['_batcher'].is_batched}"
             )

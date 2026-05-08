@@ -551,11 +551,11 @@ def run_ns(
         n_walkers, n_atoms, max_iterations, n_mcmc_steps,
     )
 
-    descriptor = SingleRun()
+    batcher = SingleRun()
     adapt_mgr = AdaptationManager(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,
-        batch_descriptor=descriptor,
+        batcher=batcher,
         adjust_n_samples=adjust_n_samples,
         adjust_factor=adjust_factor,
         adjust_max_rounds=adjust_max_rounds,
@@ -563,7 +563,7 @@ def run_ns(
     )
 
     ns_state, rng_key, _cumulative = _run_loop(
-        descriptor=descriptor,
+        batcher=batcher,
         adapt_mgr=adapt_mgr,
         ns_state=ns_state,
         step_fn=step_fn,
@@ -775,11 +775,11 @@ def run_ns_parallel(
         n_runs, n_walkers, max_iterations, n_mcmc_steps, n_extra,
     )
 
-    descriptor = VmapRuns(n_runs=n_runs)
+    batcher = VmapRuns(n_runs=n_runs)
     adapt_mgr = AdaptationManager(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,
-        batch_descriptor=descriptor,
+        batcher=batcher,
         adjust_n_samples=adjust_n_samples,
         adjust_factor=adjust_factor,
         adjust_max_rounds=adjust_max_rounds,
@@ -863,7 +863,7 @@ def run_ns_parallel(
             )
         inter_re_mgr = InterREManager(
             swap_kernel=swap_kernel,
-            batch_descriptor=descriptor,
+            batcher=batcher,
             backend=backend,
             every=cfg.every,
             n_swap_cycles=cfg.n_swap_cycles,
@@ -874,7 +874,7 @@ def run_ns_parallel(
     adapt_keys = jax.vmap(lambda k: jax.random.split(k)[0])(rng_keys)  # (n_runs,)
 
     ns_states, adapt_keys, _cumulative = _run_loop(
-        descriptor=descriptor,
+        batcher=batcher,
         adapt_mgr=adapt_mgr,
         ns_state=ns_states,
         step_fn=step_fn,
@@ -1079,8 +1079,8 @@ def run_ns_multi_gpu(
         callbacks: List of callback objects with optional ``on_iteration`` /
             ``on_finish`` methods.  Callbacks receive the ``(G, P, ...)``-shaped
             ``NSState`` directly.  Each ``info`` dict contains
-            ``info["_batch"] = PmapVmapRuns(n_gpu, n_per_gpu)`` so callbacks
-            can identify the batch shape via ``info["_batch"].is_batched``.
+            ``info["_batcher"] = PmapVmapRuns(n_gpu, n_per_gpu)`` so callbacks
+            can identify the batch shape via ``info["_batcher"].is_batched``.
             ``log_evidence`` in the associated ``NSState`` has shape ``(G, P)``.
         termination_criteria: Optional.  Defaults to
             ``[IterationTermination(max_iterations),
@@ -1190,11 +1190,11 @@ def run_ns_multi_gpu(
         n_gpu, n_per_gpu, n_total, n_walkers, max_iterations, n_mcmc_steps, n_extra,
     )
 
-    descriptor = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+    batcher = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
     adapt_mgr = AdaptationManager(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,
-        batch_descriptor=descriptor,
+        batcher=batcher,
         adjust_n_samples=adjust_n_samples,
         adjust_factor=adjust_factor,
         adjust_max_rounds=adjust_max_rounds,
@@ -1276,7 +1276,7 @@ def run_ns_multi_gpu(
             )
         inter_re_mgr = InterREManager(
             swap_kernel=swap_kernel_mg,
-            batch_descriptor=descriptor,
+            batcher=batcher,
             backend=backend,
             every=cfg.every,
             n_swap_cycles=cfg.n_swap_cycles,
@@ -1288,7 +1288,7 @@ def run_ns_multi_gpu(
     adapt_keys = adapt_keys_flat.reshape(n_gpu, n_per_gpu)
 
     ns_states, adapt_keys, _cumulative = _run_loop(
-        descriptor=descriptor,
+        batcher=batcher,
         adapt_mgr=adapt_mgr,
         ns_state=ns_states,
         step_fn=step_fn,

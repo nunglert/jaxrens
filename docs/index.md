@@ -29,11 +29,14 @@ Runnable end-to-end walk-throughs — Lennard-Jones NS, multi-GPU
 pressure-RENS, MACE.
 :::
 
-:::{grid-item-card} API Reference
+:::{grid-item-card} Reference
 :link: reference/index
 :link-type: doc
 
-Every public symbol, every CLI subcommand, every YAML schema section.
+Every public symbol, every CLI subcommand, every YAML schema
+section. Plus a {doc}`notation page <reference/notation>` that
+pins down what `K`, `P`, `μ`, `E_max`, `c_i`, … mean across the
+docs.
 :::
 
 :::{grid-item-card} Developer Guide
@@ -54,5 +57,6 @@ user/overview
 tutorials/index
 reference/index
 reference/cli
+reference/notation
 dev/install
 ```

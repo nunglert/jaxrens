@@ -112,7 +112,7 @@ class TestFires:
         mgr = AdaptationManager(
             move_descriptors=[],
             per_move_fns=None,
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -125,7 +125,7 @@ class TestFires:
         mgr = AdaptationManager(
             move_descriptors=[],
             per_move_fns=None,
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -139,7 +139,7 @@ class TestFires:
         mgr = AdaptationManager(
             move_descriptors=[],
             per_move_fns=None,
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -153,7 +153,7 @@ class TestFires:
         mgr = AdaptationManager(
             move_descriptors=[],
             per_move_fns=None,
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -175,7 +175,7 @@ class TestIsActive:
         mgr = AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=setup["per_move_fns"],
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -189,7 +189,7 @@ class TestIsActive:
         mgr = AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=None,
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -203,7 +203,7 @@ class TestIsActive:
         mgr = AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=setup["per_move_fns"],
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -217,7 +217,7 @@ class TestIsActive:
         mgr = AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=[],
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -238,7 +238,7 @@ class TestApplyInactive:
         mgr = AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=None,
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -263,7 +263,7 @@ class TestSingleRunApply:
         return AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=setup["per_move_fns"],
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=20,
             adjust_factor=1.5,
             adjust_max_rounds=8,
@@ -354,7 +354,7 @@ class TestVmapRunsApply:
         return AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=setup["per_move_fns"],
-            batch_descriptor=VmapRuns(n_runs=n_runs),
+            batcher=VmapRuns(n_runs=n_runs),
             adjust_n_samples=20,
             adjust_factor=1.5,
             adjust_max_rounds=8,
@@ -427,7 +427,7 @@ class TestJITCacheStability:
         mgr = AdaptationManager(
             move_descriptors=harmonic_setup["descriptors"],
             per_move_fns=harmonic_setup["per_move_fns"],
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=20,
             adjust_factor=1.5,
             adjust_max_rounds=8,
@@ -473,7 +473,7 @@ class TestJITCacheStability:
         mgr = AdaptationManager(
             move_descriptors=harmonic_setup["descriptors"],
             per_move_fns=harmonic_setup["per_move_fns"],
-            batch_descriptor=VmapRuns(n_runs=n_runs),
+            batcher=VmapRuns(n_runs=n_runs),
             adjust_n_samples=20,
             adjust_factor=1.5,
             adjust_max_rounds=8,

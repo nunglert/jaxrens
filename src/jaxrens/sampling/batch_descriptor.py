@@ -57,7 +57,7 @@ class BatchDescriptor(ABC):
     def is_batched(self) -> bool:
         """True when this descriptor represents multiple parallel NS runs.
 
-        Used by ``_run_loop`` to attach ``info["_batch"]`` and by
+        Used by ``_run_loop`` to attach ``info["_batcher"]`` and by
         ``_is_batched`` in ``cli/monitor.py`` to prefer a descriptor-based
         check over the ndim-sniff fallback.
 
@@ -158,6 +158,69 @@ class BatchDescriptor(ABC):
               ``(float(jnp.min(log_evidence)), float(jnp.max(hmax)))``.
             * **PmapVmapRuns** — raises ``NotImplementedError``.
         """
+
+    # ------------------------------------------------------------------
+    # Derived helpers (shape-prefix-driven; concrete classes inherit)
+    # ------------------------------------------------------------------
+
+    @property
+    def walker_axis(self) -> int:
+        """Axis index of the per-walker (K) dimension in population arrays.
+
+        ``0`` for SingleRun, ``1`` for VmapRuns, ``2`` for PmapVmapRuns.
+        """
+        return len(self.shape_prefix)
+
+    def flatten(self, arr: jnp.ndarray) -> jnp.ndarray:
+        """Collapse the leading shape-prefix dims into a single ``(n_runs,)`` axis.
+
+        For SingleRun (no prefix) prepends a length-1 axis so the output is
+        always ``(n_runs, *trailing)``.
+        """
+        n_prefix = len(self.shape_prefix)
+        if n_prefix == 0:
+            return arr[None, ...]
+        if n_prefix == 1:
+            return arr
+        return arr.reshape((self.n_runs,) + arr.shape[n_prefix:])
+
+    def unflatten(self, arr_flat: jnp.ndarray) -> jnp.ndarray:
+        """Inverse of :meth:`flatten`."""
+        n_prefix = len(self.shape_prefix)
+        if n_prefix == 0:
+            return arr_flat[0]
+        if n_prefix == 1:
+            return arr_flat
+        return arr_flat.reshape(self.shape_prefix + arr_flat.shape[1:])
+
+    def extract_step_sizes(self, pop) -> jnp.ndarray:
+        """Per-replica step sizes from ``pop.step_sizes (*prefix, K, n_moves)``.
+
+        Returns shape ``(*shape_prefix, n_moves)`` — walker axis dropped.
+        """
+        return jnp.take(pop.step_sizes, 0, axis=self.walker_axis)
+
+    def broadcast_step_sizes(
+        self, per_move_ss: jnp.ndarray, n_walkers: int,
+    ) -> jnp.ndarray:
+        """Inverse of :meth:`extract_step_sizes` — re-insert the walker axis.
+
+        Given ``per_move_ss`` of shape ``(*shape_prefix, n_moves)``, returns
+        shape ``(*shape_prefix, K, n_moves)`` broadcast across the walker axis.
+        """
+        n_moves = per_move_ss.shape[-1]
+        target_shape = self.shape_prefix + (n_walkers, n_moves)
+        return jnp.broadcast_to(
+            jnp.expand_dims(per_move_ss, axis=self.walker_axis),
+            target_shape,
+        )
+
+    def reduce_emax(self, energy: jnp.ndarray) -> jnp.ndarray:
+        """Per-replica Emax: ``max`` along the walker axis.
+
+        Returns scalar for SingleRun, ``(*shape_prefix,)`` otherwise.
+        """
+        return jnp.max(energy, axis=self.walker_axis)
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,6 @@ flowchart LR
     B --> Base["base.EnergyBackend<br/>(lj / mace / neuralil / …)"]
     Base --> U["U  (bare potential)"]
     B --> H["H = U + PV − μ·N<br/>(ensemble-corrected)"]
-    H --> M
 ```
 
 Every backend — LJ, MACE-JAX, NeuralIL, and the toy potentials —
@@ -55,31 +54,22 @@ from the `ensemble_params` dict. This means one wrapper instance
 serves multiple replicas at different pressures / chemical
 potentials — no rebuild needed.
 
-For a configuration $\theta = (\vec r, \mathbf{L}, \vec\tau)$ with
+For a configuration $r = (\mathbf q, \mathbf{L}, \sigma)$ with
 volume $V = |\det(\mathbf{L})|$ and species counts $N_i$,
 
 $$
-H_\mathrm{NVT}(\theta) = U(\theta),
+H_\mathrm{NVT}(r) = U(r),
 $$
 $$
-H_\mathrm{NPT}(\theta) = U(\theta) + P\,V,
+H_\mathrm{NPT}(r) = U(r) + P\,V,
 $$
 $$
-H_{\mu V T}(\theta) = U(\theta) + P\,V - \sum_i \mu_i N_i.
+H_{\mu P T}(r) = U(r) + P\,V - \sum_i \mu_i N_i.
 $$
 
 The NS loop always works with $H$, not $U$. Same sampler, same
 move kernels, same acceptance criterion; the ensemble only changes
 what gets compared to $E_\mathrm{max}$.
-
-```{image} /_static/figures/ensemble_tilt.png
-:alt: H(V) curves for NVT, NPT, muVT
-:align: center
-```
-
-Physically: the $+PV$ term pushes walkers toward smaller volumes at
-high pressure (compressing the system), and the $-\mu N$ term
-favours adding atoms when $\mu > 0$ (grand-canonical chemistry).
 
 ## Species indexing
 
