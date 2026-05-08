@@ -344,8 +344,8 @@ class TestPmapVmapRunsInterRE:
 class TestFlavourValidation:
     def test_xrens_accepted_at_cli_level_with_composition_targets(self):
         """CLI schema (pydantic) accepts xrens flavor when composition_targets given."""
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
-        spec = InterREConfigSpec(
+        from jaxrens.cli.schema.inter_re import InterRESpec
+        spec = InterRESpec(
             flavor="xrens",
             composition_targets=[[8, 0], [4, 4]],
         )
@@ -353,9 +353,9 @@ class TestFlavourValidation:
 
     def test_xrens_raises_at_cli_level_without_composition_targets(self):
         """CLI schema (pydantic) rejects xrens flavor when composition_targets absent."""
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         with pytest.raises((ValueError, Exception)):
-            InterREConfigSpec(flavor="xrens")
+            InterRESpec(flavor="xrens")
 
     def test_xrens_raises_at_run_time_without_composition_targets(self):
         """run_ns_parallel raises ValueError for xrens without composition_targets."""

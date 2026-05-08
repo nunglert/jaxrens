@@ -20,7 +20,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 
-class OutputSchema(BaseModel):
+class OutputSpec(BaseModel):
     """Mirrors OutputConfig; YAML key is ``output:``."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)

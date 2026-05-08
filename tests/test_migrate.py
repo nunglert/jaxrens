@@ -11,7 +11,7 @@ import pytest
 import yaml
 
 from jaxrens.cli.migrate import migrate_ns_inp
-from jaxrens.cli.schema import RootConfig
+from jaxrens.cli.schema import RootSpec
 
 PYTHON = sys.executable
 
@@ -20,7 +20,7 @@ PYTHON = sys.executable
 # ---------------------------------------------------------------------------
 
 def _minimal_raw() -> dict[str, str]:
-    """Smallest valid raw dict that produces a validatable RootConfig."""
+    """Smallest valid raw dict that produces a validatable RootSpec."""
     return {
         "n_walkers": "100",
         "n_iter": "1000",
@@ -32,9 +32,9 @@ def _minimal_raw() -> dict[str, str]:
     }
 
 
-def _migrate_and_validate(raw: dict[str, str]) -> RootConfig:
+def _migrate_and_validate(raw: dict[str, str]) -> RootSpec:
     result = migrate_ns_inp(raw)
-    return RootConfig.model_validate(result["config"])
+    return RootSpec.model_validate(result["config"])
 
 
 def _log_messages(raw: dict[str, str]) -> list[str]:
@@ -302,7 +302,7 @@ class TestValidateFlag:
         assert "Validation OK" in proc.stderr
 
     def test_validate_flag_fails_on_bad_config(self, tmp_path):
-        # Produce a YAML that will fail RootConfig because both run.pressure
+        # Produce a YAML that will fail RootSpec because both run.pressure
         # and ensemble are set — deliberately inject this scenario by handing
         # the migrator a raw dict we know will produce a broken config.
         # The easiest way: write a YAML directly that would fail.
@@ -328,7 +328,7 @@ class TestValidateFlag:
         """)
         # Validate directly (not via migrate) to confirm this is actually invalid
         with pytest.raises(Exception):
-            RootConfig.model_validate(yaml.safe_load(yaml_str))
+            RootSpec.model_validate(yaml.safe_load(yaml_str))
 
     def test_validate_roundtrip_via_cli(self, tmp_path):
         inp = tmp_path / "valid.inp"
@@ -350,7 +350,7 @@ class TestValidateFlag:
         assert proc.returncode == 0, proc.stderr
         assert out.exists()
         parsed = yaml.safe_load(out.read_text())
-        RootConfig.model_validate(parsed)
+        RootSpec.model_validate(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +375,7 @@ class TestEndToEndCLI:
         )
         assert proc.returncode == 0, proc.stderr
         parsed = yaml.safe_load(proc.stdout)
-        cfg = RootConfig.model_validate(parsed)
+        cfg = RootSpec.model_validate(parsed)
         assert cfg.run.n_live == 100
         assert cfg.run.max_iterations == 2000
 
@@ -398,7 +398,7 @@ class TestEndToEndCLI:
         )
         assert proc.returncode == 0, proc.stderr
         assert out.exists()
-        cfg = RootConfig.model_validate(yaml.safe_load(out.read_text()))
+        cfg = RootSpec.model_validate(yaml.safe_load(out.read_text()))
         assert cfg.run.n_live == 50
 
     def test_warnings_on_stderr_not_stdout(self, tmp_path):

@@ -1,6 +1,6 @@
 """Pydantic schema for the [cell] section of a jaxrens YAML config.
 
-``CellConfig`` exposes cell-geometry constraints that the volume, shear, and
+``CellSpec`` exposes cell-geometry constraints that the volume, shear, and
 stretch move kernels accept.  The resolver threads these values into
 ``MoveKernel.kernel_kwargs`` automatically at resolution time via
 ``BaseMoveSpec.to_descriptor(cell_cfg=...)``.
@@ -11,7 +11,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict
 
 
-class CellConfig(BaseModel):
+class CellSpec(BaseModel):
     """Cell-geometry constraint parameters.
 
     These values are threaded automatically into the ``kernel_kwargs`` of

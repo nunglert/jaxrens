@@ -13,7 +13,7 @@ import jax.numpy as jnp
 
 from jaxrens.backends.toy import create_harmonic
 from jaxrens.cli.resolve import resolve
-from jaxrens.cli.schema import RootConfig
+from jaxrens.cli.schema import RootSpec
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, ns_step
@@ -33,7 +33,7 @@ class TestMwgJitPlumbing:
 
     def test_spec_to_ns_step_jit(self):
         """Confirm the spec->descriptor->mwg->ns_step pipeline traces cleanly under JIT."""
-        root = RootConfig.model_validate(_minimal_dict())
+        root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
 
         backend = create_harmonic()

@@ -2,7 +2,7 @@
 
 Only ``parse_input_file`` is public.  The old dataclass-construction helpers
 (``raw_to_configs``, ``load_config``) have been removed; use
-``migrate_ns_inp`` + ``RootConfig.model_validate`` instead.
+``migrate_ns_inp`` + ``RootSpec.model_validate`` instead.
 """
 
 from __future__ import annotations

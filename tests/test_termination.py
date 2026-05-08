@@ -497,7 +497,7 @@ class TestTerminationEndToEndJit:
         """
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import resolve
-        from jaxrens.cli.schema import RootConfig
+        from jaxrens.cli.schema import RootSpec
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import run_ns
 
@@ -513,7 +513,7 @@ class TestTerminationEndToEndJit:
             "output": {"format": "none", "working_dir": ".", "info_interval": 999},
             "termination": [{"type": "iteration", "max_iterations": 5}],
         }
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         resolved = resolve(root)
 
         backend = create_harmonic()

@@ -1,6 +1,6 @@
 """Pydantic schema for the [adaptation] section of a jaxrens YAML config.
 
-``AdaptationConfig`` holds the step-size adaptation policy with a
+``AdaptationSpec`` holds the step-size adaptation policy with a
 ``defaults + per_move`` overlay.  ``resolve_for(key)`` returns the effective
 policy for a named move: per-move fields that are None fall through to
 defaults, and defaults fields that are None fall through to the hardcoded
@@ -69,10 +69,10 @@ class ResolvedAdaptationPolicy(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# AdaptationConfig
+# AdaptationSpec
 # ---------------------------------------------------------------------------
 
-class AdaptationConfig(BaseModel):
+class AdaptationSpec(BaseModel):
     """Top-level adaptation config with defaults and per-move overrides."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)

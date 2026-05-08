@@ -135,12 +135,12 @@ def test_lj_full_pipeline(tmp_path: Path) -> None:
         expand_multi_run_or_cohort,
     )
     from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootConfig
+    from jaxrens.cli.schema import RootSpec
 
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["output"]["working_dir"] = str(tmp_path / "out")
 
-    root = RootConfig.model_validate(raw)
+    root = RootSpec.model_validate(raw)
     resolved = expand_multi_run_or_cohort(root)
     assert isinstance(resolved, ResolvedMultiRunConfig), (
         "Two-pressure config should route through the multi-GPU dispatcher."
@@ -221,7 +221,7 @@ def test_lj_pipeline_smoke_variants(tmp_path: Path, missing: str) -> None:
         expand_multi_run_or_cohort,
     )
     from jaxrens.cli.run import run_from_config, run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootConfig
+    from jaxrens.cli.schema import RootSpec
 
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["output"]["working_dir"] = str(tmp_path / "out")
@@ -233,7 +233,7 @@ def test_lj_pipeline_smoke_variants(tmp_path: Path, missing: str) -> None:
     elif missing == "inter_re":
         raw.pop("inter_re", None)  # multi-run path without RENS
 
-    root = RootConfig.model_validate(raw)
+    root = RootSpec.model_validate(raw)
     resolved = expand_multi_run_or_cohort(root)
 
     if isinstance(resolved, ResolvedMultiRunConfig):
@@ -355,7 +355,7 @@ def test_lj_multi_gpu_pipeline(tmp_path: Path) -> None:
         expand_multi_run_or_cohort,
     )
     from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootConfig
+    from jaxrens.cli.schema import RootSpec
 
     n_gpu = multi_gpu_n_devices()
     n_total = n_gpu * 2
@@ -364,7 +364,7 @@ def test_lj_multi_gpu_pipeline(tmp_path: Path) -> None:
     raw["output"]["working_dir"] = str(tmp_path / "out")
     raw["ensemble"]["pressure"] = raw["ensemble"]["pressure"][:n_total]
 
-    root = RootConfig.model_validate(raw)
+    root = RootSpec.model_validate(raw)
     resolved = expand_multi_run_or_cohort(root)
     assert isinstance(resolved, ResolvedMultiRunConfig)
     assert resolved.ns.n_gpu == n_gpu, (

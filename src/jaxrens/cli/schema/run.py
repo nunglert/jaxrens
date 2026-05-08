@@ -7,7 +7,7 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict
 
 
-class RunSchema(BaseModel):
+class RunSpec(BaseModel):
     """Mirrors NSConfig; YAML key is ``run:``.
 
     ``max_iterations`` is optional — when omitted the resolver auto-derives a

@@ -602,12 +602,12 @@ class TestSemiGrandPmapVmapSmoke:
 # ---------------------------------------------------------------------------
 
 
-class TestInterREConfigSpecSemiGrand:
+class TestInterRESpecSemiGrand:
     """CLI schema validation for semi_grand flavor."""
 
     def test_semi_grand_valid_spec(self):
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
-        spec = InterREConfigSpec(
+        from jaxrens.cli.schema.inter_re import InterRESpec
+        spec = InterRESpec(
             flavor="semi_grand",
             every=1,
             n_swap_cycles=1,
@@ -618,38 +618,38 @@ class TestInterREConfigSpecSemiGrand:
         assert cfg.chemical_potentials == ((0.0, 0.0), (0.5, 1.0))
 
     def test_semi_grand_missing_chemical_potentials_raises(self):
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         with pytest.raises((ValueError, Exception)):
-            InterREConfigSpec(flavor="semi_grand")
+            InterRESpec(flavor="semi_grand")
 
     def test_semi_grand_inconsistent_row_lengths_raises(self):
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         with pytest.raises((ValueError, Exception)):
-            InterREConfigSpec(
+            InterRESpec(
                 flavor="semi_grand",
                 chemical_potentials=[[0.0, 0.0], [0.5, 1.0, 2.0]],  # different lengths
             )
 
     def test_semi_grand_no_longer_raises_not_implemented(self):
         """semi_grand must no longer raise NotImplementedError (commit 5 lands it)."""
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         # Should not raise NotImplementedError; valid spec must succeed.
-        spec = InterREConfigSpec(
+        spec = InterRESpec(
             flavor="semi_grand",
             chemical_potentials=[[0.0, 0.0], [1.0, 1.0]],
         )
         assert spec.flavor == "semi_grand"
 
     def test_pressure_flavor_still_valid(self):
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
-        spec = InterREConfigSpec(flavor="pressure", every=2, n_swap_cycles=1)
+        from jaxrens.cli.schema.inter_re import InterRESpec
+        spec = InterRESpec(flavor="pressure", every=2, n_swap_cycles=1)
         cfg = spec.to_inter_re_config()
         assert cfg.flavor == "pressure"
         assert cfg.chemical_potentials is None
 
     def test_to_inter_re_config_roundtrip(self):
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
-        spec = InterREConfigSpec(
+        from jaxrens.cli.schema.inter_re import InterRESpec
+        spec = InterRESpec(
             flavor="semi_grand",
             every=3,
             n_swap_cycles=2,

@@ -17,11 +17,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from jaxrens.backends.base import EnergyBackend
-from jaxrens.cli.schema.adaptation import AdaptationConfig, ResolvedAdaptationPolicy
-from jaxrens.cli.schema.cell import CellConfig
+from jaxrens.cli.schema.adaptation import AdaptationSpec, ResolvedAdaptationPolicy
+from jaxrens.cli.schema.cell import CellSpec
 from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-from jaxrens.cli.schema.init import InitConfig
-from jaxrens.cli.schema.root import RootConfig
+from jaxrens.cli.schema.init import InitSpec
+from jaxrens.cli.schema.root import RootSpec
 from jaxrens.init.cells import cell_shape_walk, sample_initial_volume
 from jaxrens.init.positions import grid_positions_in_cell, uniform_positions_in_cell
 from jaxrens.init.rejection import rejection_sample_positions
@@ -39,7 +39,7 @@ from jaxrens.utils.cell import get_volume, min_aspect_ratio
 
 logger = logging.getLogger(__name__)
 
-# Output fields that are accepted by OutputSchema but not yet consumed by the
+# Output fields that are accepted by OutputSpec but not yet consumed by the
 # runtime callback layer.
 _DEFERRED_OUTPUT_FIELDS: tuple[str, ...] = (
     "snapshot_time",
@@ -73,12 +73,12 @@ class ResolvedInit:
 
 
 def _build_cells(
-    init: InitConfig,
+    init: InitSpec,
     n_live: int,
     shape_key: jax.Array,
     base_cell: jnp.ndarray,
     n_atoms: int,
-    cell_cfg: CellConfig,
+    cell_cfg: CellSpec,
 ) -> jnp.ndarray:
     """Produce (n_live, 3, 3) cells from a base cell.
 
@@ -116,7 +116,7 @@ def _build_cells(
 def _describe_cell_violation(
     cell: jnp.ndarray,
     n_atoms: int,
-    cell_cfg: CellConfig,
+    cell_cfg: CellSpec,
 ) -> str | None:
     """Return a human-readable reason why ``cell`` fails ``check_cell_shape``.
 
@@ -147,7 +147,7 @@ def _describe_cell_violation(
 def _validate_input_cell(
     cell: jnp.ndarray,
     n_atoms: int,
-    cell_cfg: CellConfig,
+    cell_cfg: CellSpec,
     source: str,
 ) -> None:
     """Reject a user-provided base cell that already violates ``cell_cfg``.
@@ -172,7 +172,7 @@ def _validate_input_cell(
 def _validate_cells(
     cells: jnp.ndarray,
     n_atoms: int,
-    cell_cfg: CellConfig,
+    cell_cfg: CellSpec,
 ) -> None:
     """Raise ``RuntimeError`` if any walker cell fails check_cell_shape."""
     n_live = cells.shape[0]
@@ -246,7 +246,7 @@ def _finalise_initial_energies_and_counts(
 
 
 def _sample_per_walker_positions(
-    init: InitConfig,
+    init: InitSpec,
     n_live: int,
     pos_key: jax.Array,
     initial_cells: jnp.ndarray,
@@ -304,8 +304,8 @@ def _sample_per_walker_positions(
 
 
 def _resolve_init_walker_set(
-    init: InitConfig,
-    cell_cfg: CellConfig,
+    init: InitSpec,
+    cell_cfg: CellSpec,
     n_live: int,
     energy_backend: EnergyBackend | None,
 ) -> ResolvedInit:
@@ -340,8 +340,8 @@ def _resolve_init_walker_set(
 
 
 def _resolve_init_restart(
-    init: InitConfig,
-    cell_cfg: CellConfig,
+    init: InitSpec,
+    cell_cfg: CellSpec,
     n_live: int,
     energy_backend: EnergyBackend | None,
 ) -> ResolvedInit:
@@ -377,31 +377,31 @@ def _resolve_init_restart(
 
 
 def _resolve_init(
-    init: InitConfig,
+    init: InitSpec,
     n_live: int,
     seed: int,
     energy_backend: EnergyBackend | None = None,
-    cell_cfg: CellConfig | None = None,
+    cell_cfg: CellSpec | None = None,
 ) -> ResolvedInit:
-    """Resolve an ``InitConfig`` into concrete initial-state arrays.
+    """Resolve an ``InitSpec`` into concrete initial-state arrays.
 
     Supports ``start_species`` (Mode A), ``start_config_file`` (Mode B),
     ``start_walker_set`` (Mode C), and ``restart_file`` (Mode D).
 
     Args:
-        init: Validated ``InitConfig``.
+        init: Validated ``InitSpec``.
         n_live: Number of live walkers (from ``NSConfig.n_live``).
         seed: PRNG seed.
         energy_backend: Backend used to compute initial energies.  When
             ``None``, ``initial_energies`` is left as ``None``.
-        cell_cfg: ``CellConfig`` carrying cell-geometry constraints.  When
-            ``None`` a default ``CellConfig()`` is used.
+        cell_cfg: ``CellSpec`` carrying cell-geometry constraints.  When
+            ``None`` a default ``CellSpec()`` is used.
 
     Returns:
         ``ResolvedInit`` with arrays populated for the chosen mode.
     """
     if cell_cfg is None:
-        cell_cfg = CellConfig()
+        cell_cfg = CellSpec()
 
     if init.start_walker_set is not None:
         return _resolve_init_walker_set(init, cell_cfg, n_live, energy_backend)
@@ -417,11 +417,11 @@ def _resolve_init(
 
 
 def _resolve_init_species(
-    init: InitConfig,
+    init: InitSpec,
     n_live: int,
     seed: int,
     energy_backend: EnergyBackend | None,
-    cell_cfg: CellConfig,
+    cell_cfg: CellSpec,
 ) -> ResolvedInit:
     """Mode A: initialise from a species string (start_species)."""
     species_counts = init.parsed_species()
@@ -535,11 +535,11 @@ def _resolve_init_species(
 
 
 def _resolve_init_config_file(
-    init: InitConfig,
+    init: InitSpec,
     n_live: int,
     seed: int,
     energy_backend: EnergyBackend | None,
-    cell_cfg: CellConfig,
+    cell_cfg: CellSpec,
 ) -> ResolvedInit:
     """Mode B: initialise from a founder structure file (start_config_file)."""
     logger.info(
@@ -563,7 +563,7 @@ def _resolve_init_config_file(
         logger.warning(
             "start_config_file with random_initialise_pos=False: all %d walkers "
             "start with identical positions. They are fully correlated; enable "
-            "burn-in (InitialWalkConfig.n_walks > 0) or set random_initialise_pos=True.",
+            "burn-in (InitialWalkSpec.n_walks > 0) or set random_initialise_pos=True.",
             n_live,
         )
         initial_positions = jnp.broadcast_to(
@@ -603,10 +603,10 @@ def _null_energy_fn(
 # ---------------------------------------------------------------------------
 
 def _warn_unused_output_fields(output_schema: Any) -> None:
-    """Emit warnings for deferred ``OutputSchema`` fields that are non-default.
+    """Emit warnings for deferred ``OutputSpec`` fields that are non-default.
 
     Args:
-        output_schema: An ``OutputSchema`` instance.
+        output_schema: An ``OutputSpec`` instance.
     """
     deferred_defaults: dict[str, Any] = {
         "snapshot_time": None,
@@ -653,14 +653,14 @@ class ResolvedConfig:
     termination: tuple[TerminationCriterion, ...]
     adaptation_policies: tuple[ResolvedAdaptationPolicy, ...]
     init: ResolvedInit
-    cell: CellConfig
+    cell: CellSpec
     cohort_index: int = 0
     ensemble_params: dict = field(default_factory=dict)
     initial_walk_config: Any = None
     adaptation_cfg: Any = None
 
 
-def _cohort_size(root: RootConfig) -> int:
+def _cohort_size(root: RootSpec) -> int:
     """Return the number of cohort elements implied by the ensemble spec."""
     from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
     if isinstance(root.ensemble, NPTEnsembleSpec):
@@ -668,7 +668,7 @@ def _cohort_size(root: RootConfig) -> int:
     return 1
 
 
-def _seed_list(root: RootConfig, n: int) -> list[int]:
+def _seed_list(root: RootSpec, n: int) -> list[int]:
     """Return a list of *n* seeds derived from ``root.run.seed``.
 
     If ``run.seed`` is a scalar, generate ``[seed + i for i in range(n)]``.
@@ -676,7 +676,7 @@ def _seed_list(root: RootConfig, n: int) -> list[int]:
     return [root.run.seed + i for i in range(n)]
 
 
-def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
+def _resolve_one(root: RootSpec, cohort_index: int = 0) -> ResolvedConfig:
     """Resolve ``root`` into library dataclasses for a single cohort element."""
     ensemble_params = root.ensemble.to_ensemble_params(cohort_index=cohort_index)
     pressure = ensemble_params.get("pressure", None)
@@ -788,8 +788,8 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
     )
 
 
-def expand_cohort(root: RootConfig) -> list[ResolvedConfig]:
-    """Expand a ``RootConfig`` into one ``ResolvedConfig`` per cohort element.
+def expand_cohort(root: RootSpec) -> list[ResolvedConfig]:
+    """Expand a ``RootSpec`` into one ``ResolvedConfig`` per cohort element.
 
     Cohort axes are defined by the ensemble spec (e.g. a list of pressures in
     ``NPTEnsembleSpec``).  Scalar specs produce a single-element cohort.
@@ -803,7 +803,7 @@ def expand_cohort(root: RootConfig) -> list[ResolvedConfig]:
     reproducible from the base seed.
 
     Args:
-        root: Fully validated ``RootConfig``.
+        root: Fully validated ``RootSpec``.
 
     Returns:
         List of ``ResolvedConfig`` objects, one per cohort element.  The list
@@ -827,8 +827,8 @@ def expand_cohort(root: RootConfig) -> list[ResolvedConfig]:
     return results
 
 
-def resolve(root: RootConfig) -> ResolvedConfig:
-    """Translate a validated ``RootConfig`` into library dataclasses.
+def resolve(root: RootSpec) -> ResolvedConfig:
+    """Translate a validated ``RootSpec`` into library dataclasses.
 
     This is a thin wrapper around ``expand_cohort`` for single-element cohorts.
     For multi-element cohorts (pressure sweeps etc.) use ``expand_cohort``
@@ -882,7 +882,7 @@ class ResolvedMultiRunConfig:
     termination: tuple[TerminationCriterion, ...]
     adaptation_policies: tuple[ResolvedAdaptationPolicy, ...]
     init: ResolvedInit
-    cell: CellConfig
+    cell: CellSpec
     # Per-replica ensemble_params, flat list of length n_total.  Ordering is
     # ``flat_idx = g * n_per_gpu + p`` — matches ``init_ns_multi_gpu``.
     ensemble_params_per_run: tuple[dict, ...]
@@ -897,7 +897,7 @@ def _local_device_count() -> int:
 
 
 def _derive_replica_axes(
-    root: RootConfig,
+    root: RootSpec,
 ) -> tuple[int, int, int, list[dict]]:
     """Compute (n_total, n_gpu, n_per_gpu, ensemble_params_per_run).
 
@@ -1005,7 +1005,7 @@ def _derive_replica_axes(
     return n_total, n_gpu, n_per_gpu, params_per_run
 
 
-def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
+def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
     """Resolve ``root`` into a ``ResolvedMultiRunConfig``.
 
     Builds per-replica initial positions / cells / energies by calling
@@ -1188,7 +1188,7 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
 
 
 def expand_multi_run_or_cohort(
-    root: RootConfig,
+    root: RootSpec,
 ) -> list[ResolvedConfig] | ResolvedMultiRunConfig:
     """Dispatch between multi-run and single-run (cohort) resolution.
 

@@ -144,8 +144,7 @@ def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
     """
     from jaxrens.cli.schema.moves import (
         AlchemicalShiftMoveSpec,
-        GalileanMoveSpec,
-        GmcMoveSpec,
+        GMCMoveSpec,
         HMCMoveSpec,
         RandomWalkMoveSpec,
         SingleAtomMoveSpec,
@@ -154,8 +153,8 @@ def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
 
     _SIMPLE_SPEC_MAP: dict[str, Any] = {
         "random_walk": RandomWalkMoveSpec,
-        "galilean": GalileanMoveSpec,
-        "gmc": GmcMoveSpec,
+        "galilean": GMCMoveSpec,
+        "gmc": GMCMoveSpec,
         "hmc": HMCMoveSpec,
         "single_atom": SingleAtomMoveSpec,
         "single_atom_swap": SingleAtomSwapMoveSpec,

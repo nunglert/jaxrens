@@ -17,7 +17,7 @@ from jaxrens.cli.resolve import (
     _resolve_multi_run,
     expand_multi_run_or_cohort,
 )
-from jaxrens.cli.schema import RootConfig
+from jaxrens.cli.schema import RootSpec
 
 
 def _lj_multi_run_config(
@@ -95,7 +95,7 @@ class TestDeriveReplicaAxes:
 
     def test_scalar_pressure_is_single_run(self):
         cfg = _lj_multi_run_config([0.01])
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         n_total, n_gpu, n_per_gpu, params = _derive_replica_axes(root)
         assert n_total == 1
         assert n_gpu == 1
@@ -104,7 +104,7 @@ class TestDeriveReplicaAxes:
 
     def test_pressure_list_drives_replica_count(self):
         cfg = _lj_multi_run_config([0.01, 0.1, 1.0])
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         n_total, n_gpu, n_per_gpu, params = _derive_replica_axes(root)
         assert (n_total, n_gpu, n_per_gpu) == (3, 1, 3)
         assert [p["pressure"] for p in params] == [0.01, 0.1, 1.0]
@@ -114,7 +114,7 @@ class TestDeriveReplicaAxes:
             [0.01],
             inter_re={"flavor": "pressure", "every": 1, "n_swap_cycles": 1},
         )
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         with pytest.raises(ValueError, match="requires a list-valued"):
             _derive_replica_axes(root)
 
@@ -122,7 +122,7 @@ class TestDeriveReplicaAxes:
         from jaxrens.cli import resolve as _r
         monkeypatch.setattr(_r, "_local_device_count", lambda: 2)
         cfg = _lj_multi_run_config([0.01, 0.1, 1.0])
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         with pytest.raises(ValueError, match="not divisible"):
             _derive_replica_axes(root)
 
@@ -131,7 +131,7 @@ class TestDeriveReplicaAxes:
         from jaxrens.cli import resolve as _r
         monkeypatch.setattr(_r, "_local_device_count", lambda: 3)
         cfg = _lj_multi_run_config([0.01, 0.02, 0.03, 0.04, 0.05, 0.06])
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         n_total, n_gpu, n_per_gpu, params = _derive_replica_axes(root)
         assert (n_total, n_gpu, n_per_gpu) == (6, 3, 2)
         assert len(params) == 6
@@ -144,7 +144,7 @@ class TestDeriveReplicaAxes:
         from jaxrens.cli import resolve as _r
         monkeypatch.setattr(_r, "_local_device_count", lambda: 4)
         cfg = _lj_multi_run_config([0.01, 0.1])
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             n_total, n_gpu, n_per_gpu, _ = _derive_replica_axes(root)
         assert (n_total, n_gpu, n_per_gpu) == (2, 2, 1)
@@ -164,21 +164,21 @@ class TestResolveMultiRun:
 
     def test_expand_dispatcher_returns_multi_run_for_pressure_list(self):
         cfg = _lj_multi_run_config([0.01, 0.1])
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         out = expand_multi_run_or_cohort(root)
         assert isinstance(out, ResolvedMultiRunConfig)
         assert out.ns.n_gpu * out.ns.n_per_gpu == 2
 
     def test_expand_dispatcher_returns_cohort_for_scalar(self):
         cfg = _lj_multi_run_config([0.01])
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         out = expand_multi_run_or_cohort(root)
         assert not isinstance(out, ResolvedMultiRunConfig)
         assert isinstance(out, list) and len(out) == 1
 
     def test_resolved_init_stacked_shapes(self):
         cfg = _lj_multi_run_config([0.01, 0.1, 1.0])
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         out = _resolve_multi_run(root)
         n_total = out.ns.n_gpu * out.ns.n_per_gpu
         n_live = out.ns.n_live
@@ -194,7 +194,7 @@ class TestResolveMultiRun:
         # Different pressures → different +P·V additive term → different energies
         # when cells are shared (up to random init noise).
         cfg = _lj_multi_run_config([0.01, 10.0])
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         out = _resolve_multi_run(root)
         e_lo = out.init.initial_energies[0]
         e_hi = out.init.initial_energies[1]
@@ -206,7 +206,7 @@ class TestResolveMultiRun:
             [0.01, 0.1],
             inter_re={"flavor": "pressure", "every": 2, "n_swap_cycles": 3},
         )
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         out = _resolve_multi_run(root)
         assert out.inter_re_config is not None
         assert out.inter_re_config.flavor == "pressure"
@@ -234,7 +234,7 @@ class TestRunMultiGpuFromConfig:
             n_mcmc_steps=2,
             working_dir=tmp_path,
         )
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         resolved = _resolve_multi_run(root)
 
         from jaxrens.cli.run import run_multi_gpu_from_config
@@ -260,7 +260,7 @@ class TestRunMultiGpuFromConfig:
             working_dir=tmp_path,
             inter_re={"flavor": "pressure", "every": 1, "n_swap_cycles": 1},
         )
-        root = RootConfig.model_validate(cfg)
+        root = RootSpec.model_validate(cfg)
         resolved = _resolve_multi_run(root)
         assert resolved.inter_re_config is not None
 

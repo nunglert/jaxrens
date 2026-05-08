@@ -223,11 +223,11 @@ class TestLoadStructureErrors:
 
 
 # ---------------------------------------------------------------------------
-# Mode B E2E test moved from test_schema.py::TestInitConfigResolver (line 2080)
+# Mode B E2E test moved from test_schema.py::TestInitSpecResolver (line 2080)
 # ---------------------------------------------------------------------------
 
 class TestModeBEndToEndJit:
-    """test_mode_b_end_to_end_jit moved from second TestInitConfigResolver."""
+    """test_mode_b_end_to_end_jit moved from second TestInitSpecResolver."""
 
     def test_mode_b_end_to_end_jit(self, tmp_path):
         """Mode B resolver -> run_ns -> ns_step under JIT."""
@@ -236,8 +236,8 @@ class TestModeBEndToEndJit:
         import jax.numpy as jnp
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        from jaxrens.cli.schema.cell import CellConfig
+        from jaxrens.cli.schema.init import InitSpec
+        from jaxrens.cli.schema.cell import CellSpec
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, ns_step
         from jaxrens.sampling.move_kernel import MoveKernel
@@ -249,13 +249,13 @@ class TestModeBEndToEndJit:
         p = tmp_path / "founder_jit.extxyz"
         ase.io.write(str(p), atoms)
 
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_config_file=p,
             random_initialise_pos=True,
             random_initialise_cell=False,
             pos_randomization_mode="uniform",
         )
-        cell_cfg = CellConfig(
+        cell_cfg = CellSpec(
             max_volume_per_atom=1000.0,
             min_volume_per_atom=0.1,
             min_aspect_ratio=0.01,

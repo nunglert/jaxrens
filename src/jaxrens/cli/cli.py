@@ -4,7 +4,7 @@ Subcommands
 -----------
 run        Load YAML, validate, resolve, execute NS.
 validate   Load YAML, validate only; print OK summary.
-dump-schema  Print JSON schema for RootConfig.
+dump-schema  Print JSON schema for RootSpec.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import yaml
 
 from jaxrens.cli.resolve import expand_cohort, resolve
 from jaxrens.cli.run import run_from_config
-from jaxrens.cli.schema import RootConfig
+from jaxrens.cli.schema import RootSpec
 
 
 # ---------------------------------------------------------------------------
@@ -91,12 +91,12 @@ def _apply_overrides(raw: dict[str, Any], overrides: list[str]) -> dict[str, Any
 # Subcommand implementations
 # ---------------------------------------------------------------------------
 
-def _load_and_validate(config_path: str, overrides: list[str]) -> RootConfig:
+def _load_and_validate(config_path: str, overrides: list[str]) -> RootSpec:
     with open(config_path) as fh:
         raw: dict[str, Any] = yaml.safe_load(fh)
     if overrides:
         raw = _apply_overrides(raw, overrides)
-    return RootConfig.model_validate(raw)
+    return RootSpec.model_validate(raw)
 
 
 def _run_one(resolved, *, cohort_label: str = "") -> None:
@@ -244,7 +244,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 
 def _cmd_dump_schema(args: argparse.Namespace) -> int:
-    schema = RootConfig.model_json_schema()
+    schema = RootSpec.model_json_schema()
     fmt = getattr(args, "format", "json")
     if fmt == "json":
         print(json.dumps(schema, indent=2))
@@ -260,7 +260,7 @@ def _cmd_migrate_ns_inp(args: argparse.Namespace) -> int:
     stdout captures clean YAML.
 
     If ``--validate`` is passed, the migrated YAML is round-tripped through
-    ``RootConfig.model_validate``; any validation error is printed to stderr
+    ``RootSpec.model_validate``; any validation error is printed to stderr
     and the command returns exit code 1.
     """
     from jaxrens.cli.migrate import migrate_ns_inp
@@ -310,7 +310,7 @@ def _cmd_migrate_ns_inp(args: argparse.Namespace) -> int:
     # Optional validation round-trip --------------------------------------
     if args.validate:
         try:
-            RootConfig.model_validate(yaml.safe_load(yaml_text))
+            RootSpec.model_validate(yaml.safe_load(yaml_text))
         except Exception as exc:
             print(f"Validation failed: {exc}", file=sys.stderr)
             return 1
@@ -352,7 +352,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_val.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
 
     # -- dump-schema --
-    p_dump = sub.add_parser("dump-schema", help="Print the JSON schema for RootConfig.")
+    p_dump = sub.add_parser("dump-schema", help="Print the JSON schema for RootSpec.")
     p_dump.add_argument("--format", choices=["json"], default="json")
 
     # -- migrate-ns-inp --
@@ -377,7 +377,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "After migrating, round-trip through RootConfig.model_validate and "
+            "After migrating, round-trip through RootSpec.model_validate and "
             "exit non-zero if validation fails."
         ),
     )

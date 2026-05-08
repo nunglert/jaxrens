@@ -4,23 +4,31 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from jaxrens.cli.schema.adaptation import AdaptationConfig
+from jaxrens.cli.schema.adaptation import AdaptationSpec
 from jaxrens.cli.schema.backend import BackendSpec
-from jaxrens.cli.schema.cell import CellConfig
+from jaxrens.cli.schema.cell import CellSpec
 from jaxrens.cli.schema.ensemble import EnsembleSpec, NVTEnsembleSpec, NPTEnsembleSpec
-from jaxrens.cli.schema.init import InitConfig
-from jaxrens.cli.schema.inter_re import InterREConfigSpec
+from jaxrens.cli.schema.init import InitSpec
+from jaxrens.cli.schema.inter_re import InterRESpec
 from jaxrens.cli.schema.moves import MoveSpec
-from jaxrens.cli.schema.output import OutputSchema
-from jaxrens.cli.schema.run import RunSchema
+from jaxrens.cli.schema.output import OutputSpec
+from jaxrens.cli.schema.run import RunSpec
 from jaxrens.cli.schema.termination import TerminationSpec
 
 
 def _coerce_move_dict(d: object) -> object:
-    """Map legacy ``move_type`` key to the discriminator ``type`` field."""
+    """Map legacy ``move_type`` key and the ``type: galilean`` alias.
+
+    - ``move_type:`` → ``type:`` (legacy key name).
+    - ``type: galilean`` → ``type: gmc`` (canonical name; ``GMCMoveSpec`` is
+      the only Galilean-MC class).
+    """
     if isinstance(d, dict) and "type" not in d and "move_type" in d:
         d = dict(d)
         d["type"] = d.pop("move_type")
+    if isinstance(d, dict) and d.get("type") == "galilean":
+        d = dict(d)
+        d["type"] = "gmc"
     return d
 
 
@@ -32,26 +40,26 @@ def _coerce_backend_dict(d: object) -> object:
     return d
 
 
-class RootConfig(BaseModel):
+class RootSpec(BaseModel):
     """Top-level YAML config schema."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    run: RunSchema
+    run: RunSpec
     moves: list[MoveSpec]
     backend: BackendSpec
-    output: OutputSchema
+    output: OutputSpec
     termination: list[TerminationSpec] | None = None
-    adaptation: AdaptationConfig = Field(default_factory=AdaptationConfig)
+    adaptation: AdaptationSpec = Field(default_factory=AdaptationSpec)
     # ensemble defaults to NVT; NPTEnsembleSpec is synthesized from run.pressure
     # when no explicit ensemble: key is provided (backward compatibility).
     ensemble: EnsembleSpec = Field(default_factory=NVTEnsembleSpec)
-    init: InitConfig = Field(
-        default_factory=lambda: InitConfig(start_species="1 1")
+    init: InitSpec = Field(
+        default_factory=lambda: InitSpec(start_species="1 1")
     )
-    cell: CellConfig = Field(default_factory=CellConfig)
+    cell: CellSpec = Field(default_factory=CellSpec)
     # inter_re is optional; None → no replica-exchange swaps (zero overhead).
-    inter_re: InterREConfigSpec | None = None
+    inter_re: InterRESpec | None = None
 
     @field_validator("moves", mode="before")
     @classmethod
@@ -81,7 +89,7 @@ class RootConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _resolve_legacy_pressure(self) -> "RootConfig":
+    def _resolve_legacy_pressure(self) -> "RootSpec":
         """Synthesize NPTEnsembleSpec from ``run.pressure`` when no ``ensemble:`` key.
 
         Rules:

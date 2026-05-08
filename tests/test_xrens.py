@@ -676,12 +676,12 @@ class TestXRENSSingleRunSkip:
 # ---------------------------------------------------------------------------
 
 
-class TestInterREConfigSpecXRENS:
+class TestInterRESpecXRENS:
     """CLI schema validation for xrens flavor."""
 
     def test_xrens_valid_spec(self):
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
-        spec = InterREConfigSpec(
+        from jaxrens.cli.schema.inter_re import InterRESpec
+        spec = InterRESpec(
             flavor="xrens",
             every=1,
             n_swap_cycles=1,
@@ -692,30 +692,30 @@ class TestInterREConfigSpecXRENS:
         assert cfg.composition_targets == ((8, 0), (4, 4))
 
     def test_xrens_missing_composition_targets_raises(self):
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         with pytest.raises((ValueError, Exception)):
-            InterREConfigSpec(flavor="xrens")  # No composition_targets
+            InterRESpec(flavor="xrens")  # No composition_targets
 
     def test_xrens_inconsistent_row_sums_raises(self):
         """Rows summing to different n_atoms must raise."""
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         with pytest.raises((ValueError, Exception)):
-            InterREConfigSpec(
+            InterRESpec(
                 flavor="xrens",
                 composition_targets=[[8, 0], [4, 4, 2]],  # Inconsistent lengths
             )
 
     def test_xrens_inconsistent_sums_raises(self):
         """Rows with different sums (different n_atoms) must raise."""
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         with pytest.raises((ValueError, Exception)):
-            InterREConfigSpec(
+            InterRESpec(
                 flavor="xrens",
                 composition_targets=[[8, 0], [3, 4]],  # Sums 8 vs 7
             )
 
     def test_semi_grand_missing_chemical_potentials_raises(self):
         """semi_grand without chemical_potentials must raise ValueError."""
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         with pytest.raises((ValueError, Exception)):
-            InterREConfigSpec(flavor="semi_grand")  # missing chemical_potentials
+            InterRESpec(flavor="semi_grand")  # missing chemical_potentials

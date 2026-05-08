@@ -392,7 +392,7 @@ class TestDispatch:
 
 
 # ---------------------------------------------------------------------------
-# Mode C resolver tests (moved from test_schema.py::TestInitConfigResolverModeC)
+# Mode C resolver tests (moved from test_schema.py::TestInitSpecResolverModeC)
 # ---------------------------------------------------------------------------
 
 def _make_walker_set_extxyz(
@@ -445,57 +445,57 @@ def _make_walker_set_hdf5_resolver(
 
 
 def _cell_cfg_permissive():
-    from jaxrens.cli.schema.cell import CellConfig
-    return CellConfig(
+    from jaxrens.cli.schema.cell import CellSpec
+    return CellSpec(
         max_volume_per_atom=10000.0,
         min_volume_per_atom=0.01,
         min_aspect_ratio=0.001,
     )
 
 
-class TestInitConfigResolverModeC:
+class TestInitSpecResolverModeC:
     """Mode C resolver tests: start_walker_set.
 
-    Moved verbatim from test_schema.py::TestInitConfigResolverModeC.
+    Moved verbatim from test_schema.py::TestInitSpecResolverModeC.
     """
 
     def test_extxyz_resolved_init_type(self, tmp_path):
         from jaxrens.cli.resolve import ResolvedInit, _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_walker_set_extxyz(tmp_path, n_live=4, symbols=["Si"])
-        cfg = InitConfig(start_walker_set=p)
+        cfg = InitSpec(start_walker_set=p)
         result = _resolve_init(cfg, n_live=4, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
         assert isinstance(result, ResolvedInit)
 
     def test_extxyz_positions_shape(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_walker_set_extxyz(tmp_path, n_live=4, symbols=["Si", "Si"])
-        cfg = InitConfig(start_walker_set=p)
+        cfg = InitSpec(start_walker_set=p)
         result = _resolve_init(cfg, n_live=4, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
         assert result.initial_positions.shape == (4, 2, 3)
 
     def test_extxyz_types_shape(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_walker_set_extxyz(tmp_path, n_live=4, symbols=["Si", "Si"])
-        cfg = InitConfig(start_walker_set=p)
+        cfg = InitSpec(start_walker_set=p)
         result = _resolve_init(cfg, n_live=4, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
         assert result.initial_types.shape == (4, 2)
 
     def test_extxyz_symbol_map_correct(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si", "O", "O"])
-        cfg = InitConfig(start_walker_set=p)
+        cfg = InitSpec(start_walker_set=p)
         result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
         assert result.symbol_map == {0: "Si", 1: "O"}
 
@@ -504,7 +504,7 @@ class TestInitConfigResolverModeC:
         import ase, ase.io as _ase_io
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
 
         cell = np.eye(3, dtype=np.float32) * 6.0
         rng = np.random.default_rng(0)
@@ -517,7 +517,7 @@ class TestInitConfigResolverModeC:
         p = tmp_path / "stale.extxyz"
         _ase_io.write(str(p), frames, format="extxyz")
 
-        cfg = InitConfig(start_walker_set=p)
+        cfg = InitSpec(start_walker_set=p)
         backend = create_harmonic()
         result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=backend, cell_cfg=_cell_cfg_permissive())
         assert result.initial_energies is not None
@@ -525,21 +525,21 @@ class TestInitConfigResolverModeC:
 
     def test_hdf5_positions_shape(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_walker_set_hdf5_resolver(tmp_path, n_live=5, n_atoms=2)
-        cfg = InitConfig(start_walker_set=p)
+        cfg = InitSpec(start_walker_set=p)
         result = _resolve_init(cfg, n_live=5, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
         assert result.initial_positions.shape == (5, 2, 3)
 
     def test_hdf5_symbol_map_correct(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_walker_set_hdf5_resolver(tmp_path, n_live=3, n_atoms=1, symbol_map={0: "O"})
-        cfg = InitConfig(start_walker_set=p)
+        cfg = InitSpec(start_walker_set=p)
         result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
         assert result.symbol_map == {0: "O"}
 
@@ -548,7 +548,7 @@ class TestInitConfigResolverModeC:
         import json as _json
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
 
         rng = np.random.default_rng(5)
         positions = rng.uniform(0, 5, (4, 1, 3)).astype(np.float32)
@@ -562,7 +562,7 @@ class TestInitConfigResolverModeC:
             f.create_dataset("energies", data=np.full(4, -9999.0, dtype=np.float32))
             f.attrs["symbol_map"] = _json.dumps({"0": "Si"})
 
-        cfg = InitConfig(start_walker_set=p)
+        cfg = InitSpec(start_walker_set=p)
         backend = create_harmonic()
         result = _resolve_init(cfg, n_live=4, seed=0, energy_backend=backend, cell_cfg=_cell_cfg_permissive())
         assert result.initial_energies is not None
@@ -571,11 +571,11 @@ class TestInitConfigResolverModeC:
     def test_random_initialise_pos_true_warning(self, tmp_path, caplog):
         import logging
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si"])
-        cfg = InitConfig(start_walker_set=p, random_initialise_pos=True)
+        cfg = InitSpec(start_walker_set=p, random_initialise_pos=True)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
         assert any("random_initialise_pos" in r.message or "randomiz" in r.message.lower()
@@ -585,11 +585,11 @@ class TestInitConfigResolverModeC:
         """With random_initialise_pos=True, positions must still come from the file."""
         import logging
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si"])
-        cfg = InitConfig(start_walker_set=p, random_initialise_pos=True)
+        cfg = InitSpec(start_walker_set=p, random_initialise_pos=True)
         ws = load_walker_set(p, n_live_expected=3)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
@@ -602,11 +602,11 @@ class TestInitConfigResolverModeC:
     def test_random_initialise_cell_true_warning(self, tmp_path, caplog):
         import logging
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si"])
-        cfg = InitConfig(start_walker_set=p, random_initialise_cell=True)
+        cfg = InitSpec(start_walker_set=p, random_initialise_cell=True)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
         assert any("random_initialise_cell" in r.message or "randomiz" in r.message.lower()
@@ -616,11 +616,11 @@ class TestInitConfigResolverModeC:
         """With random_initialise_cell=True, cells must still come from the file."""
         import logging
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si"])
-        cfg = InitConfig(start_walker_set=p, random_initialise_cell=True)
+        cfg = InitSpec(start_walker_set=p, random_initialise_cell=True)
         ws = load_walker_set(p, n_live_expected=3)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
@@ -631,24 +631,24 @@ class TestInitConfigResolverModeC:
         )
 
     def test_cell_config_violation_raises(self, tmp_path):
-        """A walker cell that violates CellConfig bounds must raise RuntimeError."""
+        """A walker cell that violates CellSpec bounds must raise RuntimeError."""
         import ase, ase.io as _ase_io
         import pytest as _pytest
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        from jaxrens.cli.schema.cell import CellConfig
+        from jaxrens.cli.schema.init import InitSpec
+        from jaxrens.cli.schema.cell import CellSpec
 
         cell = np.eye(3, dtype=np.float32) * 6.0
         atoms = ase.Atoms(["Si"], positions=[[3.0, 3.0, 3.0]], cell=cell, pbc=True)
         p = tmp_path / "toosmall.extxyz"
         _ase_io.write(str(p), [atoms], format="extxyz")
 
-        strict_cfg = CellConfig(
+        strict_cfg = CellSpec(
             max_volume_per_atom=1.0,
             min_volume_per_atom=0.0001,
             min_aspect_ratio=0.001,
         )
-        cfg = InitConfig(start_walker_set=p)
+        cfg = InitSpec(start_walker_set=p)
         with _pytest.raises(RuntimeError):
             _resolve_init(cfg, n_live=1, seed=0, cell_cfg=strict_cfg)
 
@@ -658,14 +658,14 @@ class TestInitConfigResolverModeC:
         import jax.numpy as _jnp
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, ns_step
         from jaxrens.sampling.move_kernel import MoveKernel
         import jaxrens.sampling.moves.random_walk as rw_mod
 
         p = _make_walker_set_extxyz(tmp_path, n_live=6, symbols=["Si"])
-        cfg = InitConfig(start_walker_set=p)
+        cfg = InitSpec(start_walker_set=p)
         backend = create_harmonic()
         result = _resolve_init(
             cfg,

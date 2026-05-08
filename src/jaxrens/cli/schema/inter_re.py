@@ -11,7 +11,7 @@ from jaxrens.state.config import InterREConfig
 _IMPLEMENTED_FLAVORS = frozenset({"pressure", "xrens", "semi_grand"})
 
 
-class InterREConfigSpec(BaseModel):
+class InterRESpec(BaseModel):
     """YAML → pydantic → InterREConfig for the ``inter_re:`` section.
 
     The ``"pressure"``, ``"xrens"``, and ``"semi_grand"`` flavors are
@@ -73,7 +73,7 @@ class InterREConfigSpec(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _check_flavor_fields(self) -> "InterREConfigSpec":
+    def _check_flavor_fields(self) -> "InterRESpec":
         """Validate flavor-specific required fields."""
         if self.flavor == "xrens":
             if self.composition_targets is None:

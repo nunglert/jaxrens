@@ -19,7 +19,7 @@ from jaxrens.sampling.moves import alchemical, galilean, hmc, random_walk, singl
 from jaxrens.state.config import MoveConfig
 
 if TYPE_CHECKING:
-    from jaxrens.cli.schema.cell import CellConfig
+    from jaxrens.cli.schema.cell import CellSpec
 
 # ---------------------------------------------------------------------------
 # MoveType literal — kept for backward compatibility with callers that do
@@ -28,7 +28,6 @@ if TYPE_CHECKING:
 
 MoveType = Literal[
     "random_walk",
-    "galilean",
     "gmc",
     "hmc",
     "single_atom",
@@ -86,7 +85,7 @@ class BaseMoveSpec(BaseModel):
     def _kernel_kwargs(
         self,
         n_atoms: int | None = None,
-        cell_cfg: "CellConfig | None" = None,
+        cell_cfg: "CellSpec | None" = None,
     ) -> dict[str, Any]:
         """Return kernel keyword arguments.
 
@@ -98,7 +97,7 @@ class BaseMoveSpec(BaseModel):
         Args:
             n_atoms: Number of atoms, derived from the resolved initial
                 positions.  ``None`` is accepted by specs that don't need it.
-            cell_cfg: ``CellConfig`` carrying cell-geometry constraints.
+            cell_cfg: ``CellSpec`` carrying cell-geometry constraints.
                 ``None`` is accepted by specs that don't need it.
         """
         return {}
@@ -120,7 +119,7 @@ class BaseMoveSpec(BaseModel):
         self,
         *,
         n_atoms: int | None = None,
-        cell_cfg: "CellConfig | None" = None,
+        cell_cfg: "CellSpec | None" = None,
     ) -> MoveKernel:
         """Produce the ``MoveKernel`` for ``build_mwg``.
 
@@ -130,7 +129,7 @@ class BaseMoveSpec(BaseModel):
                 galilean, …) ignore this.  Cell-move specs (volume, shear,
                 stretch) and single_atom_sweep use it to populate
                 ``kernel_kwargs["n_atoms"]``.
-            cell_cfg: ``CellConfig`` carrying cell-geometry constraints.
+            cell_cfg: ``CellSpec`` carrying cell-geometry constraints.
                 Cell-move specs use it to populate ``max_volume_per_atom``,
                 ``min_volume_per_atom``, ``min_aspect_ratio``, and
                 ``flat_V_prior`` in ``kernel_kwargs``.  Simple moves ignore it.
@@ -157,30 +156,13 @@ class RandomWalkMoveSpec(BaseMoveSpec):
         return random_walk.build_kernel
 
 
-class GalileanMoveSpec(BaseMoveSpec):
-    type: Literal["galilean"] = "galilean"
-    n_reflect: int = 5
+class GMCMoveSpec(BaseMoveSpec):
+    """Galilean Monte Carlo move.
 
-    def _n_steps(self) -> int:
-        return self.n_reflect
-
-    def _build_kernel(self) -> Callable:
-        return galilean.build_kernel
-
-    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
-        return {"n_reflect": self.n_reflect}
-
-    def _extra_state_fields(self) -> dict[str, tuple[type, Callable]]:
-        return {
-            "direction": (
-                jnp.ndarray,
-                lambda positions, types: jnp.zeros_like(positions),
-            ),
-        }
-
-
-class GmcMoveSpec(BaseMoveSpec):
-    """Alias for Galilean MC — same kernel, different registry key."""
+    The legacy YAML key ``type: galilean`` is accepted via a pre-validator
+    coercion in ``root.py::_coerce_move_dict`` and rewritten to ``type: gmc``
+    at parse time.
+    """
 
     type: Literal["gmc"] = "gmc"
     n_reflect: int = 5
@@ -191,7 +173,7 @@ class GmcMoveSpec(BaseMoveSpec):
     def _build_kernel(self) -> Callable:
         return galilean.build_kernel
 
-    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellSpec | None" = None) -> dict[str, Any]:
         return {"n_reflect": self.n_reflect}
 
     def _extra_state_fields(self) -> dict[str, tuple[type, Callable]]:
@@ -213,7 +195,7 @@ class HMCMoveSpec(BaseMoveSpec):
     def _build_kernel(self) -> Callable:
         return hmc.build_kernel
 
-    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellSpec | None" = None) -> dict[str, Any]:
         return {"n_leapfrog": self.n_leapfrog}
 
 
@@ -230,7 +212,7 @@ class SingleAtomSweepMoveSpec(BaseMoveSpec):
     def _build_kernel(self) -> Callable:
         return single_atom.build_sweep_kernel
 
-    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellSpec | None" = None) -> dict[str, Any]:
         if n_atoms is None:
             raise ValueError(
                 "SingleAtomSweepMoveSpec.to_descriptor() requires n_atoms to "
@@ -256,7 +238,7 @@ class VolumeMoveSpec(BaseMoveSpec):
     def _build_kernel(self) -> Callable:
         return volume.build_kernel
 
-    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellSpec | None" = None) -> dict[str, Any]:
         if n_atoms is None:
             raise ValueError(
                 "VolumeMoveSpec.to_descriptor() requires n_atoms to be "
@@ -285,7 +267,7 @@ class ShearMoveSpec(BaseMoveSpec):
     def _build_kernel(self) -> Callable:
         return shear.build_kernel
 
-    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellSpec | None" = None) -> dict[str, Any]:
         if n_atoms is None:
             raise ValueError(
                 "ShearMoveSpec.to_descriptor() requires n_atoms to be "
@@ -313,7 +295,7 @@ class StretchMoveSpec(BaseMoveSpec):
     def _build_kernel(self) -> Callable:
         return stretch.build_kernel
 
-    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellSpec | None" = None) -> dict[str, Any]:
         if n_atoms is None:
             raise ValueError(
                 "StretchMoveSpec.to_descriptor() requires n_atoms to be "
@@ -343,7 +325,7 @@ class AlchemicalMorphMoveSpec(BaseMoveSpec):
     def _build_kernel(self) -> Callable:
         return alchemical.build_morph_kernel
 
-    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellConfig | None" = None) -> dict[str, Any]:
+    def _kernel_kwargs(self, n_atoms: int | None = None, cell_cfg: "CellSpec | None" = None) -> dict[str, Any]:
         return {"n_species": self.n_species}
 
 
@@ -363,8 +345,7 @@ class AlchemicalShiftMoveSpec(BaseMoveSpec):
 MoveSpec = Annotated[
     Union[
         RandomWalkMoveSpec,
-        GalileanMoveSpec,
-        GmcMoveSpec,
+        GMCMoveSpec,
         HMCMoveSpec,
         SingleAtomMoveSpec,
         SingleAtomSweepMoveSpec,
