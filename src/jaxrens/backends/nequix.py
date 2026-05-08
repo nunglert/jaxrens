@@ -174,7 +174,7 @@ class NequixBackend:
         cell: jnp.ndarray,
         max_neighbors: int = 50,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> tuple[jnp.ndarray, int, bool]:
         n_atoms = positions.shape[0]
         max_edges = n_atoms * max_neighbors
 

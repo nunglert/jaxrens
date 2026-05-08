@@ -281,21 +281,28 @@ class TestPmapVmapRuns:
     # --- split_keys ---
 
     def test_split_keys_shape(self):
-        """split_keys returns shape (G, P, n_sub_keys) with typed-key dtype."""
+        """split_keys takes (G, P) keys, returns (G, P, n_sub_keys) — matches the
+        ABC contract `(*B,) -> (*B, n_sub_keys)`.  Production callers (manager,
+        run_loop) always pass the per-replica `NSState.rng_key` of shape (G, P).
+        """
         n_gpu, n_per_gpu = 1, 3
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
         base_key = jax.random.key(0)
-        gpu_keys = jax.random.split(base_key, n_gpu)  # (G,)
-        result = d.split_keys(gpu_keys, 5)
+        per_replica_keys = jax.random.split(base_key, n_gpu * n_per_gpu).reshape(
+            n_gpu, n_per_gpu
+        )
+        result = d.split_keys(per_replica_keys, 5)
         assert result.shape == (n_gpu, n_per_gpu, 5)
 
     def test_split_keys_deterministic(self):
-        """Two calls with the same key produce identical results."""
+        """Two calls with the same (G, P) keys produce identical results."""
         n_gpu, n_per_gpu = 1, 2
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
-        gpu_keys = jax.random.split(jax.random.key(7), n_gpu)
-        r1 = d.split_keys(gpu_keys, 4)
-        r2 = d.split_keys(gpu_keys, 4)
+        per_replica_keys = jax.random.split(jax.random.key(7), n_gpu * n_per_gpu).reshape(
+            n_gpu, n_per_gpu
+        )
+        r1 = d.split_keys(per_replica_keys, 4)
+        r2 = d.split_keys(per_replica_keys, 4)
         np.testing.assert_array_equal(
             np.asarray(jax.random.key_data(r1)),
             np.asarray(jax.random.key_data(r2)),
@@ -304,13 +311,15 @@ class TestPmapVmapRuns:
     def test_split_keys_under_jit(self):
         n_gpu, n_per_gpu = 1, 3
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
-        gpu_keys = jax.random.split(jax.random.key(3), n_gpu)
+        per_replica_keys = jax.random.split(jax.random.key(3), n_gpu * n_per_gpu).reshape(
+            n_gpu, n_per_gpu
+        )
 
         @jax.jit
         def _split(keys):
             return d.split_keys(keys, 4)
 
-        result = _split(gpu_keys)
+        result = _split(per_replica_keys)
         assert result.shape == (n_gpu, n_per_gpu, 4)
 
     # --- reduce_for_termination ---

@@ -35,7 +35,7 @@ from jaxrens.state.mc_state import make_mc_state_class
 def build_mwg(
     backend: Any,
     move_descriptors: list[MoveKernel],
-) -> tuple[Callable, Callable]:
+) -> tuple[Callable, Callable, list[Callable]]:
     """Build a Metropolis-within-Gibbs sampler from move descriptors.
 
     Dynamically builds an MCState class containing only the fields
@@ -84,7 +84,7 @@ def build_mwg(
 
     # --- Wrap each step_fn ---
     def _wrap(raw_fn, move_idx):
-        def wrapped(state, key: jax.Array, constraint: float):
+        def wrapped(state, key: jax.Array, constraint: float | jnp.ndarray):
             # Inject this move's step_size from the per-move array
             state_with_ss = state.set(step_size=state.step_sizes[move_idx])
             new_state, info = raw_fn(key, state_with_ss, constraint)
@@ -108,10 +108,10 @@ def build_mwg(
     def init_fn(
         positions: jnp.ndarray,
         types: jnp.ndarray,
-        energy: float,
+        energy: float | jnp.ndarray,
         cell: jnp.ndarray | None = None,
         step_sizes: jnp.ndarray | None = None,
-        step_size: float | None = None,
+        step_size: float | jnp.ndarray | None = None,
         ensemble_params: dict | None = None,
         max_neighbors: int = 0,
         max_neighbor_count_init: int | jnp.ndarray = 0,
@@ -172,7 +172,7 @@ def build_mwg(
     def step_fn(
         rng_key: jax.Array,
         state: Any,
-        likelihood_constraint: float,
+        likelihood_constraint: float | jnp.ndarray,
     ) -> tuple[Any, MoveInfo]:
         """One MWG step: randomly select a move and execute it."""
         key_select, key_move = jax.random.split(rng_key)

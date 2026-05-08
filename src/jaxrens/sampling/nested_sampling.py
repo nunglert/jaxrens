@@ -19,6 +19,7 @@ from typing import Any, Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jaxtyping import Array, Float, Int, Key
 
 from jaxrens.base import NSCallback
 from jaxrens.sampling.adaptation.manager import AdaptationManager
@@ -143,16 +144,16 @@ def _get_extra_indices(
 
 def init_ns(
     init_fn: Callable,
-    positions: jnp.ndarray,
-    types: jnp.ndarray,
-    energies: jnp.ndarray,
-    cells: jnp.ndarray | None,
-    rng_key: jax.Array,
-    step_sizes: jnp.ndarray | None = None,
+    positions: Float[Array, "K N 3"],
+    types: Int[Array, "K N"] | Int[Array, "N"],
+    energies: Float[Array, "K"],
+    cells: Float[Array, "K 3 3"] | None,
+    rng_key: Key[Array, ""],
+    step_sizes: Float[Array, "n_moves"] | None = None,
     ensemble_params: dict | None = None,
     restart_state=None,
     max_neighbors: int = 0,
-    max_neighbor_counts: jnp.ndarray | None = None,
+    max_neighbor_counts: Int[Array, "K"] | None = None,
 ) -> NSState:
     """Initialize NSState from walker data.
 
@@ -609,16 +610,16 @@ def run_ns(
 
 def init_ns_parallel(
     init_fn: Callable,
-    positions: jnp.ndarray,
-    types: jnp.ndarray,
-    energies: jnp.ndarray,
-    cells: jnp.ndarray | None,
-    rng_keys: jax.Array,
-    step_sizes: jnp.ndarray | None = None,
+    positions: Float[Array, "R K N 3"],
+    types: Int[Array, "R K N"] | Int[Array, "N"],
+    energies: Float[Array, "R K"],
+    cells: Float[Array, "R K 3 3"] | None,
+    rng_keys: Key[Array, "R"],
+    step_sizes: Float[Array, "n_moves"] | None = None,
     ensemble_params_per_run: list[dict] | None = None,
     restart_states: list | None = None,
     max_neighbors: int = 0,
-    max_neighbor_counts: jnp.ndarray | None = None,
+    max_neighbor_counts: Int[Array, "R K"] | None = None,
 ) -> NSState:
     """Create batched NSState for n_runs parallel NS runs.
 

@@ -114,31 +114,35 @@ class TestPmapVmapRunsDescriptor:
         assert d.shape_prefix == (1, 3)
 
     def test_split_keys_shape(self):
-        """split_keys(gpu_keys, n_sub) returns shape (G, P, n_sub)."""
+        """split_keys((G, P) keys, n_sub) returns shape (G, P, n_sub)."""
         n_gpu, n_per_gpu = 1, 3
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
-        gpu_keys = jax.random.split(jax.random.key(0), n_gpu)  # (G,)
-        result = d.split_keys(gpu_keys, 5)
+        per_replica_keys = jax.random.split(
+            jax.random.key(0), n_gpu * n_per_gpu
+        ).reshape(n_gpu, n_per_gpu)
+        result = d.split_keys(per_replica_keys, 5)
         assert result.shape == (n_gpu, n_per_gpu, 5)
 
     def test_split_keys_dtype_is_key(self):
         """Result must have JAX typed-key dtype."""
         d = PmapVmapRuns(n_gpu=1, n_per_gpu=2)
-        gpu_keys = jax.random.split(jax.random.key(1), 1)
-        result = d.split_keys(gpu_keys, 3)
+        per_replica_keys = jax.random.split(jax.random.key(1), 1 * 2).reshape(1, 2)
+        result = d.split_keys(per_replica_keys, 3)
         # Typed keys have a special dtype; verifying key_data extraction works
         _ = jax.random.key_data(result)
 
     def test_split_keys_under_jit(self):
         n_gpu, n_per_gpu = 1, 3
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
-        gpu_keys = jax.random.split(jax.random.key(3), n_gpu)
+        per_replica_keys = jax.random.split(
+            jax.random.key(3), n_gpu * n_per_gpu
+        ).reshape(n_gpu, n_per_gpu)
 
         @jax.jit
         def _split(keys):
             return d.split_keys(keys, 4)
 
-        result = _split(gpu_keys)
+        result = _split(per_replica_keys)
         assert result.shape == (n_gpu, n_per_gpu, 4)
 
     def test_reduce_for_termination_worst_of(self):
@@ -506,7 +510,7 @@ class TestRunNsMultiGpuValidation:
             run_ns_multi_gpu(
                 jnp.zeros((2, 10, 1, 3)), jnp.zeros((1,), dtype=jnp.int32),
                 jnp.zeros((2, 10)), None,
-                init_fn=None, step_fn=None,
+                init_fn=lambda *a, **kw: None, step_fn=lambda *a, **kw: None,
                 rng_keys=jax.random.split(jax.random.key(0), 2),
                 n_gpu=0, n_per_gpu=2,
             )
@@ -517,7 +521,7 @@ class TestRunNsMultiGpuValidation:
             run_ns_multi_gpu(
                 jnp.zeros((1, 10, 1, 3)), jnp.zeros((1,), dtype=jnp.int32),
                 jnp.zeros((1, 10)), None,
-                init_fn=None, step_fn=None,
+                init_fn=lambda *a, **kw: None, step_fn=lambda *a, **kw: None,
                 rng_keys=jax.random.split(jax.random.key(0), 1),
                 n_gpu=1, n_per_gpu=0,
             )
@@ -530,7 +534,7 @@ class TestRunNsMultiGpuValidation:
                 jnp.zeros((n_available + 1, 10, 1, 3)),
                 jnp.zeros((1,), dtype=jnp.int32),
                 jnp.zeros((n_available + 1, 10)), None,
-                init_fn=None, step_fn=None,
+                init_fn=lambda *a, **kw: None, step_fn=lambda *a, **kw: None,
                 rng_keys=jax.random.split(jax.random.key(0), n_available + 1),
                 n_gpu=n_available + 1, n_per_gpu=1,
             )

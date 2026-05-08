@@ -11,11 +11,12 @@ Design doc: experiments/jaxrens_design/energy_backend_design.md
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import jax.numpy as jnp
 
 
+@runtime_checkable
 class EnergyBackend(Protocol):
     """Protocol that all energy backends must satisfy.
 

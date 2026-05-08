@@ -26,6 +26,8 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jaxtyping import Array, Float, Shaped
 
 
 class BatchDescriptor(ABC):
@@ -132,8 +134,8 @@ class BatchDescriptor(ABC):
     @abstractmethod
     def reduce_for_termination(
         self,
-        log_evidence: jax.Array,
-        hmax: jax.Array,
+        log_evidence: jax.typing.ArrayLike,
+        hmax: jax.typing.ArrayLike,
     ) -> tuple[float, float]:
         """Reduce batched scalars for the termination-check interface.
 
@@ -171,7 +173,9 @@ class BatchDescriptor(ABC):
         """
         return len(self.shape_prefix)
 
-    def flatten(self, arr: jnp.ndarray) -> jnp.ndarray:
+    def flatten(
+        self, arr: Shaped[np.ndarray | Array, "*P ..."]
+    ) -> Shaped[np.ndarray | Array, "n_runs ..."]:
         """Collapse the leading shape-prefix dims into a single ``(n_runs,)`` axis.
 
         For SingleRun (no prefix) prepends a length-1 axis so the output is
@@ -184,7 +188,9 @@ class BatchDescriptor(ABC):
             return arr
         return arr.reshape((self.n_runs,) + arr.shape[n_prefix:])
 
-    def unflatten(self, arr_flat: jnp.ndarray) -> jnp.ndarray:
+    def unflatten(
+        self, arr_flat: Shaped[np.ndarray | Array, "n_runs ..."]
+    ) -> Shaped[np.ndarray | Array, "*P ..."]:
         """Inverse of :meth:`flatten`."""
         n_prefix = len(self.shape_prefix)
         if n_prefix == 0:
@@ -215,7 +221,9 @@ class BatchDescriptor(ABC):
             target_shape,
         )
 
-    def reduce_emax(self, energy: jnp.ndarray) -> jnp.ndarray:
+    def reduce_emax(
+        self, energy: Float[Array, "*P K"]
+    ) -> Float[Array, "*P"]:
         """Per-replica Emax: ``max`` along the walker axis.
 
         Returns scalar for SingleRun, ``(*shape_prefix,)`` otherwise.
@@ -312,8 +320,8 @@ class SingleRun(BatchDescriptor):
 
     def reduce_for_termination(
         self,
-        log_evidence: jax.Array,
-        hmax: jax.Array,
+        log_evidence: jax.typing.ArrayLike,
+        hmax: jax.typing.ArrayLike,
     ) -> tuple[float, float]:
         """Identity reduction — single run has no worst-case to aggregate.
 
@@ -396,8 +404,8 @@ class VmapRuns(BatchDescriptor):
 
     def reduce_for_termination(
         self,
-        log_evidence: jax.Array,
-        hmax: jax.Array,
+        log_evidence: jax.typing.ArrayLike,
+        hmax: jax.typing.ArrayLike,
     ) -> tuple[float, float]:
         """Worst-of reduction across all runs.
 
@@ -514,49 +522,34 @@ class PmapVmapRuns(BatchDescriptor):
         return jax.pmap(per_device, axis_name="gpu")
 
     def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
-        """Split a PRNG key array into ``(G, P, n_sub_keys)`` shape.
+        """Split a per-replica PRNG key array into ``(G, P, n_sub_keys)``.
 
-        Two nested splits:
-
-        1. Split ``rng_key`` (shape ``(G,)``) into ``(G, P+1)`` — first
-           column becomes the per-GPU carry, remaining columns become
-           ``(G, P)`` run keys.
-        2. vmap over G: for each GPU's ``(P,)`` key array, split each of
-           the P keys into ``n_sub_keys`` sub-keys, producing
-           ``(G, P, n_sub_keys)``.
+        Matches the ABC contract: input shape equals ``shape_prefix``
+        (``(G, P)`` here), output prepends an ``n_sub_keys`` axis at the end.
+        Implemented as a 2-D vmap (one for each prefix axis) of
+        ``jax.random.split``.
 
         Parameters
         ----------
         rng_key : jax.Array
-            Shape ``(G,)`` — one key per GPU device.
+            Shape ``(G, P)`` — one key per replica.  Same convention as
+            ``NSState.rng_key`` for PmapVmapRuns.
         n_sub_keys : int
-            Number of sub-keys per run.
+            Number of sub-keys per replica.
 
         Returns
         -------
         jax.Array
             Shape ``(G, P, n_sub_keys)`` with typed-key dtype.
         """
-        n_per_gpu = self.n_per_gpu
-
-        # Step 1: split each GPU key into n_per_gpu sub-keys.
-        # vmap over G: jax.random.split(k, n_per_gpu) → (P,) per GPU → (G, P)
-        per_gpu_keys = jax.vmap(
-            lambda k: jax.random.split(k, n_per_gpu)
-        )(rng_key)  # (G, P)
-
-        # Step 2: for each (g, p) key, split into n_sub_keys.
-        # vmap over G then over P.
-        sub_keys = jax.vmap(
-            jax.vmap(lambda k: jax.random.split(k, n_sub_keys))
-        )(per_gpu_keys)  # (G, P, n_sub_keys)
-
-        return sub_keys
+        return jax.vmap(jax.vmap(
+            lambda k: jax.random.split(k, n_sub_keys)
+        ))(rng_key)
 
     def reduce_for_termination(
         self,
-        log_evidence: jax.Array,
-        hmax: jax.Array,
+        log_evidence: jax.typing.ArrayLike,
+        hmax: jax.typing.ArrayLike,
     ) -> tuple[float, float]:
         """Worst-of reduction across both G and P axes.
 
