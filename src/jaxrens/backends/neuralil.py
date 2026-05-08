@@ -2,15 +2,11 @@
 
 Wraps NeuralIL's PlainEnsemble behind the EnergyBackend interface.
 NeuralIL computes neighbors implicitly via supercell expansion during
-descriptor calculation — no explicit neighbor list. The `max_neighbors`
-parameter is a compile-time constant baked into the descriptor generator;
-JAX's compilation cache handles retrace when the value changes.
-
-When `max_neighbors` changes (e.g. after overflow in the outer NS loop),
-the backend lazily builds a new model instance with the updated value
-and caches it. Since `max_neighbors` is a static argument, JAX retraces
-`__call__` in Python before compiling, so the Python-level model
-construction happens outside the JIT boundary.
+descriptor calculation — no explicit neighbor list. The dynamics model
+is built **once** at construction time and reused; ``max_neighbors`` is
+passed at call time as a buffer-shape argument (mirroring the MACE
+backend's design). Different ``max_neighbors`` values trigger a JIT
+retrace because of the static shape, but no Python-side model rebuild.
 
 NeuralIL is an optional dependency. All imports are guarded.
 """
@@ -74,14 +70,13 @@ def _build_dynamics_model(
     r_cutoff: float,
     n_max: int,
     core_widths: list[int],
-    max_neighbors: int,
     supercell_trafo: tuple[int, int, int],
     has_morse: bool,
     n_ensemble: int,
 ):
-    """Build a NeuralIL dynamics model for a specific max_neighbors value."""
+    """Build the (max_neighbors-independent) NeuralIL dynamics model."""
     descriptor_gen = PowerSpectrumGenerator(
-        n_max, r_cutoff, n_types, max_neighbors, supercell_trafo,
+        n_max, r_cutoff, n_types, supercell_trafo,
     )
     core_model = ResNetCore(core_widths)
 
@@ -104,14 +99,9 @@ def _build_dynamics_model(
 class NeuralILBackend:
     """NeuralIL energy backend for jaxrens.
 
-    Model params are stored on the instance. The dynamics model is
-    lazily built and cached per `max_neighbors` value.
-
-    Since `max_neighbors` is a static argument in jaxrens (static_field
-    on MCState), JAX retraces when it changes. During retrace, Python
-    executes `__call__` which triggers the lazy model build — this
-    happens outside the JIT boundary, so Python object construction
-    is safe.
+    The dynamics model is built once at construction time. ``max_neighbors``
+    is a runtime call-time argument (static at trace time) that shapes
+    the neighbor-buffer slice inside the descriptor generator.
     """
 
     def __init__(
@@ -135,24 +125,26 @@ class NeuralILBackend:
         self.core_widths = core_widths
         self.n_ensemble = n_ensemble
         self.has_morse = has_morse
-        self._model_cache: dict[int, Any] = {}
+        self._dynamics_model = _build_dynamics_model(
+            n_types=len(sorted_elements),
+            embed_d=embed_d,
+            r_cutoff=r_cutoff,
+            n_max=n_max,
+            core_widths=core_widths,
+            supercell_trafo=supercell_trafo,
+            has_morse=has_morse,
+            n_ensemble=n_ensemble,
+        )
 
-    def _get_model(self, max_neighbors: int):
-        """Get or build a dynamics model for this max_neighbors value."""
-        if max_neighbors not in self._model_cache:
-            logger.info("Building NeuralIL model for max_neighbors=%d", max_neighbors)
-            self._model_cache[max_neighbors] = _build_dynamics_model(
-                n_types=len(self.sorted_elements),
-                embed_d=self.embed_d,
-                r_cutoff=self.r_cutoff,
-                n_max=self.n_max,
-                core_widths=self.core_widths,
-                max_neighbors=max_neighbors,
-                supercell_trafo=self.supercell_trafo,
-                has_morse=self.has_morse,
-                n_ensemble=self.n_ensemble,
-            )
-        return self._model_cache[max_neighbors]
+    @property
+    def atomic_numbers(self) -> tuple[int, ...]:
+        """Atomic numbers (Z) of the elements the model was trained on,
+        in the same order as ``sorted_elements``. Used by the resolver to
+        map user-supplied Z numbers in ``start_species`` to the model's
+        contiguous 0-based type indices."""
+        from ase.data import atomic_numbers as _Z
+
+        return tuple(_Z[s] for s in self.sorted_elements)
 
     def __call__(
         self,
@@ -162,21 +154,20 @@ class NeuralILBackend:
         max_neighbors: int = 50,
         ensemble_params: dict[str, Any] | None = None,
     ) -> tuple[jnp.ndarray, int, bool]:
-        # Get cached model for this max_neighbors (built lazily)
-        dynamics_model = self._get_model(max_neighbors)
-
         # Non-periodic: use large dummy cell
         safe_cell = jnp.where(
             jnp.trace(cell) == 0, 1000.0 * jnp.eye(3), cell,
         )
 
-        # Compute energy (ensemble mean)
-        energy_ensemble = dynamics_model.apply(
+        # Compute energy (ensemble mean). max_neighbors is a static-at-trace
+        # int that flows down into PSG._process_center as a buffer-shape arg.
+        energy_ensemble = self._dynamics_model.apply(
             self.model_params,
             positions,
             species,
             safe_cell,
-            method=dynamics_model.calc_potential_energy,
+            max_neighbors,
+            method=self._dynamics_model.calc_potential_energy,
         )
         energy = energy_ensemble.mean()
 

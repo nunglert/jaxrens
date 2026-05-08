@@ -27,9 +27,11 @@ neuralil = ["neuralil @ git+https://github.com/nunglert/neuralil-jaxrens.git@jax
 mace = [
     "mace-jax[gpu,torch] @ git+https://github.com/nunglert/mace-jax.git@fix_install"
 ]
+nequix = ["nequix @ git+https://github.com/atomicarchitects/nequix.git@main"]
 dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.5",
+    "pytest-cov>=5.0",
 ]
 docs = [
     "sphinx>=8.1",
@@ -56,9 +58,12 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not heavy'"
+addopts = "-m 'not heavy and not mace and not neuralil and not nequix'"
 markers = [
     "heavy: marks tests as heavy/slow (run with '-m heavy' or '-m \"\"' to include)",
     "gpu: marks tests requiring GPU",
     "multi_gpu: marks tests requiring multiple GPUs",
+    "mace: marks tests that exercise the MACE backend; opt-in only via '-m mace' (needs mace_jax + GPU)",
+    "neuralil: marks tests that exercise the NeuralIL backend; opt-in only via '-m neuralil' (needs neuralil)",
+    "nequix: marks tests that exercise the nequix backend; opt-in only via '-m nequix' (needs nequix package + bundled or path-loaded model)",
 ]

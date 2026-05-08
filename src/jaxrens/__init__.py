@@ -2,6 +2,21 @@
 
 __version__ = "0.1.0"
 
+import os as _os
+import tempfile as _tempfile
+
+_jax_tmpdir = _os.environ.get("TMPDIR", "/tmp")
+try:
+    with _tempfile.NamedTemporaryFile(dir=_jax_tmpdir, delete=True):
+        pass
+except OSError as _e:
+    raise RuntimeError(
+        f"jaxrens: {_jax_tmpdir!r} is not writable ({_e}). "
+        f"JAX writes compilation artifacts there and will fail with a "
+        f"confusing JaxRuntimeError later. "
+        f"Set $TMPDIR to a writable directory before importing jaxrens."
+    ) from _e
+
 # Pin float32 precision globally.  jaxrens represents positions, cells and
 # energies in float32 throughout; enabling x64 would silently promote some
 # operations and break dtype invariants (e.g. ``lax.cond`` branches in

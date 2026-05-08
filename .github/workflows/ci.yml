@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ['**']      # any branch — per-job `if:` routes by ref
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -13,39 +13,98 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Trigger matrix:
+#   * Push to a non-main branch  → `cheap` (g4dn.xlarge, smoke + integration).
+#   * Push to main / PR to main  → `full` (g5.xlarge) + `multi_gpu`
+#                                  (g4dn.12xlarge, 4× T4) in parallel.
+#   * workflow_dispatch          → all three jobs available.
+# Local `pytest tests/smoke` / `pytest tests/integration` covers the
+# manual narrow-down case without paying for an ephemeral CI runner.
+
 jobs:
-  smoke:
-    name: Smoke (fast, GPU)
-    if: github.event_name != 'schedule'
-    runs-on: runs-on=${{ github.run_id }}/family=g4dn.xlarge/image=ubuntu24-gpu-x64
+  cheap:
+    name: Cheap (smoke + integration)
+    if: |
+      (github.event_name == 'push' && github.ref != 'refs/heads/main')
+      || github.event_name == 'workflow_dispatch'
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - family=g4dn.xlarge
+      - image=ubuntu24-gpu-x64
+      - spot=price-capacity-optimized
     steps:
       - uses: actions/checkout@v4
 
       - name: Build CI image
         run: docker build -f Dockerfile.ci -t jaxrens-ci:${{ github.sha }} .
 
-      - name: Run smoke checks
+      - name: pytest tests/smoke tests/integration
         run: |
           docker run --rm --gpus all \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             jaxrens-ci:${{ github.sha }} \
-            bash scripts/ci-checks.sh smoke
+            pytest tests/smoke tests/integration -v --tb=short -m "not multi_gpu" -o addopts=""
 
   full:
-    name: Full suite (heavy, GPU)
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
-    runs-on: runs-on=${{ github.run_id }}/family=g5.xlarge/image=ubuntu24-gpu-x64
+    name: Full (whole pytest suite)
+    if: |
+      github.event_name == 'pull_request'
+      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - family=g5.xlarge
+      - image=ubuntu24-gpu-x64
+      - spot=price-capacity-optimized
     steps:
       - uses: actions/checkout@v4
 
       - name: Build CI image
         run: docker build -f Dockerfile.ci -t jaxrens-ci:${{ github.sha }} .
 
-      - name: Run full checks
+      - name: pytest tests (with coverage)
         run: |
           docker run --rm --gpus all \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             jaxrens-ci:${{ github.sha }} \
-            bash scripts/ci-checks.sh full
+            pytest tests -v --tb=short -m "not multi_gpu" -o addopts="" \
+              --cov=jaxrens \
+              --cov-branch \
+              --cov-report=term-missing \
+              --cov-report=xml \
+              --cov-fail-under=50
+
+      - name: Upload coverage to Codecov
+        if: ${{ always() }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  multi_gpu:
+    name: Multi-GPU integration (4× T4)
+    if: |
+      github.event_name == 'pull_request'
+      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - family=g4dn.12xlarge
+      - image=ubuntu24-gpu-x64
+      - spot=price-capacity-optimized
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CI image
+        run: docker build -f Dockerfile.ci -t jaxrens-ci:${{ github.sha }} .
+
+      - name: pytest tests/integration -m multi_gpu
+        run: |
+          docker run --rm --gpus all \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            jaxrens-ci:${{ github.sha }} \
+            pytest tests/integration -v --tb=short -m multi_gpu -o addopts=""
