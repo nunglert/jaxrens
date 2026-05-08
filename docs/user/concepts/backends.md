@@ -43,65 +43,94 @@ Built-in backends:
 |---|---|---|
 | `lj` | {class}`jaxrens.backends.lj.LJBackend` | periodic or finite, static cutoff |
 | `mace` | {class}`jaxrens.backends.mace.MACEBackend` | mace-jax, supercell neighbor expansion, pins float32 globally (see {doc}`../../dev/install`) |
-| `neuralil` | `jaxrens.backends.neuralil.NeuralILBackend` | bucketed `max_neighbors_list` pre-compilation |
+| `neuralil` | `jaxrens.backends.neuralil.NeuralILBackend` | bucketed `max_neighbors_list` JIT cache (lazy per-bucket compile) |
 | `harmonic`, `double_well`, `gaussian_mixture` | `jaxrens.backends.toy` | analytical test potentials |
 
 ## The neighbor problem
 
 Every modern MLIP — MACE, NeuralIL, NEQUIX, … — computes the
-energy as a sum over local atomic contributions determined by the environment around the atom. 
-Irrespective of the underlying architecture, this involves the determination of neighbours within some cutoff radius
-$r_\mathrm{cut}$. 
-In Behler-Parrinello-like ML potetials, like NeuralIL, the atomic environment within the cutoff is used to directly compute a descriptor. 
-For graph-neural-networks (GNNs), like MACE or NEQUIX, a graph consisting of nodes connected by edges is constructed instead.
+energy as a sum of local atomic contributions, each determined
+by the environment around its atom. Whatever the architecture,
+the first step is to find every neighbour within a cutoff
+radius $r_\mathrm{cut}$. Behler–Parrinello-style potentials like
+NeuralIL feed those neighbours into per-atom descriptors
+directly; graph neural networks such as MACE or NEQUIX instead
+build an explicit graph whose nodes are atoms and whose edges
+connect neighbour pairs, then pass messages along it.
 
-In both cases, the number of neighbors determined is intrinsically a dynamic quantity.
-That clashes with JAX's static-shape rule: `jax.jit` needs to
-know the size of every array at trace time. The neighbour count
-is *not* known at trace time — it depends on the live walker
-position
+Either way, the number of neighbours is intrinsically dynamic —
+it depends on the live walker's geometry, which changes every
+MCMC step. That clashes with JAX's static-shape rule: `jax.jit`
+needs the size of every array at trace time, so we can't let the
+neighbour count vary freely.
 
-Hence, in practice one needs to find a solution that lets one treat both cases with static array shapes. The unifying quantity is `max_neighbors`, which sets the upper bound for the allowed number of neighbors and fixes corresponding arrays to that size. In the case of GNNs, this corresponds to a maximum number of edges of $N_\mathrm{atoms} \times \texttt{max\_neighbors}$.
+The unifying static quantity is `max_neighbors`, an upper bound
+on the allowed neighbour count per atom; the corresponding
+arrays are pre-allocated at that size. For GNNs this caps the
+edge buffer at
+$N_\mathrm{atoms} \times \texttt{max\_neighbors}$.
+
+For jaxrens we went with the following strategy: every backend
+call takes a set of configurations and one fixed bucket size
+$b = \texttt{max\_neighbors}$, builds its neighbour data into
+arrays pre-allocated at that size, and at the same time computes
+the *true* per-atom neighbour count from the actual geometry. If
+that count fits — `true_max ≤ b` — the energy is returned
+together with the observed count and `overflow=False`. If it
+doesn't, the backend reports `overflow=True` together with the
+observed `actual_max_n`; the outer loop picks the smallest entry
+of `max_neighbors_list` that clears
+$\texttt{actual\_max\_n} + \texttt{max\_neighbors\_offset}$, and
+the same configuration is re-evaluated against that larger
+bucket. The `max_neighbors_offset` knob is the headroom that
+prevents the very next MCMC step from tripping the same overflow
+again after a trivial cell fluctuation.
+
+
 
 ```{mermaid}
 flowchart LR
-    INIT["init walkers<br/>compute true max_n at start"]
-    INIT --> BUCKET["pick smallest bucket b ∈ max_neighbors_list<br/>with b ≥ true_max + max_neighbors_offset"]
-    BUCKET --> CALL["backend(positions, species, cell,<br/>max_neighbors=b, ensemble_params)"]
-    CALL --> RES{"overflow?"}
-    RES -- "no" --> NEXT["return (energy,<br/>actual_max_n,<br/>overflow=False)"]
-    RES -- "yes" --> ESC["escalate: b ← next bucket in list,<br/>re-run inner loop with new b"]
+    CFG["configurations<br/>(positions, species, cell)<br/>+ ensemble_params<br/>+ current bucket b"]
+    CFG --> CALL["backend(...,<br/>max_neighbors=b)"]
+    CALL --> RES{"true_max &gt; b ?"}
+    RES -- "no" --> OK["return (energy,<br/>actual_max_n,<br/>overflow=False)"]
+    RES -- "yes" --> ESC["escalate:<br/>b ← smallest b' ∈ max_neighbors_list<br/>with b' ≥ true_max + max_neighbors_offset,<br/>re-run inner loop"]
     ESC --> CALL
 
-    classDef init fill:#fff7e0,stroke:#a07000,color:#222
+    classDef input fill:#fff7e0,stroke:#a07000,color:#222
     classDef decision fill:#eef5ff,stroke:#1565c0,color:#222
     classDef esc fill:#ffe0e0,stroke:#c62828,color:#5a0000
-    class INIT,BUCKET init
+    class CFG input
     class RES decision
     class ESC esc
 
-    linkStyle 5 stroke:#c62828,color:#c62828,stroke-width:2px
+    linkStyle 3,4 stroke:#c62828,color:#c62828,stroke-width:2px
 ```
 
-`max_neighbors` is a *static* argument to the JIT'd backend
-call — every distinct value triggers one fresh compile and is
-then cached forever. Backends signal overflow by returning
-`overflow=True` together with the *true* per-atom neighbour count
-(`actual_max_n`), so the outer loop can size the next bucket
-correctly. The shared helper
+Because `max_neighbors` is a *static* JIT argument,
+`max_neighbors_list` is an **allowlist** of permitted bucket
+sizes rather than a set of kernels built in advance: each entry
+is JIT-traced lazily on its first call and then cached for the
+rest of the run. The initial `b` is chosen once before the loop
+starts — the resolver calls
 {func}`~jaxrens.backends._graph_neighbors._compute_true_max_neighbors`
-runs the same neighbour-mask logic without allocating the edge
-buffer, so init-time bucket sizing is cheap.
+on the starting walker geometry (no edge buffer allocated yet)
+and picks the smallest entry of `max_neighbors_list` that clears
+`true_max + max_neighbors_offset`. That entry becomes the first
+kernel to compile.
 
 The user surface is two YAML knobs on each MLIP backend
 ({class}`~jaxrens.backends.mace.MACEBackend`,
 {mod}`jaxrens.backends.neuralil`,
 {mod}`jaxrens.backends.nequix`):
 
-- `max_neighbors_list: [50, 75, 100, 150]` — the buckets to
-  pre-compile. The resolver picks the smallest entry $\geq$
-  observed max + offset for the initial run; on overflow the
-  outer loop walks to the next entry.
+- `max_neighbors_list: [50, 75, 100, 150]` — the bucket sizes
+  the run is allowed to use. Each entry is JIT-compiled the first
+  time it's called (not at startup); the resolver picks the
+  smallest entry $\geq$ observed max + offset for the initial
+  run, and on overflow the outer loop walks to the next entry,
+  triggering one fresh compile that's then cached for the rest
+  of the run.
 - `max_neighbors_offset: 5` — safety margin added to the observed
   max when picking the initial bucket. Keeps you off the
   knife-edge where one MCMC step pushes a single atom over the

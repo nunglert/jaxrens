@@ -936,6 +936,23 @@ class TestLoadRestartMultiGpu:
                 expected = float(np.asarray(state["log_evidence"])[g, pp])
                 assert abs(result[g][pp].log_evidence - expected) < 1e-4
 
+    def test_topology_mismatch_raises(self, tmp_path, monkeypatch):
+        """Restarting a multi-GPU checkpoint on a host with a different
+        device count must raise with a clear message — silent topology
+        coercion is not supported (per §D plan)."""
+        # Save a (G=2, P=2) checkpoint.
+        G, P = 2, 2
+        state = _make_batched_ns_state_dict(batch_shape=(G, P))
+        p = tmp_path / "wrong_topology.checkpoint.h5"
+        save_checkpoint(p, state)
+
+        # Force ``len(jax.local_devices())`` to disagree with G.
+        import jax as _jax
+        monkeypatch.setattr(_jax, "local_devices", lambda *_a, **_k: [object()])
+
+        with pytest.raises(ValueError, match="Cross-topology restart is not"):
+            load_restart(p)
+
     def test_run_ns_multi_gpu_roundtrip(self, tmp_path):
         """load_restart on a (G, P) checkpoint feeds into run_ns_multi_gpu."""
         from jaxrens.backends.toy import create_harmonic
@@ -1053,7 +1070,8 @@ class TestLoadRestartShapeError:
             f.create_dataset("n_dead", data=np.ones(shape3d, dtype=np.int32))
             f.attrs["n_walkers"] = 4
 
-        with pytest.raises(ValueError, match=r"ndim=3"):
+        # New format (post-§D): error mentions the shape and rank explicitly.
+        with pytest.raises(ValueError, match=r"rank 3|\(2, 3, 4\)"):
             load_restart(p)
 
 

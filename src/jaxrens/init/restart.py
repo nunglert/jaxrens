@@ -13,10 +13,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Union
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
 from jaxrens.init.walker_set import WalkerSet
+from jaxrens.sampling.batch_descriptor import (
+    PmapVmapRuns,
+    SingleRun,
+    VmapRuns,
+    from_shape_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,19 +208,37 @@ def load_restart(
 
     ckpt = load_checkpoint(path)
 
-    # Determine batch shape from log_evidence.
-    log_ev_ndim = int(np.asarray(ckpt["log_evidence"]).ndim)
-
-    if log_ev_ndim >= 3:
+    # Recover the saved batcher from log_evidence.shape.  The shape prefix is
+    # ``()`` for SingleRun checkpoints, ``(R,)`` for VmapRuns, ``(G, P)`` for
+    # PmapVmapRuns; ``from_shape_prefix`` raises on higher ranks.
+    log_ev_arr = np.asarray(ckpt["log_evidence"])
+    try:
+        saved = from_shape_prefix(log_ev_arr.shape)
+    except ValueError as exc:
         raise ValueError(
-            f"load_restart: checkpoint at {path!r} has log_evidence.ndim="
-            f"{log_ev_ndim} (shape "
-            f"{np.asarray(ckpt['log_evidence']).shape}). "
-            f"Only ndim 0 (single run), 1 (parallel), and 2 (multi-GPU) are "
-            f"supported. Got ndim={log_ev_ndim}."
-        )
+            f"load_restart: checkpoint at {path!r} has unsupported log_evidence "
+            f"shape {log_ev_arr.shape}. {exc}"
+        ) from exc
 
-    if log_ev_ndim == 0:
+    # Strict cross-topology check: a real multi-GPU checkpoint can only be
+    # restarted on a host with the matching device count.  ``saved.n_gpu == 1``
+    # is treated as topology-agnostic (single-shard pmap is equivalent to
+    # single-device vmap), so it restarts fine on any host; SingleRun and
+    # VmapRuns checkpoints carry no GPU dim either and never trigger the
+    # check.
+    if isinstance(saved, PmapVmapRuns) and saved.n_gpu > 1:
+        n_local = len(jax.local_devices())
+        if saved.n_gpu != n_local:
+            raise ValueError(
+                f"Checkpoint at {path!r} was saved on n_gpu={saved.n_gpu} "
+                f"(log_evidence shape {log_ev_arr.shape}); current host has "
+                f"{n_local} local device(s).  Cross-topology restart is not "
+                f"supported.  Slice the checkpoint along the n_gpu axis to "
+                f"match the current device count, or rerun on a "
+                f"{saved.n_gpu}-GPU host."
+            )
+
+    if isinstance(saved, SingleRun):
         # -------------------------------------------------------------------
         # Scalar single-run checkpoint — backward-compatible path.
         # Returns (WalkerSet, RestartBundle).
@@ -243,30 +268,25 @@ def load_restart(
         )
         return walker_set, bundle
 
-    elif log_ev_ndim == 1:
+    elif isinstance(saved, VmapRuns):
         # -------------------------------------------------------------------
         # 1-D checkpoint: shape (n_runs,).
         # Returns list[RestartBundle] of length n_runs.
         # -------------------------------------------------------------------
-        n_runs = int(np.asarray(ckpt["log_evidence"]).shape[0])
         bundles: list[RestartBundle] = [
             _build_bundle_from_ckpt(ckpt, idx=(r,))
-            for r in range(n_runs)
+            for r in range(saved.n_runs)
         ]
         logger.info(
             "Restart loaded from %s: %d runs, n_dead=%s",
-            path, n_runs, [b.n_dead for b in bundles],
+            path, saved.n_runs, [b.n_dead for b in bundles],
         )
         return bundles
 
     else:
-        # log_ev_ndim == 2
-        # -------------------------------------------------------------------
-        # 2-D checkpoint: shape (G, P).
+        # PmapVmapRuns: 2-D checkpoint with shape (G, P).
         # Returns list[list[RestartBundle]] of shape (G, P).
-        # -------------------------------------------------------------------
-        log_ev_arr = np.asarray(ckpt["log_evidence"])
-        G, P = int(log_ev_arr.shape[0]), int(log_ev_arr.shape[1])
+        G, P = saved.n_gpu, saved.n_per_gpu
         bundles_2d: list[list[RestartBundle]] = [
             [_build_bundle_from_ckpt(ckpt, idx=(g, p)) for p in range(P)]
             for g in range(G)

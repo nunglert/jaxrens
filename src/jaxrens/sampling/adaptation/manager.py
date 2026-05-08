@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
-from jaxrens.sampling.batch_descriptor import BatchDescriptor, PmapVmapRuns, SingleRun, VmapRuns
+from jaxrens.sampling.batch_descriptor import BatchDescriptor
 
 logger = logging.getLogger(__name__)
 
@@ -164,39 +164,24 @@ class AdaptationManager:
                 "Check that per_move_fns, move_descriptors, and adjust_interval>0 are set."
             )
 
-        is_vmap = isinstance(self._batcher, VmapRuns)
-        is_pmap_vmap = isinstance(self._batcher, PmapVmapRuns)
-
-        # Collect per-move outputs as lists (one item per move).
-        # For SingleRun:    each item is a scalar/array.
-        # For VmapRuns:     each item is a (n_runs, ...) array.
-        # For PmapVmapRuns: each item is a (G, P, ...) array.
+        # Collect per-move outputs as lists (one item per move).  Shape per
+        # entry: ``(*shape_prefix, ...)`` — scalar leaves collapse to ``()``
+        # for SingleRun, ``(n_runs,)`` for VmapRuns, ``(G, P)`` for
+        # PmapVmapRuns.  No descriptor branching needed: indexing + key
+        # splitting use ``...`` and ``descriptor.split_keys`` uniformly.
         per_move_results: list[tuple] = []
+        log_per_move = not self._batcher.is_batched  # only meaningful for SingleRun
 
         for move_idx, desc in enumerate(self._move_descriptors):
-            if is_pmap_vmap:
-                # current_step_sizes: (G, P, n_moves); rng_key: (G, P)
-                # emax: (G, P)
-                rng_key, key_adjust = self._split_pmap_vmap_keys(rng_key)
-                ss_move = current_step_sizes[:, :, move_idx]  # (G, P)
-                result = self._jit_fns[move_idx](pop, ss_move, emax, key_adjust)
-                new_ss = result[0]  # (G, P)
-                current_step_sizes = current_step_sizes.at[:, :, move_idx].set(new_ss)
-            elif is_vmap:
-                # current_step_sizes: (n_runs, n_moves); rng_key: (n_runs,)
-                # emax: (n_runs,)
-                rng_key, key_adjust = self._split_vmap_keys(rng_key)
-                ss_move = current_step_sizes[:, move_idx]  # (n_runs,)
-                result = self._jit_fns[move_idx](pop, ss_move, emax, key_adjust)
-                new_ss = result[0]  # (n_runs,)
-                current_step_sizes = current_step_sizes.at[:, move_idx].set(new_ss)
-            else:
-                # current_step_sizes: (n_moves,); rng_key: scalar key
-                rng_key, key_adjust = jax.random.split(rng_key)
-                ss_move = current_step_sizes[move_idx]  # scalar
-                result = self._jit_fns[move_idx](pop, ss_move, emax, key_adjust)
-                new_ss = result[0]  # scalar
-                current_step_sizes = current_step_sizes.at[move_idx].set(new_ss)
+            pairs = self._batcher.split_keys(rng_key, 2)
+            rng_key = pairs[..., 0]
+            key_adjust = pairs[..., 1]
+            ss_move = current_step_sizes[..., move_idx]
+            result = self._jit_fns[move_idx](pop, ss_move, emax, key_adjust)
+            new_ss = result[0]
+            current_step_sizes = current_step_sizes.at[..., move_idx].set(new_ss)
+
+            if log_per_move:
                 logger.debug(
                     "Adjusted %s: ss=%.4g rate=%.3f rounds=%d converged=%s",
                     desc.name, float(new_ss), float(result[1]),
@@ -205,31 +190,16 @@ class AdaptationManager:
 
             per_move_results.append(result[1:])  # skip new_ss (index 0)
 
-        # Stack per-move results into arrays keyed by diagnostic name.
-        # For SingleRun:    each result[k] is scalar or (4,); stack → (n_moves, ...).
-        # For VmapRuns:     each result[k] is (n_runs,) or (n_runs, 4); stack → (n_runs, n_moves, ...).
-        # For PmapVmapRuns: each result[k] is (G, P) or (G, P, 4); stack → (G, P, n_moves, ...).
+        # Stack per-move results.  Each value has shape ``(*shape_prefix, ...)``;
+        # stacking ``n_moves`` of them along axis ``len(shape_prefix)`` produces
+        # ``(*shape_prefix, n_moves, ...)`` uniformly across descriptor types.
+        stack_axis = len(self._batcher.shape_prefix)
         per_move_outputs: dict = {}
         for k, key_name in enumerate(_DIAG_KEYS):
             values = [r[k] for r in per_move_results]
-            if is_pmap_vmap:
-                # Each value is (G, P) or (G, P, 4) etc.
-                # Stack along axis 2 to get (G, P, n_moves) or (G, P, n_moves, 4).
-                stacked = jnp.stack(values, axis=2)  # (G, P, n_moves, ...)
-            elif is_vmap:
-                # Each value is (n_runs,) or (n_runs, 4) etc.
-                # Stack along a new axis 1 to get (n_runs, n_moves) or (n_runs, n_moves, 4).
-                stacked = jnp.stack(values, axis=1)  # (n_runs, n_moves, ...)
-            else:
-                # Each value is scalar or (4,) etc.
-                # Stack along axis 0 to get (n_moves,) or (n_moves, 4).
-                stacked = jnp.stack(values, axis=0)  # (n_moves, ...)
-            per_move_outputs[key_name] = stacked
+            per_move_outputs[key_name] = jnp.stack(values, axis=stack_axis)
 
         # Return the advanced rng_key so the caller can carry it forward.
-        # For SingleRun:    rng_key is the residual after n_moves splits.
-        # For VmapRuns:     rng_key is the (n_runs,) carry after n_moves per-run splits.
-        # For PmapVmapRuns: rng_key is the (G, P) carry after n_moves per-run splits.
         return current_step_sizes, per_move_outputs, rng_key
 
     # ------------------------------------------------------------------
@@ -239,23 +209,13 @@ class AdaptationManager:
     def _build_jit_fns(self) -> list[Callable]:
         """Build one JIT'd callable per move type.
 
-        For ``SingleRun``:
-            ``jax.jit(lambda pop, ss, emax, key: adjust_step_size(...))``
-            with the static config baked in via a closure.
-
-        For ``VmapRuns``:
-            ``jax.jit(jax.vmap(lambda pop_r, ss_r, emax_r, key_r: adjust_step_size(...)))``
-            where the static config is captured in the closure.
-
-        For ``PmapVmapRuns``:
-            ``jax.pmap(jax.vmap(lambda pop_r, ss_r, emax_r, key_r: adjust_step_size(...)),
-            axis_name="gpu")``
-            Outer pmap over G (GPU) axis; inner vmap over P (per-GPU runs) axis.
-            pmap is self-JIT-compiling so no additional jax.jit is added.
+        Each callable closes over the move's static config (rate bounds,
+        ``step_size_max``, etc.) and is wrapped via
+        :meth:`BatchDescriptor.wrap_for_batch` so the same factory works for
+        SingleRun (``jit``), VmapRuns (``jit(vmap(...))``), and PmapVmapRuns
+        (``pmap(vmap(...))``).
         """
-        is_pmap_vmap = isinstance(self._batcher, PmapVmapRuns)
-        is_vmap = isinstance(self._batcher, VmapRuns)
-        fns = []
+        fns: list[Callable] = []
         for move_idx, desc in enumerate(self._move_descriptors):
             move_fn = self._per_move_fns[move_idx]
             n_samp = self._adjust_n_samples
@@ -265,97 +225,21 @@ class AdaptationManager:
             max_ss = desc.step_size_max
             max_rounds = self._adjust_max_rounds
 
-            if is_pmap_vmap:
-                # Close over all static args so pmap(vmap(...)) sees no static arg issues.
-                # pop has shape (G, P, n_walkers, ...); ss_move shape (G, P); emax (G, P);
-                # key_adjust (G, P).
-                # pmap maps over G, vmap maps over P, inner fn gets single-run shapes.
-                def _make_pmap_vmap_fn(
-                    _move_fn=move_fn,
-                    _n_samp=n_samp,
-                    _min_r=min_r,
-                    _max_r=max_r,
-                    _afac=afac,
-                    _max_ss=max_ss,
-                    _max_rounds=max_rounds,
-                ) -> Callable:
-                    def _per_run(pop_r, ss_r, emax_r, key_r):
-                        return adjust_step_size(
-                            pop_r, _move_fn, ss_r, emax_r, key_r,
-                            _n_samp, _min_r, _max_r, _afac, _max_ss, _max_rounds,
-                        )
-                    # pmap is self-JIT-compiling — do NOT wrap in jax.jit.
-                    return jax.pmap(jax.vmap(_per_run), axis_name="gpu")
+            def _per_replica(
+                pop, ss, emax, key,
+                _move_fn=move_fn,
+                _n_samp=n_samp,
+                _min_r=min_r,
+                _max_r=max_r,
+                _afac=afac,
+                _max_ss=max_ss,
+                _max_rounds=max_rounds,
+            ):
+                return adjust_step_size(
+                    pop, _move_fn, ss, emax, key,
+                    _n_samp, _min_r, _max_r, _afac, _max_ss, _max_rounds,
+                )
 
-                fns.append(_make_pmap_vmap_fn())
-
-            elif is_vmap:
-                # Close over all static args so vmap sees no static arg boundary issues.
-                def _make_vmap_fn(
-                    _move_fn=move_fn,
-                    _n_samp=n_samp,
-                    _min_r=min_r,
-                    _max_r=max_r,
-                    _afac=afac,
-                    _max_ss=max_ss,
-                    _max_rounds=max_rounds,
-                ) -> Callable:
-                    def _per_run(pop_r, ss_r, emax_r, key_r):
-                        return adjust_step_size(
-                            pop_r, _move_fn, ss_r, emax_r, key_r,
-                            _n_samp, _min_r, _max_r, _afac, _max_ss, _max_rounds,
-                        )
-                    return jax.jit(jax.vmap(_per_run))
-
-                fns.append(_make_vmap_fn())
-            else:
-                # SingleRun: each call is a scalar pop/ss/emax/key.
-                # Close over static args so the same jit object is reused
-                # across different step_size values (only dynamic: pop, ss, emax, key).
-                def _make_single_fn(
-                    _move_fn=move_fn,
-                    _n_samp=n_samp,
-                    _min_r=min_r,
-                    _max_r=max_r,
-                    _afac=afac,
-                    _max_ss=max_ss,
-                    _max_rounds=max_rounds,
-                ) -> Callable:
-                    def _call(pop, ss, emax, key):
-                        return adjust_step_size(
-                            pop, _move_fn, ss, emax, key,
-                            _n_samp, _min_r, _max_r, _afac, _max_ss, _max_rounds,
-                        )
-                    return jax.jit(_call)
-
-                fns.append(_make_single_fn())
+            fns.append(self._batcher.wrap_for_batch(_per_replica))
 
         return fns
-
-    def _split_vmap_keys(
-        self, rng_key: jax.Array
-    ) -> tuple[jax.Array, jax.Array]:
-        """Split a (n_runs,) key array into two (n_runs,) arrays.
-
-        Returns ``(carry_keys, trial_keys)`` each of shape ``(n_runs,)``.
-        """
-        # jax.vmap(jax.random.split)(rng_key) → (n_runs, 2) typed-key array
-        pairs = jax.vmap(jax.random.split)(rng_key)  # (n_runs, 2)
-        carry = pairs[:, 0]
-        trial = pairs[:, 1]
-        return carry, trial
-
-    def _split_pmap_vmap_keys(
-        self, rng_key: jax.Array
-    ) -> tuple[jax.Array, jax.Array]:
-        """Split a (G, P) key array into two (G, P) arrays.
-
-        Returns ``(carry_keys, trial_keys)`` each of shape ``(G, P)``.
-        """
-        # vmap over G then over P: jax.random.split(k) → (2,) → index 0 and 1.
-        pairs = jax.vmap(
-            jax.vmap(jax.random.split)
-        )(rng_key)  # (G, P, 2) typed-key array
-        carry = pairs[:, :, 0]  # (G, P)
-        trial = pairs[:, :, 1]  # (G, P)
-        return carry, trial

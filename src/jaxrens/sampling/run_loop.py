@@ -307,8 +307,7 @@ def _run_loop(
     # descriptors we take the first per-run key.
     inter_re_key = None
     if inter_re_mgr is not None and inter_re_mgr.is_active:
-        rng_key_scalar = rng_key.reshape(-1)[0] if jnp.asarray(rng_key).ndim > 0 else rng_key
-        inter_re_key = jax.random.split(rng_key_scalar, 1)[0]
+        inter_re_key = jax.random.split(batcher.scalar_key(rng_key), 1)[0]
 
     # ---- on_start callbacks (fired once, post-init, pre-loop) ----
     # CheckpointCallback uses this hook to snapshot the fully-initialised

@@ -22,6 +22,7 @@ from jaxrens.sampling.batch_descriptor import (
     PmapVmapRuns,
     SingleRun,
     VmapRuns,
+    from_shape_prefix,
 )
 
 
@@ -466,6 +467,101 @@ class TestReduceEmax:
         out = descriptor.reduce_emax(energy)
         expected = jnp.full(descriptor.shape_prefix, K - 1, dtype=jnp.float32)
         np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
+
+
+class TestScalarKey:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_returns_scalar_key(self, descriptor):
+        # Build a per-replica key tree of the right shape, then ensure the
+        # result is a scalar (ndim == 0) — caller can feed it to scalar APIs
+        # like ``replica_exchange_step``.
+        n_per_replica = descriptor.n_runs
+        if n_per_replica == 1 and descriptor.shape_prefix == ():
+            # SingleRun: scalar input.
+            key = jax.random.key(0)
+        else:
+            flat = jax.random.split(jax.random.key(0), n_per_replica)
+            key = flat.reshape(descriptor.shape_prefix)
+        out = descriptor.scalar_key(key)
+        assert jnp.asarray(out).ndim == 0
+
+    def test_singlerun_passthrough(self):
+        d = SingleRun()
+        key = jax.random.key(7)
+        assert jnp.asarray(d.scalar_key(key)).ndim == 0
+        # Same bits going in and out for a scalar input.
+        out = d.scalar_key(key)
+        assert jax.random.key_data(out).tolist() == jax.random.key_data(key).tolist()
+
+    def test_batched_takes_replica_zero(self):
+        d = VmapRuns(n_runs=4)
+        flat = jax.random.split(jax.random.key(11), 4)
+        out = d.scalar_key(flat)
+        # The first replica's key should match.
+        assert jax.random.key_data(out).tolist() == jax.random.key_data(flat[0]).tolist()
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_jit(self, descriptor):
+        if descriptor.shape_prefix == ():
+            key = jax.random.key(0)
+        else:
+            flat = jax.random.split(jax.random.key(0), descriptor.n_runs)
+            key = flat.reshape(descriptor.shape_prefix)
+        out = jax.jit(descriptor.scalar_key)(key)
+        assert jnp.asarray(out).ndim == 0
+
+
+class TestFromShapePrefix:
+    def test_scalar_returns_singlerun(self):
+        out = from_shape_prefix(())
+        assert isinstance(out, SingleRun)
+
+    def test_rank1_returns_vmapruns(self):
+        out = from_shape_prefix((7,))
+        assert isinstance(out, VmapRuns)
+        assert out.n_runs == 7
+
+    def test_rank2_returns_pmapvmapruns(self):
+        out = from_shape_prefix((2, 3))
+        assert isinstance(out, PmapVmapRuns)
+        assert out.n_gpu == 2
+        assert out.n_per_gpu == 3
+
+    def test_rank3_raises(self):
+        with pytest.raises(ValueError, match="rank-0/1/2"):
+            from_shape_prefix((1, 2, 3))
+
+    def test_roundtrip_via_shape_prefix(self):
+        for d in (SingleRun(), VmapRuns(n_runs=4), PmapVmapRuns(n_gpu=2, n_per_gpu=3)):
+            assert from_shape_prefix(d.shape_prefix).shape_prefix == d.shape_prefix
+
+
+class TestWrapForBatch:
+    """``wrap_for_batch`` mirrors ``wrap_step`` but for arbitrary callables."""
+
+    def _square(self, x):
+        return x * x
+
+    def test_singlerun_runs_on_scalar(self):
+        d = SingleRun()
+        wrapped = d.wrap_for_batch(self._square)
+        out = wrapped(jnp.asarray(3.0))
+        assert jnp.allclose(out, 9.0)
+
+    def test_vmap_runs_on_batch_axis(self):
+        d = VmapRuns(n_runs=4)
+        wrapped = d.wrap_for_batch(self._square)
+        out = wrapped(jnp.arange(4, dtype=jnp.float32))
+        np.testing.assert_array_equal(np.asarray(out), np.array([0.0, 1.0, 4.0, 9.0]))
+
+    def test_pmap_vmap_runs_on_GP_batch(self):
+        n_devices = jax.local_device_count()
+        d = PmapVmapRuns(n_gpu=n_devices, n_per_gpu=3)
+        # Force n_gpu==local_devices since pmap requires that.
+        wrapped = d.wrap_for_batch(self._square)
+        x = jnp.arange(n_devices * 3, dtype=jnp.float32).reshape(n_devices, 3)
+        out = wrapped(x)
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(x * x))
 
 
 class TestDerivedHelpersJIT:

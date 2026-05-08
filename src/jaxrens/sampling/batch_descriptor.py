@@ -222,6 +222,41 @@ class BatchDescriptor(ABC):
         """
         return jnp.max(energy, axis=self.walker_axis)
 
+    def scalar_key(self, rng_key: jax.Array) -> jax.Array:
+        """Reduce a per-replica key array to a single scalar key.
+
+        Identity for SingleRun (already scalar); takes replica ``(0,)``
+        for VmapRuns / PmapVmapRuns.  Used by ``_run_loop`` to derive the
+        single key the inter-RE swap path needs from the per-replica
+        adaptation key carry.
+        """
+        arr = jnp.asarray(rng_key)
+        return arr if arr.ndim == 0 else arr.reshape(-1)[0]
+
+    def wrap_for_batch(self, per_element_fn):
+        """Wrap a per-replica callable with jit/vmap/pmap as appropriate.
+
+        Generic version of :meth:`wrap_step` for callables that don't take
+        ``static_argnums``-style sentinels.  *per_element_fn* receives its
+        arguments at single-replica shape; the returned callable accepts
+        them at ``(*shape_prefix, ...)`` shape:
+
+        * **SingleRun** — ``jax.jit(per_element_fn)``.
+        * **VmapRuns** — ``jax.jit(jax.vmap(per_element_fn))``.
+        * **PmapVmapRuns** — ``jax.pmap(jax.vmap(per_element_fn), axis_name="gpu")``.
+
+        Default implementation routes by ``shape_prefix`` length so concrete
+        classes inherit unchanged.
+        """
+        n_prefix = len(self.shape_prefix)
+        if n_prefix == 0:
+            return jax.jit(per_element_fn)
+        if n_prefix == 1:
+            return jax.jit(jax.vmap(per_element_fn))
+        # n_prefix == 2 (PmapVmapRuns): outer pmap over G, inner vmap over P.
+        # pmap is self-JIT-compiling — do NOT wrap in jax.jit.
+        return jax.pmap(jax.vmap(per_element_fn), axis_name="gpu")
+
 
 # ---------------------------------------------------------------------------
 # Concrete implementations
@@ -538,3 +573,37 @@ class PmapVmapRuns(BatchDescriptor):
             Worst-case scalars across all runs on all GPUs.
         """
         return float(jnp.min(log_evidence)), float(jnp.max(hmax))
+
+
+# ---------------------------------------------------------------------------
+# Module-level factory
+# ---------------------------------------------------------------------------
+
+
+def from_shape_prefix(shape_prefix: tuple[int, ...]) -> BatchDescriptor:
+    """Return the batcher whose ``shape_prefix`` matches *shape_prefix*.
+
+    * ``()``      → :class:`SingleRun`.
+    * ``(R,)``    → :class:`VmapRuns(n_runs=R)`.
+    * ``(G, P)``  → :class:`PmapVmapRuns(n_gpu=G, n_per_gpu=P)`.
+
+    Used by ``init/restart.py``, ``io/checkpoint.py``, and ``cli/monitor.py``
+    to recover the batcher from a stored array's leading shape (``log_evidence``
+    is the canonical witness — its shape is always exactly the prefix).
+
+    Raises
+    ------
+    ValueError
+        If *shape_prefix* has more than two leading dims.
+    """
+    prefix = tuple(int(d) for d in shape_prefix)
+    if len(prefix) == 0:
+        return SingleRun()
+    if len(prefix) == 1:
+        return VmapRuns(n_runs=prefix[0])
+    if len(prefix) == 2:
+        return PmapVmapRuns(n_gpu=prefix[0], n_per_gpu=prefix[1])
+    raise ValueError(
+        f"from_shape_prefix: only rank-0/1/2 prefixes are supported, got "
+        f"shape_prefix={shape_prefix} (rank {len(prefix)})."
+    )

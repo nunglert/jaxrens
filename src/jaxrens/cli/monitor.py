@@ -156,12 +156,14 @@ def _is_batched(ns_state: Any, info: "dict | None" = None) -> bool:
         if batcher is not None:
             return batcher.is_batched
 
-    # Fallback: ndim-sniff on log_evidence (backward compat)
+    # Fallback: recover the batcher from log_evidence's shape prefix.
+    from jaxrens.sampling.batch_descriptor import from_shape_prefix
+
     if isinstance(ns_state, NSState):
-        return jnp.asarray(ns_state.log_evidence).ndim > 0
-    # dict form (run_ns_parallel result)
-    ev = ns_state.get("log_evidence", jnp.array(0.0))
-    return jnp.asarray(ev).ndim > 0
+        log_ev = jnp.asarray(ns_state.log_evidence)
+    else:
+        log_ev = jnp.asarray(ns_state.get("log_evidence", jnp.array(0.0)))
+    return from_shape_prefix(log_ev.shape).is_batched
 
 
 class ProgressCallback:

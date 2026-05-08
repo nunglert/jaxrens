@@ -45,6 +45,17 @@ pip install -e ".[dev,neuralil]"
 
 Pulls a jaxrens-compatible fork (`nunglert/neuralil-jaxrens@jaxrens`).
 
+### Nequix
+
+```bash
+pip install -e ".[dev,nequix]"
+```
+
+Pulls upstream `atomicarchitects/nequix@main`. Optional backend
+that exposes the same `EnergyBackend` protocol as MACE/NeuralIL;
+nequix tests sit behind the `nequix` pytest marker (off by
+default, opt-in via `pytest -m nequix`).
+
 ### Docs
 
 ```bash
@@ -87,14 +98,6 @@ Markers:
 - `heavy` — slow tests (long example runs).
 - `gpu` — requires CUDA.
 - `multi_gpu` — requires 2+ CUDA devices.
-
-## One-GPU-at-a-time convention
-
-The repo runs a single GPU process at a time. Don't launch parallel
-GPU-using jobs (e.g. `pytest-xdist` on JAX tests, or two example
-runs in the background). This includes falling back to
-`JAX_PLATFORMS=cpu` as a workaround to dodge contention — don't;
-serialize and wait instead.
 
 ## Scratch / temp paths on SLURM
 

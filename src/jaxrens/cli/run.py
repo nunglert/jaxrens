@@ -31,6 +31,7 @@ from jaxrens.io.trajectory import create_trajectory_writer
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import (
+    init_ns_multi_gpu,
     init_ns_parallel,
     run_ns,
     run_ns_multi_gpu,
@@ -402,7 +403,6 @@ def run_from_config(
             adjust_interval=burn_in_cfg.adjust_interval,
             emax_offset_per_atom=burn_in_cfg.emax_offset_per_atom,
             n_atoms=n_atoms,
-            batched=False,
             walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
             run_batch_size=getattr(burn_in_cfg, "run_batch_size", None),
             per_move_fns=burn_per_move_fns,
@@ -573,16 +573,17 @@ def run_multi_gpu_from_config(resolved) -> dict:
         rng_keys = jax.random.split(key_init, n_total)
         step_sizes = jnp.full(len(resolved.move_descriptors), resolved.moves[0].step_size)
 
-        logger.debug("[stage] init_ns_parallel (burn-in NSState): starting")
-        ns_state_burn = init_ns_parallel(
+        logger.debug("[stage] init_ns_multi_gpu (burn-in NSState): starting")
+        ns_state_burn = init_ns_multi_gpu(
             init_fn,
             positions, types, energies, cells, rng_keys,
+            n_gpu, n_per_gpu,
             step_sizes=step_sizes,
             ensemble_params_per_run=list(resolved.ensemble_params_per_run),
             max_neighbors=starting_bucket,
             max_neighbor_counts=_init_counts,
         )
-        _barrier("init_ns_parallel", ns_state_burn.population.positions)
+        _barrier("init_ns_multi_gpu", ns_state_burn.population.positions)
 
         n_atoms = positions.shape[-2]
         adaptation_policies = resolved.adaptation_policies
@@ -608,7 +609,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
             adjust_interval=burn_in_cfg.adjust_interval,
             emax_offset_per_atom=burn_in_cfg.emax_offset_per_atom,
             n_atoms=n_atoms,
-            batched=True,
+            batcher=resolved.batcher,
             walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
             run_batch_size=getattr(burn_in_cfg, "run_batch_size", None),
             per_move_fns=burn_per_move_fns,
@@ -617,9 +618,18 @@ def run_multi_gpu_from_config(resolved) -> dict:
             adjust_max_rounds=getattr(resolved.adaptation_cfg, "adjust_max_rounds", 15),
         )
         pop = ns_state_burn.population
-        positions = pop.positions
-        energies = pop.energy
-        cells = pop.cell
+        # Burn-in operated on (G, P, K, ...) state via the PmapVmapRuns batcher.
+        # Downstream code (``_recompute_max_neighbor_counts``, ``run_ns_multi_gpu``
+        # input adapters) consumes the flat ``(n_total, K, ...)`` form, so flatten
+        # the leading G×P axes back here.
+        def _flatten_GP(arr):
+            if arr is None:
+                return None
+            return arr.reshape((n_total,) + arr.shape[2:])
+
+        positions = _flatten_GP(pop.positions)
+        energies = _flatten_GP(pop.energy)
+        cells = _flatten_GP(pop.cell)
         _barrier("initial_walk", positions, energies, cells)
         logger.info("Burn-in complete")
 
@@ -744,6 +754,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
         max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
         max_neighbors_offset=resolved.backend.max_neighbors_offset,
         initial_max_neighbor_counts=post_burn_in_counts,
+        batcher=resolved.batcher,
         **full_auto_kwargs,
     )
     return result

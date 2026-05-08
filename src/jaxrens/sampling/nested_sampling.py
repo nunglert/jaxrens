@@ -1052,6 +1052,7 @@ def run_ns_multi_gpu(
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
+    batcher: PmapVmapRuns | None = None,
 ) -> dict:
     """Run NS with ``pmap(vmap(ns_step))`` dispatch across G GPUs × P runs each.
 
@@ -1190,7 +1191,15 @@ def run_ns_multi_gpu(
         n_gpu, n_per_gpu, n_total, n_walkers, max_iterations, n_mcmc_steps, n_extra,
     )
 
-    batcher = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+    if batcher is None:
+        batcher = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+    elif batcher.n_gpu != n_gpu or batcher.n_per_gpu != n_per_gpu:
+        raise ValueError(
+            f"run_ns_multi_gpu: batcher topology ({batcher.n_gpu}, "
+            f"{batcher.n_per_gpu}) disagrees with explicit n_gpu={n_gpu}, "
+            f"n_per_gpu={n_per_gpu}. Pass either form, not both with "
+            f"conflicting values."
+        )
     adapt_mgr = AdaptationManager(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,

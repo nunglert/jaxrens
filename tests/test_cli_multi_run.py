@@ -213,6 +213,17 @@ class TestResolveMultiRun:
         assert out.inter_re_config.every == 2
         assert out.inter_re_config.n_swap_cycles == 3
 
+    def test_batcher_field_populated(self):
+        from jaxrens.sampling.batch_descriptor import PmapVmapRuns
+
+        cfg = _lj_multi_run_config([0.01, 0.1])
+        root = RootSpec.model_validate(cfg)
+        out = _resolve_multi_run(root)
+        assert out.batcher is not None
+        assert isinstance(out.batcher, PmapVmapRuns)
+        assert out.batcher.n_gpu == out.ns.n_gpu
+        assert out.batcher.n_per_gpu == out.ns.n_per_gpu
+
 
 # ---------------------------------------------------------------------------
 # End-to-end multi-run dispatch via the CLI-level entry point (CPU-only path:

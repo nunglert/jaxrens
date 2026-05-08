@@ -2,6 +2,17 @@
  * top-LEFT to leave the upstream "⛶" fullscreen button (top-RIGHT) alone. */
 pre.mermaid, div.mermaid {
     position: relative;
+    /* Override sphinxcontrib-mermaid's hard-coded 500px container so
+     * short, wide (LR) diagrams don't get padded with empty space.
+     * SVG sizes itself from its viewBox; max-height caps very tall ones
+     * — the pan/zoom toolbar still lets users zoom in if they want more. */
+    height: auto !important;
+}
+pre.mermaid > svg, div.mermaid > svg {
+    height: auto !important;
+    max-height: 70vh;
+    display: block;
+    margin: 0 auto;
 }
 .mermaid-zoom-toolbar {
     position: absolute;

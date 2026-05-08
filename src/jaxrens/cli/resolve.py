@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from jaxrens.backends.base import EnergyBackend
+from jaxrens.sampling.batch_descriptor import BatchDescriptor, PmapVmapRuns
 from jaxrens.cli.schema.adaptation import AdaptationSpec, ResolvedAdaptationPolicy
 from jaxrens.cli.schema.cell import CellSpec
 from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
@@ -889,6 +890,11 @@ class ResolvedMultiRunConfig:
     initial_walk_config: Any = None
     adaptation_cfg: Any = None
     inter_re_config: Any = None  # InterREConfig | None
+    # Batcher describing the (n_gpu, n_per_gpu) topology.  Carries the same
+    # information as ``ns.n_gpu``/``ns.n_per_gpu`` but in the canonical form
+    # consumed by ``_run_loop``, ``AdaptationManager``, ``InterREManager``,
+    # and (post-§C) ``initial_walk``.
+    batcher: BatchDescriptor | None = None
 
 
 def _local_device_count() -> int:
@@ -1184,6 +1190,7 @@ def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
         inter_re_config=(
             root.inter_re.to_inter_re_config() if root.inter_re is not None else None
         ),
+        batcher=PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu),
     )
 
 
