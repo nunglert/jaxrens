@@ -119,10 +119,14 @@ def _build_dynamics_model(
     core_model = ResNetCore(core_widths)
 
     if has_morse:
+        # neuralil >= some-version replaced ``morse_type`` with a flax
+        # ``mixer`` submodule.  Constructing with defaults reproduces
+        # the layout the pickle was trained against (since the pickle
+        # encodes whatever module tree the installed neuralil exposes).
         individual = NeuralILwithMorse(
             n_types, embed_d, r_cutoff,
             descriptor_gen, descriptor_gen.process_some_data,
-            core_model, morse_type="RepulsiveMorse",
+            core_model,
         )
     else:
         individual = NeuralIL(

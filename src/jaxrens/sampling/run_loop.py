@@ -347,7 +347,6 @@ def _run_loop(
 
         # ---- Overflow retry ----
         # For PmapVmapRuns, any overflow across any (G, P) shard triggers a retry.
-        # TODO: for multi-GPU, consider per-shard retry rather than stop-the-world.
         if jnp.any(new_ns_state.population.overflow):
             true_max = int(new_ns_state.population.max_neighbor_count.max())
             current = int(ns_state.population.max_neighbors)

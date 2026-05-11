@@ -1,6 +1,13 @@
 """Lennard-Jones pair potential backend.
 
-E = sum_{i<j} 4 * eps_ij * [(sig_ij/r_ij)^12 - (sig_ij/r_ij)^6]
+E = sum_{i<j, k} 4 * eps_ij * [(sig_ij/r_ijk)^12 - (sig_ij/r_ijk)^6]
+
+where ``k`` ranges over the periodic-image offsets enumerated by
+``supercell_trafo``. The summation uses **triclinic minimum-image** for
+the central image (correct for sheared cells from shear/stretch moves),
+then explicitly tiles ``supercell_trafo`` additional images on top of
+that so cells smaller than ``2 · r_cut`` can be handled when
+``supercell_trafo`` is bumped above ``(1, 1, 1)``.
 
 Single-species mode (default):
     eps_ij = epsilon, sig_ij = sigma  (scalars, ignore species)
@@ -9,7 +16,11 @@ Multi-species mode (``epsilon``/``sigma`` given as 1-D sequences):
     eps_ij = sqrt(eps[s_i] * eps[s_j])     (geometric Lorentz-Berthelot)
     sig_ij = (sig[s_i] + sig[s_j]) / 2     (arithmetic Lorentz-Berthelot)
 
-Supports non-periodic and periodic (minimum image convention) systems.
+The ``supercell_trafo`` convention matches MACE / Nequix: it must satisfy
+``min(perp_distance · sc) >= 2 · r_cut`` for the energy to capture every
+true neighbor. The resolver emits a startup warning when the cell prior
+permits cells that violate this bound.
+
 All-pairs computation — no neighbor list needed.
 """
 
@@ -19,6 +30,8 @@ from typing import Any, Sequence
 
 import jax.numpy as jnp
 
+from jaxrens.backends._graph_neighbors import _make_image_offsets
+
 
 _ScalarOrSeq = float | Sequence[float] | jnp.ndarray
 
@@ -26,8 +39,9 @@ _ScalarOrSeq = float | Sequence[float] | jnp.ndarray
 class LJBackend:
     """Lennard-Jones pair potential.
 
-    All-pairs computation with minimum image convention.
-    Ignores ``max_neighbors`` (no neighbor list needed).
+    All-pairs computation with triclinic minimum-image convention and
+    explicit supercell-image enumeration. Ignores ``max_neighbors`` (no
+    neighbor list needed).
 
     Args:
         epsilon: Energy well depth.  Scalar (single-species) or 1-D
@@ -36,6 +50,13 @@ class LJBackend:
         sigma: Length scale.  Same shape rules as ``epsilon``;
             arithmetic Lorentz-Berthelot mixing for cross-species pairs.
         cutoff: Distance cutoff (scalar; applies uniformly across species).
+        supercell_trafo: ``(sc_a, sc_b, sc_c)`` integer expansion for
+            periodic-image enumeration. Must satisfy
+            ``min(perp_distance · sc) >= 2 · r_cut`` to capture every
+            true neighbor. Default ``(1, 1, 1)`` is MIC-only (correct
+            iff the actual cell already has min perpendicular distance
+            ≥ ``2 · r_cut``); bump to ``(2, 2, 2)`` (27 images) for
+            cells that may shrink below that threshold.
     """
 
     def __init__(
@@ -43,6 +64,7 @@ class LJBackend:
         epsilon: _ScalarOrSeq = 1.0,
         sigma: _ScalarOrSeq = 1.0,
         cutoff: float | None = None,
+        supercell_trafo: tuple[int, int, int] = (1, 1, 1),
     ):
         eps_arr = jnp.asarray(epsilon, dtype=jnp.float32)
         sig_arr = jnp.asarray(sigma, dtype=jnp.float32)
@@ -82,6 +104,18 @@ class LJBackend:
         self.cutoff = cutoff
         self.r_cutoff = cutoff if cutoff is not None else 0.0
 
+        sc_a, sc_b, sc_c = (int(x) for x in supercell_trafo)
+        if min(sc_a, sc_b, sc_c) < 1:
+            raise ValueError(
+                f"supercell_trafo entries must be >= 1, got {supercell_trafo}"
+            )
+        self.supercell_trafo = (sc_a, sc_b, sc_c)
+        # _make_image_offsets returns centered integer offsets in fractional
+        # coordinates: e.g. (2,2,2) → [-1, 0, +1]^3 → 27 images.
+        self._image_offsets = jnp.asarray(
+            _make_image_offsets(sc_a, sc_b, sc_c), dtype=jnp.float32
+        )
+
     def __call__(
         self,
         positions: jnp.ndarray,
@@ -92,39 +126,64 @@ class LJBackend:
     ) -> tuple[jnp.ndarray, int, bool]:
         n_atoms = positions.shape[0]
 
-        dr = positions[:, None, :] - positions[None, :, :]  # (N, N, 3)
+        # Non-periodic systems: cell is all zeros. Substitute a huge cube so
+        # (a) inv(cell) is well-defined, (b) MIC rounds to zero (no wrap),
+        # (c) supercell image translations land far outside any cutoff.
+        det = jnp.linalg.det(cell)
+        safe_cell = jnp.where(det == 0.0, 1.0e10 * jnp.eye(3), cell)
 
-        # Minimum image convention for periodic systems
-        # For non-periodic (cell=zeros), replace zeros with large value to avoid div-by-zero
-        box_diag = jnp.diag(cell)
-        safe_diag = jnp.where(box_diag == 0, 1e10, box_diag)
-        dr = dr - jnp.round(dr / safe_diag[None, None, :]) * box_diag[None, None, :]
+        # (N, N, 3) pair displacements: r_ij = r_j - r_i.
+        dr = positions[None, :, :] - positions[:, None, :]
 
-        r2 = jnp.sum(dr**2, axis=-1)  # (N, N)
+        # Triclinic minimum-image: project to fractional coords, round, project
+        # back. Replaces the previous diag-only MIC, which was wrong for any
+        # sheared cell produced by shear / stretch moves.
+        inv_cell = jnp.linalg.inv(safe_cell)
+        dr_frac = dr @ inv_cell
+        dr_mic = dr - jnp.round(dr_frac) @ safe_cell  # (N, N, 3)
 
-        mask = jnp.triu(jnp.ones((n_atoms, n_atoms), dtype=bool), k=1)
-        r2_safe = jnp.where(mask, r2, jnp.ones_like(r2))
+        # Add explicit supercell image translations on top of the MIC pair.
+        # image_translations: (K, 3), broadcast to (K, N, N, 3).
+        image_translations = self._image_offsets @ safe_cell
+        dr_kij = dr_mic[None, :, :, :] + image_translations[:, None, None, :]
+        r2 = jnp.sum(dr_kij**2, axis=-1)  # (K, N, N)
+
+        # Exclude only the central self-pair (i = j and k = (0,0,0)) — every
+        # other (i, j, k) entry is a real interaction. For i ≠ j and any k,
+        # the (j, i, -k) mirror entry duplicates it: hence the 0.5 prefactor
+        # below counts each interaction exactly once.
+        is_center = jnp.all(self._image_offsets == 0.0, axis=-1)  # (K,)
+        self_pair = jnp.eye(n_atoms, dtype=bool)                  # (N, N)
+        exclude = is_center[:, None, None] & self_pair[None, :, :]  # (K, N, N)
+
+        # Avoid 0/0 at the excluded entries.
+        r2_safe = jnp.where(exclude, 1.0, r2)
 
         if self._per_species:
             eps_per_atom = self._eps_table[species]                          # (N,)
             sig_per_atom = self._sig_table[species]                          # (N,)
             eps_ij = jnp.sqrt(eps_per_atom[:, None] * eps_per_atom[None, :]) # (N, N)
             sig_ij = 0.5 * (sig_per_atom[:, None] + sig_per_atom[None, :])   # (N, N)
-            sig_r2 = sig_ij**2 / r2_safe
+            sig_r2 = sig_ij[None, :, :] ** 2 / r2_safe                       # (K, N, N)
+            eps_ij_bcast = eps_ij[None, :, :]
         else:
-            eps_ij = self.epsilon
-            sig_r2 = self.sigma**2 / r2_safe
+            eps_ij_bcast = self.epsilon
+            sig_r2 = self.sigma ** 2 / r2_safe
 
-        sig_r6 = sig_r2**3
-        sig_r12 = sig_r6**2
+        sig_r6 = sig_r2 ** 3
+        sig_r12 = sig_r6 ** 2
 
-        pair_energy = 4.0 * eps_ij * (sig_r12 - sig_r6)
+        pair_energy = 4.0 * eps_ij_bcast * (sig_r12 - sig_r6)
 
         if self.cutoff is not None:
-            cutoff_mask = r2_safe < self.cutoff**2
+            cutoff_mask = r2 < self.cutoff ** 2
             pair_energy = jnp.where(cutoff_mask, pair_energy, 0.0)
 
-        energy = jnp.sum(jnp.where(mask, pair_energy, 0.0))
+        # Zero out excluded (central self) entries before summing.
+        pair_energy = jnp.where(exclude, 0.0, pair_energy)
+
+        # Each (i, j, k) and its mirror (j, i, -k) both contribute — divide by 2.
+        energy = 0.5 * jnp.sum(pair_energy)
         return energy, 0, False
 
 
@@ -132,11 +191,21 @@ def create_lj(
     epsilon: _ScalarOrSeq = 1.0,
     sigma: _ScalarOrSeq = 1.0,
     cutoff: float | None = None,
+    supercell_trafo: tuple[int, int, int] = (1, 1, 1),
 ) -> LJBackend:
     """Create a Lennard-Jones backend.
 
     Pass scalar ``epsilon``/``sigma`` for the classic single-species
     potential; pass 1-D sequences (length ``n_species``) for a per-species
     table with Lorentz-Berthelot mixing on cross-species pairs.
+
+    ``supercell_trafo`` enumerates explicit periodic images on top of the
+    triclinic MIC pair distance — bump above ``(1, 1, 1)`` when the cell
+    prior permits cells smaller than ``2 · cutoff`` along any direction.
     """
-    return LJBackend(epsilon=epsilon, sigma=sigma, cutoff=cutoff)
+    return LJBackend(
+        epsilon=epsilon,
+        sigma=sigma,
+        cutoff=cutoff,
+        supercell_trafo=supercell_trafo,
+    )

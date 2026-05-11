@@ -183,3 +183,248 @@ class TestScalarRegression:
         e, _, _ = be(pos, jnp.array([0, 0], dtype=jnp.int32), cell)
         expected = 4.0 * eps * ((sig / r) ** 12 - (sig / r) ** 6)
         assert jnp.allclose(e, expected, atol=1e-5, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Triclinic MIC — sheared cells must wrap to the true nearest image
+# ---------------------------------------------------------------------------
+
+
+def _brute_force_pair_energy(
+    positions, cell, epsilon, sigma, cutoff, supercell
+):
+    """Reference Python loop computing LJ pair energy with explicit periodic
+    images. Used to validate the JAX implementation against a slow but
+    obviously-correct baseline."""
+    import numpy as np
+
+    pos = np.asarray(positions)
+    cell = np.asarray(cell)
+    n = pos.shape[0]
+    sc_a, sc_b, sc_c = supercell
+    offsets = []
+    for a in range(-(sc_a // 2), sc_a // 2 + 1):
+        for b in range(-(sc_b // 2), sc_b // 2 + 1):
+            for c in range(-(sc_c // 2), sc_c // 2 + 1):
+                offsets.append((a, b, c))
+    offsets = np.asarray(offsets, dtype=float)
+
+    inv_cell = np.linalg.inv(cell)
+    energy = 0.0
+    for i in range(n):
+        for j in range(n):
+            dr = pos[j] - pos[i]
+            # Triclinic MIC.
+            dr_frac = dr @ inv_cell
+            dr_mic = dr - np.round(dr_frac) @ cell
+            for k, off in enumerate(offsets):
+                if i == j and np.all(off == 0):
+                    continue
+                dr_kij = dr_mic + off @ cell
+                r2 = float((dr_kij ** 2).sum())
+                if cutoff is not None and r2 >= cutoff ** 2:
+                    continue
+                sig_r6 = (sigma ** 2 / r2) ** 3
+                pair = 4.0 * epsilon * (sig_r6 ** 2 - sig_r6)
+                energy += 0.5 * pair
+    return energy
+
+
+class TestTriclinicMIC:
+    def test_sheared_cell_matches_brute_force(self):
+        # 8-atom random configuration in a sheared cell.
+        key = jax.random.PRNGKey(0)
+        cell = jnp.array([
+            [5.0, 0.5, 0.0],
+            [0.6, 5.0, 0.3],
+            [0.2, 0.4, 5.0],
+        ])
+        positions = jax.random.uniform(
+            key, (8, 3), minval=-1.0, maxval=6.0
+        )
+
+        be = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5)
+        e, _, _ = be(positions, jnp.zeros(8, dtype=jnp.int32), cell)
+        ref = _brute_force_pair_energy(
+            positions, cell, 1.0, 1.0, 2.5, (1, 1, 1),
+        )
+        assert jnp.allclose(e, ref, atol=1e-4, rtol=1e-4), (e, ref)
+
+    def test_diagonal_cell_unchanged(self):
+        # MIC-safe cubic cell: triclinic MIC and the previous diag-only MIC
+        # must give the same energy.
+        positions = jnp.array([
+            [0.0, 0.0, 0.0],
+            [1.2, 0.0, 0.0],
+            [0.0, 1.5, 0.0],
+        ])
+        cell = jnp.diag(jnp.array([10.0, 10.0, 10.0]))
+        be = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5)
+        e, _, _ = be(positions, jnp.zeros(3, dtype=jnp.int32), cell)
+        ref = _brute_force_pair_energy(
+            positions, cell, 1.0, 1.0, 2.5, (1, 1, 1),
+        )
+        assert jnp.allclose(e, ref, atol=1e-5, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Supercell-image enumeration — additional images for tight cells
+# ---------------------------------------------------------------------------
+
+
+class TestSupercellTrafo:
+    def test_default_is_mic_only(self):
+        # Spacious cubic cell: (1,1,1) and (2,2,2) must agree because every
+        # extra image is beyond the cutoff.
+        positions = jnp.array([
+            [0.0, 0.0, 0.0],
+            [1.4, 0.0, 0.0],
+            [0.0, 1.4, 0.0],
+        ])
+        cell = jnp.diag(jnp.array([10.0, 10.0, 10.0]))
+        be_a = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5,
+                         supercell_trafo=(1, 1, 1))
+        be_b = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5,
+                         supercell_trafo=(2, 2, 2))
+        e_a, _, _ = be_a(positions, jnp.zeros(3, dtype=jnp.int32), cell)
+        e_b, _, _ = be_b(positions, jnp.zeros(3, dtype=jnp.int32), cell)
+        assert jnp.allclose(e_a, e_b, atol=1e-5, rtol=1e-5)
+
+    def test_tight_cell_picks_up_images(self):
+        # Cell side 3.55 σ < 2 σ * cutoff/σ = 5 — needs (2,2,2) to be correct.
+        positions = jnp.array([
+            [0.0, 0.0, 0.0],
+            [1.2, 0.0, 0.0],
+        ])
+        cell = jnp.diag(jnp.array([3.55, 3.55, 3.55]))
+        be_mic = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5,
+                           supercell_trafo=(1, 1, 1))
+        be_sc = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5,
+                          supercell_trafo=(2, 2, 2))
+        e_mic, _, _ = be_mic(positions, jnp.zeros(2, dtype=jnp.int32), cell)
+        e_sc, _, _ = be_sc(positions, jnp.zeros(2, dtype=jnp.int32), cell)
+        ref_mic = _brute_force_pair_energy(
+            positions, cell, 1.0, 1.0, 2.5, (1, 1, 1),
+        )
+        ref_sc = _brute_force_pair_energy(
+            positions, cell, 1.0, 1.0, 2.5, (2, 2, 2),
+        )
+        assert jnp.allclose(e_mic, ref_mic, atol=1e-4, rtol=1e-4)
+        assert jnp.allclose(e_sc, ref_sc, atol=1e-4, rtol=1e-4)
+        # Images add real neighbours → energy must actually differ.
+        assert not jnp.allclose(e_mic, e_sc, atol=1e-3, rtol=1e-3)
+
+    def test_jit_compatibility(self):
+        be = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5,
+                       supercell_trafo=(2, 2, 2))
+        @jax.jit
+        def energy_fn(pos, sp, c):
+            e, _, _ = be(pos, sp, c)
+            return e
+        pos = jnp.array([[0.0, 0.0, 0.0], [1.2, 0.0, 0.0]])
+        e = energy_fn(pos, jnp.zeros(2, dtype=jnp.int32),
+                      jnp.diag(jnp.array([4.0, 4.0, 4.0])))
+        assert jnp.isfinite(e)
+
+    def test_invalid_supercell_trafo_raises(self):
+        with pytest.raises(ValueError, match=">= 1"):
+            create_lj(supercell_trafo=(0, 1, 1))
+
+
+# ---------------------------------------------------------------------------
+# Startup warning when the cell prior permits MIC-violating cells
+# ---------------------------------------------------------------------------
+
+
+class TestStartupCutoffWarning:
+    def _minimal_config(self):
+        return {
+            "run": {"n_live": 8, "max_iterations": 5, "seed": 42},
+            "backend": {
+                "type": "lj",
+                "epsilon": 1.0,
+                "sigma": 1.0,
+                "cutoff": 2.5,
+                "periodic": True,
+            },
+            "ensemble": {
+                "type": "npt",
+                "pressure": 0.1,
+                "pressure_units": "eva3",
+            },
+            "moves": [
+                {"type": "gmc", "n_reflect": 4, "step_size": 0.1, "weight": 1.0},
+            ],
+            "init": {
+                "start_species": "18 8",
+                "random_initialise_pos": True,
+                "pos_randomization_mode": "grid",
+                "grid_distance": 1.0,
+                "random_initialise_cell": True,
+                "initial_walk": {
+                    "n_walks": 1, "walklength": 1, "adjust_interval": 1,
+                    "emax_offset_per_atom": 1.0,
+                },
+            },
+            "output": {
+                "format": "extxyz",
+                "working_dir": "./output",
+                "out_file_prefix": "lj_unsafe_test",
+            },
+        }
+
+    def test_warns_on_tight_cell_prior(self, caplog):
+        from jaxrens.cli.resolve import _resolve_one
+        from jaxrens.cli.schema.root import RootSpec
+
+        cfg = self._minimal_config()
+        # Tight cell prior: smallest cube side ≈ (1.5*8)^(1/3) ≈ 2.29 σ,
+        # less than 2*cutoff=5.0. Must warn.
+        cfg["cell"] = {
+            "max_volume_per_atom": 10.0,
+            "min_volume_per_atom": 1.5,
+            "min_aspect_ratio": 0.6,
+            "flat_V_prior": False,
+        }
+        root = RootSpec.model_validate(cfg)
+        with caplog.at_level("WARNING", logger="jaxrens.cli.resolve"):
+            _resolve_one(root)
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("LJ cutoff vs cell-prior bounds" in m for m in msgs), msgs
+
+    def test_no_warning_on_spacious_cell_prior(self, caplog):
+        from jaxrens.cli.resolve import _resolve_one
+        from jaxrens.cli.schema.root import RootSpec
+
+        cfg = self._minimal_config()
+        # Generous cell prior: smallest cube side ≈ (50*8)^(1/3) ≈ 7.37 σ,
+        # times min_aspect 0.9 = 6.63 σ, comfortably above 2*cutoff=5.0.
+        cfg["cell"] = {
+            "max_volume_per_atom": 200.0,
+            "min_volume_per_atom": 50.0,
+            "min_aspect_ratio": 0.9,
+            "flat_V_prior": False,
+        }
+        root = RootSpec.model_validate(cfg)
+        with caplog.at_level("WARNING", logger="jaxrens.cli.resolve"):
+            _resolve_one(root)
+        msgs = [r.getMessage() for r in caplog.records]
+        assert not any("LJ cutoff vs cell-prior bounds" in m for m in msgs), msgs
+
+    def test_no_warning_without_cutoff(self, caplog):
+        from jaxrens.cli.resolve import _resolve_one
+        from jaxrens.cli.schema.root import RootSpec
+
+        cfg = self._minimal_config()
+        cfg["backend"]["cutoff"] = None
+        cfg["cell"] = {
+            "max_volume_per_atom": 10.0,
+            "min_volume_per_atom": 1.5,
+            "min_aspect_ratio": 0.6,
+            "flat_V_prior": False,
+        }
+        root = RootSpec.model_validate(cfg)
+        with caplog.at_level("WARNING", logger="jaxrens.cli.resolve"):
+            _resolve_one(root)
+        msgs = [r.getMessage() for r in caplog.records]
+        assert not any("LJ cutoff vs cell-prior bounds" in m for m in msgs), msgs

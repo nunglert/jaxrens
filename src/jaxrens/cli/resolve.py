@@ -37,6 +37,7 @@ from jaxrens.sampling.termination import (
 )
 from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
 from jaxrens.utils.cell import get_volume, min_aspect_ratio
+from jaxrens.cli.schema.backend import LJBackendSpec
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,56 @@ def _validate_input_cell(
         f"config or provide a structure whose cell satisfies them.\n"
         f"Cell:\n{cell}"
     )
+
+
+def _warn_if_lj_cutoff_unsafe(
+    backend_spec: Any,
+    cell_cfg: CellSpec,
+    n_atoms: int,
+) -> None:
+    """Warn if the LJ cutoff cannot be honoured by the smallest legal cell.
+
+    Triggers only for the LJ backend with a finite cutoff. The smallest cell
+    permitted by the prior is the one at ``min_volume_per_atom`` with the
+    worst-case aspect ratio. For an isotropic cubic cell at that volume, the
+    perpendicular distance equals the cube side; allowing the aspect ratio to
+    drop to ``min_aspect_ratio`` shrinks this proportionally. The MIC + image
+    sum is correct iff ``perp · min(supercell_trafo) >= 2 · cutoff``.
+    """
+    if not isinstance(backend_spec, LJBackendSpec):
+        return
+    if backend_spec.cutoff is None:
+        return
+
+    sc_min = min(backend_spec.supercell_trafo)
+    if sc_min <= 0:
+        return
+
+    vmin = cell_cfg.min_volume_per_atom * n_atoms
+    cubic_side = vmin ** (1.0 / 3.0)
+    # Worst-case perpendicular distance under the prior: shrinks linearly
+    # with min_aspect_ratio relative to the equal-axis cubic shape.
+    worst_perp = cubic_side * cell_cfg.min_aspect_ratio
+    required = 2.0 * backend_spec.cutoff
+
+    if worst_perp * sc_min < required:
+        logger.warning(
+            "LJ cutoff vs cell-prior bounds: smallest legal cell has worst-case "
+            "perpendicular distance %.4f A (n_atoms=%d, min_volume_per_atom=%.4f, "
+            "min_aspect_ratio=%.4f); with supercell_trafo=%s the effective span "
+            "is %.4f A, below the required 2 * cutoff = %.4f A. LJ energies will "
+            "undercount neighbours on the tight end of the cell-prior range. "
+            "Mitigate by raising cell.min_volume_per_atom, raising "
+            "cell.min_aspect_ratio, lowering backend.cutoff, or bumping "
+            "backend.supercell_trafo.",
+            worst_perp,
+            n_atoms,
+            cell_cfg.min_volume_per_atom,
+            cell_cfg.min_aspect_ratio,
+            backend_spec.supercell_trafo,
+            worst_perp * sc_min,
+            required,
+        )
 
 
 def _validate_cells(
@@ -758,6 +809,8 @@ def _resolve_one(root: RootSpec, cohort_index: int = 0) -> ResolvedConfig:
     # config field — this is the single canonical source of truth.
     n_atoms = int(resolved_init.initial_positions.shape[-2])
 
+    _warn_if_lj_cutoff_unsafe(root.backend, root.cell, n_atoms)
+
     import dataclasses as _dc
 
     moves = tuple(m.to_move_config() for m in root.moves)
@@ -1160,6 +1213,8 @@ def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
     )
 
     n_atoms = int(stacked_init.initial_positions.shape[-2])
+    _warn_if_lj_cutoff_unsafe(root.backend, root.cell, n_atoms)
+
     import dataclasses as _dc
 
     moves = tuple(m.to_move_config() for m in root.moves)
