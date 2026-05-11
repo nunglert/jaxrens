@@ -244,6 +244,35 @@ class NeuralILBackend:
 
         return energy, actual_max_neighbors, overflow
 
+    def max_neighbors_for(
+        self,
+        positions: jnp.ndarray,
+        cell: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """Geometry-only per-walker max neighbor count.
+
+        Mirrors MACE's same-named method (``mace.py:224-237``) so the
+        resolver's ``_finalise_initial_energies_and_counts`` can take
+        the bucket-aware branch instead of falling through to the
+        ``max_neighbors=0`` path.  No NeuralIL forward pass is
+        triggered — the result is a static-shape buffer sizing hint
+        derived purely from coordinates + the model's r_cutoff +
+        supercell_trafo.
+
+        Pass dummy zero ``species`` since neighbor counting depends
+        only on positions and the cutoff (species enter only through
+        a padded-atom mask which ``_get_max_number_of_neighbors``
+        ignores for length-N inputs).
+        """
+        sc_a, sc_b, sc_c = self.supercell_trafo
+        safe_cell = jnp.where(
+            jnp.trace(cell) == 0, 1000.0 * jnp.eye(3), cell,
+        )
+        species = jnp.zeros(positions.shape[0], dtype=jnp.int32)
+        return _get_max_number_of_neighbors(
+            positions, species, self.r_cutoff, safe_cell, sc_a, sc_b, sc_c,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Factory

@@ -105,6 +105,48 @@ class TestNeuralILBackend:
         _, _, overflow = backend(positions, species, cell, max_neighbors=1)
         assert overflow, "Should overflow with max_neighbors=1"
 
+    def test_max_neighbors_for(self, backend, reference):
+        """Geometry-only neighbor count agrees with the value the
+        backend itself reports during a real energy call.
+
+        Mirrors ``tests/test_mace.py::test_max_neighbors_for``.  The
+        resolver's ``_finalise_initial_energies_and_counts`` relies on
+        this method existing so it can size the initial energy compile
+        to the bucket burn-in / NS step will use, rather than wasting
+        a heavy compile at ``max_neighbors=0``.
+        """
+        positions = jnp.array(reference["positions"])
+        species = jnp.array(reference["types"], dtype=jnp.int32)
+        cell = jnp.array(reference["cell"])
+
+        # max_neighbors_for is geometry-only — no species mask, no
+        # energy compile — so passing the real cell/positions should
+        # produce the same count the backend reports internally.
+        n_from_method = int(backend.max_neighbors_for(positions, cell))
+        _, n_from_call, _ = backend(positions, species, cell, max_neighbors=64)
+        assert n_from_method == int(n_from_call), (
+            f"max_neighbors_for={n_from_method} disagrees with the count "
+            f"the backend reports during __call__={int(n_from_call)}"
+        )
+
+    def test_max_neighbors_for_vmap(self, backend, reference):
+        """``max_neighbors_for`` must be jax.vmap-compatible.
+
+        The resolver vmaps it over walkers (and pmaps over GPUs);
+        confirm a 2-walker stack works.
+        """
+        positions = jnp.array(reference["positions"])
+        cell = jnp.array(reference["cell"])
+        stacked_positions = jnp.stack([positions, positions], axis=0)
+        stacked_cells = jnp.stack([cell, cell], axis=0)
+
+        counts = jax.vmap(backend.max_neighbors_for)(
+            stacked_positions, stacked_cells,
+        )
+        assert counts.shape == (2,)
+        assert int(counts[0]) == int(counts[1])  # identical inputs
+        assert int(counts[0]) > 0
+
 
 @neuralil_required
 class TestNeuralILNSStep:
