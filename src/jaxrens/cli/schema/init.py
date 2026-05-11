@@ -33,7 +33,8 @@ class InitialWalkSpec(BaseModel):
     Memory-control knobs:
         ``walker_batch_size``: chunk the per-walker vmap via ``lax.map``.
             ``None`` = full vmap over all walkers (default; fastest).
-            Must divide ``n_walkers`` evenly or ``initial_walk`` raises.
+            Any positive int; non-divisors of ``n_walkers`` are handled
+            internally by padding.
         ``run_batch_size``: chunk the per-run vmap when ``batched=True``.
             ``None`` = full vmap over all runs (default).
             Must divide ``n_runs`` evenly. Ignored for single-run configs.
@@ -56,7 +57,8 @@ class InitialWalkSpec(BaseModel):
         description=(
             "Chunk walkers during burn-in vmap for memory control. "
             "None = full vmap over all walkers (max speed). "
-            "Must divide n_walkers evenly."
+            "Any positive int; non-divisors of n_walkers are padded "
+            "internally."
         ),
     )
     run_batch_size: int | None = Field(

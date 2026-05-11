@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 from pathlib import Path
@@ -19,8 +20,10 @@ from typing import Any
 import yaml
 
 from jaxrens.cli.resolve import expand_cohort, resolve
-from jaxrens.cli.run import run_from_config
+from jaxrens.cli.run import configure_file_logging, run_from_config
 from jaxrens.cli.schema import RootSpec
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +166,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     root = _load_and_validate(args.config, args.set)
 
+    # Hoist file logging before the resolver: heavy backends (NeuralIL,
+    # MACE, nequix) spend many minutes in the resolver placing walkers
+    # and JIT-compiling, and the resolver already emits ``logger.info``
+    # progress messages.  Configuring the log handlers here means those
+    # messages reach ``<prefix>.log`` and stderr at second 1 of the
+    # run, instead of being dropped until ``run_*_from_config`` runs
+    # the same call.
+    root.output.working_dir.mkdir(parents=True, exist_ok=True)
+    configure_file_logging(
+        working_dir=root.output.working_dir,
+        prefix=root.output.out_file_prefix,
+        level=root.output.log_level,
+    )
+
     from jaxrens.cli.resolve import (
         ResolvedMultiRunConfig,
         expand_multi_run_or_cohort,
@@ -172,16 +189,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     resolved_any = expand_multi_run_or_cohort(root)
 
     if isinstance(resolved_any, ResolvedMultiRunConfig):
-        print(
-            f"[multi-run] n_gpu={resolved_any.ns.n_gpu} "
-            f"n_per_gpu={resolved_any.ns.n_per_gpu} "
-            f"n_total={resolved_any.ns.n_gpu * resolved_any.ns.n_per_gpu} "
-            f"pressures="
-            + ", ".join(
+        logger.info(
+            "[multi-run] n_gpu=%d n_per_gpu=%d n_total=%d pressures=%s",
+            resolved_any.ns.n_gpu,
+            resolved_any.ns.n_per_gpu,
+            resolved_any.ns.n_gpu * resolved_any.ns.n_per_gpu,
+            ", ".join(
                 f"{p.get('pressure'):.4g}"
                 if p.get('pressure') is not None else "—"
                 for p in resolved_any.ensemble_params_per_run
-            )
+            ),
         )
         run_multi_gpu_from_config(resolved_any)
         return 0
@@ -192,9 +209,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         _run_one(cohort[0])
     else:
         for i, resolved in enumerate(cohort):
-            print(
-                f"[cohort {i + 1}/{n}] pressure={resolved.ensemble_params.get('pressure')} "
-                f"seed={resolved.ns.seed}"
+            logger.info(
+                "[cohort %d/%d] pressure=%s seed=%d",
+                i + 1, n,
+                resolved.ensemble_params.get('pressure'),
+                resolved.ns.seed,
             )
             _run_one(resolved, cohort_label=f"{i + 1}/{n}")
     return 0

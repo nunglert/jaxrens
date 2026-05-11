@@ -523,16 +523,54 @@ class TestWalkerChunking:
             atol=1e-5,
         )
 
-    def test_walker_batch_size_not_dividing_raises(self):
-        """walker_batch_size=3 on n_walkers=4: raises ValueError."""
-        ns_state, step_fn, _, _ = _build_ns_state(n_walkers=4, n_atoms=2)
-        with pytest.raises(ValueError, match="walker_batch_size"):
-            initial_walk(
-                jax.random.key(0), ns_state, step_fn,
-                n_walks=1, walklength=2, adjust_interval=100,
-                emax_offset_per_atom=0.0, n_atoms=2,
-                walker_batch_size=3,
-            )
+    def test_walker_batch_size_not_dividing_pads_and_matches_full_vmap(self):
+        """walker_batch_size=3 on n_walkers=4: pads internally; live slots match."""
+        n_walkers, n_atoms = 4, 2
+        ns_state, step_fn, _, _ = _build_ns_state(
+            n_walkers=n_walkers, n_atoms=n_atoms
+        )
+        key = jax.random.key(11)
+
+        result_full = initial_walk(
+            key, ns_state, step_fn,
+            n_walks=2, walklength=5, adjust_interval=100,
+            emax_offset_per_atom=0.5, n_atoms=n_atoms,
+            walker_batch_size=None,
+        )
+        result_padded = initial_walk(
+            key, ns_state, step_fn,
+            n_walks=2, walklength=5, adjust_interval=100,
+            emax_offset_per_atom=0.5, n_atoms=n_atoms,
+            walker_batch_size=3,
+        )
+
+        assert result_padded.population.positions.shape == (
+            n_walkers, *result_full.population.positions.shape[1:]
+        )
+        np.testing.assert_allclose(
+            np.array(result_full.population.positions),
+            np.array(result_padded.population.positions),
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            np.array(result_full.population.energy),
+            np.array(result_padded.population.energy),
+            atol=1e-5,
+        )
+
+    def test_walker_batch_size_non_divisor_large(self):
+        """walker_batch_size=8 on n_walkers=10 (user-reported pattern): runs, shape preserved."""
+        n_walkers, n_atoms = 10, 2
+        ns_state, step_fn, _, _ = _build_ns_state(
+            n_walkers=n_walkers, n_atoms=n_atoms
+        )
+        result = initial_walk(
+            jax.random.key(0), ns_state, step_fn,
+            n_walks=1, walklength=2, adjust_interval=100,
+            emax_offset_per_atom=0.0, n_atoms=n_atoms,
+            walker_batch_size=8,
+        )
+        assert result.population.energy.shape[0] == n_walkers
 
     def test_walker_batch_size_equals_n_walkers_same_as_full_vmap(self):
         """walker_batch_size == n_walkers: same result as full vmap."""
@@ -763,4 +801,23 @@ class TestAdaptationChunking:
         np.testing.assert_array_equal(
             np.array(baseline.population.step_sizes),
             np.array(chunked.population.step_sizes),
+        )
+
+    def test_walker_batch_size_non_divisor_in_trial_vmap(self):
+        """walker_batch_size=3 with n_walkers=4 and adjust_n_samples=8.
+
+        Exercises padding in both _one_walk (4 walkers, chunk 3) and the
+        trial vmap inside adjust_step_size (8 samples, chunk 3).  Live
+        slots must match the unchunked baseline bit-for-bit.
+        """
+        baseline = self._run_with(walker_batch_size=None, run_batch_size=None)
+        chunked = self._run_with(walker_batch_size=3, run_batch_size=None)
+        np.testing.assert_array_equal(
+            np.array(baseline.population.step_sizes),
+            np.array(chunked.population.step_sizes),
+        )
+        np.testing.assert_allclose(
+            np.array(baseline.population.positions),
+            np.array(chunked.population.positions),
+            atol=1e-5,
         )

@@ -33,6 +33,7 @@ from jaxrens.sampling.batch_descriptor import (
     VmapRuns,
 )
 from jaxrens.state.ns import NSState
+from jaxrens.utils.padding import pad_to_multiple
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +58,9 @@ def _one_walk(
         walklength: Number of MCMC steps per walker.
         emax: Scalar energy ceiling.
         walker_batch_size: If None, vmap over all walkers. If int, chunk via
-            lax.map(batch_size=walker_batch_size). Must divide n_walkers.
+            lax.map(batch_size=walker_batch_size). Any positive int is
+            accepted; non-divisors are handled by padding the population with
+            copies of the last walker and slicing the padding off the output.
 
     Returns:
         (new_ns_state, last_accepted) where last_accepted is (n_walkers, walklength).
@@ -81,11 +84,26 @@ def _one_walk(
         new_population, accepted = jax.vmap(walker_fn)(population, chain_keys)
     else:
         # lax.map processes (population[i], chain_keys[i]) pairs in chunks.
-        new_population, accepted = jax.lax.map(
+        # Pad to a multiple of walker_batch_size when n_walkers isn't a
+        # divisor; padded slots are stepped through and discarded.
+        padded_pop, n_pad = pad_to_multiple(
+            population, n_walkers, walker_batch_size
+        )
+        padded_keys, _ = pad_to_multiple(
+            chain_keys, n_walkers, walker_batch_size
+        )
+        new_pop_padded, accepted_padded = jax.lax.map(
             lambda x: walker_fn(x[0], x[1]),
-            (population, chain_keys),
+            (padded_pop, padded_keys),
             batch_size=walker_batch_size,
         )
+        if n_pad == 0:
+            new_population, accepted = new_pop_padded, accepted_padded
+        else:
+            new_population = jax.tree.map(
+                lambda x: x[:n_walkers], new_pop_padded
+            )
+            accepted = accepted_padded[:n_walkers]
 
     return ns_state.set(population=new_population), accepted
 
@@ -220,7 +238,8 @@ def initial_walk(
 
     Parallelism:
         walker_batch_size=None: vmap over all walkers simultaneously (fastest).
-        walker_batch_size=N: chunk via lax.map(batch_size=N). Must divide n_walkers.
+        walker_batch_size=N: chunk via lax.map(batch_size=N). Any positive
+            int; non-divisors are handled internally by padding.
         run_batch_size=None: vmap over all runs simultaneously (VmapRuns only).
         run_batch_size=M: chunk via lax.map(batch_size=M). Must divide n_runs.
             Ignored for SingleRun and PmapVmapRuns.
@@ -246,7 +265,7 @@ def initial_walk(
             the input shape and emits a ``DeprecationWarning``.  Pass
             ``batcher`` instead.
         walker_batch_size: Chunk size for walker vmap. None = full vmap.
-            Must divide n_walkers evenly.
+            Any positive int; non-divisors are handled internally by padding.
         run_batch_size: Chunk size for run vmap (VmapRuns only). None =
             full vmap over runs. Must divide n_runs evenly.
         per_move_fns: Per-move step functions (third return of build_mwg).
@@ -261,8 +280,7 @@ def initial_walk(
         Dead-point arrays, log_evidence, iteration, n_dead are unchanged.
 
     Raises:
-        ValueError: If walker_batch_size does not evenly divide n_walkers, or
-            if run_batch_size does not evenly divide n_runs.
+        ValueError: If run_batch_size does not evenly divide n_runs.
     """
     if batched is not None:
         warnings.warn(
@@ -288,12 +306,6 @@ def initial_walk(
 
     # --- Validate chunking parameters ---
     n_walkers = int(ns_state.population.energy.shape[batcher.walker_axis])
-    if walker_batch_size is not None and n_walkers % walker_batch_size != 0:
-        raise ValueError(
-            f"walker_batch_size={walker_batch_size} does not evenly divide "
-            f"n_walkers={n_walkers}. "
-            f"Choose a divisor of {n_walkers}."
-        )
     if (
         isinstance(batcher, VmapRuns)
         and run_batch_size is not None

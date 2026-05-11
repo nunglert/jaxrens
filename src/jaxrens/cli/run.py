@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -44,18 +45,21 @@ logger = logging.getLogger(__name__)
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
-def _configure_file_logging(
+def configure_file_logging(
     *,
     working_dir: Path,
     prefix: str,
     level: str,
 ) -> None:
-    """Attach file handlers to the ``jaxrens`` logger.
+    """Attach file + stderr handlers to the ``jaxrens`` logger.
 
-    Always writes INFO+ to ``<working_dir>/<prefix>.log``. If ``level`` is
-    ``debug``, additionally writes DEBUG+ to ``<working_dir>/<prefix>.debug.log``.
+    Always writes INFO+ to ``<working_dir>/<prefix>.log`` and mirrors
+    INFO+ to stderr.  If ``level`` is ``debug``, additionally writes
+    DEBUG+ to ``<working_dir>/<prefix>.debug.log``.
+
     Idempotent: removes any prior handlers this function attached before
-    re-attaching, so repeated calls (e.g. across cohort runs) stay clean.
+    re-attaching, so repeated calls (early CLI hoist + per-cohort
+    reconfigure) stay clean.
     """
     root = logging.getLogger("jaxrens")
     root.setLevel(logging.DEBUG if level == "debug" else logging.INFO)
@@ -70,6 +74,12 @@ def _configure_file_logging(
     info_h.setFormatter(logging.Formatter(_LOG_FORMAT))
     info_h._jaxrens_managed = True  # type: ignore[attr-defined]
     root.addHandler(info_h)
+
+    stream_h = logging.StreamHandler(sys.stderr)
+    stream_h.setLevel(logging.INFO)
+    stream_h.setFormatter(logging.Formatter(_LOG_FORMAT))
+    stream_h._jaxrens_managed = True  # type: ignore[attr-defined]
+    root.addHandler(stream_h)
 
     if level == "debug":
         debug_h = logging.FileHandler(working_dir / f"{prefix}.debug.log", mode="w")
@@ -286,7 +296,7 @@ def run_from_config(
     working_dir = output_config.working_dir
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    _configure_file_logging(
+    configure_file_logging(
         working_dir=working_dir,
         prefix=output_config.out_file_prefix,
         level=output_config.log_level,
@@ -526,7 +536,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
     working_dir = resolved.output.working_dir
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    _configure_file_logging(
+    configure_file_logging(
         working_dir=working_dir,
         prefix=resolved.output.out_file_prefix,
         level=resolved.output.log_level,
