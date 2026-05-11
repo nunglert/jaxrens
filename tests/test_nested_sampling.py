@@ -379,6 +379,187 @@ class TestAdjustmentInfoKeys:
         assert jnp.all(jnp.asarray(info["adjustment_floor_hits"]) >= 0)
 
 
+class TestAdjustmentInfoKeysBatched:
+    """Adjustment info packs for batched (VmapRuns) runs too — previously
+    gated out by ``not batcher.is_batched``.  Covers two layers:
+
+    1. ``info`` carries the adjustment_* keys at adjust iterations and
+       arrays are shaped ``(n_runs, n_moves[, 4])``.
+    2. ``AdaptationCallback`` + ``AdaptationLogger`` produce a real
+       ``.adaptation.h5`` with ``step_sizes`` of shape
+       ``(n_entries, n_runs, n_moves)``.
+    """
+
+    def test_batched_info_has_per_replica_shapes(self):
+        backend = create_harmonic(k=1.0)
+        descriptors = [
+            MoveKernel("rw0", random_walk.build_kernel, step_size=0.1,
+                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+            MoveKernel("rw1", random_walk.build_kernel, step_size=0.2,
+                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+        ]
+        init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
+
+        n_runs = 3
+        n_walkers = 20
+        n_atoms = 1
+        types = jnp.zeros((n_atoms,), dtype=jnp.int32)
+
+        keys = jax.random.split(jax.random.key(0), n_runs)
+        positions = jax.vmap(
+            lambda k: jax.random.uniform(k, (n_walkers, n_atoms, 3), minval=-3.0, maxval=3.0)
+        )(keys)
+        energies = jax.vmap(
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
+        )(positions)
+        rng_keys = jax.random.split(jax.random.key(42), n_runs)
+
+        captured: list[dict] = []
+
+        class _Capture:
+            def on_iteration(self, iteration, ns_state, info):
+                if "adjustment_n_rounds" in info:
+                    captured.append({
+                        k: info[k] for k in (
+                            "step_sizes_per_move",
+                            "acceptance_rates_per_move",
+                            "reject_counts_per_move",
+                            "adjustment_n_rounds",
+                            "adjustment_converged",
+                            "adjustment_cap_hits",
+                            "adjustment_floor_hits",
+                            "adjustment_bracket_detected",
+                            "trial_n_evaluations_per_move",
+                            "trial_n_grad_evaluations_per_move",
+                        )
+                    })
+
+            def on_finish(self, ns_state):
+                pass
+
+        run_ns_parallel(
+            positions, types, energies,
+            cells=None,
+            init_fn=init_fn,
+            step_fn=step_fn,
+            rng_keys=rng_keys,
+            max_iterations=25,
+            n_mcmc_steps=3,
+            per_move_fns=per_move_fns,
+            move_descriptors=descriptors,
+            adjust_interval=10,
+            adjust_n_samples=10,
+            callbacks=[_Capture()],
+        )
+
+        assert len(captured) >= 1, "expected at least one adjust iter under run_ns_parallel"
+        info = captured[0]
+        n_moves = len(descriptors)
+
+        assert jnp.asarray(info["step_sizes_per_move"]).shape == (n_runs, n_moves)
+        assert jnp.asarray(info["acceptance_rates_per_move"]).shape == (n_runs, n_moves)
+        assert jnp.asarray(info["reject_counts_per_move"]).shape == (n_runs, n_moves, 4)
+        for k in (
+            "adjustment_n_rounds",
+            "adjustment_converged",
+            "adjustment_cap_hits",
+            "adjustment_floor_hits",
+            "adjustment_bracket_detected",
+            "trial_n_evaluations_per_move",
+            "trial_n_grad_evaluations_per_move",
+        ):
+            assert jnp.asarray(info[k]).shape == (n_runs, n_moves), (
+                f"info[{k}] has shape {jnp.asarray(info[k]).shape}, "
+                f"expected {(n_runs, n_moves)}"
+            )
+
+    def test_batched_adaptation_logger_round_trip(self, tmp_path):
+        """End-to-end: AdaptationCallback + AdaptationLogger under VmapRuns
+        write an HDF5 with shape ``(n_entries, n_runs, n_moves)``.
+        """
+        import numpy as np
+
+        from jaxrens.cli.monitor import AdaptationCallback
+        from jaxrens.io.adaptation_log import AdaptationLogger
+
+        backend = create_harmonic(k=1.0)
+        descriptors = [
+            MoveKernel("rw0", random_walk.build_kernel, step_size=0.1,
+                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+            MoveKernel("rw1", random_walk.build_kernel, step_size=0.2,
+                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+        ]
+        init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
+
+        n_runs = 2
+        n_walkers = 20
+        n_atoms = 1
+        types = jnp.zeros((n_atoms,), dtype=jnp.int32)
+        keys = jax.random.split(jax.random.key(0), n_runs)
+        positions = jax.vmap(
+            lambda k: jax.random.uniform(k, (n_walkers, n_atoms, 3), minval=-3.0, maxval=3.0)
+        )(keys)
+        energies = jax.vmap(
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
+        )(positions)
+        rng_keys = jax.random.split(jax.random.key(7), n_runs)
+
+        adapt_log_path = tmp_path / "test.adaptation.h5"
+        adaptation_logger = AdaptationLogger(
+            path=adapt_log_path,
+            move_names=[d.name for d in descriptors],
+            n_runs=n_runs,
+        )
+        adaptation_cb = AdaptationCallback(adaptation_logger)
+
+        run_ns_parallel(
+            positions, types, energies,
+            cells=None,
+            init_fn=init_fn,
+            step_fn=step_fn,
+            rng_keys=rng_keys,
+            max_iterations=30,
+            n_mcmc_steps=3,
+            per_move_fns=per_move_fns,
+            move_descriptors=descriptors,
+            adjust_interval=10,
+            adjust_n_samples=10,
+            callbacks=[adaptation_cb],
+        )
+        adaptation_logger.close()
+
+        assert adapt_log_path.exists(), (
+            "AdaptationLogger should have produced an HDF5 file once "
+            "_pack_adjustment_info no longer gates out batched runs."
+        )
+
+        log = AdaptationLogger.read(adapt_log_path)
+        n_moves = len(descriptors)
+        assert log.n_runs == n_runs
+        assert log.n_moves == n_moves
+        assert log.iterations.ndim == 1
+        n_entries = log.iterations.shape[0]
+        assert n_entries >= 1
+        assert log.step_sizes.shape == (n_entries, n_runs, n_moves)
+        assert log.acceptance_rates.shape == (n_entries, n_runs, n_moves)
+        # v2 adjustment_stats present
+        assert log.adjustment_stats is not None
+        assert log.adjustment_stats["n_rounds"].shape == (n_entries, n_runs, n_moves)
+        assert log.adjustment_stats["reject_reason_counts"].shape == (
+            n_entries, n_runs, n_moves, 4,
+        )
+        # v3 evaluation counts present
+        assert log.n_evaluations is not None
+        assert log.n_evaluations.shape == (n_entries, n_runs, n_moves)
+        # Sanity: every entry's iteration is a positive multiple of adjust_interval
+        assert np.all(log.iterations > 0)
+        assert np.all(log.iterations % 10 == 0)
+
+
 # ---------------------------------------------------------------------------
 # Task C: parity test — run_ns_parallel(n_runs=1) vs run_ns (bisection)
 # ---------------------------------------------------------------------------

@@ -78,7 +78,7 @@ termination:
 # Adaptation must not fire mid-run; set adjust interval > max.
 adaptation:
   full_auto: true
-  full_auto_steps: 100
+  adjust_interval: 100
   defaults:
     min_rate: 0.3
     max_rate: 0.5
@@ -251,7 +251,7 @@ termination:
 
 adaptation:
   full_auto: true
-  full_auto_steps: 100
+  adjust_interval: 100
   defaults:
     min_rate: 0.3
     max_rate: 0.5

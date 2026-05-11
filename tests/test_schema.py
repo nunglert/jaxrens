@@ -525,9 +525,25 @@ class TestAdaptationSpec:
         from jaxrens.cli.schema.adaptation import AdaptationSpec
         cfg = AdaptationSpec()
         assert cfg.full_auto is False
-        assert cfg.full_auto_steps == 0
+        assert cfg.adjust_interval == 0
         assert cfg.per_move == {}
         assert cfg.defaults.min_rate is None
+
+    def test_full_auto_steps_alias_emits_deprecation(self):
+        """Legacy ``full_auto_steps`` key is coerced to ``adjust_interval``."""
+        from jaxrens.cli.schema.adaptation import AdaptationSpec
+        with pytest.warns(DeprecationWarning, match="full_auto_steps"):
+            cfg = AdaptationSpec.model_validate({"full_auto_steps": 20})
+        assert cfg.adjust_interval == 20
+
+    def test_full_auto_steps_alias_in_root_yaml(self):
+        """Legacy key still works when nested in a full RootSpec."""
+        d = _minimal_dict()
+        d["adaptation"] = {"full_auto": True, "full_auto_steps": 50}
+        with pytest.warns(DeprecationWarning, match="full_auto_steps"):
+            root = RootSpec.model_validate(d)
+        assert root.adaptation.adjust_interval == 50
+        assert root.adaptation.full_auto is True
 
     def test_adaptation_extra_field_rejected(self):
         d = _minimal_dict()
@@ -545,6 +561,29 @@ class TestAdaptationSpec:
         root = RootSpec.model_validate(d)
         assert root.adaptation.full_auto is False
         assert root.adaptation.defaults.min_rate is None
+
+
+# ---------------------------------------------------------------------------
+# 25b. RootSpec.interval_units — schema-level tests
+# (resolver scaling lives in tests/test_interval_units.py)
+# ---------------------------------------------------------------------------
+
+class TestIntervalUnitsField:
+    def test_default_is_absolute(self):
+        root = RootSpec.model_validate(_minimal_dict())
+        assert root.interval_units == "absolute"
+
+    def test_per_walker_accepted(self):
+        d = _minimal_dict()
+        d["interval_units"] = "per_walker"
+        root = RootSpec.model_validate(d)
+        assert root.interval_units == "per_walker"
+
+    def test_invalid_value_rejected(self):
+        d = _minimal_dict()
+        d["interval_units"] = "sweep"
+        with pytest.raises(ValidationError):
+            RootSpec.model_validate(d)
 
 
 # ---------------------------------------------------------------------------

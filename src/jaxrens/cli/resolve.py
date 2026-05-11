@@ -8,7 +8,7 @@ library core.  Cohort expansion (pressure sweeps, seed sweeps) lives in
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,7 @@ from jaxrens.cli.schema.cell import CellSpec
 from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
 from jaxrens.cli.schema.init import InitSpec
 from jaxrens.cli.schema.root import RootSpec
+from jaxrens.cli.schema.termination import IterationTerminationSpec
 from jaxrens.init.cells import cell_shape_walk, sample_initial_volume
 from jaxrens.init.positions import grid_positions_in_cell, uniform_positions_in_cell
 from jaxrens.init.rejection import rejection_sample_positions
@@ -52,6 +53,90 @@ _DEFERRED_OUTPUT_FIELDS: tuple[str, ...] = (
     "write_traj_db",
     "write_walkers_db",
 )
+
+
+# ---------------------------------------------------------------------------
+# Interval-unit scaling (RootSpec.interval_units = "absolute" | "per_walker")
+# ---------------------------------------------------------------------------
+
+
+def _scale_interval(v: int | float | None, *, factor: int) -> int | None:
+    """Scale one iteration-counted field for the resolver.
+
+    * ``None`` (e.g. unset ``run.max_iterations``) passes through unchanged.
+    * Numeric values are multiplied by ``factor`` and cast to int via
+      ``round``; the result is clamped to ``>= 1`` so that a per-walker
+      ``snapshot_interval: 0.001`` does not collapse to zero.
+    """
+    if v is None:
+        return None
+    scaled = round(float(v) * factor)
+    return max(1, int(scaled))
+
+
+def _apply_interval_units(root: RootSpec) -> RootSpec:
+    """Return a new RootSpec with the 8 interval fields scaled to absolute iters.
+
+    When ``root.interval_units == "absolute"`` this is a no-op apart from
+    rounding any float values down to int (so the downstream runtime
+    dataclasses always see ints).  When ``"per_walker"`` every affected field
+    is multiplied by ``root.run.n_live`` first.
+
+    The eight scaled fields:
+        output.{info,traj,snapshot,checkpoint}_interval
+        run.max_iterations  (None preserved)
+        termination[iteration].max_iterations
+        inter_re.every
+        adaptation.adjust_interval
+    """
+    factor = root.run.n_live if root.interval_units == "per_walker" else 1
+
+    output_upd = {
+        name: _scale_interval(getattr(root.output, name), factor=factor)
+        for name in (
+            "info_interval",
+            "traj_interval",
+            "snapshot_interval",
+            "checkpoint_interval",
+        )
+    }
+    run_upd = {
+        "max_iterations": _scale_interval(root.run.max_iterations, factor=factor),
+    }
+    adaptation_upd = {
+        "adjust_interval": _scale_interval(
+            root.adaptation.adjust_interval, factor=factor,
+        ),
+    }
+
+    update: dict[str, Any] = {
+        "output": root.output.model_copy(update=output_upd),
+        "run": root.run.model_copy(update=run_upd),
+        "adaptation": root.adaptation.model_copy(update=adaptation_upd),
+    }
+
+    if root.inter_re is not None:
+        update["inter_re"] = root.inter_re.model_copy(
+            update={"every": _scale_interval(root.inter_re.every, factor=factor)},
+        )
+
+    if root.termination is not None:
+        update["termination"] = [
+            (
+                t.model_copy(
+                    update={
+                        "max_iterations": _scale_interval(
+                            t.max_iterations, factor=factor,
+                        ),
+                    },
+                )
+                if isinstance(t, IterationTerminationSpec)
+                else t
+            )
+            for t in root.termination
+        ]
+
+    return root.model_copy(update=update)
 
 
 # ---------------------------------------------------------------------------
@@ -439,10 +524,13 @@ def _resolve_init_walker_set(
     init: InitSpec,
     cell_cfg: CellSpec,
     n_live: int,
-    energy_backend: EnergyBackend | None,
-    defer_finalize: bool = False,
 ) -> ResolvedInit:
-    """Mode C: load a pre-computed set of N walker configurations from disk."""
+    """Mode C: load a pre-computed set of N walker configurations from disk.
+
+    Returns structural-init only.  ``initial_energies`` and
+    ``initial_max_neighbor_counts`` are left as ``None``; the caller
+    (``_resolve_one`` / ``_resolve_multi_run``) finalises them once.
+    """
     logger.info(
         "[resolve] init mode C: loading walker set from %s (n_live=%d)",
         init.start_walker_set, n_live,
@@ -458,19 +546,12 @@ def _resolve_init_walker_set(
 
     _validate_cells(walker_set.cells, n_atoms, cell_cfg)
 
-    if defer_finalize:
-        energies, counts = None, None
-    else:
-        energies, counts = _finalise_initial_energies_and_counts(
-            energy_backend, walker_set.positions, walker_set.types, walker_set.cells,
-        )
-
     return ResolvedInit(
         initial_positions=walker_set.positions,
         initial_types=walker_set.types,
         initial_cells=walker_set.cells,
-        initial_energies=energies,
-        initial_max_neighbor_counts=counts,
+        initial_energies=None,
+        initial_max_neighbor_counts=None,
         symbol_map=walker_set.symbol_map,
     )
 
@@ -479,10 +560,13 @@ def _resolve_init_restart(
     init: InitSpec,
     cell_cfg: CellSpec,
     n_live: int,
-    energy_backend: EnergyBackend | None,
-    defer_finalize: bool = False,
 ) -> ResolvedInit:
-    """Mode D: resume an NS run from a checkpoint file (restart_file)."""
+    """Mode D: resume an NS run from a checkpoint file (restart_file).
+
+    Returns structural-init only.  ``initial_energies`` and
+    ``initial_max_neighbor_counts`` are left as ``None``; the caller
+    (``_resolve_one`` / ``_resolve_multi_run``) finalises them once.
+    """
     logger.info(
         "[resolve] init mode D: restarting from checkpoint %s (n_live=%d)",
         init.restart_file, n_live,
@@ -498,19 +582,12 @@ def _resolve_init_restart(
 
     _validate_cells(walker_set.cells, n_atoms, cell_cfg)
 
-    if defer_finalize:
-        energies, counts = None, None
-    else:
-        energies, counts = _finalise_initial_energies_and_counts(
-            energy_backend, walker_set.positions, walker_set.types, walker_set.cells,
-        )
-
     return ResolvedInit(
         initial_positions=walker_set.positions,
         initial_types=walker_set.types,
         initial_cells=walker_set.cells,
-        initial_energies=energies,
-        initial_max_neighbor_counts=counts,
+        initial_energies=None,
+        initial_max_neighbor_counts=None,
         symbol_map=walker_set.symbol_map,
         restart_state=restart_bundle,
     )
@@ -522,57 +599,50 @@ def _resolve_init(
     seed: int,
     energy_backend: EnergyBackend | None = None,
     cell_cfg: CellSpec | None = None,
-    defer_finalize: bool = False,
 ) -> ResolvedInit:
     """Resolve an ``InitSpec`` into concrete initial-state arrays.
 
     Supports ``start_species`` (Mode A), ``start_config_file`` (Mode B),
     ``start_walker_set`` (Mode C), and ``restart_file`` (Mode D).
 
+    Returns structural-init only — ``initial_energies`` and
+    ``initial_max_neighbor_counts`` are left as ``None`` on the returned
+    ``ResolvedInit``.  The caller (``_resolve_one`` or
+    ``_resolve_multi_run``) performs a single consolidated finalize via
+    ``_finalise_initial_energies_and_counts`` after this returns.
+
     Args:
         init: Validated ``InitSpec``.
         n_live: Number of live walkers (from ``NSConfig.n_live``).
         seed: PRNG seed.
-        energy_backend: Backend used to compute initial energies.  When
-            ``None``, ``initial_energies`` is left as ``None``.  In
-            rejection-mode position placement the backend is still
-            consumed internally for the ceiling check even when
-            ``defer_finalize=True``.
+        energy_backend: Backend used by rejection-mode position placement
+            (mode A / mode B) for the internal ceiling check.  Not used
+            for energy finalize — that is the caller's responsibility.
         cell_cfg: ``CellSpec`` carrying cell-geometry constraints.  When
             ``None`` a default ``CellSpec()`` is used.
-        defer_finalize: When ``True``, skip the per-replica
-            ``_finalise_initial_energies_and_counts`` call so the
-            caller can do one consolidated finalize on the stacked
-            multi-run arrays (used by ``_resolve_multi_run`` to avoid
-            16× heavy compiles when there are 16 replicas).
-            ``ResolvedInit.initial_energies`` and
-            ``initial_max_neighbor_counts`` will be ``None`` and must
-            be populated by the caller.
 
     Returns:
-        ``ResolvedInit`` with arrays populated for the chosen mode.
+        ``ResolvedInit`` with positions / types / cells / symbol_map /
+        (optionally) ``restart_state`` populated; energies and neighbor
+        counts left as ``None``.
     """
     if cell_cfg is None:
         cell_cfg = CellSpec()
 
     if init.start_walker_set is not None:
-        return _resolve_init_walker_set(
-            init, cell_cfg, n_live, energy_backend, defer_finalize=defer_finalize,
-        )
+        return _resolve_init_walker_set(init, cell_cfg, n_live)
 
     if init.restart_file is not None:
-        return _resolve_init_restart(
-            init, cell_cfg, n_live, energy_backend, defer_finalize=defer_finalize,
-        )
+        return _resolve_init_restart(init, cell_cfg, n_live)
 
     if init.start_config_file is not None:
         return _resolve_init_config_file(
-            init, n_live, seed, energy_backend, cell_cfg, defer_finalize=defer_finalize,
+            init, n_live, seed, energy_backend, cell_cfg,
         )
 
     assert init.start_species is not None
     return _resolve_init_species(
-        init, n_live, seed, energy_backend, cell_cfg, defer_finalize=defer_finalize,
+        init, n_live, seed, energy_backend, cell_cfg,
     )
 
 
@@ -582,9 +652,14 @@ def _resolve_init_species(
     seed: int,
     energy_backend: EnergyBackend | None,
     cell_cfg: CellSpec,
-    defer_finalize: bool = False,
 ) -> ResolvedInit:
-    """Mode A: initialise from a species string (start_species)."""
+    """Mode A: initialise from a species string (start_species).
+
+    Returns structural-init only.  ``initial_energies`` and
+    ``initial_max_neighbor_counts`` are left as ``None``; the caller
+    finalises them once.  ``energy_backend`` is still required for the
+    rejection-mode ceiling check inside ``_sample_per_walker_positions``.
+    """
     species_counts = init.parsed_species()
     assert species_counts is not None
     logger.info(
@@ -676,24 +751,15 @@ def _resolve_init_species(
             init, n_live, pos_key, initial_cells, initial_types, n_atoms, energy_backend
         )
 
-    # Energies are computed once at the correct bucket size in
-    # ``_finalise_initial_energies_and_counts``; the structural-init
-    # helper above does not return them anymore.  Multi-run callers
-    # pass ``defer_finalize=True`` so the per-replica heavy compile
-    # is deferred to a single post-stacking finalize.
-    if defer_finalize:
-        initial_energies, initial_counts = None, None
-    else:
-        initial_energies, initial_counts = _finalise_initial_energies_and_counts(
-            energy_backend, initial_positions, initial_types, initial_cells,
-        )
-
+    # Energies and neighbor counts are computed once at the correct
+    # bucket size by the caller via ``_finalise_initial_energies_and_counts``
+    # — this helper returns structural-init only.
     return ResolvedInit(
         initial_positions=initial_positions,
         initial_types=initial_types,
         initial_cells=initial_cells,
-        initial_energies=initial_energies,
-        initial_max_neighbor_counts=initial_counts,
+        initial_energies=None,
+        initial_max_neighbor_counts=None,
         symbol_map=symbol_map,
     )
 
@@ -704,9 +770,14 @@ def _resolve_init_config_file(
     seed: int,
     energy_backend: EnergyBackend | None,
     cell_cfg: CellSpec,
-    defer_finalize: bool = False,
 ) -> ResolvedInit:
-    """Mode B: initialise from a founder structure file (start_config_file)."""
+    """Mode B: initialise from a founder structure file (start_config_file).
+
+    Returns structural-init only.  ``initial_energies`` and
+    ``initial_max_neighbor_counts`` are left as ``None``; the caller
+    finalises them once.  ``energy_backend`` is still required for the
+    rejection-mode ceiling check inside ``_sample_per_walker_positions``.
+    """
     logger.info(
         "[resolve] init mode B: loading structure from %s (n_live=%d, seed=%d)",
         init.start_config_file, n_live, seed,
@@ -739,19 +810,12 @@ def _resolve_init_config_file(
             init, n_live, pos_key, initial_cells, types_single, n_atoms, energy_backend
         )
 
-    if defer_finalize:
-        initial_energies, initial_counts = None, None
-    else:
-        initial_energies, initial_counts = _finalise_initial_energies_and_counts(
-            energy_backend, initial_positions, types_single, initial_cells,
-        )
-
     return ResolvedInit(
         initial_positions=initial_positions,
         initial_types=types_single,
         initial_cells=initial_cells,
-        initial_energies=initial_energies,
-        initial_max_neighbor_counts=initial_counts,
+        initial_energies=None,
+        initial_max_neighbor_counts=None,
         symbol_map=symbol_map,
     )
 
@@ -846,6 +910,10 @@ def _seed_list(root: RootSpec, n: int) -> list[int]:
 
 def _resolve_one(root: RootSpec, cohort_index: int = 0) -> ResolvedConfig:
     """Resolve ``root`` into library dataclasses for a single cohort element."""
+    # Scale iteration-counted fields once at the top so every downstream read
+    # of root.{output,run,adaptation,inter_re,termination} sees absolute-iter
+    # values (see ``_apply_interval_units`` for the field list).
+    root = _apply_interval_units(root)
     ensemble_params = root.ensemble.to_ensemble_params(cohort_index=cohort_index)
     pressure = ensemble_params.get("pressure", None)
 
@@ -919,6 +987,26 @@ def _resolve_one(root: RootSpec, cohort_index: int = 0) -> ResolvedConfig:
         seed=seed,
         energy_backend=init_energy_backend,
         cell_cfg=root.cell,
+    )
+
+    # Single consolidated finalize for the single-run path.  Multi-run has
+    # its own equivalent seam in ``_resolve_multi_run`` after stacking.
+    # Passes ``ladder``/``offset`` from the backend config so the chosen
+    # initial bucket matches ``cli/run.py``'s starting-bucket pick
+    # (previously this path used the legacy ``int(max(counts))`` fallback).
+    initial_energies, initial_counts = _finalise_initial_energies_and_counts(
+        init_energy_backend,
+        resolved_init.initial_positions,
+        resolved_init.initial_types,
+        resolved_init.initial_cells,
+        batcher=SingleRun(),
+        ladder=tuple(backend.max_neighbors_list),
+        offset=int(backend.max_neighbors_offset),
+    )
+    resolved_init = replace(
+        resolved_init,
+        initial_energies=initial_energies,
+        initial_max_neighbor_counts=initial_counts,
     )
 
     # Derive n_atoms from the resolved initial positions rather than from a
@@ -1191,6 +1279,8 @@ def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
     This intentionally mirrors the single-run :func:`_resolve_one` — the two
     paths diverge only in the init loop.
     """
+    # Scale iteration-counted fields once up-front; ditto _resolve_one.
+    root = _apply_interval_units(root)
     n_total, n_gpu, n_per_gpu, params_per_run = _derive_replica_axes(root)
     if n_total < 2:
         raise ValueError(
@@ -1243,7 +1333,6 @@ def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
             seed=seed_r,
             energy_backend=per_run_backend,
             cell_cfg=root.cell,
-            defer_finalize=True,
         )
         per_run_init.append(init_r)
 

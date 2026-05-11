@@ -488,20 +488,28 @@ class TestInitSpecResolverModeD:
         assert result.symbol_map == {0: "Si"}
 
     def test_mode_d_energies_recomputed(self, tmp_path):
-        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.resolve import (
+            _finalise_initial_energies_and_counts,
+            _resolve_init,
+        )
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
         cfg = InitSpec(restart_file=p)
+        backend = create_harmonic()
         result = _resolve_init(
             cfg, n_live=4, seed=0,
-            energy_backend=create_harmonic(),
+            energy_backend=backend,
             cell_cfg=_cell_cfg_permissive_restart(),
         )
-        assert result.initial_energies is not None
-        assert result.initial_energies.shape == (4,)
-        assert jnp.all(jnp.isfinite(result.initial_energies))
+        # _resolve_init now leaves energies as None; caller finalizes.
+        energies, _ = _finalise_initial_energies_and_counts(
+            backend, result.initial_positions, result.initial_types, result.initial_cells,
+        )
+        assert energies is not None
+        assert energies.shape == (4,)
+        assert jnp.all(jnp.isfinite(energies))
 
     def test_mode_d_random_initialise_pos_true_warns(self, tmp_path, caplog):
         import logging
@@ -559,7 +567,10 @@ class TestInitSpecResolverModeD:
     def test_mode_d_end_to_end_jit(self, tmp_path):
         """Mode D: load checkpoint, init_ns with restart_state, run ns_step under JIT."""
         from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.resolve import (
+            _finalise_initial_energies_and_counts,
+            _resolve_init,
+        )
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, ns_step
@@ -575,6 +586,10 @@ class TestInitSpecResolverModeD:
             cfg, n_live=4, seed=0,
             energy_backend=backend,
             cell_cfg=_cell_cfg_permissive_restart(),
+        )
+        # Finalize is the caller's job after the refactor.
+        energies, _ = _finalise_initial_energies_and_counts(
+            backend, result.initial_positions, result.initial_types, result.initial_cells,
         )
 
         desc = MoveKernel(
@@ -592,7 +607,7 @@ class TestInitSpecResolverModeD:
             init_fn,
             result.initial_positions,
             result.initial_types,
-            result.initial_energies,
+            energies,
             cells=result.initial_cells,
             rng_key=key,
             restart_state=result.restart_state,
@@ -609,7 +624,10 @@ class TestInitSpecResolverModeD:
     def test_mode_d_continued_run_n_dead_increments(self, tmp_path):
         """After restart, run_ns for N more steps: n_dead >= checkpoint + N."""
         from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.resolve import (
+            _finalise_initial_energies_and_counts,
+            _resolve_init,
+        )
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import run_ns
@@ -628,6 +646,10 @@ class TestInitSpecResolverModeD:
             energy_backend=backend,
             cell_cfg=_cell_cfg_permissive_restart(),
         )
+        # Finalize is the caller's job after the refactor.
+        energies, _ = _finalise_initial_energies_and_counts(
+            backend, result.initial_positions, result.initial_types, result.initial_cells,
+        )
 
         desc = MoveKernel(
             name="random_walk",
@@ -645,7 +667,7 @@ class TestInitSpecResolverModeD:
         out = run_ns(
             positions=result.initial_positions,
             types=result.initial_types,
-            energies=result.initial_energies,
+            energies=energies,
             cells=result.initial_cells,
             init_fn=init_fn,
             step_fn=step_fn,

@@ -460,7 +460,7 @@ def run_from_config(
         full_auto_kwargs = dict(
             per_move_fns=per_move_fns,
             move_descriptors=list(move_descriptors) if move_descriptors is not None else None,
-            adjust_interval=adaptation_config.full_auto_steps,
+            adjust_interval=adaptation_config.adjust_interval,
             adjust_n_samples=adaptation_config.adjust_n_samples,
             adjust_max_rounds=adaptation_config.adjust_max_rounds,
             adjust_factor=adjust_factor,
@@ -725,7 +725,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
         )
         full_auto_kwargs = dict(
             per_move_fns=per_move_fns,
-            adjust_interval=resolved.adaptation_cfg.full_auto_steps,
+            adjust_interval=resolved.adaptation_cfg.adjust_interval,
             adjust_n_samples=resolved.adaptation_cfg.adjust_n_samples,
             adjust_max_rounds=resolved.adaptation_cfg.adjust_max_rounds,
             adjust_factor=adjust_factor,

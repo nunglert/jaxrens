@@ -391,7 +391,9 @@ def _handle_full_auto_step_sizes(value: str, cfg: dict, logs: list) -> None:
 
 
 def _handle_full_auto_steps(value: str, cfg: dict, logs: list) -> None:
-    _nest(cfg, "adaptation", "full_auto_steps", value=int(value))
+    # Legacy ns.inp key ``full_auto_steps`` maps to the renamed YAML field
+    # ``adaptation.adjust_interval`` (see schema/adaptation.py).
+    _nest(cfg, "adaptation", "adjust_interval", value=int(value))
 
 
 def _handle_GMC_adjust_min_rate(value: str, cfg: dict, logs: list) -> None:

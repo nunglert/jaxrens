@@ -49,7 +49,9 @@ class BaseTerminationSpec(BaseModel):
 
 class IterationTerminationSpec(BaseTerminationSpec):
     type: Literal["iteration"] = "iteration"
-    max_iterations: int
+    # Widened to int|float so RootSpec.interval_units='per_walker' can express
+    # the cap in walker-sweeps; resolver scales+casts before to_criterion.
+    max_iterations: int | float
 
     def to_criterion(
         self,
@@ -57,7 +59,7 @@ class IterationTerminationSpec(BaseTerminationSpec):
         n_live: int | None = None,
         n_cull: int | None = None,
     ) -> TerminationCriterion:
-        return IterationTermination(max_iterations=self.max_iterations)
+        return IterationTermination(max_iterations=int(self.max_iterations))
 
 
 class PriorMassTerminationSpec(BaseTerminationSpec):

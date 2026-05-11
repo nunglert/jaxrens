@@ -101,16 +101,8 @@ def _inject_cumulative_into_info(info: dict, cumulative: dict) -> None:
 def _pack_adjustment_info(
     info: dict,
     *,
-    current_step_sizes,
-    per_move_rates: list,
-    per_move_counts: list,
-    per_move_n_rounds: list,
-    per_move_converged: list,
-    per_move_cap_hits: list,
-    per_move_floor_hits: list,
-    per_move_bracket_detected: list,
-    per_move_trial_n_evals: list,
-    per_move_trial_n_grad_evals: list,
+    current_step_sizes: jnp.ndarray,
+    adjust_info: dict,
     move_descriptors: list,
 ) -> None:
     """Pack per-move adjustment diagnostics into *info*.
@@ -120,37 +112,38 @@ def _pack_adjustment_info(
     ``"trial_n_grad_evaluations_per_move"``) that
     ``_bump_cumulative_counters`` consumes when ``include_trial=True``.
 
+    All array values are passed through with shape ``(*shape_prefix,
+    n_moves, ...)`` exactly as ``AdaptationManager.apply`` returned
+    them — no list-of-scalars round-trip — so this works uniformly for
+    SingleRun (``(n_moves,)`` / ``(n_moves, 4)``), VmapRuns
+    (``(n_runs, n_moves, ...)``), and PmapVmapRuns (``(G, P,
+    n_moves, ...)``).  Downstream ``AdaptationCallback`` calls
+    ``batcher.flatten`` to coerce these to ``(n_runs_total, n_moves,
+    ...)`` for the HDF5 writer.
+
     Args:
         info: Info dict to update.
-        current_step_sizes: Current per-move step sizes array ``(n_moves,)``.
-        per_move_rates: List of float acceptance rates, one per move.
-        per_move_counts: List of reject-count arrays, one per move.
-        per_move_n_rounds: List of bisection round counts, one per move.
-        per_move_converged: List of bool convergence flags, one per move.
-        per_move_cap_hits: List of int cap-hit counts, one per move.
-        per_move_floor_hits: List of int floor-hit counts, one per move.
-        per_move_bracket_detected: List of bool flags, one per move.
-        per_move_trial_n_evals: List of int trial eval counts, one per move.
-        per_move_trial_n_grad_evals: List of int trial grad-eval counts, one per move.
+        current_step_sizes: Per-move step sizes after the adjust call,
+            shape ``(*shape_prefix, n_moves)``.
+        adjust_info: Dict returned by ``AdaptationManager.apply`` —
+            keys ``rate``, ``counts``, ``n_rounds``, ``converged``,
+            ``cap_hits``, ``floor_hits``, ``bracket_detected``,
+            ``trial_n_evaluations``, ``trial_n_grad_evaluations``.
         move_descriptors: MoveKernel descriptors (provide ``.name`` and
             ``.reject_reasons``).
     """
-    trial_n_evals_arr = np.array(
-        [int(v) for v in per_move_trial_n_evals], dtype=np.int64
-    )
-    trial_n_grad_evals_arr = np.array(
-        [int(v) for v in per_move_trial_n_grad_evals], dtype=np.int64
-    )
     info["step_sizes_per_move"] = current_step_sizes
-    info["acceptance_rates_per_move"] = jnp.array(per_move_rates)
-    info["reject_counts_per_move"] = jnp.stack(per_move_counts, axis=0)
-    info["adjustment_n_rounds"] = jnp.array(per_move_n_rounds, dtype=jnp.int32)
-    info["adjustment_converged"] = jnp.array(per_move_converged)
-    info["adjustment_cap_hits"] = jnp.array(per_move_cap_hits, dtype=jnp.int32)
-    info["adjustment_floor_hits"] = jnp.array(per_move_floor_hits, dtype=jnp.int32)
-    info["adjustment_bracket_detected"] = jnp.array(per_move_bracket_detected)
-    info["trial_n_evaluations_per_move"] = trial_n_evals_arr
-    info["trial_n_grad_evaluations_per_move"] = trial_n_grad_evals_arr
+    info["acceptance_rates_per_move"] = adjust_info["rate"]
+    info["reject_counts_per_move"] = adjust_info["counts"]
+    info["adjustment_n_rounds"] = adjust_info["n_rounds"]
+    info["adjustment_converged"] = adjust_info["converged"]
+    info["adjustment_cap_hits"] = adjust_info["cap_hits"]
+    info["adjustment_floor_hits"] = adjust_info["floor_hits"]
+    info["adjustment_bracket_detected"] = adjust_info["bracket_detected"]
+    info["trial_n_evaluations_per_move"] = adjust_info["trial_n_evaluations"]
+    info["trial_n_grad_evaluations_per_move"] = adjust_info[
+        "trial_n_grad_evaluations"
+    ]
     info["move_names"] = [d.name for d in move_descriptors]
     info["move_reject_reasons"] = tuple(
         frozenset(d.reject_reasons) for d in move_descriptors
@@ -388,25 +381,24 @@ def _run_loop(
         # ---- Cumulative counters (chain phase) ----
         _bump_cumulative_counters(cumulative, info)
 
-        # ---- Pack adjustment info (only when fires this iter, single-run only) ----
-        # Batched per_move_outputs have shape (*shape_prefix, n_moves, ...) which
-        # is incompatible with the scalar-per-move pattern of _pack_adjustment_info.
-        if adjust_info is not None and not batcher.is_batched:
+        # ---- Pack adjustment info (only when fires this iter) ----
+        # Works uniformly for SingleRun, VmapRuns, and PmapVmapRuns:
+        # adjust_info values are already shaped ``(*shape_prefix, n_moves, ...)``
+        # straight from ``AdaptationManager.apply``; the packer is shape-agnostic
+        # and ``AdaptationCallback.on_iteration`` will call ``batcher.flatten``
+        # to land them in ``(n_runs_total, n_moves, ...)`` before HDF5.
+        if adjust_info is not None:
             _pack_adjustment_info(
                 info,
                 current_step_sizes=current_step_sizes,
-                per_move_rates=list(adjust_info["rate"]),
-                per_move_counts=list(adjust_info["counts"]),
-                per_move_n_rounds=list(adjust_info["n_rounds"]),
-                per_move_converged=list(adjust_info["converged"]),
-                per_move_cap_hits=list(adjust_info["cap_hits"]),
-                per_move_floor_hits=list(adjust_info["floor_hits"]),
-                per_move_bracket_detected=list(adjust_info["bracket_detected"]),
-                per_move_trial_n_evals=list(adjust_info["trial_n_evaluations"]),
-                per_move_trial_n_grad_evals=list(adjust_info["trial_n_grad_evaluations"]),
+                adjust_info=adjust_info,
                 move_descriptors=move_descriptors or [],
             )
-            # Also accumulate trial-phase evals into cumulative counters
+            # Also accumulate trial-phase evals into cumulative counters.
+            # cumulative has shape (*shape_prefix, n_moves); the trial arrays
+            # already match, so the in-place add is shape-correct for all
+            # batchers (numpy broadcasting handles the SingleRun case where
+            # shape_prefix is empty).
             _bump_cumulative_counters(cumulative, info, include_trial=True)
 
         # ---- Inject cumulative snapshot ----

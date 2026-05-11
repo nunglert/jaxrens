@@ -26,10 +26,14 @@ class OutputSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     format: str = "extxyz"
-    traj_interval: int = 1
-    snapshot_interval: int = 100
-    checkpoint_interval: int = 100
-    info_interval: int = 100
+    # The four ``*_interval`` fields are widened to int|float so the
+    # per-walker interval-unit mode (see RootSpec.interval_units) can accept
+    # fractional walker-sweeps (e.g. ``info_interval: 0.2``).  The resolver
+    # rounds and casts to int before constructing OutputConfig.
+    traj_interval: int | float = 1
+    snapshot_interval: int | float = 100
+    checkpoint_interval: int | float = 100
+    info_interval: int | float = 100
     out_file_prefix: str = "ns"
     working_dir: Path = Path(".")
     log_level: Literal["info", "debug"] = "info"

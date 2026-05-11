@@ -57,7 +57,9 @@ class InterRESpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     flavor: str = "pressure"
-    every: int = 1
+    # Widened to int|float for RootSpec.interval_units='per_walker'; resolver
+    # scales+casts to int before constructing InterREConfig.
+    every: int | float = 1
     n_swap_cycles: int = 1
     composition_targets: Optional[List[List[int]]] = None
     chemical_potentials: Optional[List[List[float]]] = None

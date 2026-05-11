@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from jaxrens.cli.schema.adaptation import AdaptationSpec
@@ -45,6 +47,15 @@ class RootSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    # ``interval_units`` controls how the resolver interprets every
+    # iteration-counted field downstream:
+    #   * ``"absolute"`` (default): values are absolute NS iteration counts.
+    #   * ``"per_walker"``: values are walker-sweeps (1 sweep = ``n_live`` iters);
+    #     the resolver multiplies by ``run.n_live`` before constructing runtime
+    #     dataclasses.  Affected fields: ``output.{info,traj,snapshot,checkpoint}_interval``,
+    #     ``run.max_iterations``, ``termination[iteration].max_iterations``,
+    #     ``inter_re.every``, ``adaptation.adjust_interval``.
+    interval_units: Literal["absolute", "per_walker"] = "absolute"
     run: RunSpec
     moves: list[MoveSpec]
     backend: BackendSpec

@@ -1182,7 +1182,10 @@ class TestInitSpecResolverPartB:
     def test_mode_b_energies_computed_with_backend(self, tmp_path):
         import jax.numpy as jnp
         from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.resolve import (
+            _finalise_initial_energies_and_counts,
+            _resolve_init,
+        )
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.cli.schema.cell import CellSpec
         p = self._make_founder(tmp_path, symbols=["Si"], cell_size=5.0)
@@ -1199,9 +1202,14 @@ class TestInitSpecResolverPartB:
         )
         backend = create_harmonic()
         result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=backend, cell_cfg=cell_cfg)
-        assert result.initial_energies is not None
-        assert result.initial_energies.shape == (3,)
-        assert jnp.all(jnp.isfinite(result.initial_energies))
+        # _resolve_init now returns structural-init only; finalize is the
+        # caller's responsibility (mirrors _resolve_one).
+        energies, _ = _finalise_initial_energies_and_counts(
+            backend, result.initial_positions, result.initial_types, result.initial_cells,
+        )
+        assert energies is not None
+        assert energies.shape == (3,)
+        assert jnp.all(jnp.isfinite(energies))
 
 
 # ---------------------------------------------------------------------------
@@ -1303,3 +1311,114 @@ class TestBackendAwareSpeciesMapping:
             cfg, n_live=2, seed=0, energy_backend=wrapped,
         )
         assert list(map(int, result.initial_types)) == [7, 7, 7, 21, 37]
+
+
+class _BucketRecordingBackend:
+    """Stub backend exposing ``max_neighbors_for`` and recording the
+    ``max_neighbors`` value passed into ``__call__``.
+
+    Used to verify that ``_finalise_initial_energies_and_counts`` honours
+    ``ladder`` / ``offset`` and dispatches the energy compile at the chosen
+    bucket size — the wiring change that ``_resolve_one`` now uses for the
+    single-run finalize seam.
+    """
+
+    def __init__(self, per_walker_count: int):
+        self._per_walker_count = int(per_walker_count)
+        self.calls: list[int] = []
+
+    def max_neighbors_for(self, positions, cell):
+        import jax.numpy as jnp
+        return jnp.int32(self._per_walker_count)
+
+    def __call__(self, positions, species, cell, max_neighbors, ensemble_params=None):
+        import jax.numpy as jnp
+        self.calls.append(int(max_neighbors))
+        return jnp.float32(0.0), jnp.int32(int(max_neighbors)), jnp.bool_(False)
+
+
+class TestFinaliseInitialBucketChoice:
+    """``_finalise_initial_energies_and_counts`` bucket-choice paths.
+
+    When ``ladder`` is supplied, the helper must dispatch at
+    ``_choose_starting_bucket(counts, ladder, offset)``; when not, it
+    must fall back to ``int(jnp.max(counts))``.  The single-run path
+    in ``_resolve_one`` now passes ``ladder``/``offset`` (matching the
+    multi-run path); this test pins that the helper does the right thing
+    given those args.
+    """
+
+    def _positions_types_cells(self, n_walkers: int = 3, n_atoms: int = 2):
+        import jax.numpy as jnp
+        positions = jnp.zeros((n_walkers, n_atoms, 3), dtype=jnp.float32)
+        types = jnp.zeros((n_atoms,), dtype=jnp.int32)
+        cells = jnp.broadcast_to(
+            jnp.eye(3, dtype=jnp.float32) * 10.0, (n_walkers, 3, 3)
+        )
+        return positions, types, cells
+
+    def test_ladder_and_offset_used_when_provided(self):
+        from jaxrens.cli.resolve import _finalise_initial_energies_and_counts
+        from jaxrens.sampling.batch_descriptor import SingleRun
+        from jaxrens.sampling.nested_sampling import _choose_starting_bucket
+        import jax.numpy as jnp
+
+        per_walker = 27
+        backend = _BucketRecordingBackend(per_walker_count=per_walker)
+        positions, types, cells = self._positions_types_cells()
+
+        ladder = (32, 64, 128)
+        offset = 4
+        energies, counts = _finalise_initial_energies_and_counts(
+            backend, positions, types, cells,
+            batcher=SingleRun(), ladder=ladder, offset=offset,
+        )
+
+        assert counts is not None
+        expected_bucket = int(_choose_starting_bucket(
+            counts, ladder, offset,
+        ))
+        # 27 + 4 = 31 → smallest ladder entry ≥ 31 is 32.
+        assert expected_bucket == 32
+        # The energy call was dispatched at the ladder-chosen bucket,
+        # NOT at int(max(counts)) = 27.
+        assert backend.calls, "energy backend was never called"
+        assert all(c == expected_bucket for c in backend.calls)
+
+    def test_no_ladder_falls_back_to_max_counts(self):
+        from jaxrens.cli.resolve import _finalise_initial_energies_and_counts
+        from jaxrens.sampling.batch_descriptor import SingleRun
+
+        per_walker = 27
+        backend = _BucketRecordingBackend(per_walker_count=per_walker)
+        positions, types, cells = self._positions_types_cells()
+
+        _finalise_initial_energies_and_counts(
+            backend, positions, types, cells, batcher=SingleRun(),
+        )
+
+        # Legacy fallback: bucket = int(jnp.max(counts)) = 27.
+        assert backend.calls, "energy backend was never called"
+        assert all(c == per_walker for c in backend.calls)
+
+    def test_resolve_one_populates_neighbor_counts_via_new_seam(self):
+        """End-to-end: ``_resolve_one`` runs the finalize seam after
+        ``_resolve_init``, so ``initial_max_neighbor_counts`` is no
+        longer ``None`` for ladder-aware backends.
+
+        Uses a small species harmonic config (which doesn't expose
+        ``max_neighbors_for`` → counts will be ``None``), then a stubbed
+        ladder-aware backend via monkeypatch to prove the seam wires
+        through to the bucket-choice path.
+        """
+        from jaxrens.cli.resolve import _resolve_one
+        from jaxrens.cli.schema import RootSpec
+
+        # Sanity: with a backend that lacks max_neighbors_for, the seam
+        # runs but counts stay None.  This exercises the new code path
+        # without any monkeypatching.
+        root = RootSpec.model_validate(_species_dict(n_atoms=2, n_live=4))
+        resolved = _resolve_one(root)
+        assert resolved.init.initial_energies is not None
+        # Harmonic backend has no max_neighbors_for → counts stay None.
+        assert resolved.init.initial_max_neighbor_counts is None

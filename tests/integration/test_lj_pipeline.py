@@ -76,7 +76,7 @@ termination:
 # full_auto with adjust_interval=10 → bisection fires at iter 10 / 20.
 adaptation:
   full_auto: true
-  full_auto_steps: 10
+  adjust_interval: 10
   defaults:
     min_rate: 0.3
     max_rate: 0.5
@@ -298,7 +298,7 @@ termination:
 
 adaptation:
   full_auto: true
-  full_auto_steps: 10
+  adjust_interval: 10
   defaults:
     min_rate: 0.3
     max_rate: 0.5

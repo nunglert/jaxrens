@@ -9,7 +9,9 @@ library values that ``MoveKernel`` and ``adjust_step_size`` use today.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+import warnings
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -73,16 +75,37 @@ class ResolvedAdaptationPolicy(BaseModel):
 # ---------------------------------------------------------------------------
 
 class AdaptationSpec(BaseModel):
-    """Top-level adaptation config with defaults and per-move overrides."""
+    """Top-level adaptation config with defaults and per-move overrides.
+
+    ``adjust_interval`` is the iteration cadence at which step-size adaptation
+    fires.  ``0`` disables adaptation (the manager's ``is_active`` guard).
+    The legacy YAML key ``full_auto_steps`` is accepted with a
+    ``DeprecationWarning`` and remapped onto ``adjust_interval`` at parse time.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     full_auto: bool = False
-    full_auto_steps: int = 0
+    adjust_interval: int | float = 0
     adjust_n_samples: int = 50
     adjust_max_rounds: int = 15
     defaults: AdaptationPolicy = Field(default_factory=AdaptationPolicy)
     per_move: dict[str, AdaptationPolicy] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_full_auto_steps(cls, v: object) -> object:
+        """Map legacy ``full_auto_steps`` → ``adjust_interval`` with a warning."""
+        if isinstance(v, dict) and "full_auto_steps" in v and "adjust_interval" not in v:
+            warnings.warn(
+                "adaptation.full_auto_steps is deprecated; rename to "
+                "adaptation.adjust_interval.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            v = dict(v)
+            v["adjust_interval"] = v.pop("full_auto_steps")
+        return v
 
     def resolve_for(self, move_name_or_type: str) -> ResolvedAdaptationPolicy:
         """Return the effective policy for a named move.

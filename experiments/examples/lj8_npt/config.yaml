@@ -38,7 +38,7 @@ termination:
 
 adaptation:
   full_auto: true
-  full_auto_steps: 20
+  adjust_interval: 20
   defaults:
     min_rate: 0.3
     max_rate: 0.5
