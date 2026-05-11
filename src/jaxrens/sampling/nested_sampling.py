@@ -772,7 +772,7 @@ def run_ns_parallel(
     )
 
     logger.info(
-        "Starting parallel NS: %d runs, %d walkers, max_iter=%d, n_mcmc=%d, n_extra=%d",
+        "Starting parallel NS: %d runs, %d walkers, max_iter=%s, n_mcmc=%d, n_extra=%d",
         n_runs, n_walkers, max_iterations, n_mcmc_steps, n_extra,
     )
 
@@ -1011,14 +1011,30 @@ def init_ns_multi_gpu(
         max_neighbor_counts=mnc_flat,
     )
 
-    # Reshape all dynamic fields from (G*P, ...) to (G, P, ...).
-    def _reshape(x):
+    # Reshape all dynamic fields from (G*P, ...) to (G, P, ...) and explicitly
+    # shard along the GPU axis. The explicit shard is load-bearing for the
+    # post-burn-in path: when ``positions`` / ``energies`` / ``cells`` arrive
+    # already pmap-sharded (``NamedSharding(spec=P('gpu',))``),
+    # ``init_ns_parallel``'s per-run ``positions[i]`` + ``jnp.stack`` produces
+    # replicated (``spec=P()``) leaves, which the downstream ``jit_ns_step``
+    # pmap rejects. ``jax.device_put`` with the gpu-axis sharding repairs the
+    # replicated leaves and is a no-op when the data is already correctly
+    # sharded or uncommitted.
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    gpu_sharding = NamedSharding(
+        Mesh(jax.local_devices()[:n_gpu], ("gpu",)),
+        PartitionSpec("gpu"),
+    )
+
+    def _reshape_and_shard(x):
         if x is None:
             return x
         arr = jnp.asarray(x)
-        return arr.reshape((n_gpu, n_per_gpu) + arr.shape[1:])
+        arr = arr.reshape((n_gpu, n_per_gpu) + arr.shape[1:])
+        return jax.device_put(arr, gpu_sharding)
 
-    return jax.tree.map(_reshape, flat_states)
+    return jax.tree.map(_reshape_and_shard, flat_states)
 
 
 def run_ns_multi_gpu(

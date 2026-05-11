@@ -723,7 +723,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
 
     logger.info(
         "Starting multi-GPU NS: n_gpu=%d, n_per_gpu=%d (n_total=%d), "
-        "n_walkers=%d, n_mcmc=%d, max_iter=%d",
+        "n_walkers=%d, n_mcmc=%d, max_iter=%s",
         n_gpu, n_per_gpu, n_total, n_live,
         ns.n_mcmc_steps, ns.max_iterations,
     )

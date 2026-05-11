@@ -8,3 +8,5 @@
 - [x] in ns_loop figure, Also group the stepsize adjustion into an outer orange box with sth like "Stepsize adjustion - JIT" and an inner box in the same blueish as the ns_step box with "AdaptionManager.apply" as the called function. The "every adjust_interval" shouzld be on the arrow towards the box
 - [x] For teh mwg article, I would also like to have a flow chart for the stepsize adjusting code, similar to what we have done for the RE flowchart
 - [x] For the walker pytree vis, can we make the MCState less linear so it takes less place?
+- [] clicking on core concepts doesnt load atm. Check why
+- [] 

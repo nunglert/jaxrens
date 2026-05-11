@@ -1,12 +1,21 @@
 """NeuralIL backend wrapper.
 
-Wraps NeuralIL's PlainEnsemble behind the EnergyBackend interface.
-NeuralIL computes neighbors implicitly via supercell expansion during
-descriptor calculation — no explicit neighbor list. The dynamics model
-is built **once** at construction time and reused; ``max_neighbors`` is
-passed at call time as a buffer-shape argument (mirroring the MACE
-backend's design). Different ``max_neighbors`` values trigger a JIT
-retrace because of the static shape, but no Python-side model rebuild.
+Wraps NeuralIL behind the EnergyBackend interface. Supports both single
+``NeuralIL`` / ``NeuralILwithMorse`` models and ``PlainEnsemble`` /
+``PlainEnsemblewithMorse`` ensembles; the layout is auto-detected from
+the saved params at load time. NeuralIL computes neighbors implicitly
+via supercell expansion during descriptor calculation — no explicit
+neighbor list. The dynamics model is built **once** at construction
+time and reused; ``max_neighbors`` is passed at call time as a
+buffer-shape argument (mirroring the MACE backend's design). Different
+``max_neighbors`` values trigger a JIT retrace because of the static
+shape, but no Python-side model rebuild.
+
+If the saved model carries a per-atom energy baseline (under
+``model_info.specific_info["energy_shift_per_atom"]``), the backend
+adds ``shift * n_real_atoms`` back to the predicted total energy so
+calling code sees absolute energies. Training scripts subtract this
+shift from targets for numerical stability.
 
 NeuralIL is an optional dependency. All imports are guarded.
 """
@@ -60,6 +69,29 @@ def is_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Params-layout detection
+# ---------------------------------------------------------------------------
+
+
+def _detect_layout(params: dict) -> tuple[bool, bool]:
+    """Return ``(is_ensemble, has_morse)`` from the saved Flax params dict.
+
+    A ``PlainEnsemble[withMorse]`` nests its sub-model under a
+    ``"neuralil"`` (or ``"neuralil_w_morse"``) key inside ``params``; a
+    single ``NeuralIL[withMorse]`` does not, exposing its submodules
+    (``core_model``, ``embed``, ``denormalizer``, optionally ``morse``)
+    directly.
+    """
+    inner = params.get("params", params)
+    ensemble_keys = {"neuralil", "neuralil_w_morse"}
+    ensemble_match = ensemble_keys & inner.keys()
+    if ensemble_match:
+        sub = inner[next(iter(ensemble_match))]
+        return True, "morse" in sub
+    return False, "morse" in inner
+
+
+# ---------------------------------------------------------------------------
 # NeuralILBackend
 # ---------------------------------------------------------------------------
 
@@ -72,9 +104,15 @@ def _build_dynamics_model(
     core_widths: list[int],
     supercell_trafo: tuple[int, int, int],
     has_morse: bool,
+    is_ensemble: bool,
     n_ensemble: int,
 ):
-    """Build the (max_neighbors-independent) NeuralIL dynamics model."""
+    """Build the (max_neighbors-independent) NeuralIL dynamics model.
+
+    Returns a single ``NeuralIL[withMorse]`` when ``is_ensemble`` is
+    False, otherwise the corresponding ``PlainEnsemble[withMorse]``
+    wrapper.
+    """
     descriptor_gen = PowerSpectrumGenerator(
         n_max, r_cutoff, n_types, supercell_trafo,
     )
@@ -86,14 +124,19 @@ def _build_dynamics_model(
             descriptor_gen, descriptor_gen.process_some_data,
             core_model, morse_type="RepulsiveMorse",
         )
-        return PlainEnsemblewithMorse(individual, n_ensemble)
     else:
         individual = NeuralIL(
             n_types, embed_d, r_cutoff,
             descriptor_gen, descriptor_gen.process_some_data,
             core_model,
         )
-        return PlainEnsemble(individual, n_ensemble)
+
+    if not is_ensemble:
+        return individual
+
+    if has_morse:
+        return PlainEnsemblewithMorse(individual, n_ensemble)
+    return PlainEnsemble(individual, n_ensemble)
 
 
 class NeuralILBackend:
@@ -102,6 +145,11 @@ class NeuralILBackend:
     The dynamics model is built once at construction time. ``max_neighbors``
     is a runtime call-time argument (static at trace time) that shapes
     the neighbor-buffer slice inside the descriptor generator.
+
+    Single-model and ensemble checkpoints are both supported; the layout
+    is selected via ``is_ensemble`` and the energy is reduced
+    accordingly (``.mean()`` over the ensemble axis, identity for a
+    single model).
     """
 
     def __init__(
@@ -113,8 +161,10 @@ class NeuralILBackend:
         n_max: int,
         embed_d: int,
         core_widths: list[int],
-        n_ensemble: int,
+        is_ensemble: bool,
         has_morse: bool,
+        n_ensemble: int = 1,
+        energy_shift_per_atom: float = 0.0,
     ):
         self.r_cutoff = r_cutoff
         self.model_params = model_params
@@ -123,8 +173,10 @@ class NeuralILBackend:
         self.n_max = n_max
         self.embed_d = embed_d
         self.core_widths = core_widths
-        self.n_ensemble = n_ensemble
+        self.is_ensemble = is_ensemble
+        self.n_ensemble = n_ensemble if is_ensemble else 1
         self.has_morse = has_morse
+        self.energy_shift_per_atom = float(energy_shift_per_atom)
         self._dynamics_model = _build_dynamics_model(
             n_types=len(sorted_elements),
             embed_d=embed_d,
@@ -133,7 +185,8 @@ class NeuralILBackend:
             core_widths=core_widths,
             supercell_trafo=supercell_trafo,
             has_morse=has_morse,
-            n_ensemble=n_ensemble,
+            is_ensemble=is_ensemble,
+            n_ensemble=self.n_ensemble,
         )
 
     @property
@@ -159,9 +212,11 @@ class NeuralILBackend:
             jnp.trace(cell) == 0, 1000.0 * jnp.eye(3), cell,
         )
 
-        # Compute energy (ensemble mean). max_neighbors is a static-at-trace
-        # int that flows down into PSG._process_center as a buffer-shape arg.
-        energy_ensemble = self._dynamics_model.apply(
+        # Compute energy. max_neighbors is a static-at-trace int that flows
+        # down into PSG._process_center as a buffer-shape arg. For an
+        # ensemble the output is shape (n_ensemble,) → reduce by mean; for
+        # a single model the output is scalar and .mean() is identity.
+        energy_out = self._dynamics_model.apply(
             self.model_params,
             positions,
             species,
@@ -169,7 +224,12 @@ class NeuralILBackend:
             max_neighbors,
             method=self._dynamics_model.calc_potential_energy,
         )
-        energy = energy_ensemble.mean()
+        energy = energy_out.mean() if self.is_ensemble else energy_out
+
+        # Re-add the per-atom baseline that training subtracted from targets.
+        if self.energy_shift_per_atom != 0.0:
+            n_real = (species >= 0).sum()
+            energy = energy + self.energy_shift_per_atom * n_real
 
         # Check actual neighbor count for overflow detection
         sc_a, sc_b, sc_c = self.supercell_trafo
@@ -193,8 +253,13 @@ def create_neuralil(
 ) -> NeuralILBackend:
     """Create a NeuralIL energy backend.
 
+    Auto-detects whether the pickle is a single ``NeuralIL[withMorse]``
+    or a ``PlainEnsemble[withMorse]`` from the saved params layout, and
+    builds the matching dynamics model.
+
     Args:
-        pickle_file: Path to NeuralIL model pickle (NeuralILModelInfo).
+        pickle_file: Path to NeuralIL model pickle (``NeuralILModelInfo``).
+            Either single-model or ensemble checkpoints are accepted.
         supercell_trafo: Supercell diagonal transformation (s_a, s_b, s_c).
 
     Returns:
@@ -211,14 +276,21 @@ def create_neuralil(
     with open(pickle_file, "rb") as f:
         model_info = pickle.load(f)
 
-    has_morse = "morse" in model_info.params["params"]["neuralil"]
-    n_ensemble = get_n_models(model_info.params)
+    is_ensemble, has_morse = _detect_layout(model_info.params)
+    n_ensemble = get_n_models(model_info.params) if is_ensemble else 1
+
+    energy_shift_per_atom = 0.0
+    specific_info = getattr(model_info, "specific_info", None)
+    if isinstance(specific_info, dict):
+        energy_shift_per_atom = float(
+            specific_info.get("energy_shift_per_atom", 0.0)
+        )
 
     logger.info(
         "NeuralIL backend created: r_cut=%.2f, elements=%s, supercell=%s, "
-        "n_ensemble=%d, morse=%s",
+        "ensemble=%s, n_ensemble=%d, morse=%s, energy_shift_per_atom=%g",
         model_info.r_cut, model_info.sorted_elements, supercell_trafo,
-        n_ensemble, has_morse,
+        is_ensemble, n_ensemble, has_morse, energy_shift_per_atom,
     )
 
     return NeuralILBackend(
@@ -229,6 +301,8 @@ def create_neuralil(
         n_max=model_info.n_max,
         embed_d=model_info.embed_d,
         core_widths=model_info.core_widths,
+        is_ensemble=is_ensemble,
         n_ensemble=n_ensemble,
         has_morse=has_morse,
+        energy_shift_per_atom=energy_shift_per_atom,
     )
