@@ -305,10 +305,19 @@ def _run_loop(
     # ---- on_start callbacks (fired once, post-init, pre-loop) ----
     # CheckpointCallback uses this hook to snapshot the fully-initialised
     # NSState before iteration 0, giving a reproducible entry point for
-    # post-hoc debugging of init/overflow issues.
+    # post-hoc debugging of init/overflow issues.  AdaptationCallback uses
+    # it to write the mandatory iter-0 step-size baseline row.
+    #
+    # ``start_info`` carries ``_batcher`` and the initial
+    # ``step_sizes_per_move`` so callbacks can reuse the same shape
+    # coercion they apply on ``on_iteration`` info dicts.
+    start_info = {
+        "_batcher": batcher,
+        "step_sizes_per_move": current_step_sizes,
+    }
     for cb in callbacks:
         if hasattr(cb, "on_start"):
-            cb.on_start(ns_state)
+            cb.on_start(ns_state, start_info)
 
     i = 0
     while True:

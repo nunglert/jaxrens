@@ -57,9 +57,11 @@ def configure_file_logging(
     INFO+ to stderr.  If ``level`` is ``debug``, additionally writes
     DEBUG+ to ``<working_dir>/<prefix>.debug.log``.
 
-    Idempotent: removes any prior handlers this function attached before
-    re-attaching, so repeated calls (early CLI hoist + per-cohort
-    reconfigure) stay clean.
+    Should be called once per process, early.  ``cli._cmd_run`` hoists
+    this before the resolver so resolver-phase logs (which can take
+    many minutes on heavy backends) reach the file from second 1.
+    Direct callers of ``run_*_from_config`` (tests, scripts) may call
+    this themselves if they want file output.
     """
     root = logging.getLogger("jaxrens")
     root.setLevel(logging.DEBUG if level == "debug" else logging.INFO)
@@ -296,11 +298,10 @@ def run_from_config(
     working_dir = output_config.working_dir
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    configure_file_logging(
-        working_dir=working_dir,
-        prefix=output_config.out_file_prefix,
-        level=output_config.log_level,
-    )
+    # File logging is configured once, early, by ``cli._cmd_run`` so the
+    # resolver phase reaches the log file.  Direct callers (tests,
+    # scripts) that want a log file should call ``configure_file_logging``
+    # before invoking this function.
 
     # Set up callbacks
     callbacks = [
@@ -336,8 +337,12 @@ def run_from_config(
         )
     )
 
-    # Wire adaptation logger when full_auto is active
-    if adaptation_config is not None and adaptation_config.full_auto and move_descriptors is not None:
+    # Wire the adaptation logger unconditionally when move descriptors
+    # exist.  The callback's ``on_start`` writes a mandatory iter-0
+    # baseline row carrying the initial step sizes, so a non-full_auto
+    # run still produces a useful 1-row artefact documenting the
+    # constant ss; full_auto runs append on every bisection event.
+    if move_descriptors is not None:
         from jaxrens.io.adaptation_log import AdaptationLogger
 
         adapt_log_path = working_dir / f"{output_config.out_file_prefix}.adaptation.h5"
@@ -348,6 +353,24 @@ def run_from_config(
             n_runs=1,
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
+
+    # Wire per-iter chain-acceptance logger when requested (independent
+    # of full_auto — the chain counters are populated by ns_step every
+    # iter regardless of adaptation).
+    if move_descriptors is not None and getattr(output_config, "save_acc_rates", False):
+        from jaxrens.io.acc_rates_log import AccRatesLogger
+        from jaxrens.cli.monitor import AccRatesCallback
+
+        acc_log_path = working_dir / f"{output_config.out_file_prefix}.acc_rates.h5"
+        acc_logger = AccRatesLogger(
+            path=acc_log_path,
+            move_names=[d.name for d in move_descriptors],
+            n_runs=1,
+        )
+        callbacks.append(AccRatesCallback(
+            acc_logger,
+            interval=int(getattr(output_config, "acc_rates_interval", 1)),
+        ))
 
     first_mc = move_config[0] if isinstance(move_config, list) else move_config
 
@@ -536,11 +559,10 @@ def run_multi_gpu_from_config(resolved) -> dict:
     working_dir = resolved.output.working_dir
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    configure_file_logging(
-        working_dir=working_dir,
-        prefix=resolved.output.out_file_prefix,
-        level=resolved.output.log_level,
-    )
+    # File logging is configured once, early, by ``cli._cmd_run`` so the
+    # resolver phase reaches the log file.  Direct callers (tests,
+    # scripts) that want a log file should call ``configure_file_logging``
+    # before invoking this function.
 
     n_live = ns.n_live
     positions = resolved.init.initial_positions  # (n_total, K, A, 3)
@@ -703,7 +725,11 @@ def run_multi_gpu_from_config(resolved) -> dict:
         )
     )
 
-    if resolved.adaptation_cfg is not None and resolved.adaptation_cfg.full_auto:
+    # Register unconditionally — the iter-0 baseline row makes the
+    # adaptation file useful even when full_auto is off (single-row
+    # artefact documenting the constant step size).  See
+    # ``run_from_config`` for the matching wire-up on the single-run path.
+    if resolved.move_descriptors:
         adapt_log_path = (
             working_dir / f"{resolved.output.out_file_prefix}.adaptation.h5"
         )
@@ -714,6 +740,26 @@ def run_multi_gpu_from_config(resolved) -> dict:
             n_runs=n_total,
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
+
+    # Per-iter chain-acceptance logger (multi-run path).
+    if resolved.move_descriptors and getattr(
+        resolved.output, "save_acc_rates", False,
+    ):
+        from jaxrens.io.acc_rates_log import AccRatesLogger
+        from jaxrens.cli.monitor import AccRatesCallback
+
+        acc_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.acc_rates.h5"
+        )
+        acc_logger = AccRatesLogger(
+            path=acc_log_path,
+            move_names=[d.name for d in resolved.move_descriptors],
+            n_runs=n_total,
+        )
+        callbacks.append(AccRatesCallback(
+            acc_logger,
+            interval=int(getattr(resolved.output, "acc_rates_interval", 1)),
+        ))
 
     first_mc = resolved.moves[0]
     full_auto_kwargs: dict[str, Any] = {}

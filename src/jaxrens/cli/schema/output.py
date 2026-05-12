@@ -7,7 +7,6 @@ Users who set these will see a ``logging.warning`` from the resolver:
     iteration-based snapshots today).
   - ``snapshot_clean``: delete older snapshots on write.
   - ``wrap_atoms``: wrap atom positions into the cell on output.
-  - ``save_stepsizes``: write a step-size trajectory file.
   - ``write_traj_db``: write a trajectory database (no DB writer exists yet).
   - ``write_walkers_db``: write a walker database (no walker DB writer exists).
 """
@@ -17,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class OutputSpec(BaseModel):
@@ -38,10 +37,22 @@ class OutputSpec(BaseModel):
     working_dir: Path = Path(".")
     log_level: Literal["info", "debug"] = "info"
 
+    # Per-iter chain-phase acceptance log.  When ``save_acc_rates`` is
+    # True the runtime registers an ``AccRatesCallback`` that writes
+    # ``<prefix>.acc_rates.h5`` every ``acc_rates_interval`` iterations.
+    # Independent of ``adaptation.full_auto``.
+    save_acc_rates: bool = False
+    acc_rates_interval: int | float = Field(
+        default=1,
+        description=(
+            "Fire AccRatesCallback every N iterations.  Default 1 (every "
+            "iter); set higher for long runs to reduce I/O."
+        ),
+    )
+
     # -- Deferred fields (see module docstring) --
     snapshot_time: float | None = None
     snapshot_clean: bool = False
     wrap_atoms: bool = False
-    save_stepsizes: bool = False
     write_traj_db: bool = False
     write_walkers_db: bool = False

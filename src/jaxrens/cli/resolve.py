@@ -49,7 +49,6 @@ _DEFERRED_OUTPUT_FIELDS: tuple[str, ...] = (
     "snapshot_time",
     "snapshot_clean",
     "wrap_atoms",
-    "save_stepsizes",
     "write_traj_db",
     "write_walkers_db",
 )
@@ -844,7 +843,6 @@ def _warn_unused_output_fields(output_schema: Any) -> None:
         "snapshot_time": None,
         "snapshot_clean": False,
         "wrap_atoms": False,
-        "save_stepsizes": False,
         "write_traj_db": False,
         "write_walkers_db": False,
     }
@@ -955,6 +953,8 @@ def _resolve_one(root: RootSpec, cohort_index: int = 0) -> ResolvedConfig:
         out_file_prefix=root.output.out_file_prefix,
         working_dir=Path(root.output.working_dir),
         log_level=root.output.log_level,
+        save_acc_rates=root.output.save_acc_rates,
+        acc_rates_interval=int(root.output.acc_rates_interval),
     )
 
     _warn_unused_output_fields(root.output)
@@ -1455,6 +1455,8 @@ def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
         out_file_prefix=root.output.out_file_prefix,
         working_dir=Path(root.output.working_dir),
         log_level=root.output.log_level,
+        save_acc_rates=root.output.save_acc_rates,
+        acc_rates_interval=int(root.output.acc_rates_interval),
     )
     _warn_unused_output_fields(root.output)
 

@@ -97,16 +97,33 @@ replicas run *concurrently* instead of serially.
 Once the dispatcher has picked a branch, both paths do the same three
 jobs — derive the runtime topology, lay out per-walker initial state,
 and price the initial energies on the right ensemble scale — they
-just differ in *where the parallelism lives*. The single-run / cohort
-path builds one replica at a time, then runs a single
-`_finalise_initial_energies_and_counts` call to price its initial
-energies; the multi-run path builds N replicas in a tight Python loop
-(cheap, no JIT compiles), stacks them, and runs the same helper once
-on the stacked `(G, P, K, …)` arrays under `pmap(vmap(...))`. The
-helper is shared verbatim — only the `batcher` argument differs
-(`SingleRun()` vs `PmapVmapRuns(G, P)`). Mode helpers themselves
-return structural init only (positions / cells / types / restart
-state); finalize is always the caller's responsibility.
+just differ in *where the parallelism lives*.
+
+Both paths walk the same per-iteration setup: look up the iteration's
+pressure, build the base backend, wrap it in
+`EnsembleBackend(base, pressure=P)` (the rejection-mode ceiling check
+inside `_sample_per_walker_positions` needs ensemble-corrected
+energies), then dispatch the right `_resolve_init` mode helper.  Mode
+helpers return structural init only (positions / cells / types /
+restart state); finalize is always the caller's responsibility.
+
+The paths then diverge:
+
+- **Single-run / cohort.** Once `_validate_cells` returns,
+  `_resolve_one` calls `_finalise_initial_energies_and_counts`
+  immediately on its single-replica arrays with `batcher=SingleRun()`.
+- **Multi-run.** The structural-init step runs once per replica in a
+  tight Python loop (cheap, no JIT compiles), stacks the resulting
+  `(K, …)` arrays into `(n_total, K, …)`, then reshapes to
+  `(G, P, K, …)`.  Before finalize the resolver does a *second*
+  ensemble wrap — one `EnsembleBackend(base, pressure=0.0)` shared by
+  all replicas; the per-replica pressure flows in through the
+  `ensemble_params={"pressure": p}` kwarg on the vmap axis.  Then the
+  same `_finalise_initial_energies_and_counts` helper is called once
+  with `batcher=PmapVmapRuns(G, P)`.
+
+The helper body is identical between paths — only the `batcher` and
+the per-replica `pressures` argument differ.
 
 ```{mermaid}
 %%{init: {"layout": "elk"}}%%
@@ -126,17 +143,16 @@ flowchart TB
         DRA["_derive_replica_axes<br>→ (n_gpu, n_per_gpu,<br>params_per_run)"]
         BATCH["batcher = PmapVmapRuns(G, P)"]
         MFOR(["for r in range(n_total)"])
-        STK["jnp.stack along replica axis<br>(n_total, K, …) → (G, P, K, …)"]
     end
 
-    subgraph one["_resolve_one"]
+    subgraph one["Per-iteration setup<br>(cohort element i / replica r — shared by both paths)"]
         direction TB
-        EP["ensemble.to_ensemble_params(i)<br>→ pressure"]
-        BB1["build_backend(spec)<br>→ base_backend"]
-        EBW["wrap EnsembleBackend<br>(if pressure)"]
+        EP["pressure = ensemble.to_ensemble_params(<br>cohort_index = i / r).get('pressure')"]
+        BB1["build_backend(spec)<br>→ base_backend (built once per call)"]
+        EBW["wrap EnsembleBackend(base, pressure=P)<br>(rejection-mode ceiling check<br>during structural init)"]
     end
 
-    subgraph init["_resolve_init — structural init"]
+    subgraph init["_resolve_init — structural init only"]
         direction TB
         MODE{"select mode<br>(A / B / C / D)"}
         A["A: start_species<br>sample cell + positions"]
@@ -146,7 +162,13 @@ flowchart TB
         VAL["_validate_cells"]
     end
 
-    subgraph fin["_finalise_initial_energies_and_counts"]
+    subgraph mrwrap["Multi-run only — after the per-replica loop"]
+        direction TB
+        STK["jnp.stack along replica axis<br>(n_total, K, …) → (G, P, K, …)"]
+        EBW0["wrap one EnsembleBackend(base, pressure=0.0)<br>(per-replica P flows via ensemble_params kwarg<br>on the vmap axis)"]
+    end
+
+    subgraph fin["_finalise_initial_energies_and_counts<br>(only place initial energies are priced)"]
         direction TB
         HAS{"backend has<br>max_neighbors_for?"}
         CNT["counts = batcher.wrap_for_batch(<br>vmap(max_neighbors_for))<br>(positions, cells)"]
@@ -164,15 +186,16 @@ flowchart TB
     SIZE --> COHFOR --> RONE
     DRA --> BATCH --> MFOR
     RONE -.calls.-> EP
+    MFOR -.calls.-> EP
     EP --> BB1 --> EBW --> MODE
-    MFOR -.->|"structural init only"| MODE
     MODE -- A --> A --> VAL
     MODE -- B --> B --> VAL
     MODE -- C --> C --> VAL
     MODE -- D --> D --> VAL
-    VAL -->|"single-run (SingleRun,<br>ladder + offset)"| HAS
-    VAL -->|"multi-run: stack first"| STK
-    STK -->|"one call (PmapVmapRuns)"| HAS
+    VAL -->|"single-run<br>(SingleRun,<br>ladder + offset)"| HAS
+    VAL -.->|"replica r built;<br>loop continues"| MFOR
+    MFOR -->|"all n_total replicas built"| STK
+    STK --> EBW0 -->|"PmapVmapRuns(G, P),<br>pressures kwarg"| HAS
     HAS -- yes --> CNT --> BUCK --> EN
     HAS -- no --> EN0
     EN --> OUT1
@@ -184,6 +207,7 @@ flowchart TB
     multi:::pyBox
     one:::pyBox
     init:::pyBox
+    mrwrap:::pyBox
     fin:::jitBox
     EMC:::decision
     MODE:::decision

@@ -543,7 +543,8 @@ class TestAdjustmentInfoKeysBatched:
         assert log.n_moves == n_moves
         assert log.iterations.ndim == 1
         n_entries = log.iterations.shape[0]
-        assert n_entries >= 1
+        # iter-0 baseline row + at least one adjust event.
+        assert n_entries >= 2
         assert log.step_sizes.shape == (n_entries, n_runs, n_moves)
         assert log.acceptance_rates.shape == (n_entries, n_runs, n_moves)
         # v2 adjustment_stats present
@@ -555,9 +556,215 @@ class TestAdjustmentInfoKeysBatched:
         # v3 evaluation counts present
         assert log.n_evaluations is not None
         assert log.n_evaluations.shape == (n_entries, n_runs, n_moves)
-        # Sanity: every entry's iteration is a positive multiple of adjust_interval
-        assert np.all(log.iterations > 0)
-        assert np.all(log.iterations % 10 == 0)
+        # Row 0 is the iter-0 baseline (zeros / converged=True);
+        # subsequent rows are real adjust events at multiples of adjust_interval.
+        assert int(log.iterations[0]) == 0
+        assert np.all(log.adjustment_stats["n_rounds"][0] == 0)
+        assert np.all(log.adjustment_stats["converged"][0] == True)
+        assert np.all(log.iterations[1:] > 0)
+        assert np.all(log.iterations[1:] % 10 == 0)
+
+
+class TestAdaptationIter0BaselineRow:
+    """The iter-0 baseline row is written even for runs without full_auto
+    (no bisection events ever fire) — so the file becomes a 1-row
+    artefact documenting the constant step size.
+
+    Also: row 0's adjustment_* fields signal "no bisection ran"
+    (n_rounds=0, converged=True, etc.).
+    """
+
+    def test_single_run_no_adjustment_writes_iter0_only(self, tmp_path):
+        import numpy as np
+
+        from jaxrens.cli.monitor import AdaptationCallback
+        from jaxrens.io.adaptation_log import AdaptationLogger
+
+        backend = create_harmonic(k=1.0)
+        descriptors = [
+            MoveKernel("rw", random_walk.build_kernel, step_size=0.25,
+                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+        ]
+        init_fn, step_fn, _ = build_mwg(backend, descriptors)
+
+        n_walkers = 12
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        key = jax.random.key(11)
+        key, init_key = jax.random.split(key)
+        positions = jax.random.uniform(init_key, (n_walkers, 1, 3), minval=-2, maxval=2)
+        energies = jax.vmap(
+            lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+        )(positions)
+
+        adapt_log_path = tmp_path / "no_full_auto.adaptation.h5"
+        adapt_logger = AdaptationLogger(
+            path=adapt_log_path,
+            move_names=["rw"],
+            n_runs=1,
+        )
+
+        run_ns(
+            positions, types, energies,
+            cells=None,
+            init_fn=init_fn,
+            step_fn=step_fn,
+            rng_key=key,
+            max_iterations=15,
+            n_mcmc_steps=3,
+            initial_step_size=0.25,
+            # no per_move_fns / move_descriptors -> no adaptation at all,
+            # but we still want the iter-0 baseline row, so we register
+            # the callback manually.
+            callbacks=[AdaptationCallback(adapt_logger)],
+        )
+        adapt_logger.close()
+
+        assert adapt_log_path.exists(), (
+            "iter-0 baseline row must produce the file even without adaptation"
+        )
+        log = AdaptationLogger.read(adapt_log_path)
+        assert log.iterations.shape == (1,)
+        assert int(log.iterations[0]) == 0
+        # Row 0 carries the initial ss as passed to run_ns.
+        np.testing.assert_allclose(
+            log.step_sizes[0, 0], np.array([0.25], dtype=np.float32),
+            rtol=1e-5,
+        )
+        # Adjustment-event fields signal "no bisection ran".
+        assert log.adjustment_stats is not None
+        assert int(log.adjustment_stats["n_rounds"][0, 0, 0]) == 0
+        assert bool(log.adjustment_stats["converged"][0, 0, 0]) is True
+
+    def test_multi_run_baseline_per_replica_shape(self, tmp_path):
+        """The iter-0 row honours the multi-run (n_runs, n_moves) shape."""
+        import numpy as np
+
+        from jaxrens.cli.monitor import AdaptationCallback
+        from jaxrens.io.adaptation_log import AdaptationLogger
+
+        backend = create_harmonic(k=1.0)
+        descriptors = [
+            MoveKernel("rw0", random_walk.build_kernel, step_size=0.1,
+                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+            MoveKernel("rw1", random_walk.build_kernel, step_size=0.3,
+                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+        ]
+        init_fn, step_fn, _ = build_mwg(backend, descriptors)
+
+        n_runs, n_walkers = 2, 12
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        keys = jax.random.split(jax.random.key(0), n_runs)
+        positions = jax.vmap(
+            lambda k: jax.random.uniform(k, (n_walkers, 1, 3), minval=-2, maxval=2)
+        )(keys)
+        energies = jax.vmap(
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
+        )(positions)
+        rng_keys = jax.random.split(jax.random.key(33), n_runs)
+
+        adapt_log_path = tmp_path / "multi.adaptation.h5"
+        adapt_logger = AdaptationLogger(
+            path=adapt_log_path,
+            move_names=["rw0", "rw1"],
+            n_runs=n_runs,
+        )
+
+        run_ns_parallel(
+            positions, types, energies,
+            cells=None,
+            init_fn=init_fn,
+            step_fn=step_fn,
+            rng_keys=rng_keys,
+            max_iterations=10,
+            n_mcmc_steps=2,
+            initial_step_size=0.4,
+            # Pass descriptors so n_moves is honoured (without per_move_fns
+            # adaptation stays inactive — only the iter-0 row gets written).
+            move_descriptors=descriptors,
+            callbacks=[AdaptationCallback(adapt_logger)],
+        )
+        adapt_logger.close()
+
+        log = AdaptationLogger.read(adapt_log_path)
+        assert log.n_runs == n_runs
+        # No adjust events fired (no per_move_fns), so only the baseline row.
+        assert log.iterations.shape == (1,)
+        assert log.step_sizes.shape == (1, n_runs, 2)
+        # All replicas, all moves see the same broadcast initial ss.
+        np.testing.assert_allclose(
+            log.step_sizes[0],
+            np.full((n_runs, 2), 0.4, dtype=np.float32),
+            rtol=1e-5,
+        )
+
+
+class TestAccRatesCallbackEndToEnd:
+    """AccRatesCallback fires every iter regardless of full_auto and
+    produces a multi-run-shaped HDF5 file."""
+
+    def test_per_iter_logging_no_full_auto(self, tmp_path):
+        import numpy as np
+
+        from jaxrens.cli.monitor import AccRatesCallback
+        from jaxrens.io.acc_rates_log import AccRatesLogger
+
+        backend = create_harmonic(k=1.0)
+        descriptors = [
+            MoveKernel("rw", random_walk.build_kernel, step_size=0.25,
+                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+        ]
+        init_fn, step_fn, _ = build_mwg(backend, descriptors)
+
+        n_runs, n_walkers = 2, 12
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        keys = jax.random.split(jax.random.key(0), n_runs)
+        positions = jax.vmap(
+            lambda k: jax.random.uniform(k, (n_walkers, 1, 3), minval=-2, maxval=2)
+        )(keys)
+        energies = jax.vmap(
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
+        )(positions)
+        rng_keys = jax.random.split(jax.random.key(99), n_runs)
+
+        acc_path = tmp_path / "no_full_auto.acc_rates.h5"
+        acc_logger = AccRatesLogger(
+            path=acc_path,
+            move_names=["rw"],
+            n_runs=n_runs,
+        )
+
+        max_iter = 12
+        run_ns_parallel(
+            positions, types, energies,
+            cells=None,
+            init_fn=init_fn,
+            step_fn=step_fn,
+            rng_keys=rng_keys,
+            max_iterations=max_iter,
+            n_mcmc_steps=3,
+            callbacks=[AccRatesCallback(acc_logger, interval=1)],
+        )
+        acc_logger.close()
+
+        assert acc_path.exists()
+        log = AccRatesLogger.read(acc_path)
+        assert log.n_runs == n_runs
+        assert log.n_moves == 1
+        # iter starts at 0 inside _run_loop; fires every iter.
+        # The exact n_entries can vary by ±1 depending on when termination
+        # fires relative to the callback dispatch; check it's plausible.
+        n_entries = log.iterations.shape[0]
+        assert n_entries >= max_iter - 2
+        assert log.n_accepted.shape == (n_entries, n_runs, 1)
+        assert log.n_proposed.shape == (n_entries, n_runs, 1)
+        # Chain proposed counts are positive on every iter.
+        assert np.all(log.n_proposed > 0)
+        # Acceptance counts ≤ proposed counts.
+        assert np.all(log.n_accepted <= log.n_proposed)
 
 
 # ---------------------------------------------------------------------------

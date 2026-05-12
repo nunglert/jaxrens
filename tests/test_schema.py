@@ -1035,9 +1035,11 @@ class TestExtendedOutputSpec:
         assert schema.snapshot_time is None
         assert schema.snapshot_clean is False
         assert schema.wrap_atoms is False
-        assert schema.save_stepsizes is False
         assert schema.write_traj_db is False
         assert schema.write_walkers_db is False
+        # save_acc_rates was promoted out of deferred into a real field.
+        assert schema.save_acc_rates is False
+        assert schema.acc_rates_interval == 1
 
     def test_deferred_fields_accept_non_defaults(self):
         from jaxrens.cli.schema.output import OutputSpec
@@ -1046,16 +1048,20 @@ class TestExtendedOutputSpec:
             snapshot_time=60.0,
             snapshot_clean=True,
             wrap_atoms=True,
-            save_stepsizes=True,
             write_traj_db=True,
             write_walkers_db=True,
         )
         assert schema.snapshot_time == pytest.approx(60.0)
         assert schema.snapshot_clean is True
         assert schema.wrap_atoms is True
-        assert schema.save_stepsizes is True
         assert schema.write_traj_db is True
         assert schema.write_walkers_db is True
+
+    def test_save_acc_rates_accept_non_defaults(self):
+        from jaxrens.cli.schema.output import OutputSpec
+        schema = OutputSpec(save_acc_rates=True, acc_rates_interval=10)
+        assert schema.save_acc_rates is True
+        assert schema.acc_rates_interval == 10
 
     def test_extra_field_still_rejected(self):
         from jaxrens.cli.schema.output import OutputSpec

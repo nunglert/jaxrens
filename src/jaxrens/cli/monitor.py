@@ -409,6 +409,64 @@ class AdaptationCallback:
     def __init__(self, logger_obj: Any) -> None:
         self._adaptation_logger = logger_obj
 
+    def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
+        """Write the mandatory iter-0 baseline row.
+
+        This pins the initial step sizes for post-hoc reconstruction:
+        active ss at iter k = last row whose ``iter <= k``.  Without
+        this row, a non-``full_auto`` run would produce an empty file
+        (no adjustment events ever fire), and a ``full_auto`` run
+        would mis-attribute the pre-first-adjust period to the first
+        adjustment event's step size.
+
+        Adjustment-event-only fields (``n_rounds``, ``cap_hits``,
+        ``floor_hits``, ``converged``, ``bracket_detected``,
+        ``reject_reason_counts``) are written as zeros / ``True`` to
+        signal "no bisection ran for this row".  Evaluation counters
+        are zero too.
+
+        Acceptance rates default to 0 here: real chain rates are
+        absent at iter 0 (no NS step has run yet), and the trial-phase
+        rates from bisection don't exist either.  Downstream readers
+        should ignore acc rates on the iter-0 row.
+        """
+        if start_info is None:
+            return
+        ss = start_info.get("step_sizes_per_move")
+        if ss is None:
+            return
+        ss_arr = jnp.asarray(ss)
+        batcher = start_info.get("_batcher")
+        if batcher is not None:
+            ss_flat = batcher.flatten(ss_arr)
+        else:
+            ss_flat = ss_arr[None, :] if ss_arr.ndim == 1 else ss_arr
+
+        n_runs = self._adaptation_logger.n_runs
+        n_moves = self._adaptation_logger.n_moves
+        ss_np = np.asarray(ss_flat, dtype=np.float32)
+        acc_np = np.zeros((n_runs, n_moves), dtype=np.float32)
+
+        zero_int = np.zeros((n_runs, n_moves), dtype=np.int32)
+        zero_int64 = np.zeros((n_runs, n_moves), dtype=np.int64)
+        baseline_adj_stats = {
+            "n_rounds": zero_int,
+            # converged=True signals "no bisection needed / not run".
+            "converged": np.ones((n_runs, n_moves), dtype=bool),
+            "cap_hits": zero_int,
+            "floor_hits": zero_int,
+            "bracket_detected": np.zeros((n_runs, n_moves), dtype=bool),
+            "reject_reason_counts": np.zeros((n_runs, n_moves, 4), dtype=np.int32),
+        }
+        self._adaptation_logger.write_entry(
+            iteration=0,
+            step_sizes=ss_np,
+            acceptance_rates=acc_np,
+            adjustment_stats=baseline_adj_stats,
+            n_evaluations=zero_int64,
+            n_grad_evaluations=zero_int64,
+        )
+
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
         ss = info.get("step_sizes_per_move")
         acc = info.get("acceptance_rates_per_move")
@@ -433,7 +491,28 @@ class AdaptationCallback:
                 ss_np = ss_np.reshape(-1, n_moves_here)
                 acc_np = acc_np.reshape(-1, n_moves_here)
 
-        # Collect per-adjust-call diagnostic stats when present (v2 schema)
+        # Collect per-adjust-call diagnostic stats when present (v2 schema).
+        # All values arrive shaped ``(*shape_prefix, n_moves[, 4])`` straight
+        # from ``AdaptationManager.apply`` — for PmapVmapRuns(G, P) that's
+        # ``(G, P, n_moves[, 4])``.  Coerce to the flat ``(n_runs, ...)``
+        # layout the HDF5 schema expects using the same ``batcher.flatten``
+        # the ss/acc path uses above.  Without this the dataset is created
+        # at the correct shape on the iter-0 baseline row (which is already
+        # flat) but real adjust events would fail with a broadcast error.
+        def _flatten_for_hdf5(arr):
+            arr = np.asarray(arr)
+            if batcher is not None:
+                return np.asarray(batcher.flatten(arr))
+            # No batcher available: fall back to ndim-based reshape.
+            if arr.ndim == 1:
+                return arr[None, :]
+            if arr.ndim >= 3:
+                # Last 1 or 2 axes are payload (n_moves[, 4]); rest is prefix.
+                # Heuristic: reject_reason_counts has trailing 4, others trail at n_moves.
+                tail = arr.shape[-2:] if arr.shape[-1] == 4 else arr.shape[-1:]
+                return arr.reshape((-1,) + tail)
+            return arr
+
         adjustment_stats: "dict[str, np.ndarray] | None" = None
         _adj_keys = (
             "adjustment_n_rounds",
@@ -456,7 +535,7 @@ class AdaptationCallback:
             if val is not None:
                 if adjustment_stats is None:
                     adjustment_stats = {}
-                adjustment_stats[_adj_rename[info_key]] = np.asarray(val)
+                adjustment_stats[_adj_rename[info_key]] = _flatten_for_hdf5(val)
 
         # Collect per-iter evaluation counts for v3 schema (shape (n_runs, n_moves))
         n_evals_raw = info.get("n_evaluations_per_move")
@@ -464,12 +543,13 @@ class AdaptationCallback:
         n_evals_np: "np.ndarray | None" = None
         n_grad_evals_np: "np.ndarray | None" = None
         if n_evals_raw is not None:
-            arr = np.asarray(n_evals_raw, dtype=np.int64)
-            # Ensure (n_runs, n_moves) shape
-            n_evals_np = arr[None, :] if arr.ndim == 1 else arr
+            n_evals_np = np.asarray(
+                _flatten_for_hdf5(n_evals_raw), dtype=np.int64,
+            )
         if n_grad_evals_raw is not None:
-            arr = np.asarray(n_grad_evals_raw, dtype=np.int64)
-            n_grad_evals_np = arr[None, :] if arr.ndim == 1 else arr
+            n_grad_evals_np = np.asarray(
+                _flatten_for_hdf5(n_grad_evals_raw), dtype=np.int64,
+            )
 
         self._adaptation_logger.write_entry(
             iteration=iteration,
@@ -482,6 +562,63 @@ class AdaptationCallback:
 
     def on_finish(self, ns_state: Any) -> None:
         self._adaptation_logger.close()
+
+
+class AccRatesCallback:
+    """Writes per-iteration chain-phase per-move acceptance counts to HDF5.
+
+    Independent of ``full_auto``: the chain counters ``n_accepted_per_move``
+    and ``n_proposed_per_move`` are populated by ``ns_step`` on every
+    iteration, so this callback fires regardless of whether bisection
+    adaptation is active.  ``AdaptationCallback`` complements this by
+    capturing the *sparse* step-size event series; this callback captures
+    the *dense* per-iter chain-rate series.
+
+    Stores raw counts (not derived rates) so downstream code can
+    re-aggregate over arbitrary windows.
+
+    Args:
+        logger_obj: A ready-to-use ``AccRatesLogger`` instance.
+        interval: Fire every ``interval`` iterations.  Default ``1``
+            (every iter); set higher to reduce I/O on long runs.
+    """
+
+    def __init__(self, logger_obj: Any, interval: int = 1) -> None:
+        self._logger = logger_obj
+        self._interval = max(1, int(interval))
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        if iteration % self._interval != 0:
+            return
+        n_acc = info.get("n_accepted_per_move")
+        n_prop = info.get("n_proposed_per_move")
+        if n_acc is None or n_prop is None:
+            return
+
+        n_acc_arr = jnp.asarray(n_acc)
+        n_prop_arr = jnp.asarray(n_prop)
+
+        batcher = info.get("_batcher")
+        if batcher is not None:
+            n_acc_arr = batcher.flatten(n_acc_arr)
+            n_prop_arr = batcher.flatten(n_prop_arr)
+        else:
+            if n_acc_arr.ndim == 1:
+                n_acc_arr = n_acc_arr[None, :]
+                n_prop_arr = n_prop_arr[None, :]
+            elif n_acc_arr.ndim >= 3:
+                n_moves_here = n_acc_arr.shape[-1]
+                n_acc_arr = n_acc_arr.reshape(-1, n_moves_here)
+                n_prop_arr = n_prop_arr.reshape(-1, n_moves_here)
+
+        self._logger.write_entry(
+            iteration=iteration,
+            n_accepted=np.asarray(n_acc_arr, dtype=np.int64),
+            n_proposed=np.asarray(n_prop_arr, dtype=np.int64),
+        )
+
+    def on_finish(self, ns_state: Any) -> None:
+        self._logger.close()
 
 
 class EnergyCheckCallback:
@@ -523,7 +660,7 @@ class CheckpointCallback:
         self.prefix = prefix
         self.symbol_map = symbol_map
 
-    def on_start(self, ns_state: Any) -> None:
+    def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
         from jaxrens.io.checkpoint import save_checkpoint
 
         path = self.working_dir / f"{self.prefix}.initial.checkpoint.h5"
@@ -582,7 +719,7 @@ class MemProfileCallback:
         p = Path(self.out_path)
         return str(p.with_name(p.stem + ".baseline" + p.suffix))
 
-    def on_start(self, ns_state: Any) -> None:
+    def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
         import jax
 
         jax.profiler.save_device_memory_profile(self._baseline_path())

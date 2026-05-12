@@ -116,7 +116,7 @@ class NSCallback(Protocol):
     Called at the outer loop boundary (Python level, outside JIT/pmap).
     """
 
-    def on_start(self, ns_state: Any) -> None: ...
+    def on_start(self, ns_state: Any, start_info: dict | None = None) -> None: ...
 
     def on_iteration(
         self, iteration: int, ns_state: Any, info: dict

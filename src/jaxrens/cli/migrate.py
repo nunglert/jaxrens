@@ -146,7 +146,11 @@ _DEFERRED: dict[str, tuple[tuple[str, ...], Any]] = {
     "write_walkers_db": (("output", "write_walkers_db"), _str_to_bool),
     "wrap_atoms": (("output", "wrap_atoms"), _str_to_bool),
     "snapshot_clean": (("output", "snapshot_clean"), _str_to_bool),
-    "save_stepsizes": (("output", "save_stepsizes"), _str_to_bool),
+    # ``save_stepsizes`` is intentionally dropped: in jaxrens, step
+    # sizes are recoverable from ``<prefix>.adaptation.h5`` (iter-0
+    # baseline row + bisection events), so a dedicated step-size
+    # trajectory file is redundant.  Legacy configs that set it will
+    # have the value preserved under ``_unknown`` for manual review.
     "snapshot_time": (("output", "snapshot_time"), float),
     # Cell config (deferred: not threaded into move kernels yet)
     "max_volume_per_atom": (("cell", "max_volume_per_atom"), float),

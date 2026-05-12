@@ -133,3 +133,27 @@ class TestPublicAPI:
     def test_migrate_importable(self):
         from jaxrens.cli.migrate import migrate_ns_inp
         assert callable(migrate_ns_inp)
+
+
+class TestConfigureFileLogging:
+    """``configure_file_logging`` is called exactly once, early, from
+    ``cli._cmd_run`` so the resolver phase reaches the log file from
+    second 1.  Regression: previously called a second time inside
+    ``run_*_from_config`` which truncated the resolver content (see
+    jaxmd_si16_2 slurm-453556 where the file started at burn-in).
+    """
+    def test_writes_to_file(self, tmp_path):
+        import logging
+        from jaxrens.cli.run import configure_file_logging
+
+        configure_file_logging(
+            working_dir=tmp_path, prefix="run", level="info",
+        )
+        logging.getLogger("jaxrens").info("hello")
+
+        for h in list(logging.getLogger("jaxrens").handlers):
+            if getattr(h, "_jaxrens_managed", False):
+                logging.getLogger("jaxrens").removeHandler(h)
+                h.close()
+
+        assert "hello" in (tmp_path / "run.log").read_text()
