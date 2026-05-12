@@ -568,6 +568,199 @@ class PmapVmapRuns(BatchDescriptor):
         return float(jnp.min(log_evidence)), float(jnp.max(hmax))
 
 
+@dataclass(frozen=True)
+class ShardedSingleRun(BatchDescriptor):
+    """Descriptor for a single NS run sharded across ``n_gpu`` GPUs.
+
+    Logically one NS run; physically the ``K``-walker population is
+    split into ``n_gpu`` chunks of ``K // n_gpu`` walkers, one per
+    device.  ``ns_step_sharded`` uses ``lax.all_gather`` /
+    ``lax.argmax`` / ``lax.psum`` collectives across the
+    ``"shard"`` axis to act on the global population coherently
+    while letting each device hold only its share.  Use case:
+    memory scaling for heavy backends (MACE, NeuralIL, Nequix) on
+    large populations that overflow a single GPU.
+
+    Distinct from :class:`PmapVmapRuns` — that class runs ``G * P``
+    *independent* NS replicas.  ``ShardedSingleRun`` runs one
+    population spread across G devices.
+
+    Shape conventions:
+
+    * Population leaves: ``(G, K // G, ...)``.
+    * ``shape_prefix = (n_gpu,)`` — matches the physical layout.
+      The ``n_runs == prod(shape_prefix)`` invariant that the other
+      batchers happen to satisfy does NOT hold here: ``n_runs = 1``
+      logically, but the leading ``G`` axis is the sharding axis,
+      not a replica axis.  Consumers iterating ``shape_prefix`` (the
+      cumulative counters in ``_run_loop``, the per-move
+      ``stack_axis`` in ``AdaptationManager``) end up with a length-G
+      axis where each row is identical post-``lax.psum``.  Correct;
+      G× redundant memory on small counters.  Acceptable cost.
+
+    Reductions (``reduce_emax``, ``reduce_for_termination``) collapse
+    the (G,) axis to a scalar — every shard sees the same global
+    value after the in-step collectives.
+
+    Inputs to :meth:`wrap_for_batch`-wrapped callables are scalar
+    (ss / emax / key); the wrapper broadcasts to (G,) before
+    ``pmap`` and takes ``[0]`` of the result on the way out.  This
+    keeps the per-replica callable signature identical to
+    SingleRun so :class:`AdaptationManager` doesn't need a different
+    closure shape — only the underlying ``adjust_step_size_sharded``
+    call needs to know it's running under pmap.
+
+    Attributes
+    ----------
+    n_gpu : int
+        Number of GPU devices (G) the population is sharded across.
+    n_runs : int
+        Always 1 — one logical NS run.
+    shape_prefix : tuple[int, ...]
+        ``(n_gpu,)`` — physical sharding axis.
+    """
+
+    n_gpu: int
+    n_runs: int = 1
+    shape_prefix: tuple[int, ...] = ()  # set by __post_init__
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "shape_prefix", (self.n_gpu,))
+
+    @property
+    def is_batched(self) -> bool:
+        """Always ``True`` — the population is distributed across G devices."""
+        return True
+
+    def wrap_step(
+        self,
+        ns_step_fn,
+        step_fn,
+        n_mcmc_steps: int,
+        n_extra: int,
+    ):
+        """Return a ``pmap``-compiled NS step callable.
+
+        ``ns_step_fn`` here should be ``ns_step_sharded`` (not the
+        plain ``ns_step``) — it uses ``lax.all_gather`` / ``lax.psum``
+        collectives that only work inside a ``pmap`` context with
+        matching ``axis_name="shard"``.
+
+        The returned callable has signature::
+
+            pmap_step(ns_state)  ->  (ns_state, info)
+
+        with leading shape ``(G, ...)`` on every leaf.
+        """
+        def per_shard(ns_state):
+            return ns_step_fn(ns_state, step_fn, n_mcmc_steps, n_extra)
+
+        return jax.pmap(per_shard, axis_name="shard")
+
+    def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
+        """Broadcast a single scalar key to all G shards then split.
+
+        ``rng_key`` is a scalar key (logically one run's key).  We
+        broadcast to ``(G,)`` so every shard runs the *same* chain
+        with the *same* RNG decisions — this is the load-bearing
+        invariant that makes "all shards run an identical chain on
+        the broadcast seed walker" work in ``ns_step_sharded``.
+
+        Returns shape ``(G, n_sub_keys)`` with typed-key dtype.
+        """
+        sub = jax.random.split(rng_key, n_sub_keys)  # (n_sub_keys,)
+        return jnp.broadcast_to(sub[None, ...], (self.n_gpu,) + sub.shape)
+
+    def reduce_for_termination(
+        self,
+        log_evidence: jax.typing.ArrayLike,
+        hmax: jax.typing.ArrayLike,
+    ) -> tuple[float, float]:
+        """Take ``[0]`` from the (G,) axis — every shard has the same value.
+
+        ``ns_step_sharded`` writes identical ``log_evidence`` /
+        ``hmax`` on every shard (post-psum), so ``[0]`` is exact.
+        """
+        log_z_arr = jnp.asarray(log_evidence)
+        hmax_arr = jnp.asarray(hmax)
+        log_z = log_z_arr[0] if log_z_arr.ndim > 0 else log_z_arr
+        h = hmax_arr[0] if hmax_arr.ndim > 0 else hmax_arr
+        return float(log_z), float(h)
+
+    # ------------------------------------------------------------------
+    # Override base helpers where the (G,) prefix needs special treatment
+    # ------------------------------------------------------------------
+
+    def reduce_emax(
+        self, energy: Float[Array, "G K"]
+    ) -> Float[Array, ""]:
+        """Global ``max`` over the entire (G, K_per_gpu) population.
+
+        Returns a scalar (NOT shape (G,)) so downstream consumers
+        (``AdaptationManager.apply``) see a single Emax constraint —
+        same shape as ``SingleRun.reduce_emax``.  This is the right
+        physical interpretation: there's one logical population, so
+        one Emax.
+        """
+        return jnp.max(energy)
+
+    def flatten(
+        self, arr: Shaped[np.ndarray | Array, "G ..."]
+    ) -> Shaped[np.ndarray | Array, "1 ..."]:
+        """Take ``[0:1]`` from the G axis — one logical run.
+
+        All shards hold identical per-run data after ``lax.psum`` in
+        ``ns_step_sharded`` / ``adjust_step_size_sharded``, so
+        slicing one shard is exact.  Returns a length-1 leading
+        axis to match the ``flatten`` contract (``(n_runs, ...)``).
+        """
+        arr_np = np.asarray(arr) if isinstance(arr, np.ndarray) else arr
+        return arr_np[:1]
+
+    def unflatten(
+        self, arr_flat: Shaped[np.ndarray | Array, "1 ..."]
+    ) -> Shaped[np.ndarray | Array, "G ..."]:
+        """Re-broadcast a length-1 leading axis to (G, ...)."""
+        return jnp.broadcast_to(arr_flat[0:1], (self.n_gpu,) + arr_flat.shape[1:])
+
+    def wrap_for_batch(self, per_element_fn):
+        """Wrap a per-replica callable in ``pmap`` with auto-broadcast scalars.
+
+        The closure ``per_element_fn`` is written for SingleRun
+        shapes — it expects ``pop`` (no leading prefix), scalar ``ss``,
+        scalar ``emax``, scalar ``key``.  Under sharding, ``pop`` is
+        physically ``(G, K_per_gpu, ...)`` (sharded) but the scalars
+        still reflect the logical single run.  This wrapper:
+
+        1. Broadcasts ``ss``, ``emax``, ``key`` to leading ``(G,)``
+           so ``pmap`` accepts them.
+        2. Calls ``pmap(per_element_fn, axis_name="shard")``.
+        3. Takes ``[0]`` of every output leaf — all shards produce
+           identical results (post-``lax.psum`` in
+           ``adjust_step_size_sharded``), so ``[0]`` is exact.
+
+        The result is that callers see the same scalar-in / scalar-out
+        contract as SingleRun, except ``pop`` is sharded.
+        """
+        G = self.n_gpu
+        pmapped = jax.pmap(per_element_fn, axis_name="shard")
+
+        def _broadcast_scalar(x):
+            x_arr = jnp.asarray(x)
+            return jnp.broadcast_to(x_arr[None], (G,) + x_arr.shape)
+
+        def _wrapped(pop, ss, emax, key):
+            ss_g = _broadcast_scalar(ss)
+            emax_g = _broadcast_scalar(emax)
+            key_g = _broadcast_scalar(key)
+            result = pmapped(pop, ss_g, emax_g, key_g)
+            # Every leaf has leading (G,); take [0].  Preserves PyTree
+            # shape and dtype.
+            return jax.tree.map(lambda x: x[0], result)
+
+        return _wrapped
+
+
 # ---------------------------------------------------------------------------
 # Module-level factory
 # ---------------------------------------------------------------------------

@@ -915,8 +915,48 @@ class ResolvedConfig:
     batcher: BatchDescriptor | None = None
 
 
-def _resolve_single_replica(root: RootSpec, *, ensemble_params: dict) -> ResolvedConfig:
-    """Resolve ``root`` into a SingleRun ``ResolvedConfig`` (n_total = 1)."""
+def _resolve_single_replica(
+    root: RootSpec,
+    *,
+    ensemble_params: dict,
+    shard_n_gpu: int = 1,
+) -> ResolvedConfig:
+    """Resolve ``root`` into a single-replica ``ResolvedConfig`` (n_total = 1).
+
+    ``shard_n_gpu`` (default 1) selects the batcher:
+
+    * ``1`` → :class:`SingleRun` (the historical behaviour).
+    * ``> 1`` → :class:`ShardedSingleRun(n_gpu=shard_n_gpu)`.  The
+      walker population is split across ``shard_n_gpu`` devices at
+      ``init_ns_sharded`` time; ``run_sharded_from_config`` is the
+      runtime dispatcher.
+
+    The structural init layout is identical between the two — initial
+    positions / energies / counts come out of the resolver as flat
+    ``(K, ...)`` arrays.  The reshape to ``(G, K // G, ...)`` happens
+    later in ``init_ns_sharded`` so this resolver doesn't need to know
+    about the physical sharding layout.
+
+    Validates ``n_live % shard_n_gpu == 0`` and rejects the
+    ``inter_re ∧ shard_n_gpu > 1`` combination (sharded single run is
+    one population — there's nothing to swap with).
+    """
+    if shard_n_gpu > 1:
+        if root.run.n_live % shard_n_gpu != 0:
+            raise ValueError(
+                f"run.n_live ({root.run.n_live}) is not divisible by "
+                f"run.shard_n_gpu ({shard_n_gpu}).  Adjust n_live or "
+                f"shard_n_gpu so that n_live % shard_n_gpu == 0."
+            )
+        if root.inter_re is not None:
+            raise ValueError(
+                "run.shard_n_gpu > 1 is incompatible with inter_re.  "
+                "Sharded single run holds one population spread across "
+                "GPUs — there's no second replica to swap with.  "
+                "Either remove inter_re or set shard_n_gpu = 1 (and "
+                "supply a multi-replica axis like ensemble.pressure: "
+                "[...] for inter-RE)."
+            )
     # Scale iteration-counted fields once at the top so every downstream read
     # of root.{output,run,adaptation,inter_re,termination} sees absolute-iter
     # values (see ``_apply_interval_units`` for the field list).
@@ -1038,6 +1078,12 @@ def _resolve_single_replica(root: RootSpec, *, ensemble_params: dict) -> Resolve
         for m, policy in zip(root.moves, adaptation_policies)
     )
 
+    if shard_n_gpu > 1:
+        from jaxrens.sampling.batch_descriptor import ShardedSingleRun
+        chosen_batcher: BatchDescriptor = ShardedSingleRun(n_gpu=shard_n_gpu)
+    else:
+        chosen_batcher = SingleRun()
+
     return ResolvedConfig(
         ns=ns,
         moves=moves,
@@ -1055,7 +1101,7 @@ def _resolve_single_replica(root: RootSpec, *, ensemble_params: dict) -> Resolve
         inter_re_config=(
             root.inter_re.to_inter_re_config() if root.inter_re is not None else None
         ),
-        batcher=SingleRun(),
+        batcher=chosen_batcher,
     )
 
 
@@ -1470,12 +1516,28 @@ def resolve(root: RootSpec) -> ResolvedConfig:
         )
 
     if n_total == 1:
-        # SingleRun path.  ``params_per_run`` is empty here per the contract
-        # of ``_derive_replica_axes``; reconstruct the scalar dict from the
-        # ensemble spec directly so ``ensemble_params_per_run`` always has
-        # length 1 in the resolved config.
+        # SingleRun (or sharded-single) path.  ``params_per_run`` is
+        # empty here per the contract of ``_derive_replica_axes``;
+        # reconstruct the scalar dict from the ensemble spec directly
+        # so ``ensemble_params_per_run`` always has length 1 in the
+        # resolved config.
         ensemble_params = root.ensemble.to_ensemble_params(cohort_index=0)
-        return _resolve_single_replica(root, ensemble_params=ensemble_params)
+        return _resolve_single_replica(
+            root,
+            ensemble_params=ensemble_params,
+            shard_n_gpu=root.run.shard_n_gpu,
+        )
+
+    if root.run.shard_n_gpu > 1:
+        raise ValueError(
+            f"run.shard_n_gpu ({root.run.shard_n_gpu}) is incompatible "
+            f"with the multi-replica topology implied by this config "
+            f"(n_total = {n_total} > 1).  Sharded single-run holds one "
+            f"population spread across GPUs; multi-replica runs hold "
+            f"n_total *independent* populations.  Pick one — remove the "
+            f"replica-axis list (ensemble.pressure / inter_re.*) or set "
+            f"shard_n_gpu = 1."
+        )
 
     return _resolve_multi_replica(
         root,

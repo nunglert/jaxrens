@@ -106,12 +106,14 @@ def _build_dynamics_model(
     has_morse: bool,
     is_ensemble: bool,
     n_ensemble: int,
+    morse_type: str = "RepulsiveMorse",
 ):
     """Build the (max_neighbors-independent) NeuralIL dynamics model.
 
     Returns a single ``NeuralIL[withMorse]`` when ``is_ensemble`` is
     False, otherwise the corresponding ``PlainEnsemble[withMorse]``
-    wrapper.
+    wrapper. ``morse_type`` selects the Morse flavour (``"RepulsiveMorse"``
+    or ``"Morse"``); ignored when ``has_morse`` is False.
     """
     descriptor_gen = PowerSpectrumGenerator(
         n_max, r_cutoff, n_types, supercell_trafo,
@@ -119,14 +121,11 @@ def _build_dynamics_model(
     core_model = ResNetCore(core_widths)
 
     if has_morse:
-        # neuralil >= some-version replaced ``morse_type`` with a flax
-        # ``mixer`` submodule.  Constructing with defaults reproduces
-        # the layout the pickle was trained against (since the pickle
-        # encodes whatever module tree the installed neuralil exposes).
         individual = NeuralILwithMorse(
             n_types, embed_d, r_cutoff,
             descriptor_gen, descriptor_gen.process_some_data,
             core_model,
+            morse_type=morse_type,
         )
     else:
         individual = NeuralIL(
@@ -169,6 +168,7 @@ class NeuralILBackend:
         has_morse: bool,
         n_ensemble: int = 1,
         energy_shift_per_atom: float = 0.0,
+        morse_type: str = "RepulsiveMorse",
     ):
         self.r_cutoff = r_cutoff
         self.model_params = model_params
@@ -180,6 +180,7 @@ class NeuralILBackend:
         self.is_ensemble = is_ensemble
         self.n_ensemble = n_ensemble if is_ensemble else 1
         self.has_morse = has_morse
+        self.morse_type = morse_type
         self.energy_shift_per_atom = float(energy_shift_per_atom)
         self._dynamics_model = _build_dynamics_model(
             n_types=len(sorted_elements),
@@ -191,6 +192,7 @@ class NeuralILBackend:
             has_morse=has_morse,
             is_ensemble=is_ensemble,
             n_ensemble=self.n_ensemble,
+            morse_type=morse_type,
         )
 
     @property
@@ -319,11 +321,29 @@ def create_neuralil(
             specific_info.get("energy_shift_per_atom", 0.0)
         )
 
+    # The Morse flavour (full ``MorseModel`` vs purely-repulsive
+    # ``RepulsiveMorseModel``) is *not* recoverable from the flax params
+    # — both classes share the same parameter tree.  Training writes it
+    # into ``constructor_kwargs``; we read it back here and pass it to
+    # ``NeuralILwithMorse(...)``.  Older pickles have
+    # ``constructor_kwargs={}``: fall back to the new default and warn.
+    ckwargs = getattr(model_info, "constructor_kwargs", None) or {}
+    if has_morse and "morse_type" not in ckwargs:
+        logger.warning(
+            "NeuralIL pickle has no 'morse_type' in constructor_kwargs; "
+            "defaulting to 'RepulsiveMorse'. If this model was trained "
+            "with the full MorseModel, pass morse_type='Morse' or "
+            "edit the pickle's constructor_kwargs."
+        )
+    morse_type = ckwargs.get("morse_type", "RepulsiveMorse")
+
     logger.info(
         "NeuralIL backend created: r_cut=%.2f, elements=%s, supercell=%s, "
-        "ensemble=%s, n_ensemble=%d, morse=%s, energy_shift_per_atom=%g",
+        "ensemble=%s, n_ensemble=%d, morse=%s, morse_type=%s, "
+        "energy_shift_per_atom=%g",
         model_info.r_cut, model_info.sorted_elements, supercell_trafo,
-        is_ensemble, n_ensemble, has_morse, energy_shift_per_atom,
+        is_ensemble, n_ensemble, has_morse, morse_type,
+        energy_shift_per_atom,
     )
 
     return NeuralILBackend(
@@ -337,5 +357,6 @@ def create_neuralil(
         is_ensemble=is_ensemble,
         n_ensemble=n_ensemble,
         has_morse=has_morse,
+        morse_type=morse_type,
         energy_shift_per_atom=energy_shift_per_atom,
     )

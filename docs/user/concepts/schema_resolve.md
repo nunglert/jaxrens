@@ -199,28 +199,32 @@ burn-in and the NS step will compile against (same JIT cache slot).
 ```{mermaid}
 %%{init: {"layout": "elk"}}%%
 flowchart LR
-    FN["_finalise_initial_energies_and_counts(<br>backend, positions, types, cells,<br>batcher, ladder, offset,<br>pressures=None)"]
-    HAS{"backend has<br>max_neighbors_for?"}
-    CNT["counts = batcher.wrap_for_batch(<br>vmap(max_neighbors_for))(positions, cells)"]
-    BUCK["init_bucket =<br>_choose_starting_bucket(counts, ladder, offset)"]
-    EN["energies = batcher.wrap_for_batch(<br>vmap(backend(…, init_bucket)))<br>(positions, cells [, ensemble_params])"]
-    EN0["energies = batcher.wrap_for_batch(<br>vmap(backend(…, 0)))<br>(positions, cells [, ensemble_params])"]
-    OUTF["(energies, counts)"]
+    subgraph FIN["_finalise_initial_energies_and_counts"]
+        direction LR
+        FN["backend, positions, types, cells,<br>batcher, ladder, offset,<br>pressures=None"]
+        HAS{"backend has<br>max_neighbors_for?"}
+        CNT["counts = batcher.wrap_for_batch(<br>vmap(max_neighbors_for))(positions, cells)"]
+        BUCK["init_bucket =<br>_choose_starting_bucket(counts, ladder, offset)"]
+        EN["energies = batcher.wrap_for_batch(<br>vmap(backend(…, init_bucket)))<br>(positions, cells [, ensemble_params])"]
+        EN0["energies = batcher.wrap_for_batch(<br>vmap(backend(…, 0)))<br>(positions, cells [, ensemble_params])"]
+        OUTF["(energies, counts)"]
 
-    FN --> HAS
-    HAS -- yes --> CNT --> BUCK --> EN --> OUTF
-    HAS -- no --> EN0 --> OUTF
+        FN --> HAS
+        HAS -- yes --> CNT --> BUCK --> EN --> OUTF
+        HAS -- no --> EN0 --> OUTF
+    end
 
-    classDef finBox fill:#fff7e0,stroke:#a07000,color:#5a4000
-    classDef finInner fill:#fffbef,stroke:#d8a23e,color:#5a4000
+    classDef pyBox fill:#f5f5f5,stroke:#888,color:#222
     classDef decision fill:#eef5ff,stroke:#1565c0,color:#222
-    FN:::finBox
-    OUTF:::finBox
-    CNT:::finInner
-    BUCK:::finInner
-    EN:::finInner
-    EN0:::finInner
+    classDef finFrame fill:#fff7e0,stroke:#a07000,stroke-width:2px,color:#5a4000
+    FN:::pyBox
+    OUTF:::pyBox
+    CNT:::pyBox
+    BUCK:::pyBox
+    EN:::pyBox
+    EN0:::pyBox
     HAS:::decision
+    class FIN finFrame
 ```
 
 `pressures` is only passed in by the multi-replica branch, where
@@ -258,10 +262,14 @@ flowchart TB
         direction TB
         S1["base_backend = root.backend.build_backend()"]
         S2["init_backend =<br>EnsembleBackend(base, P) if P else base<br>(P from ensemble_params)"]
-        S3["init = _resolve_init(<br>root.init, n_live, seed=root.run.seed,<br>init_backend, cell_cfg)"]
-        S4["(energies, counts) =<br>_finalise_initial_energies_and_counts(<br>init_backend, positions, types, cells,<br>batcher=SingleRun(), ladder, offset)"]
+        subgraph S3box["_resolve_init"]
+            S3in["root.init, n_live,<br>seed=root.run.seed,<br>init_backend, cell_cfg"]
+        end
+        subgraph S4box["_finalise_initial_energies_and_counts"]
+            S4in["init_backend, positions, types, cells,<br>batcher=SingleRun(),<br>ladder, offset"]
+        end
         S5["return ResolvedConfig(<br>batcher=SingleRun(),<br>ensemble_params_per_run=(eparams,))"]
-        S1 --> S2 --> S3 --> S4 --> S5
+        S1 --> S2 --> S3in --> S4in --> S5
     end
 
     %% --- multi-replica branch (resolve.py:1181) ---
@@ -271,34 +279,51 @@ flowchart TB
         M2["base_backend = root.backend.build_backend()<br>(once, outside the loop)"]
         M3(["for r in range(n_total)"])
         M3a["P_r = params_per_run[r].get('pressure')<br>per_run_backend =<br>EnsembleBackend(base, P_r) if P_r else base"]
-        M3b["init_r = _resolve_init(<br>root.init, n_live,<br>seed=root.run.seed + r,<br>per_run_backend, cell_cfg)"]
+        subgraph M3box["_resolve_init"]
+            M3bin["root.init, n_live,<br>seed=root.run.seed + r,<br>per_run_backend, cell_cfg"]
+        end
         M4["jnp.stack per-replica init along axis 0<br>→ (n_total, K, …)"]
         M5["reshape → (G, P, K, …)"]
         M6["finalize_backend =<br>EnsembleBackend(base, P=0.0) if any_pressure else base"]
-        M7["(energies, counts) =<br>_finalise_initial_energies_and_counts(<br>finalize_backend, (G,P,K,N,3) positions,<br>types, (G,P,K,3,3) cells,<br>batcher=PmapVmapRuns,<br>ladder, offset,<br>pressures=(G,P))"]
+        subgraph M7box["_finalise_initial_energies_and_counts"]
+            M7in["finalize_backend,<br>(G,P,K,N,3) positions, types, (G,P,K,3,3) cells,<br>batcher=PmapVmapRuns,<br>ladder, offset, pressures=(G,P)"]
+        end
         M8["reshape (G,P,K,…) back to (n_total, K, …)<br>(downstream dispatcher input)"]
         M9["return ResolvedConfig(<br>batcher=PmapVmapRuns(G,P),<br>ensemble_params_per_run=tuple(params_per_run))"]
         M1 --> M2 --> M3
-        M3 --> M3a --> M3b
-        M3b -.->|"replica r built;<br>loop continues"| M3
-        M3 -->|"all n_total replicas built"| M4 --> M5 --> M6 --> M7 --> M8 --> M9
+        M3 --> M3a --> M3bin
+        M3bin -.->|"replica r built;<br>loop continues"| M3
+        M3 -->|"all n_total replicas built"| M4 --> M5 --> M6 --> M7in --> M8 --> M9
     end
 
     BR -- yes --> S1
     BR -- no --> M1
 
     classDef pyBox fill:#f5f5f5,stroke:#888,color:#222
-    classDef initBox fill:#e0f2f1,stroke:#00897b,color:#004d40
-    classDef finBox fill:#fff7e0,stroke:#a07000,color:#5a4000
+    classDef initFrame fill:#e0f2f1,stroke:#00897b,stroke-width:2px,color:#004d40
+    classDef finFrame fill:#fff7e0,stroke:#a07000,stroke-width:2px,color:#5a4000
     classDef decision fill:#eef5ff,stroke:#1565c0,color:#222
-    S:::pyBox
-    M:::pyBox
-    S3:::initBox
-    M3b:::initBox
-    S4:::finBox
-    M7:::finBox
+    S1:::pyBox
+    S2:::pyBox
+    S3in:::pyBox
+    S4in:::pyBox
+    S5:::pyBox
+    M1:::pyBox
+    M2:::pyBox
+    M3a:::pyBox
+    M3bin:::pyBox
+    M4:::pyBox
+    M5:::pyBox
+    M6:::pyBox
+    M7in:::pyBox
+    M8:::pyBox
+    M9:::pyBox
     GUARD:::decision
     BR:::decision
+    class S3box initFrame
+    class M3box initFrame
+    class S4box finFrame
+    class M7box finFrame
 ```
 
 Reading the diagram:
@@ -306,18 +331,20 @@ Reading the diagram:
 - The prelude (`_apply_interval_units` → `_derive_replica_axes` →
   restart guard → topology branch) is the first ~30 lines of
   `resolve()`. After that the two branches are entirely separate.
-- **Teal** boxes (`_resolve_init(...)`) and **amber** boxes
-  (`_finalise_initial_energies_and_counts(...)`) are call sites for
-  the two mini-diagrams above; the color matches the box color used
-  in the corresponding standalone diagram.
+- Inner step boxes are gray — same as every other resolver step.
+  The two subroutines that have their own mini-diagrams above are
+  shown as **colored wrappers** around the gray call-args box:
+  teal frame for `_resolve_init`, amber frame for
+  `_finalise_initial_energies_and_counts`. The wrapper's name
+  matches the mini-diagram heading so the reader can drill in.
 - `_resolve_single_replica` is linear: build backend → wrap → init
-  (teal) → finalize (amber) → return.
+  (teal wrapper) → finalize (amber wrapper) → return.
 - `_resolve_multi_replica` has the per-replica Python loop on the
   inside (`build_backend` runs *once* outside it; `EnsembleBackend`
-  wrap and `_resolve_init` (teal) run *n_total* times); then the
-  stack-reshape-finalize (amber)-reshape chain produces the final
-  `(n_total, K, …)` arrays.
-- The amber `_finalise_…` call is the only JIT-compiled work in
+  wrap and `_resolve_init` (teal wrapper) run *n_total* times);
+  then the stack-reshape-finalize (amber wrapper)-reshape chain
+  produces the final `(n_total, K, …)` arrays.
+- The amber `_finalise_…` wrapper is the only JIT-compiled work in
   the resolver. Everything else is plain Python shuffling pydantic
   specs into dataclasses.
 

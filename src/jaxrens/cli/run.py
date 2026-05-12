@@ -36,6 +36,7 @@ from jaxrens.sampling.nested_sampling import (
     init_ns_parallel,
     run_ns,
     run_ns_multi_gpu,
+    run_ns_sharded,
 )
 from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
 
@@ -829,6 +830,193 @@ def run_multi_gpu_from_config(resolved) -> dict:
         max_neighbors_offset=resolved.backend.max_neighbors_offset,
         initial_max_neighbor_counts=post_burn_in_counts,
         batcher=resolved.batcher,
+        **full_auto_kwargs,
+    )
+    return result
+
+
+def run_sharded_from_config(resolved) -> dict:
+    """Execute a sharded-single NS dispatch from a sharded ``ResolvedConfig``.
+
+    One logical NS run with its ``n_live`` walker population sharded
+    across ``shard_n_gpu`` GPUs.  Sibling of :func:`run_from_config`
+    (one population on one device) and :func:`run_multi_gpu_from_config`
+    (G*P independent populations).
+
+    The resolver populates ``resolved.batcher`` with a
+    :class:`ShardedSingleRun(n_gpu=...)` and keeps the init arrays in
+    the flat ``(K, ...)`` layout — ``init_ns_sharded`` (inside
+    ``run_ns_sharded``) does the reshape and per-device placement.
+
+    Burn-in is intentionally skipped in v1: the existing
+    :func:`initial_walk` codepath assumes the SingleRun / VmapRuns /
+    PmapVmapRuns shape contracts and is not yet sharded-aware.
+    A clear warning is logged when ``initial_walk`` is configured.
+    """
+    from jaxrens.io.adaptation_log import AdaptationLogger
+
+    ns = resolved.ns
+    batcher = resolved.batcher  # ShardedSingleRun
+    n_gpu = batcher.n_gpu
+    n_live = ns.n_live
+
+    base_backend = resolved.base_backend
+    backend = EnsembleBackend(base_backend, pressure=0.0)
+    init_fn, step_fn, per_move_fns = build_mwg(
+        backend, list(resolved.move_descriptors),
+    )
+
+    working_dir = resolved.output.working_dir
+    working_dir.mkdir(parents=True, exist_ok=True)
+
+    positions = resolved.init.initial_positions  # (K, A, 3)
+    types = resolved.init.initial_types
+    cells = resolved.init.initial_cells
+    energies = resolved.init.initial_energies
+
+    if positions.shape[0] != n_live:
+        raise RuntimeError(
+            f"run_sharded_from_config: init positions axis 0 is "
+            f"{positions.shape[0]} but n_live={n_live}."
+        )
+
+    burn_in_cfg = resolved.initial_walk_config
+    if burn_in_cfg is not None and burn_in_cfg.n_walks > 0:
+        logger.warning(
+            "Burn-in (initial_walk) is configured (n_walks=%d) but is not "
+            "yet supported on the sharded single-run path.  Skipping burn-in "
+            "for this run.  Followup: extend initial_walk to handle "
+            "ShardedSingleRun.",
+            burn_in_cfg.n_walks,
+        )
+
+    key = jax.random.key(ns.seed)
+
+    ensemble_params = (
+        resolved.ensemble_params_per_run[0]
+        if resolved.ensemble_params_per_run
+        else None
+    )
+
+    callbacks: list[Any] = [
+        ProgressCallback(info_interval=resolved.output.info_interval),
+        EnergyCheckCallback(),
+    ]
+
+    symbol_map = resolved.init.symbol_map
+    callbacks.append(
+        CheckpointCallback(
+            working_dir=working_dir,
+            interval=resolved.output.checkpoint_interval,
+            prefix=resolved.output.out_file_prefix,
+            symbol_map=symbol_map,
+        )
+    )
+
+    if (memprof := os.environ.get("JAXRENS_MEMPROF")):
+        callbacks.append(MemProfileCallback(working_dir / memprof))
+
+    n_atoms = positions.shape[-2]
+    traj_path = (
+        working_dir
+        / f"{resolved.output.out_file_prefix}.traj.{resolved.output.format}"
+    )
+    writer = create_trajectory_writer(
+        resolved.output.format, traj_path, symbol_map,
+    )
+    energy_path = (
+        working_dir / f"{resolved.output.out_file_prefix}.energies"
+    )
+    energy_logger = EnergyLogger(
+        energy_path, n_walkers=n_live, n_atoms=n_atoms,
+    )
+    callbacks.append(
+        TrajectoryCallback(
+            writer=writer,
+            energy_logger=energy_logger,
+            traj_interval=resolved.output.traj_interval,
+            snapshot_interval=resolved.output.snapshot_interval,
+        )
+    )
+
+    if resolved.move_descriptors:
+        adapt_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.adaptation.h5"
+        )
+        move_name_list = [d.name for d in resolved.move_descriptors]
+        adaptation_logger = AdaptationLogger(
+            path=adapt_log_path,
+            move_names=move_name_list,
+            n_runs=1,
+        )
+        callbacks.append(AdaptationCallback(adaptation_logger))
+
+    if resolved.move_descriptors and getattr(
+        resolved.output, "save_acc_rates", False,
+    ):
+        from jaxrens.io.acc_rates_log import AccRatesLogger
+        from jaxrens.cli.monitor import AccRatesCallback
+
+        acc_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.acc_rates.h5"
+        )
+        acc_logger = AccRatesLogger(
+            path=acc_log_path,
+            move_names=[d.name for d in resolved.move_descriptors],
+            n_runs=1,
+        )
+        callbacks.append(AccRatesCallback(
+            acc_logger,
+            interval=int(getattr(resolved.output, "acc_rates_interval", 1)),
+        ))
+
+    first_mc = resolved.moves[0]
+    full_auto_kwargs: dict[str, Any] = {}
+    if resolved.adaptation_cfg is not None and resolved.adaptation_cfg.full_auto:
+        adjust_factor = (
+            resolved.adaptation_cfg.defaults.adjust_factor
+            if resolved.adaptation_cfg.defaults.adjust_factor is not None
+            else 1.5
+        )
+        full_auto_kwargs = dict(
+            per_move_fns=per_move_fns,
+            adjust_interval=resolved.adaptation_cfg.adjust_interval,
+            adjust_n_samples=resolved.adaptation_cfg.adjust_n_samples,
+            adjust_max_rounds=resolved.adaptation_cfg.adjust_max_rounds,
+            adjust_factor=adjust_factor,
+        )
+
+    logger.info(
+        "Starting sharded-single NS: n_gpu=%d, n_live=%d "
+        "(K_per_gpu=%d), n_mcmc=%d, max_iter=%s",
+        n_gpu, n_live, n_live // n_gpu,
+        ns.n_mcmc_steps, ns.max_iterations,
+    )
+
+    result = run_ns_sharded(
+        positions=positions,
+        types=types,
+        energies=energies,
+        cells=cells,
+        init_fn=init_fn,
+        step_fn=step_fn,
+        rng_key=key,
+        n_gpu=n_gpu,
+        n_walkers=n_live,
+        max_iterations=ns.max_iterations,
+        n_mcmc_steps=ns.n_mcmc_steps,
+        n_extra=ns.n_extra,
+        convergence_threshold=ns.convergence_threshold,
+        initial_step_size=first_mc.step_size,
+        target_acceptance=first_mc.target_acceptance,
+        callbacks=callbacks,
+        termination_criteria=list(resolved.termination),
+        ensemble_params=ensemble_params,
+        move_descriptors=list(resolved.move_descriptors),
+        max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
+        max_neighbors_offset=resolved.backend.max_neighbors_offset,
+        initial_max_neighbor_counts=resolved.init.initial_max_neighbor_counts,
+        batcher=batcher,
         **full_auto_kwargs,
     )
     return result

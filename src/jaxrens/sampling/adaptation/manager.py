@@ -17,8 +17,11 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, Key
 
-from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
-from jaxrens.sampling.batch_descriptor import BatchDescriptor
+from jaxrens.sampling.adaptation.stepsize_handler import (
+    adjust_step_size,
+    adjust_step_size_sharded,
+)
+from jaxrens.sampling.batch_descriptor import BatchDescriptor, ShardedSingleRun
 from jaxrens.sampling.move_kernel import MoveKernel
 
 logger = logging.getLogger(__name__)
@@ -235,6 +238,18 @@ class AdaptationManager:
         SingleRun (``jit``), VmapRuns (``jit(vmap(...))``), and PmapVmapRuns
         (``pmap(vmap(...))``).
         """
+        # Select the underlying step-size adjustment function once.
+        # For ShardedSingleRun the bisection's accept/eval counters need
+        # ``lax.psum`` across the shard axis (since each shard samples
+        # locally) — ``adjust_step_size_sharded`` does that internally.
+        # All other batchers (SingleRun / VmapRuns / PmapVmapRuns) use
+        # the plain function; cross-replica aggregation is not desired
+        # because those modes run *independent* replicas.
+        if isinstance(self._batcher, ShardedSingleRun):
+            adjust_fn = adjust_step_size_sharded
+        else:
+            adjust_fn = adjust_step_size
+
         fns: list[Callable] = []
         for move_idx, desc in enumerate(self._move_descriptors):
             move_fn = self._per_move_fns[move_idx]
@@ -254,8 +269,9 @@ class AdaptationManager:
                 _afac=afac,
                 _max_ss=max_ss,
                 _max_rounds=max_rounds,
+                _adjust_fn=adjust_fn,
             ):
-                return adjust_step_size(
+                return _adjust_fn(
                     pop, _move_fn, ss, emax, key,
                     _n_samp, _min_r, _max_r, _afac, _max_ss, _max_rounds,
                 )

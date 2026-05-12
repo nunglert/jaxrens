@@ -210,8 +210,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         ).rstrip(),
     )
 
-    from jaxrens.sampling.batch_descriptor import SingleRun
-    from jaxrens.cli.run import run_multi_gpu_from_config
+    from jaxrens.sampling.batch_descriptor import (
+        ShardedSingleRun,
+        SingleRun,
+    )
+    from jaxrens.cli.run import (
+        run_multi_gpu_from_config,
+        run_sharded_from_config,
+    )
 
     resolved = resolve(root)
 
@@ -223,6 +229,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
             f" pressure={pressure:.4g}" if pressure is not None else "",
         )
         _run_single(resolved)
+    elif isinstance(resolved.batcher, ShardedSingleRun):
+        pressure = resolved.ensemble_params_per_run[0].get("pressure")
+        logger.info(
+            "[sharded-single] seed=%d n_gpu=%d n_live=%d (K_per_gpu=%d)%s",
+            resolved.ns.seed,
+            resolved.batcher.n_gpu,
+            resolved.ns.n_live,
+            resolved.ns.n_live // resolved.batcher.n_gpu,
+            f" pressure={pressure:.4g}" if pressure is not None else "",
+        )
+        run_sharded_from_config(resolved)
     else:
         logger.info(
             "[multi-replica] n_gpu=%d n_per_gpu=%d n_total=%d pressures=%s",
@@ -256,7 +273,10 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         )
         return 0
 
-    from jaxrens.sampling.batch_descriptor import SingleRun
+    from jaxrens.sampling.batch_descriptor import (
+        ShardedSingleRun,
+        SingleRun,
+    )
 
     resolved = resolve(root)
     n_moves = len(resolved.moves)
@@ -265,6 +285,11 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
     if isinstance(resolved.batcher, SingleRun):
         topology_line = "  topology: SingleRun (1 replica, 1 GPU)\n"
+    elif isinstance(resolved.batcher, ShardedSingleRun):
+        topology_line = (
+            f"  topology: ShardedSingleRun "
+            f"(1 replica, sharded across {resolved.batcher.n_gpu} GPUs)\n"
+        )
     else:
         topology_line = (
             f"  topology: n_gpu={resolved.ns.n_gpu} × "

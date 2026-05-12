@@ -227,6 +227,7 @@ def _run_loop(
     inter_re_mgr: InterREManager | None = None,
     max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
+    ns_step_fn: Callable | None = None,
 ) -> tuple[NSState, Key[Array, "*B"], dict[str, np.ndarray]]:
     """Unified NS outer loop shared by ``run_ns`` and ``run_ns_parallel``.
 
@@ -281,8 +282,12 @@ def _run_loop(
     """
     from jaxrens.sampling.nested_sampling import ns_step  # avoid circular at module level
 
-    # JIT-compile ns_step once before the loop.
-    jit_ns_step = batcher.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
+    # JIT-compile ns_step once before the loop.  Callers may override
+    # the underlying step function (e.g. ``ns_step_sharded`` for the
+    # ShardedSingleRun mode) via ``ns_step_fn``; default preserves the
+    # SingleRun / VmapRuns / PmapVmapRuns behaviour.
+    step_to_wrap = ns_step_fn if ns_step_fn is not None else ns_step
+    jit_ns_step = batcher.wrap_step(step_to_wrap, step_fn, n_mcmc_steps, n_extra)
 
     # Per-replica step sizes: pop.step_sizes is (*shape_prefix, K, n_moves).
     # The descriptor drops the walker axis to give (*shape_prefix, n_moves).

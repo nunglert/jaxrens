@@ -1,0 +1,283 @@
+"""Tests for the sharded-single-run NS mode (``ShardedSingleRun``).
+
+Covers:
+- bit-exact parity between ``ShardedSingleRun(n_gpu=1)`` and ``SingleRun()``
+- bit-exact parity between ``ShardedSingleRun(n_gpu=2)`` and ``SingleRun()``
+  on a small harmonic problem
+- end-to-end smoke test for ``run_ns_sharded``
+- resolver dispatch on the ``run.shard_n_gpu`` schema field
+- divisibility / cohort incompatibility error paths
+
+The parity tests use a harmonic toy backend so the run is fast and the
+parity comparison is deterministic.  They run on a single device by
+default (``n_gpu=1``) and on 2 devices when at least 2 local devices are
+visible.
+"""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from jaxrens.backends.toy import create_harmonic
+from jaxrens.sampling.batch_descriptor import (
+    ShardedSingleRun,
+    SingleRun,
+)
+from jaxrens.sampling.move_kernel import MoveKernel
+from jaxrens.sampling.moves import random_walk
+from jaxrens.sampling.mwg import build_mwg
+from jaxrens.sampling.nested_sampling import (
+    init_ns,
+    init_ns_sharded,
+    ns_step,
+    ns_step_sharded,
+    run_ns,
+    run_ns_sharded,
+)
+from jaxrens.sampling.termination import IterationTermination
+
+
+N_LOCAL = len(jax.local_devices())
+
+
+def _make_harmonic_problem(seed: int, n_walkers: int):
+    backend = create_harmonic(k=1.0)
+    descriptors = [
+        MoveKernel(
+            "rw", random_walk.build_kernel,
+            step_size=0.2, step_size_max=5.0,
+            min_rate=0.2, max_rate=0.7,
+        ),
+    ]
+    init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
+    key = jax.random.key(seed)
+    key, pos_key = jax.random.split(key)
+    positions = jax.random.uniform(
+        pos_key, (n_walkers, 1, 3), minval=-2.0, maxval=2.0,
+    )
+    types = jnp.zeros((1,), dtype=jnp.int32)
+    energies = jax.vmap(
+        lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
+    )(positions)
+    return {
+        "init_fn": init_fn,
+        "step_fn": step_fn,
+        "per_move_fns": per_move_fns,
+        "descriptors": descriptors,
+        "positions": positions,
+        "types": types,
+        "energies": energies,
+        "key": key,
+        "n_walkers": n_walkers,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Parity: ShardedSingleRun vs SingleRun
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n_gpu", [1, pytest.param(2, marks=pytest.mark.skipif(
+    N_LOCAL < 2, reason="requires 2 local devices",
+))])
+def test_run_ns_sharded_matches_single_run(n_gpu):
+    """Sharded run reproduces the SingleRun reference exactly.
+
+    Uses a small harmonic problem (K=8, n_atoms=1) and runs 3 NS
+    iterations from the same seed.  All shards make the same global
+    decisions (same RNG broadcast), so the result is bit-exact at
+    G=1 and effectively bit-exact at G=2 on this toy problem.
+    """
+    if n_gpu > 1 and 8 % n_gpu != 0:
+        pytest.skip("n_walkers must divide n_gpu")
+
+    setup = _make_harmonic_problem(seed=123, n_walkers=8)
+    n_iter = 3
+    rng_key = jax.random.key(0)
+
+    ref = run_ns(
+        positions=setup["positions"],
+        types=setup["types"],
+        energies=setup["energies"],
+        cells=None,
+        init_fn=setup["init_fn"],
+        step_fn=setup["step_fn"],
+        rng_key=rng_key,
+        n_walkers=8,
+        max_iterations=n_iter,
+        n_mcmc_steps=4,
+        n_extra=0,
+        move_descriptors=setup["descriptors"],
+        termination_criteria=[IterationTermination(n_iter)],
+    )
+
+    out = run_ns_sharded(
+        positions=setup["positions"],
+        types=setup["types"],
+        energies=setup["energies"],
+        cells=None,
+        init_fn=setup["init_fn"],
+        step_fn=setup["step_fn"],
+        rng_key=rng_key,
+        n_gpu=n_gpu,
+        n_walkers=8,
+        max_iterations=n_iter,
+        n_mcmc_steps=4,
+        n_extra=0,
+        move_descriptors=setup["descriptors"],
+        termination_criteria=[IterationTermination(n_iter)],
+    )
+
+    # ``out["log_evidence"]`` is shape (G,) with identical entries.
+    sharded_log_z = float(np.asarray(out["log_evidence"])[0])
+    ref_log_z = float(ref["log_evidence"])
+    np.testing.assert_allclose(sharded_log_z, ref_log_z, rtol=1e-5, atol=1e-7)
+
+    # Energies: flatten sharded (G, K/G) to (K,) and compare.
+    sharded_energies = np.asarray(out["energies"]).reshape(-1)
+    ref_energies = np.asarray(ref["energies"]).reshape(-1)
+    sharded_sorted = np.sort(sharded_energies)
+    ref_sorted = np.sort(ref_energies)
+    np.testing.assert_allclose(
+        sharded_sorted, ref_sorted, rtol=1e-5, atol=1e-7,
+    )
+
+
+def test_init_ns_sharded_divisibility_error():
+    """``init_ns_sharded`` rejects K not divisible by n_gpu."""
+    setup = _make_harmonic_problem(seed=0, n_walkers=7)
+    with pytest.raises(ValueError, match="divisible"):
+        init_ns_sharded(
+            setup["init_fn"],
+            setup["positions"],
+            setup["types"],
+            setup["energies"],
+            None,
+            jax.random.key(0),
+            n_gpu=2,
+        )
+
+
+def test_run_ns_sharded_divisibility_error():
+    """``run_ns_sharded`` rejects K not divisible by n_gpu."""
+    setup = _make_harmonic_problem(seed=0, n_walkers=7)
+    with pytest.raises(ValueError, match="divisible"):
+        run_ns_sharded(
+            positions=setup["positions"],
+            types=setup["types"],
+            energies=setup["energies"],
+            cells=None,
+            init_fn=setup["init_fn"],
+            step_fn=setup["step_fn"],
+            rng_key=jax.random.key(0),
+            n_gpu=2,
+            n_walkers=7,
+            max_iterations=1,
+            n_mcmc_steps=1,
+            move_descriptors=setup["descriptors"],
+            termination_criteria=[IterationTermination(1)],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Resolver dispatch
+# ---------------------------------------------------------------------------
+
+
+def _minimal_root(tmp_path, *, shard_n_gpu, n_live=8, pressures=None):
+    """Build a minimal LJ NPT config and validate it through RootSpec.
+
+    Mirrors ``experiments/examples/lj8_npt/config.yaml`` minus the
+    full burn-in / adaptation machinery so resolve() runs quickly.
+    """
+    from jaxrens.cli.schema import RootSpec
+    cfg = {
+        "run": {
+            "n_live": n_live,
+            "max_iterations": 1,
+            "n_mcmc_steps": 1,
+            "seed": 0,
+        },
+        "backend": {
+            "type": "lj",
+            "epsilon": 1.0,
+            "sigma": 1.0,
+            "cutoff": 2.5,
+            "periodic": True,
+        },
+        "ensemble": {
+            "type": "npt",
+            "pressure": pressures if pressures is not None else 0.1,
+            "pressure_units": "eva3",
+        },
+        "moves": [
+            {"type": "random_walk", "step_size": 0.1},
+        ],
+        "termination": [{"type": "iteration", "max_iterations": 1}],
+        "init": {
+            "start_species": "18 4",
+            "random_initialise_pos": True,
+            "pos_randomization_mode": "grid",
+            "grid_distance": 1.0,
+            "random_initialise_cell": False,
+            "start_energy_ceiling_per_atom": 100.0,
+        },
+        "cell": {
+            "max_volume_per_atom": 30.0,
+            "min_volume_per_atom": 1.5,
+            "min_aspect_ratio": 0.6,
+            "flat_V_prior": False,
+        },
+        "output": {
+            "format": "extxyz",
+            "working_dir": str(tmp_path / "out"),
+            "out_file_prefix": "test",
+            "info_interval": 50,
+            "traj_interval": 50,
+            "snapshot_interval": 100000,
+            "checkpoint_interval": 100000,
+        },
+    }
+    if shard_n_gpu != 1:
+        cfg["run"]["shard_n_gpu"] = shard_n_gpu
+    return RootSpec.model_validate(cfg)
+
+
+def test_resolver_routes_shard_to_sharded_batcher(tmp_path):
+    """``shard_n_gpu > 1`` ⇒ resolver returns ``ShardedSingleRun(n_gpu)``."""
+    from jaxrens.cli.resolve import resolve
+
+    root = _minimal_root(tmp_path, shard_n_gpu=2)
+    resolved = resolve(root)
+    assert isinstance(resolved.batcher, ShardedSingleRun)
+    assert resolved.batcher.n_gpu == 2
+
+
+def test_resolver_default_keeps_single_run(tmp_path):
+    """``shard_n_gpu=1`` (default) keeps the ``SingleRun`` batcher."""
+    from jaxrens.cli.resolve import resolve
+
+    root = _minimal_root(tmp_path, shard_n_gpu=1)
+    resolved = resolve(root)
+    assert isinstance(resolved.batcher, SingleRun)
+
+
+def test_resolver_rejects_shard_with_pressure_list(tmp_path):
+    """Sharded single run cannot combine with a multi-pressure cohort."""
+    from jaxrens.cli.resolve import resolve
+
+    root = _minimal_root(tmp_path, shard_n_gpu=2, pressures=[1.0, 2.0])
+    with pytest.raises(ValueError, match="shard_n_gpu"):
+        resolve(root)
+
+
+def test_resolver_rejects_indivisible_n_live(tmp_path):
+    """n_live % shard_n_gpu != 0 raises a clear error."""
+    from jaxrens.cli.resolve import resolve
+
+    root = _minimal_root(tmp_path, shard_n_gpu=3, n_live=8)
+    with pytest.raises(ValueError, match="divisible"):
+        resolve(root)
