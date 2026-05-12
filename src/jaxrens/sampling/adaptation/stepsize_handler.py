@@ -21,20 +21,24 @@ from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float, Int, Key
 
 from jaxrens.utils.padding import pad_to_multiple
 
 
 def _process_rate_jax(
-    rate: jnp.ndarray,
-    step_size: jnp.ndarray,
-    step_size_prev: jnp.ndarray,
-    rate_prev: jnp.ndarray,
+    rate: Float[Array, ""],
+    step_size: Float[Array, ""],
+    step_size_prev: Float[Array, ""],
+    rate_prev: Float[Array, ""],
     min_rate: float,
     max_rate: float,
     adjust_factor: float,
     max_step_size: float,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[
+    Float[Array, ""], Bool[Array, ""], Bool[Array, ""],
+    Bool[Array, ""], Bool[Array, ""], Bool[Array, ""],
+]:
     """Branchless rate processing for step size adjustment.
 
     Given an acceptance rate and the target window [min_rate, max_rate],
@@ -91,9 +95,9 @@ def _process_rate_jax(
 def adjust_step_size(
     population: Any,
     move_fn: Callable,
-    step_size: jnp.ndarray,
-    emax: jnp.ndarray,
-    rng_key: jax.Array,
+    step_size: Float[Array, ""],
+    emax: Float[Array, ""],
+    rng_key: Key[Array, ""],
     n_samples: int,
     min_rate: float,
     max_rate: float,
@@ -103,9 +107,9 @@ def adjust_step_size(
     *,
     trial_batch_size: int | None = None,
 ) -> tuple[
-    jnp.ndarray, jnp.ndarray, jnp.ndarray,
-    jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray,
-    jnp.ndarray, jnp.ndarray,
+    Float[Array, ""], Float[Array, ""], Int[Array, "4"],
+    Int[Array, ""], Bool[Array, ""], Int[Array, ""], Int[Array, ""], Bool[Array, ""],
+    Int[Array, ""], Int[Array, ""],
 ]:
     """Adjust step size for one move type until acceptance rate is in window.
 

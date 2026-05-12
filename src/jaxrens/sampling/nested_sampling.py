@@ -611,7 +611,7 @@ def run_ns(
 def init_ns_parallel(
     init_fn: Callable,
     positions: Float[Array, "R K N 3"],
-    types: Int[Array, "R K N"] | Int[Array, "N"],
+    types: Int[Array, "R K N"] | Int[Array, "R N"] | Int[Array, "N"],
     energies: Float[Array, "R K"],
     cells: Float[Array, "R K 3 3"] | None,
     rng_keys: Key[Array, "R"],
@@ -625,7 +625,7 @@ def init_ns_parallel(
 
     Args:
         positions: (n_runs, n_walkers, n_atoms, 3)
-        types: (n_runs, n_walkers, n_atoms) or (n_atoms,)
+        types: (n_runs, n_walkers, n_atoms), (n_runs, n_atoms), or (n_atoms,)
         energies: (n_runs, n_walkers)
         cells: (n_runs, n_walkers, 3, 3) or None
         rng_keys: (n_runs,) per-run PRNG keys

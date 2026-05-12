@@ -23,15 +23,20 @@ Design invariants
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jaxtyping import Array, Float, Key
 
 from jaxrens.sampling.adaptation.manager import AdaptationManager
 from jaxrens.sampling.batch_descriptor import BatchDescriptor
+from jaxrens.sampling.inter_re_manager import InterREManager
+from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.termination import PriorMassTermination, check_any
+from jaxrens.state.ns import NSState
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +47,8 @@ logger = logging.getLogger(__name__)
 
 
 def _bump_cumulative_counters(
-    cumulative: dict,
-    info: dict,
+    cumulative: dict[str, np.ndarray],
+    info: dict[str, Any],
     *,
     include_trial: bool = False,
 ) -> None:
@@ -80,7 +85,9 @@ def _bump_cumulative_counters(
         )
 
 
-def _inject_cumulative_into_info(info: dict, cumulative: dict) -> None:
+def _inject_cumulative_into_info(
+    info: dict[str, Any], cumulative: dict[str, np.ndarray],
+) -> None:
     """Write cumulative counter snapshots into *info* for downstream callbacks.
 
     Sets ``info["cumulative_n_evaluations_per_move"]`` and
@@ -99,11 +106,11 @@ def _inject_cumulative_into_info(info: dict, cumulative: dict) -> None:
 
 
 def _pack_adjustment_info(
-    info: dict,
+    info: dict[str, Any],
     *,
-    current_step_sizes: jnp.ndarray,
-    adjust_info: dict,
-    move_descriptors: list,
+    current_step_sizes: Float[Array, "*B n_moves"],
+    adjust_info: dict[str, Any],
+    move_descriptors: list[MoveKernel],
 ) -> None:
     """Pack per-move adjustment diagnostics into *info*.
 
@@ -153,8 +160,8 @@ def _pack_adjustment_info(
 def _dispatch_callbacks(
     callbacks: list,
     iteration: int,
-    ns_state: Any,
-    info: dict,
+    ns_state: NSState,
+    info: dict[str, Any],
 ) -> None:
     """Call ``on_iteration`` on every callback that exposes it.
 
@@ -207,20 +214,20 @@ def _run_loop(
     *,
     batcher: BatchDescriptor,
     adapt_mgr: AdaptationManager,
-    ns_state: Any,
-    step_fn,
+    ns_state: NSState,
+    step_fn: Callable,
     n_mcmc_steps: int,
     n_extra: int,
     termination_criteria: list,
     callbacks: list,
     n_moves: int,
-    move_descriptors: Any,
-    rng_key,
+    move_descriptors: list[MoveKernel] | None,
+    rng_key: Key[Array, "*B"],
     info_interval: int,
-    inter_re_mgr: Any = None,
+    inter_re_mgr: InterREManager | None = None,
     max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
-) -> tuple[Any, Any, dict]:
+) -> tuple[NSState, Key[Array, "*B"], dict[str, np.ndarray]]:
     """Unified NS outer loop shared by ``run_ns`` and ``run_ns_parallel``.
 
     All shape differences between single-run and multi-run execution are

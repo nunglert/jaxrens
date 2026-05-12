@@ -1,0 +1,58 @@
+# bench/configs/jaxmd.yaml — ns_step bench, jax-md Tersoff Si16 NPT.
+#
+# Cheap classical 3-body potential; needs `jax_md` import.
+
+run:
+  n_live: 200
+  max_iterations: 1            # unused — bench bypasses run_ns
+  n_mcmc_steps: 20
+  n_extra: 49
+  seed: 42
+
+backend:
+  type: jaxmd
+  potential: tersoff
+  tersoff_params: si
+  periodic: true
+
+ensemble:
+  type: npt
+  pressure: 1.0
+  pressure_units: gpa
+
+moves:
+  - type: galilean
+    n_reflect: 4
+    step_size: 0.03
+    weight: 2.0
+  - type: volume
+    step_size: 0.05
+    weight: 16.0
+  - type: shear
+    step_size: 0.02
+    weight: 8.0
+  - type: stretch
+    step_size: 0.02
+    weight: 8.0
+
+termination:
+  - type: iteration
+    max_iterations: 1
+
+init:
+  start_species: "14 16"        # 16 Si atoms
+  random_initialise_pos: true
+  pos_randomization_mode: grid
+  grid_distance: 1.5
+  start_energy_ceiling_per_atom: 100.0
+
+cell:
+  max_volume_per_atom: 60.0
+  min_volume_per_atom: 12.0
+  min_aspect_ratio: 0.5
+  flat_V_prior: false
+
+output:
+  format: none
+  working_dir: ./bench/_scratch
+  out_file_prefix: bench_jaxmd

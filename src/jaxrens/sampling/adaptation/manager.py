@@ -11,13 +11,15 @@ vmap (``VmapRuns``) dispatch via the batch descriptor passed at construction.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, TypedDict
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float, Int, Key
 
 from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
 from jaxrens.sampling.batch_descriptor import BatchDescriptor
+from jaxrens.sampling.move_kernel import MoveKernel
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,24 @@ _DIAG_KEYS = (
     "trial_n_evaluations",
     "trial_n_grad_evaluations",
 )
+
+
+class PerMoveDiag(TypedDict):
+    """Stacked-over-moves return type of ``AdaptationManager.apply``.
+
+    Shape prefix ``*B`` is empty for ``SingleRun``, ``(n_runs,)`` for
+    ``VmapRuns``, and ``(G, P)`` for ``PmapVmapRuns``.
+    """
+
+    rate: Float[Array, "*B n_moves"]
+    counts: Int[Array, "*B n_moves 4"]
+    n_rounds: Int[Array, "*B n_moves"]
+    converged: Bool[Array, "*B n_moves"]
+    cap_hits: Int[Array, "*B n_moves"]
+    floor_hits: Int[Array, "*B n_moves"]
+    bracket_detected: Bool[Array, "*B n_moves"]
+    trial_n_evaluations: Int[Array, "*B n_moves"]
+    trial_n_grad_evaluations: Int[Array, "*B n_moves"]
 
 
 class AdaptationManager:
@@ -63,7 +83,7 @@ class AdaptationManager:
 
     def __init__(
         self,
-        move_descriptors: Sequence,
+        move_descriptors: Sequence[MoveKernel],
         per_move_fns: Sequence[Callable] | None,
         batcher: BatchDescriptor,
         adjust_n_samples: int,
@@ -119,10 +139,10 @@ class AdaptationManager:
     def apply(
         self,
         pop: Any,
-        emax: jax.Array,
-        rng_key: jax.Array,
-        current_step_sizes: jax.Array,
-    ) -> tuple[jax.Array, dict, jax.Array]:
+        emax: Float[Array, "*B"],
+        rng_key: Key[Array, "*B"],
+        current_step_sizes: Float[Array, "*B n_moves"],
+    ) -> tuple[Float[Array, "*B n_moves"], PerMoveDiag, Key[Array, "*B"]]:
         """Run one adjust pass across all moves.
 
         Args:

@@ -18,10 +18,11 @@ each iteration.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypedDict
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Key
 
 from jaxrens.sampling.batch_descriptor import (
     BatchDescriptor,
@@ -38,9 +39,20 @@ from jaxrens.sampling.moves.replica_exchange import (
     semi_grand_replica_exchange_step,
     xrens_replica_exchange_step,
 )
+from jaxrens.state.ns import NSState
 
 
-_EMPTY_STATS: dict = {
+class SwapStats(TypedDict):
+    """Public return type of ``InterREManager.apply``'s stats dict."""
+
+    n_swap_pairs_attempted: int
+    n_swap_pairs_accepted: int
+    acceptance_rate: float
+    n_energy_evals: int
+    n_grad_evals: int
+
+
+_EMPTY_STATS: SwapStats = {
     "n_swap_pairs_attempted": 0,
     "n_swap_pairs_accepted": 0,
     "acceptance_rate": 0.0,
@@ -119,8 +131,8 @@ class InterREManager:
         return self._batcher.is_batched and self._every > 0
 
     def apply(
-        self, ns_state: Any, rng_key: jax.Array
-    ) -> tuple[Any, dict, jax.Array]:
+        self, ns_state: NSState, rng_key: Key[Array, ""]
+    ) -> tuple[NSState, SwapStats, Key[Array, ""]]:
         """Run one inter-RE swap pass.
 
         For ``SingleRun``: returns state unchanged with zero stats.
@@ -418,7 +430,7 @@ class InterREManager:
 
         return jit_vmap, jit_pmap
 
-    def _extract_swap_inputs(self, ns_state: Any):
+    def _extract_swap_inputs(self, ns_state: NSState):
         """Extract swap inputs from state.
 
         For VmapRuns the population has shape ``(n_runs, K, ...)``.
@@ -488,7 +500,7 @@ class InterREManager:
             pressures, composition_targets, chemical_potentials,
         )
 
-    def _apply_vmap(self, ns_state: Any, swap_key: jax.Array):
+    def _apply_vmap(self, ns_state: NSState, swap_key: Key[Array, ""]) -> tuple[NSState, SwapStats]:
         """Apply swap pass for VmapRuns descriptor.
 
         State population has shape ``(n_runs, K, ...)``.
@@ -535,7 +547,7 @@ class InterREManager:
         stats = self._build_stats(swap_info)
         return new_ns_state, stats
 
-    def _apply_pmap_vmap(self, ns_state: Any, swap_key: jax.Array):
+    def _apply_pmap_vmap(self, ns_state: NSState, swap_key: Key[Array, ""]) -> tuple[NSState, SwapStats]:
         """Apply swap pass for PmapVmapRuns descriptor.
 
         Population has shape ``(G, P, K, ...)``.  Uses ``lax.all_gather``
@@ -601,7 +613,7 @@ class InterREManager:
         return new_ns_state, stats
 
     @staticmethod
-    def _build_stats(swap_info: dict) -> dict:
+    def _build_stats(swap_info: dict[str, Any]) -> SwapStats:
         """Convert ``replica_exchange_step`` swap_info to the public stats dict.
 
         Args:

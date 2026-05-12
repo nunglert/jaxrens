@@ -1,0 +1,62 @@
+# bench/configs/neuralil.yaml — ns_step bench, locally-trained NeuralIL Si16 NPT.
+#
+# Heavy backend.  Skipped if `neuralil` is missing or the trained
+# `.pkl` model fixture is absent.  Path matches experiments/neuralil_si16/.
+
+run:
+  n_live: 32
+  max_iterations: 1            # unused — bench bypasses run_ns
+  n_mcmc_steps: 20
+  n_extra: 9
+  seed: 42
+
+backend:
+  type: neuralil
+  # Path is resolved against CWD; bench is run from repo root.
+  checkpoint_path: experiments/si_neuralil_train3/model_params_neuralil_SI_92E9131B.pkl
+  supercell_trafo: [3, 3, 3]
+  periodic: true
+  max_neighbors_list: [20, 30, 40, 50, 60]
+  max_neighbors_offset: 4
+
+ensemble:
+  type: npt
+  pressure: 1.0
+  pressure_units: gpa
+
+moves:
+  - type: galilean
+    n_reflect: 4
+    step_size: 0.03
+    weight: 2.0
+  - type: volume
+    step_size: 0.05
+    weight: 16.0
+  - type: shear
+    step_size: 0.02
+    weight: 8.0
+  - type: stretch
+    step_size: 0.02
+    weight: 8.0
+
+termination:
+  - type: iteration
+    max_iterations: 1
+
+init:
+  start_species: "14 16"        # 16 Si atoms
+  random_initialise_pos: true
+  pos_randomization_mode: grid
+  grid_distance: 1.5
+  start_energy_ceiling_per_atom: 100.0
+
+cell:
+  max_volume_per_atom: 60.0
+  min_volume_per_atom: 12.0
+  min_aspect_ratio: 0.5
+  flat_V_prior: false
+
+output:
+  format: none
+  working_dir: ./bench/_scratch
+  out_file_prefix: bench_neuralil
