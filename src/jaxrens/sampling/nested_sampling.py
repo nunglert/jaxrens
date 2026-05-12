@@ -19,6 +19,7 @@ from typing import Any, Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jaxtyping import Array, Float, Int, Key
 
 from jaxrens.base import NSCallback
 from jaxrens.sampling.adaptation.manager import AdaptationManager
@@ -143,16 +144,16 @@ def _get_extra_indices(
 
 def init_ns(
     init_fn: Callable,
-    positions: jnp.ndarray,
-    types: jnp.ndarray,
-    energies: jnp.ndarray,
-    cells: jnp.ndarray | None,
-    rng_key: jax.Array,
-    step_sizes: jnp.ndarray | None = None,
+    positions: Float[Array, "K N 3"],
+    types: Int[Array, "K N"] | Int[Array, "N"],
+    energies: Float[Array, "K"],
+    cells: Float[Array, "K 3 3"] | None,
+    rng_key: Key[Array, ""],
+    step_sizes: Float[Array, "n_moves"] | None = None,
     ensemble_params: dict | None = None,
     restart_state=None,
     max_neighbors: int = 0,
-    max_neighbor_counts: jnp.ndarray | None = None,
+    max_neighbor_counts: Int[Array, "K"] | None = None,
 ) -> NSState:
     """Initialize NSState from walker data.
 
@@ -551,11 +552,11 @@ def run_ns(
         n_walkers, n_atoms, max_iterations, n_mcmc_steps,
     )
 
-    descriptor = SingleRun()
+    batcher = SingleRun()
     adapt_mgr = AdaptationManager(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,
-        batch_descriptor=descriptor,
+        batcher=batcher,
         adjust_n_samples=adjust_n_samples,
         adjust_factor=adjust_factor,
         adjust_max_rounds=adjust_max_rounds,
@@ -563,7 +564,7 @@ def run_ns(
     )
 
     ns_state, rng_key, _cumulative = _run_loop(
-        descriptor=descriptor,
+        batcher=batcher,
         adapt_mgr=adapt_mgr,
         ns_state=ns_state,
         step_fn=step_fn,
@@ -609,22 +610,22 @@ def run_ns(
 
 def init_ns_parallel(
     init_fn: Callable,
-    positions: jnp.ndarray,
-    types: jnp.ndarray,
-    energies: jnp.ndarray,
-    cells: jnp.ndarray | None,
-    rng_keys: jax.Array,
-    step_sizes: jnp.ndarray | None = None,
+    positions: Float[Array, "R K N 3"],
+    types: Int[Array, "R K N"] | Int[Array, "R N"] | Int[Array, "N"],
+    energies: Float[Array, "R K"],
+    cells: Float[Array, "R K 3 3"] | None,
+    rng_keys: Key[Array, "R"],
+    step_sizes: Float[Array, "n_moves"] | None = None,
     ensemble_params_per_run: list[dict] | None = None,
     restart_states: list | None = None,
     max_neighbors: int = 0,
-    max_neighbor_counts: jnp.ndarray | None = None,
+    max_neighbor_counts: Int[Array, "R K"] | None = None,
 ) -> NSState:
     """Create batched NSState for n_runs parallel NS runs.
 
     Args:
         positions: (n_runs, n_walkers, n_atoms, 3)
-        types: (n_runs, n_walkers, n_atoms) or (n_atoms,)
+        types: (n_runs, n_walkers, n_atoms), (n_runs, n_atoms), or (n_atoms,)
         energies: (n_runs, n_walkers)
         cells: (n_runs, n_walkers, 3, 3) or None
         rng_keys: (n_runs,) per-run PRNG keys
@@ -771,15 +772,15 @@ def run_ns_parallel(
     )
 
     logger.info(
-        "Starting parallel NS: %d runs, %d walkers, max_iter=%d, n_mcmc=%d, n_extra=%d",
+        "Starting parallel NS: %d runs, %d walkers, max_iter=%s, n_mcmc=%d, n_extra=%d",
         n_runs, n_walkers, max_iterations, n_mcmc_steps, n_extra,
     )
 
-    descriptor = VmapRuns(n_runs=n_runs)
+    batcher = VmapRuns(n_runs=n_runs)
     adapt_mgr = AdaptationManager(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,
-        batch_descriptor=descriptor,
+        batcher=batcher,
         adjust_n_samples=adjust_n_samples,
         adjust_factor=adjust_factor,
         adjust_max_rounds=adjust_max_rounds,
@@ -863,7 +864,7 @@ def run_ns_parallel(
             )
         inter_re_mgr = InterREManager(
             swap_kernel=swap_kernel,
-            batch_descriptor=descriptor,
+            batcher=batcher,
             backend=backend,
             every=cfg.every,
             n_swap_cycles=cfg.n_swap_cycles,
@@ -874,7 +875,7 @@ def run_ns_parallel(
     adapt_keys = jax.vmap(lambda k: jax.random.split(k)[0])(rng_keys)  # (n_runs,)
 
     ns_states, adapt_keys, _cumulative = _run_loop(
-        descriptor=descriptor,
+        batcher=batcher,
         adapt_mgr=adapt_mgr,
         ns_state=ns_states,
         step_fn=step_fn,
@@ -1010,14 +1011,30 @@ def init_ns_multi_gpu(
         max_neighbor_counts=mnc_flat,
     )
 
-    # Reshape all dynamic fields from (G*P, ...) to (G, P, ...).
-    def _reshape(x):
+    # Reshape all dynamic fields from (G*P, ...) to (G, P, ...) and explicitly
+    # shard along the GPU axis. The explicit shard is load-bearing for the
+    # post-burn-in path: when ``positions`` / ``energies`` / ``cells`` arrive
+    # already pmap-sharded (``NamedSharding(spec=P('gpu',))``),
+    # ``init_ns_parallel``'s per-run ``positions[i]`` + ``jnp.stack`` produces
+    # replicated (``spec=P()``) leaves, which the downstream ``jit_ns_step``
+    # pmap rejects. ``jax.device_put`` with the gpu-axis sharding repairs the
+    # replicated leaves and is a no-op when the data is already correctly
+    # sharded or uncommitted.
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    gpu_sharding = NamedSharding(
+        Mesh(jax.local_devices()[:n_gpu], ("gpu",)),
+        PartitionSpec("gpu"),
+    )
+
+    def _reshape_and_shard(x):
         if x is None:
             return x
         arr = jnp.asarray(x)
-        return arr.reshape((n_gpu, n_per_gpu) + arr.shape[1:])
+        arr = arr.reshape((n_gpu, n_per_gpu) + arr.shape[1:])
+        return jax.device_put(arr, gpu_sharding)
 
-    return jax.tree.map(_reshape, flat_states)
+    return jax.tree.map(_reshape_and_shard, flat_states)
 
 
 def run_ns_multi_gpu(
@@ -1052,6 +1069,7 @@ def run_ns_multi_gpu(
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
+    batcher: PmapVmapRuns | None = None,
 ) -> dict:
     """Run NS with ``pmap(vmap(ns_step))`` dispatch across G GPUs × P runs each.
 
@@ -1079,8 +1097,8 @@ def run_ns_multi_gpu(
         callbacks: List of callback objects with optional ``on_iteration`` /
             ``on_finish`` methods.  Callbacks receive the ``(G, P, ...)``-shaped
             ``NSState`` directly.  Each ``info`` dict contains
-            ``info["_batch"] = PmapVmapRuns(n_gpu, n_per_gpu)`` so callbacks
-            can identify the batch shape via ``info["_batch"].is_batched``.
+            ``info["_batcher"] = PmapVmapRuns(n_gpu, n_per_gpu)`` so callbacks
+            can identify the batch shape via ``info["_batcher"].is_batched``.
             ``log_evidence`` in the associated ``NSState`` has shape ``(G, P)``.
         termination_criteria: Optional.  Defaults to
             ``[IterationTermination(max_iterations),
@@ -1190,11 +1208,19 @@ def run_ns_multi_gpu(
         n_gpu, n_per_gpu, n_total, n_walkers, max_iterations, n_mcmc_steps, n_extra,
     )
 
-    descriptor = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+    if batcher is None:
+        batcher = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+    elif batcher.n_gpu != n_gpu or batcher.n_per_gpu != n_per_gpu:
+        raise ValueError(
+            f"run_ns_multi_gpu: batcher topology ({batcher.n_gpu}, "
+            f"{batcher.n_per_gpu}) disagrees with explicit n_gpu={n_gpu}, "
+            f"n_per_gpu={n_per_gpu}. Pass either form, not both with "
+            f"conflicting values."
+        )
     adapt_mgr = AdaptationManager(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,
-        batch_descriptor=descriptor,
+        batcher=batcher,
         adjust_n_samples=adjust_n_samples,
         adjust_factor=adjust_factor,
         adjust_max_rounds=adjust_max_rounds,
@@ -1276,7 +1302,7 @@ def run_ns_multi_gpu(
             )
         inter_re_mgr = InterREManager(
             swap_kernel=swap_kernel_mg,
-            batch_descriptor=descriptor,
+            batcher=batcher,
             backend=backend,
             every=cfg.every,
             n_swap_cycles=cfg.n_swap_cycles,
@@ -1288,7 +1314,7 @@ def run_ns_multi_gpu(
     adapt_keys = adapt_keys_flat.reshape(n_gpu, n_per_gpu)
 
     ns_states, adapt_keys, _cumulative = _run_loop(
-        descriptor=descriptor,
+        batcher=batcher,
         adapt_mgr=adapt_mgr,
         ns_state=ns_states,
         step_fn=step_fn,
@@ -1319,7 +1345,7 @@ def run_ns_multi_gpu(
 
     for g in range(n_gpu):
         for p in range(n_per_gpu):
-            logger.info(
+            logger.debug(
                 "GPU %d run %d complete: %d dead points, log_Z=%.4f",
                 g, p, int(ns_states.iteration[g, p]),
                 float(ns_states.log_evidence[g, p]),

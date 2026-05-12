@@ -15,7 +15,6 @@ flowchart LR
     B --> Base["base.EnergyBackend<br/>(lj / mace / neuralil / …)"]
     Base --> U["U  (bare potential)"]
     B --> H["H = U + PV − μ·N<br/>(ensemble-corrected)"]
-    H --> M
 ```
 
 Every backend — LJ, MACE-JAX, NeuralIL, and the toy potentials —
@@ -44,8 +43,104 @@ Built-in backends:
 |---|---|---|
 | `lj` | {class}`jaxrens.backends.lj.LJBackend` | periodic or finite, static cutoff |
 | `mace` | {class}`jaxrens.backends.mace.MACEBackend` | mace-jax, supercell neighbor expansion, pins float32 globally (see {doc}`../../dev/install`) |
-| `neuralil` | `jaxrens.backends.neuralil.NeuralILBackend` | bucketed `max_neighbors_list` pre-compilation |
+| `neuralil` | `jaxrens.backends.neuralil.NeuralILBackend` | bucketed `max_neighbors_list` JIT cache (lazy per-bucket compile) |
 | `harmonic`, `double_well`, `gaussian_mixture` | `jaxrens.backends.toy` | analytical test potentials |
+
+## The neighbor problem
+
+Every modern MLIP — MACE, NeuralIL, NEQUIX, … — computes the
+energy as a sum of local atomic contributions, each determined
+by the environment around its atom. Whatever the architecture,
+the first step is to find every neighbour within a cutoff
+radius $r_\mathrm{cut}$. Behler–Parrinello-style potentials like
+NeuralIL feed those neighbours into per-atom descriptors
+directly; graph neural networks such as MACE or NEQUIX instead
+build an explicit graph whose nodes are atoms and whose edges
+connect neighbour pairs, then pass messages along it.
+
+Either way, the number of neighbours is intrinsically dynamic —
+it depends on the live walker's geometry, which changes every
+MCMC step. That clashes with JAX's static-shape rule: `jax.jit`
+needs the size of every array at trace time, so we can't let the
+neighbour count vary freely.
+
+The unifying static quantity is `max_neighbors`, an upper bound
+on the allowed neighbour count per atom; the corresponding
+arrays are pre-allocated at that size. For GNNs this caps the
+edge buffer at
+$N_\mathrm{atoms} \times \texttt{max\_neighbors}$.
+
+For jaxrens we went with the following strategy: every backend
+call takes a set of configurations and one fixed bucket size
+$b = \texttt{max\_neighbors}$, builds its neighbour data into
+arrays pre-allocated at that size, and at the same time computes
+the *true* per-atom neighbour count from the actual geometry. If
+that count fits — `true_max ≤ b` — the energy is returned
+together with the observed count and `overflow=False`. If it
+doesn't, the backend reports `overflow=True` together with the
+observed `actual_max_n`; the outer loop picks the smallest entry
+of `max_neighbors_list` that clears
+$\texttt{actual\_max\_n} + \texttt{max\_neighbors\_offset}$, and
+the same configuration is re-evaluated against that larger
+bucket. The `max_neighbors_offset` knob is the headroom that
+prevents the very next MCMC step from tripping the same overflow
+again after a trivial cell fluctuation.
+
+
+
+```{mermaid}
+flowchart LR
+    CFG["configurations<br/>(positions, species, cell)<br/>+ ensemble_params<br/>+ current bucket b"]
+    CFG --> CALL["backend(...,<br/>max_neighbors=b)"]
+    CALL --> RES{"true_max &gt; b ?"}
+    RES -- "no" --> OK["return (energy,<br/>actual_max_n,<br/>overflow=False)"]
+    RES -- "yes" --> ESC["escalate:<br/>b ← smallest b' ∈ max_neighbors_list<br/>with b' ≥ true_max + max_neighbors_offset,<br/>re-run inner loop"]
+    ESC --> CALL
+
+    classDef input fill:#fff7e0,stroke:#a07000,color:#222
+    classDef decision fill:#eef5ff,stroke:#1565c0,color:#222
+    classDef esc fill:#ffe0e0,stroke:#c62828,color:#5a0000
+    class CFG input
+    class RES decision
+    class ESC esc
+
+    linkStyle 3,4 stroke:#c62828,color:#c62828,stroke-width:2px
+```
+
+Because `max_neighbors` is a *static* JIT argument,
+`max_neighbors_list` is an **allowlist** of permitted bucket
+sizes rather than a set of kernels built in advance: each entry
+is JIT-traced lazily on its first call and then cached for the
+rest of the run. The initial `b` is chosen once before the loop
+starts — the resolver calls
+{func}`~jaxrens.backends._graph_neighbors._compute_true_max_neighbors`
+on the starting walker geometry (no edge buffer allocated yet)
+and picks the smallest entry of `max_neighbors_list` that clears
+`true_max + max_neighbors_offset`. That entry becomes the first
+kernel to compile.
+
+The user surface is two YAML knobs on each MLIP backend
+({class}`~jaxrens.backends.mace.MACEBackend`,
+{mod}`jaxrens.backends.neuralil`,
+{mod}`jaxrens.backends.nequix`):
+
+- `max_neighbors_list: [50, 75, 100, 150]` — the bucket sizes
+  the run is allowed to use. Each entry is JIT-compiled the first
+  time it's called (not at startup); the resolver picks the
+  smallest entry $\geq$ observed max + offset for the initial
+  run, and on overflow the outer loop walks to the next entry,
+  triggering one fresh compile that's then cached for the rest
+  of the run.
+- `max_neighbors_offset: 5` — safety margin added to the observed
+  max when picking the initial bucket. Keeps you off the
+  knife-edge where one MCMC step pushes a single atom over the
+  buffer.
+
+This is why `ns_step` returns a `neighbor_count` and an
+`overflow` flag in its `info` dict: the outer loop reads them,
+and on overflow it bumps `max_neighbors` and re-enters the same
+iteration. The red `escalate max_neighbors` node in the NS-loop
+figure ({doc}`ns_loop`) is exactly this back-edge.
 
 ## Ensembles as additive corrections
 
@@ -55,31 +150,22 @@ from the `ensemble_params` dict. This means one wrapper instance
 serves multiple replicas at different pressures / chemical
 potentials — no rebuild needed.
 
-For a configuration $\theta = (\vec r, \mathbf{L}, \vec\tau)$ with
+For a configuration $r = (\mathbf q, \mathbf{L}, \sigma)$ with
 volume $V = |\det(\mathbf{L})|$ and species counts $N_i$,
 
 $$
-H_\mathrm{NVT}(\theta) = U(\theta),
+H_\mathrm{NVT}(r) = U(r),
 $$
 $$
-H_\mathrm{NPT}(\theta) = U(\theta) + P\,V,
+H_\mathrm{NPT}(r) = U(r) + P\,V,
 $$
 $$
-H_{\mu V T}(\theta) = U(\theta) + P\,V - \sum_i \mu_i N_i.
+H_{\mu P T}(r) = U(r) + P\,V - \sum_i \mu_i N_i.
 $$
 
 The NS loop always works with $H$, not $U$. Same sampler, same
 move kernels, same acceptance criterion; the ensemble only changes
 what gets compared to $E_\mathrm{max}$.
-
-```{image} /_static/figures/ensemble_tilt.png
-:alt: H(V) curves for NVT, NPT, muVT
-:align: center
-```
-
-Physically: the $+PV$ term pushes walkers toward smaller volumes at
-high pressure (compressing the system), and the $-\mu N$ term
-favours adding atoms when $\mu > 0$ (grand-canonical chemistry).
 
 ## Species indexing
 

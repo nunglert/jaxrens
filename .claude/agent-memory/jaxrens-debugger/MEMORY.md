@@ -10,6 +10,7 @@ Each entry points to a pathology memory file. Read all of these at the start of 
 - [Termination at n_live+2](pathology_early_termination.md) — prior-mass fires immediately after n_live iterations
 - [Log columns mislabeled](pathology_log_columns_mislabeled.md) — format-string / arg-order mismatches
 - [Slow Monitor observables](pathology_slow_monitor_observables.md) — plot.py takes minutes per 200 T points
+- [NeuralILwithMorse NaN grad on padded atoms](pathology_neuralil_morse_padded_inf_nan.md) — center_at_atoms emits inf radii for type<0 pairs; MorseModel's exp(-a*(inf-b)) yields 0*inf=NaN in the gradient even though the forward is fine
 
 ## Diagnostic templates
 

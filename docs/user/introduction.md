@@ -70,8 +70,10 @@ thermodynamic post-processing respectively.
 :::
 
 See {doc}`overview` for a conceptual map of how the subpackages
-talk to each other, and {doc}`concepts/schema_resolve` for the
-CLI's three-layer data flow.
+talk to each other, {doc}`concepts/schema_resolve` for the
+CLI's three-layer data flow, and {doc}`/reference/notation` for
+the symbols and shape conventions used throughout the rest of
+the documentation.
 
 ## License
 

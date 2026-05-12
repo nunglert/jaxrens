@@ -1,0 +1,14 @@
+2026-05-08 09:48:36,481 INFO jaxrens.cli.run: Running initial-walk burn-in: 1 walks x 5 steps/walk
+2026-05-08 09:48:40,947 INFO jaxrens.cli.run: Burn-in complete
+2026-05-08 09:48:41,237 INFO jaxrens.sampling.nested_sampling: Starting NS run: 32 walkers, 8 atoms, max_iter=200, n_mcmc=10
+2026-05-08 09:48:41,342 INFO jaxrens.io.checkpoint: Checkpoint saved to output/lj8_npt.initial.checkpoint.h5 (iteration 0)
+2026-05-08 09:48:45,690 INFO jaxrens.cli.monitor: iter=0  Emax=29.4035  log_Z=-32.8693  dt=9.2s  nE=2.80e+01  nG=2.40e+01
+2026-05-08 09:48:54,431 INFO jaxrens.cli.monitor: iter=50  Emax=21.4119  log_Z=-22.4606  dt=8.7s  nE=9.11e+03  nG=7.44e+03
+2026-05-08 09:48:54,765 INFO jaxrens.cli.monitor: iter=100  Emax=20.3967  log_Z=-21.9172  dt=0.2s  nE=2.20e+04  nG=1.80e+04
+  galilean          ss=5.000e-01  acc=1.00
+  volume            ss=5.000e-01  acc=0.00   reject: E=100% C=  0% P=  0%
+2026-05-08 09:48:54,932 INFO jaxrens.cli.monitor: iter=150  Emax=19.4672  log_Z=-21.7110  dt=0.3s  nE=3.10e+04  nG=2.53e+04
+2026-05-08 09:48:55,083 INFO jaxrens.sampling.run_loop: NS terminated at iter 199: Reached max iterations (200)
+2026-05-08 09:48:55,303 INFO jaxrens.sampling.nested_sampling: NS complete: 200 dead points, log_Z=-21.5647
+2026-05-08 09:48:55,303 INFO jaxrens.cli.monitor: NS finished: 200 iterations, log_Z=-21.5647, elapsed=18.8s
+2026-05-08 09:48:55,310 INFO jaxrens.io.checkpoint: Checkpoint saved to output/lj8_npt.final.checkpoint.h5 (iteration 200)

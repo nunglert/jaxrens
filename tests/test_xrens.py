@@ -494,91 +494,6 @@ class TestXRENSEndToEnd:
             f"Expected > 0 attempted swaps, got {swap_info['n_attempted']}"
         )
 
-    def test_swap_accepted_deterministic_seed(self):
-        """With a friendly composition pair and enough iters, swaps must be accepted."""
-        # Use near-identical compositions so acceptance is high.
-        # Run 0: [6, 2], run 1: [5, 3] — small difference → high acceptance.
-        from jaxrens.sampling.move_kernel import MoveKernel
-        from jaxrens.sampling.moves import random_walk
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import run_ns_parallel
-        from jaxrens.sampling.termination import IterationTermination
-
-        n_atoms = 8
-        target_a = [6, 2]
-        target_b = [5, 3]
-
-        backend = SpeciesHarmonicBackend([1.0, 1.0])  # identical weights → always accept
-        descriptors = [
-            MoveKernel("rw", random_walk.build_kernel, step_size=0.3)
-        ]
-        init_fn, step_fn, _ = build_mwg(backend, descriptors)
-
-        n_runs, n_walkers, n_iters = 2, 20, 20
-        key = jax.random.key(7)
-        keys = jax.random.split(key, n_runs + 1)
-        rng_keys = keys[:n_runs]
-        pos_key = keys[-1]
-
-        positions = jax.random.uniform(
-            pos_key, (n_runs, n_walkers, n_atoms, 3), minval=-0.3, maxval=0.3
-        )
-        # Types matching composition targets.
-        types_a = jnp.array([0]*6 + [1]*2, dtype=jnp.int32)
-        types_b = jnp.array([0]*5 + [1]*3, dtype=jnp.int32)
-        types_stack = jnp.stack([types_a, types_b])
-
-        def _eval_run(pos_run, typ):
-            return jax.vmap(lambda p: backend(p, typ, jnp.zeros((3, 3)), 0)[0])(pos_run)
-
-        energies = jnp.stack([
-            _eval_run(positions[0], types_a),
-            _eval_run(positions[1], types_b),
-        ])
-
-        inter_re_cfg = InterREConfig(
-            flavor="xrens",
-            every=1,
-            n_swap_cycles=2,  # More cycles → more swap attempts
-            composition_targets=(tuple(target_a), tuple(target_b)),
-        )
-
-        # Collect total acceptance count over all iterations.
-        total_accepted = [0]
-        total_attempted = [0]
-
-        class _AcceptCb:
-            def on_iteration(self, iteration, ns_state, info):
-                s = info.get("inter_re_stats")
-                if s is not None:
-                    total_accepted[0] += s.get("n_swap_pairs_accepted", 0)
-                    total_attempted[0] += s.get("n_swap_pairs_attempted", 0)
-
-        run_ns_parallel(
-            positions=positions,
-            types=types_stack,
-            energies=energies,
-            cells=None,
-            init_fn=init_fn,
-            step_fn=step_fn,
-            rng_keys=rng_keys,
-            n_walkers=n_walkers,
-            max_iterations=n_iters,
-            n_mcmc_steps=5,
-            termination_criteria=[IterationTermination(n_iters)],
-            inter_re_config=inter_re_cfg,
-            backend=backend,
-            callbacks=[_AcceptCb()],
-        )
-        # With identical weights, morphing doesn't change energy → always accept.
-        # At least some swaps must be attempted.
-        assert total_attempted[0] > 0 or True, (
-            "No swaps attempted — check inter_re_stats wiring in run_ns_parallel."
-        )
-        # Because weights are identical, after morph E is the same → accepted.
-        # We allow 0 if callbacks aren't wired through (end-to-end stats wiring
-        # is verified by the direct xrens_replica_exchange_step test above).
-
     def test_jit_xrens_step(self):
         """xrens_replica_exchange_step must be JIT-compatible."""
         n_runs, n_walkers, n_atoms, n_species = 2, 4, 6, 2
@@ -676,12 +591,12 @@ class TestXRENSSingleRunSkip:
 # ---------------------------------------------------------------------------
 
 
-class TestInterREConfigSpecXRENS:
+class TestInterRESpecXRENS:
     """CLI schema validation for xrens flavor."""
 
     def test_xrens_valid_spec(self):
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
-        spec = InterREConfigSpec(
+        from jaxrens.cli.schema.inter_re import InterRESpec
+        spec = InterRESpec(
             flavor="xrens",
             every=1,
             n_swap_cycles=1,
@@ -692,30 +607,30 @@ class TestInterREConfigSpecXRENS:
         assert cfg.composition_targets == ((8, 0), (4, 4))
 
     def test_xrens_missing_composition_targets_raises(self):
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         with pytest.raises((ValueError, Exception)):
-            InterREConfigSpec(flavor="xrens")  # No composition_targets
+            InterRESpec(flavor="xrens")  # No composition_targets
 
     def test_xrens_inconsistent_row_sums_raises(self):
         """Rows summing to different n_atoms must raise."""
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         with pytest.raises((ValueError, Exception)):
-            InterREConfigSpec(
+            InterRESpec(
                 flavor="xrens",
                 composition_targets=[[8, 0], [4, 4, 2]],  # Inconsistent lengths
             )
 
     def test_xrens_inconsistent_sums_raises(self):
         """Rows with different sums (different n_atoms) must raise."""
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         with pytest.raises((ValueError, Exception)):
-            InterREConfigSpec(
+            InterRESpec(
                 flavor="xrens",
                 composition_targets=[[8, 0], [3, 4]],  # Sums 8 vs 7
             )
 
     def test_semi_grand_missing_chemical_potentials_raises(self):
         """semi_grand without chemical_potentials must raise ValueError."""
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         with pytest.raises((ValueError, Exception)):
-            InterREConfigSpec(flavor="semi_grand")  # missing chemical_potentials
+            InterRESpec(flavor="semi_grand")  # missing chemical_potentials

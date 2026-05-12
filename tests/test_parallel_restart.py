@@ -133,30 +133,6 @@ def _load_bundle(path: Path) -> RestartBundle:
 class TestInitNsParallelRestart:
     """Unit tests for init_ns_parallel(..., restart_states=...)."""
 
-    def test_restart_seeds_n_dead(self, tmp_path):
-        """init_ns_parallel with restart_states seeds n_dead from checkpoint."""
-        n_runs = 2
-        n_dead_checkpoint = 5
-        s = _make_harmonic_setup(seed=10)
-
-        # Build per-run positions/energies by stacking the same init
-        positions = jnp.stack([s["positions"]] * n_runs)
-        energies = jnp.stack([s["energies"]] * n_runs)
-        cells = jnp.stack([s["cells"]] * n_runs)
-        keys = jax.random.split(s["key"], n_runs)
-
-        p = _write_checkpoint(tmp_path, s, n_dead=n_dead_checkpoint)
-        bundle = _load_bundle(p)
-
-        ns_states = init_ns_parallel(
-            s["init_fn"], positions, s["types"], energies, cells, keys,
-            max_dead=200,
-            restart_states=[bundle, bundle],
-        )
-
-        assert int(ns_states.n_dead[0]) == n_dead_checkpoint
-        assert int(ns_states.n_dead[1]) == n_dead_checkpoint
-
     def test_restart_seeds_iteration(self, tmp_path):
         """init_ns_parallel seeds iteration counter from checkpoint."""
         n_dead_checkpoint = 7
@@ -172,7 +148,6 @@ class TestInitNsParallelRestart:
 
         ns_states = init_ns_parallel(
             s["init_fn"], positions, s["types"], energies, cells, keys,
-            max_dead=200,
             restart_states=[bundle, bundle],
         )
 
@@ -195,7 +170,6 @@ class TestInitNsParallelRestart:
 
         ns_states = init_ns_parallel(
             s["init_fn"], positions, s["types"], energies, cells, keys,
-            max_dead=200,
             restart_states=[bundle, bundle],
         )
 
@@ -217,14 +191,13 @@ class TestInitNsParallelRestart:
 
         ns_states = init_ns_parallel(
             s["init_fn"], positions, s["types"], energies, cells, keys,
-            max_dead=200,
             restart_states=[bundle, None],
         )
 
-        # Run 0: restarted — n_dead == checkpoint
-        assert int(ns_states.n_dead[0]) == n_dead_checkpoint
-        # Run 1: fresh — n_dead == 0
-        assert int(ns_states.n_dead[1]) == 0
+        # Run 0: restarted — iteration seeded from checkpoint.
+        assert int(ns_states.iteration[0]) == n_dead_checkpoint
+        # Run 1: fresh — iteration starts at 0.
+        assert int(ns_states.iteration[1]) == 0
 
     def test_restart_wrong_length_raises(self, tmp_path):
         """init_ns_parallel raises ValueError when restart_states length != n_runs."""
@@ -242,34 +215,8 @@ class TestInitNsParallelRestart:
         with pytest.raises(ValueError, match="restart_states length"):
             init_ns_parallel(
                 s["init_fn"], positions, s["types"], energies, cells, keys,
-                max_dead=200,
                 restart_states=[bundle, bundle],  # length 2 != n_runs=3
             )
-
-    def test_restart_dead_arrays_padded(self, tmp_path):
-        """init_ns_parallel pads dead arrays to max_dead per run."""
-        n_dead_checkpoint = 4
-        max_dead = 50
-        s = _make_harmonic_setup(seed=15)
-
-        positions = jnp.stack([s["positions"]])
-        energies = jnp.stack([s["energies"]])
-        cells = jnp.stack([s["cells"]])
-        keys = jax.random.split(s["key"], 1)
-
-        p = _write_checkpoint(tmp_path, s, n_dead=n_dead_checkpoint)
-        bundle = _load_bundle(p)
-
-        ns_states = init_ns_parallel(
-            s["init_fn"], positions, s["types"], energies, cells, keys,
-            max_dead=max_dead,
-            restart_states=[bundle],
-        )
-
-        # Shape: (n_runs, max_dead) = (1, max_dead)
-        assert ns_states.dead_energies.shape == (1, max_dead)
-        # Positions beyond n_dead should be zero-padded
-        assert float(jnp.min(ns_states.dead_energies[0, n_dead_checkpoint:])) == float(jnp.inf)
 
     def test_no_restart_states_gives_fresh_start(self, tmp_path):
         """Without restart_states, all runs start with n_dead=0."""
@@ -282,11 +229,10 @@ class TestInitNsParallelRestart:
 
         ns_states = init_ns_parallel(
             s["init_fn"], positions, s["types"], energies, cells, keys,
-            max_dead=200,
         )
 
-        assert int(ns_states.n_dead[0]) == 0
-        assert int(ns_states.n_dead[1]) == 0
+        assert int(ns_states.iteration[0]) == 0
+        assert int(ns_states.iteration[1]) == 0
 
 
 # ---------------------------------------------------------------------------

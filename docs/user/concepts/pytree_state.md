@@ -11,29 +11,77 @@ inner kernels** — only extra leading axes.
 
 ## The tree
 
+`NSState` is the top-level pytree the NS loop carries. Its single
+non-trivial child is `population`, a batched
+{class}`~jaxrens.state.mc_state.MCState` whose leaves carry the
+`(K, …)` per-walker arrays. Solid arrows are pytree leaves; dashed
+arrows mark `static_field()` entries that live in *aux data* and
+trigger a JIT recompile when they change.
+
 ```{mermaid}
-flowchart TD
-    NS["NSState"] --> P["population: MCState (batched)"]
-    NS --> DE["dead_energies: (max_dead,)"]
-    NS --> DP["dead_positions: (max_dead, A, 3)"]
-    NS --> DV["dead_volumes: (max_dead,)"]
-    NS --> IT["iteration: int32"]
-    NS --> ND["n_dead: int32"]
-    NS --> LZ["log_evidence: float"]
-    P --> POS["positions: (K, A, 3)"]
-    P --> CELL["cell: (K, 3, 3)"]
-    P --> TYP["types: (K, A)"]
-    P --> STEP["step_sizes: (K, n_moves)"]
-    P --> EN["energy: (K,)"]
-    P --> EP["ensemble_params: dict  (pressure/mu/...)"]
-    P --> EX["extra fields<br/>e.g. direction (galilean), momenta (HMC)"]
-    P -. static .-> MN["max_neighbors: int"]
-    P -. static .-> NA["n_atoms: int"]
+flowchart LR
+    NS["NSState"]
+    NS --> P["population<br/>(MCState, batched)"]
+    NS --> LZ["log_evidence:<br/>scalar"]
+    NS --> IT["iteration:<br/>int32"]
+    NS --> KEY["rng_key:<br/>PRNGKey"]
+    NS -. static .-> NW["n_walkers: int"]
+    NS -. static .-> NA0["n_atoms: int"]
+
+    subgraph MC_leaves["MCState leaves (per-walker, batch K)"]
+        direction LR
+        subgraph mc_config["configuration"]
+            direction TB
+            POS["positions: (K, A, 3)"]
+            CELL["cell: (K, 3, 3)"]
+            TYP["types: (K, A)"]
+            EN["energy: (K,)"]
+        end
+        subgraph mc_mcmc["MCMC stats"]
+            direction TB
+            SS["step_sizes: (K, n_moves)"]
+            ACC["n_accepted: (K, n_moves)"]
+            PROP["n_proposed: (K, n_moves)"]
+        end
+        subgraph mc_misc["overflow / ensemble / extras"]
+            direction TB
+            MNC["max_neighbor_count: (K,)"]
+            OV["overflow: (K,) bool"]
+            EP["ensemble_params: dict<br/>(pressure / μ / target_comp / …)"]
+            EX["extras<br/>e.g. direction (galilean),<br/>momenta (HMC)"]
+        end
+    end
+
+    subgraph MC_aux["MCState aux (static_field)"]
+        direction TB
+        MN["max_neighbors: int"]
+        NA1["n_atoms: int"]
+    end
+
+    P --> MC_leaves
+    P -. static .-> MC_aux
+
+    classDef root fill:#fff7e0,stroke:#a07000,color:#222
+    classDef leafBox fill:#eef5ff,stroke:#1565c0,color:#222
+    classDef auxBox fill:#f5f5f5,stroke:#888,color:#222
+    classDef colBox fill:#fafdff,stroke:#9bb8d6,color:#222
+    class NS,P root
+    class MC_leaves leafBox
+    class MC_aux auxBox
+    class mc_config,mc_mcmc,mc_misc colBox
+
+    linkStyle 4,5,7 stroke:#888,color:#555
 ```
 
-`max_neighbors`, `n_atoms` and other fields marked `static_field()`
-live in the pytree's *aux data*, not the leaves. Changing them
-triggers a JIT recompilation; changing a leaf does not.
+`NSState` sits on the left; its level-2 children stack vertically
+in the next column; the batched `MCState` leaves form the right
+panel split into three logical sub-columns — *configuration*
+(positions / cell / types / energy), *MCMC stats* (step sizes,
+accept / propose counters), and *overflow / ensemble / extras*
+(neighbour-count + ensemble parameters + per-kernel extras). The
+two dashed edges at the `NSState` and `population` level point to
+aux blocks — `static_field()` entries that live outside the
+pytree leaves and gate recompilation.
 
 ## Dynamic class construction
 

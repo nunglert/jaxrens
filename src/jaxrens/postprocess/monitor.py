@@ -336,9 +336,21 @@ class Monitor:
         return results[0] if scalar else results
 
     def expectation(
-        self, observable: np.ndarray, T: np.ndarray | float
+        self,
+        observable: np.ndarray,
+        T: np.ndarray | float,
+        k_B: float = 1.0,
     ) -> np.ndarray:
-        """Compute thermal expectation <O>(T) for a per-dead-point observable."""
+        """Compute thermal expectation <O>(T) for a per-dead-point observable.
+
+        Args:
+            observable: Per-dead-point values, shape ``(n_dead,)``.
+            T: Temperature(s), scalar or array.
+            k_B: Boltzmann constant in the same energy units as the stored
+                ``dead_energies``.  Defaults to ``1.0``; pass e.g.
+                ``8.617e-5`` (eV/K) when ``T`` is in Kelvin and the energies
+                are in eV.
+        """
         import jax.numpy as jnp
 
         observable = np.asarray(observable, dtype=np.float64)
@@ -350,7 +362,7 @@ class Monitor:
 
         T = np.asarray(T, dtype=np.float64)
         scalar = T.ndim == 0
-        betas = 1.0 / np.atleast_1d(T)
+        betas = self._beta(np.atleast_1d(T), k_B)
         arrs = self._jax_arrays()
 
         live_obs = jnp.full(self.live_energies.shape[0], float(np.mean(observable)))

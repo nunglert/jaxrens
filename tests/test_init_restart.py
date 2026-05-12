@@ -247,7 +247,7 @@ class TestNPTRestart:
 # ---------------------------------------------------------------------------
 
 class TestInitNsRestart:
-    def test_init_ns_with_restart_state_seeds_n_dead(self, tmp_path):
+    def test_init_ns_with_restart_state_seeds_iteration(self, tmp_path):
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns
@@ -268,11 +268,9 @@ class TestInitNsRestart:
 
         ns_state = init_ns(
             init_fn, positions, types, energies, ws.cells, key,
-            max_dead=200,
             restart_state=bundle,
         )
 
-        assert int(ns_state.n_dead) == 7
         assert int(ns_state.iteration) == bundle.iteration
 
     def test_init_ns_with_restart_state_seeds_log_evidence(self, tmp_path):
@@ -297,7 +295,6 @@ class TestInitNsRestart:
 
         ns_state = init_ns(
             init_fn, positions, types, energies, ws.cells, key,
-            max_dead=200,
             restart_state=bundle,
         )
 
@@ -323,42 +320,10 @@ class TestInitNsRestart:
         key = jax.random.key(5)
 
         ns_state = init_ns(
-            init_fn, positions, types, energies, ws.cells, key, max_dead=200,
-        )
-
-        assert int(ns_state.n_dead) == 0
-        assert int(ns_state.iteration) == 0
-
-    def test_init_ns_restart_dead_arrays_padded_to_max_dead(self, tmp_path):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import init_ns
-
-        n_dead = 4
-        state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=n_dead)
-        p = _write_checkpoint(tmp_path, state)
-        ws, bundle = load_restart(p)
-
-        backend = create_harmonic()
-        init_fn, _, _ = build_mwg(backend, [_rw_descriptor()])
-
-        positions = ws.positions
-        types = ws.types[0]
-        energies = jax.vmap(
-            lambda pos, typs, cel: backend(pos, typs, cel, 0)[0]
-        )(positions, ws.types, ws.cells)
-        key = jax.random.key(5)
-        max_dead = 50
-
-        ns_state = init_ns(
             init_fn, positions, types, energies, ws.cells, key,
-            max_dead=max_dead,
-            restart_state=bundle,
         )
 
-        assert ns_state.dead_energies.shape == (max_dead,)
-        assert ns_state.dead_positions.shape == (max_dead, 1, 3)
-        assert float(jnp.min(ns_state.dead_energies[n_dead:])) == float(jnp.inf)
+        assert int(ns_state.iteration) == 0
 
     def test_init_ns_restart_under_jit(self, tmp_path):
         """init_ns with restart_state: the produced NSState must survive ns_step under jit."""
@@ -382,20 +347,18 @@ class TestInitNsRestart:
 
         ns_state = init_ns(
             init_fn, positions, types, energies, ws.cells, key,
-            max_dead=100,
             restart_state=bundle,
         )
 
         jit_ns_step = jax.jit(ns_step, static_argnames=("step_fn", "n_mcmc_steps"))
         new_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps=3)
 
-        assert int(new_state.n_dead) == bundle.n_dead + 1
         assert int(new_state.iteration) == bundle.iteration + 1
         assert jnp.isfinite(info["emax"])
 
 
 # ---------------------------------------------------------------------------
-# Mode D resolver tests (moved from test_schema.py::TestInitConfigResolverModeD)
+# Mode D resolver tests (moved from test_schema.py::TestInitSpecResolverModeD)
 # ---------------------------------------------------------------------------
 
 def _make_ns_checkpoint_resolver(
@@ -438,27 +401,27 @@ def _make_ns_checkpoint_resolver(
 
 
 def _cell_cfg_permissive_restart():
-    from jaxrens.cli.schema.cell import CellConfig
-    return CellConfig(
+    from jaxrens.cli.schema.cell import CellSpec
+    return CellSpec(
         max_volume_per_atom=10000.0,
         min_volume_per_atom=0.01,
         min_aspect_ratio=0.001,
     )
 
 
-class TestInitConfigResolverModeD:
+class TestInitSpecResolverModeD:
     """Mode D resolver tests: restart_file.
 
-    Moved verbatim from test_schema.py::TestInitConfigResolverModeD.
+    Moved verbatim from test_schema.py::TestInitSpecResolverModeD.
     """
 
     def test_mode_d_returns_resolved_init(self, tmp_path):
         from jaxrens.cli.resolve import ResolvedInit, _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
-        cfg = InitConfig(restart_file=p)
+        cfg = InitSpec(restart_file=p)
         result = _resolve_init(
             cfg, n_live=4, seed=0,
             energy_backend=create_harmonic(),
@@ -468,12 +431,12 @@ class TestInitConfigResolverModeD:
 
     def test_mode_d_restart_state_populated(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.init.restart import RestartBundle
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
-        cfg = InitConfig(restart_file=p)
+        cfg = InitSpec(restart_file=p)
         result = _resolve_init(
             cfg, n_live=4, seed=0,
             energy_backend=create_harmonic(),
@@ -484,11 +447,11 @@ class TestInitConfigResolverModeD:
 
     def test_mode_d_restart_state_n_dead(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
-        cfg = InitConfig(restart_file=p)
+        cfg = InitSpec(restart_file=p)
         result = _resolve_init(
             cfg, n_live=4, seed=0,
             energy_backend=create_harmonic(),
@@ -498,11 +461,11 @@ class TestInitConfigResolverModeD:
 
     def test_mode_d_restart_state_iteration(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
-        cfg = InitConfig(restart_file=p)
+        cfg = InitSpec(restart_file=p)
         result = _resolve_init(
             cfg, n_live=4, seed=0,
             energy_backend=create_harmonic(),
@@ -512,11 +475,11 @@ class TestInitConfigResolverModeD:
 
     def test_mode_d_symbol_map_populated(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
-        cfg = InitConfig(restart_file=p)
+        cfg = InitSpec(restart_file=p)
         result = _resolve_init(
             cfg, n_live=4, seed=0,
             energy_backend=create_harmonic(),
@@ -525,29 +488,37 @@ class TestInitConfigResolverModeD:
         assert result.symbol_map == {0: "Si"}
 
     def test_mode_d_energies_recomputed(self, tmp_path):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.resolve import (
+            _finalise_initial_energies_and_counts,
+            _resolve_init,
+        )
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
-        cfg = InitConfig(restart_file=p)
+        cfg = InitSpec(restart_file=p)
+        backend = create_harmonic()
         result = _resolve_init(
             cfg, n_live=4, seed=0,
-            energy_backend=create_harmonic(),
+            energy_backend=backend,
             cell_cfg=_cell_cfg_permissive_restart(),
         )
-        assert result.initial_energies is not None
-        assert result.initial_energies.shape == (4,)
-        assert jnp.all(jnp.isfinite(result.initial_energies))
+        # _resolve_init now leaves energies as None; caller finalizes.
+        energies, _ = _finalise_initial_energies_and_counts(
+            backend, result.initial_positions, result.initial_types, result.initial_cells,
+        )
+        assert energies is not None
+        assert energies.shape == (4,)
+        assert jnp.all(jnp.isfinite(energies))
 
     def test_mode_d_random_initialise_pos_true_warns(self, tmp_path, caplog):
         import logging
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
-        cfg = InitConfig(restart_file=p, random_initialise_pos=True)
+        cfg = InitSpec(restart_file=p, random_initialise_pos=True)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             _resolve_init(
                 cfg, n_live=4, seed=0,
@@ -561,7 +532,7 @@ class TestInitConfigResolverModeD:
 
     def test_cohort_gt_1_with_restart_file_raises(self, tmp_path):
         from jaxrens.cli.resolve import expand_cohort
-        from jaxrens.cli.schema import RootConfig
+        from jaxrens.cli.schema import RootSpec
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
         d = {
             "run": {"n_live": 4, "max_iterations": 5, "n_mcmc_steps": 2, "seed": 0},
@@ -571,14 +542,14 @@ class TestInitConfigResolverModeD:
             "ensemble": {"type": "npt", "pressure": [0.01, 0.02]},
             "init": {"restart_file": str(p)},
         }
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         import pytest as _pytest
         with _pytest.raises(ValueError, match="restart_file"):
             expand_cohort(root)
 
     def test_cohort_gt_1_restart_error_message_contains_cohort_size(self, tmp_path):
         from jaxrens.cli.resolve import expand_cohort
-        from jaxrens.cli.schema import RootConfig
+        from jaxrens.cli.schema import RootSpec
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
         d = {
             "run": {"n_live": 4, "max_iterations": 5, "n_mcmc_steps": 2, "seed": 0},
@@ -588,7 +559,7 @@ class TestInitConfigResolverModeD:
             "ensemble": {"type": "npt", "pressure": [0.01, 0.02, 0.03]},
             "init": {"restart_file": str(p)},
         }
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         import pytest as _pytest
         with _pytest.raises(ValueError, match="3"):
             expand_cohort(root)
@@ -596,8 +567,11 @@ class TestInitConfigResolverModeD:
     def test_mode_d_end_to_end_jit(self, tmp_path):
         """Mode D: load checkpoint, init_ns with restart_state, run ns_step under JIT."""
         from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.resolve import (
+            _finalise_initial_energies_and_counts,
+            _resolve_init,
+        )
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, ns_step
         from jaxrens.sampling.move_kernel import MoveKernel
@@ -606,12 +580,16 @@ class TestInitConfigResolverModeD:
         n_dead_checkpoint = 5
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=n_dead_checkpoint)
 
-        cfg = InitConfig(restart_file=p)
+        cfg = InitSpec(restart_file=p)
         backend = create_harmonic()
         result = _resolve_init(
             cfg, n_live=4, seed=0,
             energy_backend=backend,
             cell_cfg=_cell_cfg_permissive_restart(),
+        )
+        # Finalize is the caller's job after the refactor.
+        energies, _ = _finalise_initial_energies_and_counts(
+            backend, result.initial_positions, result.initial_types, result.initial_cells,
         )
 
         desc = MoveKernel(
@@ -629,28 +607,28 @@ class TestInitConfigResolverModeD:
             init_fn,
             result.initial_positions,
             result.initial_types,
-            result.initial_energies,
+            energies,
             cells=result.initial_cells,
             rng_key=key,
-            max_dead=200,
             restart_state=result.restart_state,
         )
 
-        assert int(ns_state.n_dead) == n_dead_checkpoint
         assert int(ns_state.iteration) == n_dead_checkpoint
 
         jit_ns_step = jax.jit(ns_step, static_argnames=("step_fn", "n_mcmc_steps"))
         new_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps=3)
 
-        assert int(new_state.n_dead) == n_dead_checkpoint + 1
         assert int(new_state.iteration) == n_dead_checkpoint + 1
         assert jnp.isfinite(info["emax"])
 
     def test_mode_d_continued_run_n_dead_increments(self, tmp_path):
         """After restart, run_ns for N more steps: n_dead >= checkpoint + N."""
         from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.resolve import (
+            _finalise_initial_energies_and_counts,
+            _resolve_init,
+        )
+        from jaxrens.cli.schema.init import InitSpec
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import run_ns
         from jaxrens.sampling.termination import IterationTermination
@@ -661,12 +639,16 @@ class TestInitConfigResolverModeD:
         n_extra_iters = 5
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=n_dead_checkpoint)
 
-        cfg = InitConfig(restart_file=p)
+        cfg = InitSpec(restart_file=p)
         backend = create_harmonic()
         result = _resolve_init(
             cfg, n_live=4, seed=0,
             energy_backend=backend,
             cell_cfg=_cell_cfg_permissive_restart(),
+        )
+        # Finalize is the caller's job after the refactor.
+        energies, _ = _finalise_initial_energies_and_counts(
+            backend, result.initial_positions, result.initial_types, result.initial_cells,
         )
 
         desc = MoveKernel(
@@ -685,7 +667,7 @@ class TestInitConfigResolverModeD:
         out = run_ns(
             positions=result.initial_positions,
             types=result.initial_types,
-            energies=result.initial_energies,
+            energies=energies,
             cells=result.initial_cells,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -976,6 +958,23 @@ class TestLoadRestartMultiGpu:
                 expected = float(np.asarray(state["log_evidence"])[g, pp])
                 assert abs(result[g][pp].log_evidence - expected) < 1e-4
 
+    def test_topology_mismatch_raises(self, tmp_path, monkeypatch):
+        """Restarting a multi-GPU checkpoint on a host with a different
+        device count must raise with a clear message — silent topology
+        coercion is not supported (per §D plan)."""
+        # Save a (G=2, P=2) checkpoint.
+        G, P = 2, 2
+        state = _make_batched_ns_state_dict(batch_shape=(G, P))
+        p = tmp_path / "wrong_topology.checkpoint.h5"
+        save_checkpoint(p, state)
+
+        # Force ``len(jax.local_devices())`` to disagree with G.
+        import jax as _jax
+        monkeypatch.setattr(_jax, "local_devices", lambda *_a, **_k: [object()])
+
+        with pytest.raises(ValueError, match="Cross-topology restart is not"):
+            load_restart(p)
+
     def test_run_ns_multi_gpu_roundtrip(self, tmp_path):
         """load_restart on a (G, P) checkpoint feeds into run_ns_multi_gpu."""
         from jaxrens.backends.toy import create_harmonic
@@ -1093,7 +1092,8 @@ class TestLoadRestartShapeError:
             f.create_dataset("n_dead", data=np.ones(shape3d, dtype=np.int32))
             f.attrs["n_walkers"] = 4
 
-        with pytest.raises(ValueError, match=r"ndim=3"):
+        # New format (post-§D): error mentions the shape and rank explicitly.
+        with pytest.raises(ValueError, match=r"rank 3|\(2, 3, 4\)"):
             load_restart(p)
 
 

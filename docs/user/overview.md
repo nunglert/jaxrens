@@ -140,3 +140,4 @@ divisibility rules.
 | Add a new MCMC move | {mod}`jaxrens.sampling.move_kernel`, {mod}`jaxrens.sampling.mwg` |
 | Debug a run that looks wrong | monitor log `*.log` + `*.adaptation.h5` |
 | Post-process evidence / heat capacity | {mod}`jaxrens.postprocess.thermodynamics` |
+| Look up what a symbol (`K`, `P`, `μ`, `E_max`, `c_i`, …) means | {doc}`/reference/notation` |

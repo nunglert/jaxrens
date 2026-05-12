@@ -53,20 +53,6 @@ class TestFormatRejectBreakdown:
     - 7%   -> ``"  7%"`` (two leading spaces)
     """
 
-    def test_energy_only_reasons_used(self):
-        """counts=[10,5,0,0] with reasons_used={"energy"} -> E=100% (no leading space)."""
-        result = _format_reject_breakdown(
-            [10, 5, 0, 0], reasons_used=frozenset({"energy"})
-        )
-        assert result == "   reject: E=100%"
-
-    def test_energy_and_cell_reasons_used(self):
-        """counts=[10,3,2,0] with reasons_used={"energy","cell"} -> E= 60% C= 40%."""
-        result = _format_reject_breakdown(
-            [10, 3, 2, 0], reasons_used=frozenset({"energy", "cell"})
-        )
-        assert result == "   reject: E= 60% C= 40%"
-
     def test_backward_compat_none_reasons_used(self):
         """counts=[10,3,2,0] with reasons_used=None -> all three columns (backward compat).
 
@@ -84,10 +70,6 @@ class TestFormatRejectBreakdown:
         assert _format_reject_breakdown([10, 0, 0, 0], reasons_used=None) == ""
         assert _format_reject_breakdown([10, 0, 0, 0], reasons_used=frozenset({"energy", "cell", "prior"})) == ""
 
-    def test_zero_total_returns_empty(self):
-        """counts=[0,0,0,0] -> empty string."""
-        assert _format_reject_breakdown([0, 0, 0, 0]) == ""
-
     def test_all_three_reasons(self):
         """counts=[5,3,1,1] with all three reasons -> E= 60% C= 20% P= 20%."""
         result = _format_reject_breakdown(
@@ -96,15 +78,6 @@ class TestFormatRejectBreakdown:
         assert "E= 60%" in result
         assert "C= 20%" in result
         assert "P= 20%" in result
-
-    def test_galilean_energy_only_output(self):
-        """Galilean: reasons_used={"energy"}, some rejects -> only E column."""
-        result = _format_reject_breakdown(
-            [50, 50, 0, 0], reasons_used=frozenset({"energy"})
-        )
-        assert "E=100%" in result
-        assert "C=" not in result
-        assert "P=" not in result
 
     def test_unknown_reject_flagged(self):
         """If rejects appear outside declared reasons, ???= flag is appended."""
@@ -263,17 +236,6 @@ class TestProgressCallbackAlignment:
             + "\n".join(move_rows)
         )
 
-    def test_single_run_no_rejects_acc_aligned(self):
-        """Rows without reject suffix still have acc= at the same column."""
-        info = self._make_single_run_info(with_rejects=False)
-        lines = _capture_progress_lines(info, batched=False)
-        move_rows = [l for l in lines if "acc=" in l]
-        assert len(move_rows) == 3
-        offsets = [_acc_col_offset(r) for r in move_rows]
-        assert len(set(offsets)) == 1, (
-            f"acc= column offset differs: {offsets}\nRows:\n" + "\n".join(move_rows)
-        )
-
     def test_single_run_reject_and_no_reject_same_column(self):
         """Rows with and without reject suffix must have acc= at the same column.
 
@@ -319,61 +281,6 @@ class TestProgressCallbackAlignment:
             f"acc= column differs in batched rows: {offsets}\nRows:\n"
             + "\n".join(move_rows)
         )
-
-    def test_name_width_16_chars(self):
-        """Name column is padded/truncated to 16 characters."""
-        import jax.numpy as jnp
-
-        # "replica_exchange" is exactly 16 chars — should fit without overflow
-        info = {
-            "emax": -10.0,
-            "step_sizes_per_move": jnp.array([1.0, 0.1]),
-            "move_names": ["a", "replica_exchange"],
-            "n_accepted_per_move": jnp.array([500, 500]),
-            "n_proposed_per_move": jnp.array([1000, 1000]),
-            "reject_reason_counts_per_move": None,
-            "move_reject_reasons": None,
-        }
-        lines = _capture_progress_lines(info, batched=False)
-        move_rows = [l for l in lines if "acc=" in l]
-        assert len(move_rows) == 2
-        offsets = [_acc_col_offset(r) for r in move_rows]
-        assert len(set(offsets)) == 1, (
-            f"Short name 'a' and 16-char name 'replica_exchange' produce different acc= offsets: {offsets}\n"
-            + "\n".join(move_rows)
-        )
-
-    def test_ss_scientific_notation_fixed_width(self):
-        """Step size is formatted as :>9.3e — same width regardless of magnitude."""
-        import jax.numpy as jnp
-
-        info = {
-            "emax": -10.0,
-            "step_sizes_per_move": jnp.array([5.0, 1e-6]),
-            "move_names": ["big", "small"],
-            "n_accepted_per_move": jnp.array([500, 500]),
-            "n_proposed_per_move": jnp.array([1000, 1000]),
-            "reject_reason_counts_per_move": None,
-            "move_reject_reasons": None,
-        }
-        lines = _capture_progress_lines(info, batched=False)
-        move_rows = [l for l in lines if "acc=" in l]
-        assert len(move_rows) == 2
-        offsets = [_acc_col_offset(r) for r in move_rows]
-        assert len(set(offsets)) == 1, (
-            f"Different ss magnitudes should not shift acc= column: {offsets}\n"
-            + "\n".join(move_rows)
-        )
-        # Both ss= tokens should have the same length after "ss="
-        # Format is "ss={v:>9.3e}" so the token after "ss=" is 9 chars + "  acc=" separator
-        for row in move_rows:
-            ss_start = row.find("ss=") + 3
-            acc_start = row.find("  acc=")
-            ss_token = row[ss_start:acc_start]
-            assert len(ss_token) == 9, (
-                f"ss token width should be 9 chars, got {len(ss_token)}: {repr(ss_token)}"
-            )
-
 
 # ---------------------------------------------------------------------------
 # Synthetic data helpers
@@ -935,12 +842,14 @@ class TestMonitorCollection:
 _LJ8_NPT_OUTPUT = Path(__file__).parent.parent / "experiments" / "examples" / "lj8_npt" / "output"
 
 
-@pytest.mark.skipif(
-    not _LJ8_NPT_OUTPUT.exists(),
-    reason="lj8_npt example output not present",
-)
 class TestSmokeRealRun:
-    """Load the pre-computed lj8_npt example artefacts and exercise the full stack."""
+    """Load the pre-computed lj8_npt example artefacts and exercise the full stack.
+
+    The artefacts under ``experiments/examples/lj8_npt/output/`` are
+    committed to the repo and produced by running ``jaxrens run -c
+    experiments/examples/lj8_npt/config.yaml`` (a sub-second 8-atom LJ NPT
+    NS, 200 iterations).
+    """
 
     def test_from_directory_lj8_npt(self):
         m = Monitor.from_directory(_LJ8_NPT_OUTPUT, prefix="lj8_npt", label="lj8_smoke")

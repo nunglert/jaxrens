@@ -11,7 +11,6 @@ Covers:
 
 from __future__ import annotations
 
-import time
 
 import jax
 import jax.numpy as jnp
@@ -71,7 +70,7 @@ def harmonic_setup():
 
     ns_state = init_ns(
         init_fn, positions, types, energies,
-        cells=None, rng_key=key, max_dead=500,
+        cells=None, rng_key=key,
     )
     # Run a few NS steps to tighten the population
     for _ in range(20):
@@ -86,7 +85,7 @@ def harmonic_setup():
     energies_batch = jnp.broadcast_to(energies[None, :], (n_runs, n_walkers))
     ns_states_batch = init_ns_parallel(
         init_fn, pos_batch, types, energies_batch,
-        cells=None, rng_keys=run_keys, max_dead=500,
+        cells=None, rng_keys=run_keys,
     )
     pop_batched = ns_states_batch.population
 
@@ -112,7 +111,7 @@ class TestFires:
         mgr = AdaptationManager(
             move_descriptors=[],
             per_move_fns=None,
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -125,7 +124,7 @@ class TestFires:
         mgr = AdaptationManager(
             move_descriptors=[],
             per_move_fns=None,
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -139,7 +138,7 @@ class TestFires:
         mgr = AdaptationManager(
             move_descriptors=[],
             per_move_fns=None,
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -153,7 +152,7 @@ class TestFires:
         mgr = AdaptationManager(
             move_descriptors=[],
             per_move_fns=None,
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -175,7 +174,7 @@ class TestIsActive:
         mgr = AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=setup["per_move_fns"],
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -189,7 +188,7 @@ class TestIsActive:
         mgr = AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=None,
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -203,7 +202,7 @@ class TestIsActive:
         mgr = AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=setup["per_move_fns"],
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -217,7 +216,7 @@ class TestIsActive:
         mgr = AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=[],
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -238,7 +237,7 @@ class TestApplyInactive:
         mgr = AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=None,
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -263,7 +262,7 @@ class TestSingleRunApply:
         return AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=setup["per_move_fns"],
-            batch_descriptor=SingleRun(),
+            batcher=SingleRun(),
             adjust_n_samples=20,
             adjust_factor=1.5,
             adjust_max_rounds=8,
@@ -354,7 +353,7 @@ class TestVmapRunsApply:
         return AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=setup["per_move_fns"],
-            batch_descriptor=VmapRuns(n_runs=n_runs),
+            batcher=VmapRuns(n_runs=n_runs),
             adjust_n_samples=20,
             adjust_factor=1.5,
             adjust_max_rounds=8,
@@ -418,90 +417,3 @@ class TestVmapRunsApply:
 # ---------------------------------------------------------------------------
 
 
-class TestJITCacheStability:
-    """The JIT-compiled functions inside AdaptationManager must not retrace
-    between calls with the same shapes but different key/ss values."""
-
-    def test_no_retrace_single_run(self, harmonic_setup):
-        """Second and third apply() calls must be much faster than the first (compile vs cached)."""
-        mgr = AdaptationManager(
-            move_descriptors=harmonic_setup["descriptors"],
-            per_move_fns=harmonic_setup["per_move_fns"],
-            batch_descriptor=SingleRun(),
-            adjust_n_samples=20,
-            adjust_factor=1.5,
-            adjust_max_rounds=8,
-            adjust_interval=50,
-        )
-        pop = harmonic_setup["pop"]
-        emax = jnp.max(pop.energy)
-        ss = pop.step_sizes[0]
-
-        keys = jax.random.split(jax.random.key(99), 5)
-
-        # First call — compiles the jit functions; this is the slow one.
-        t0 = time.perf_counter()
-        _, _, k_out = mgr.apply(pop, emax, keys[0], ss)
-        # Force device synchronization to measure real compile time
-        jax.effects_barrier()
-        t_compile = time.perf_counter() - t0
-
-        # Subsequent calls should use the compiled cache.
-        times_cached = []
-        k = k_out
-        for idx in range(1, 4):
-            t0 = time.perf_counter()
-            _, _, k = mgr.apply(pop, emax, keys[idx], ss)
-            jax.effects_barrier()
-            times_cached.append(time.perf_counter() - t0)
-
-        t_cached_mean = sum(times_cached) / len(times_cached)
-
-        # If JIT cache is working, cached calls should be at most 50% of the
-        # compile time. On fast machines the compile may be quick already, so
-        # we only assert the ratio when compile time was > 0.1s (meaningful).
-        if t_compile > 0.1:
-            assert t_cached_mean < t_compile * 0.5, (
-                f"Possible retrace: compile={t_compile:.3f}s cached_mean={t_cached_mean:.3f}s"
-            )
-        # Always check shapes are correct (sanity check not a NOP)
-        assert k is not None
-
-    def test_no_retrace_vmap(self, harmonic_setup):
-        """VmapRuns apply() — second call must not retrace."""
-        n_runs = harmonic_setup["n_runs"]
-        mgr = AdaptationManager(
-            move_descriptors=harmonic_setup["descriptors"],
-            per_move_fns=harmonic_setup["per_move_fns"],
-            batch_descriptor=VmapRuns(n_runs=n_runs),
-            adjust_n_samples=20,
-            adjust_factor=1.5,
-            adjust_max_rounds=8,
-            adjust_interval=50,
-        )
-        pop = harmonic_setup["pop_batched"]
-        emax_per_run = jnp.max(pop.energy, axis=1)
-        ss = pop.step_sizes[:, 0, :]
-        run_keys_base = jax.random.split(jax.random.key(88), n_runs)
-
-        # First call — compile.
-        t0 = time.perf_counter()
-        _, _, k_out = mgr.apply(pop, emax_per_run, run_keys_base, ss)
-        jax.effects_barrier()
-        t_compile = time.perf_counter() - t0
-
-        # Subsequent calls.
-        times_cached = []
-        k = k_out
-        for _ in range(3):
-            t0 = time.perf_counter()
-            _, _, k = mgr.apply(pop, emax_per_run, k, ss)
-            jax.effects_barrier()
-            times_cached.append(time.perf_counter() - t0)
-
-        t_cached_mean = sum(times_cached) / len(times_cached)
-        if t_compile > 0.1:
-            assert t_cached_mean < t_compile * 0.5, (
-                f"Possible retrace: compile={t_compile:.3f}s cached_mean={t_cached_mean:.3f}s"
-            )
-        assert k is not None

@@ -7,7 +7,7 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict
 
 
-class RunSchema(BaseModel):
+class RunSpec(BaseModel):
     """Mirrors NSConfig; YAML key is ``run:``.
 
     ``max_iterations`` is optional — when omitted the resolver auto-derives a
@@ -19,7 +19,9 @@ class RunSchema(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     n_live: int = 500
-    max_iterations: Optional[int] = None
+    # Widened to int|float so RootSpec.interval_units='per_walker' can accept
+    # fractional sweeps (e.g. ``max_iterations: 2.5``).  Resolver rounds + casts.
+    max_iterations: Optional[int | float] = None
     convergence_threshold: float = 0.1
     n_mcmc_steps: int = 20
     n_extra: int = 0

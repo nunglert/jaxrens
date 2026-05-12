@@ -18,10 +18,11 @@ each iteration.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TypedDict
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Key
 
 from jaxrens.sampling.batch_descriptor import (
     BatchDescriptor,
@@ -38,9 +39,20 @@ from jaxrens.sampling.moves.replica_exchange import (
     semi_grand_replica_exchange_step,
     xrens_replica_exchange_step,
 )
+from jaxrens.state.ns import NSState
 
 
-_EMPTY_STATS: dict = {
+class SwapStats(TypedDict):
+    """Public return type of ``InterREManager.apply``'s stats dict."""
+
+    n_swap_pairs_attempted: int
+    n_swap_pairs_accepted: int
+    acceptance_rate: float
+    n_energy_evals: int
+    n_grad_evals: int
+
+
+_EMPTY_STATS: SwapStats = {
     "n_swap_pairs_attempted": 0,
     "n_swap_pairs_accepted": 0,
     "acceptance_rate": 0.0,
@@ -58,7 +70,7 @@ class InterREManager:
 
     Args:
         swap_kernel: :class:`SwapKernel` instance (e.g. ``PressureRENSSwap()``).
-        batch_descriptor: ``BatchDescriptor`` controlling the execution mode.
+        batcher: ``BatchDescriptor`` controlling the execution mode.
         backend: Energy backend (unused for ``PressureRENSSwap`` but part of
             the general API for future kernels such as ``XRENSSwap``).
         every: Fire a swap pass every this many NS iterations.  0 → never fire.
@@ -68,13 +80,13 @@ class InterREManager:
     def __init__(
         self,
         swap_kernel: SwapKernel,
-        batch_descriptor: BatchDescriptor,
+        batcher: BatchDescriptor,
         backend: Any,
         every: int = 1,
         n_swap_cycles: int = 1,
     ) -> None:
         self._swap_kernel = swap_kernel
-        self._descriptor = batch_descriptor
+        self._batcher = batcher
         self._backend = backend
         self._every = every
         self._n_swap_cycles = n_swap_cycles
@@ -88,7 +100,7 @@ class InterREManager:
         self._jit_pmap_swap = None
         self._jit_xrens_vmap_swap = None
         self._jit_xrens_pmap_swap = None
-        if batch_descriptor.is_batched:
+        if batcher.is_batched:
             self._jit_vmap_swap, self._jit_pmap_swap = self._build_jit_fns()
 
     # ------------------------------------------------------------------
@@ -116,11 +128,11 @@ class InterREManager:
         ``SingleRun`` descriptors return False (no batched population to swap).
         ``VmapRuns`` / ``PmapVmapRuns`` return True when ``every > 0``.
         """
-        return self._descriptor.is_batched and self._every > 0
+        return self._batcher.is_batched and self._every > 0
 
     def apply(
-        self, ns_state: Any, rng_key: jax.Array
-    ) -> tuple[Any, dict, jax.Array]:
+        self, ns_state: NSState, rng_key: Key[Array, ""]
+    ) -> tuple[NSState, SwapStats, Key[Array, ""]]:
         """Run one inter-RE swap pass.
 
         For ``SingleRun``: returns state unchanged with zero stats.
@@ -144,14 +156,14 @@ class InterREManager:
               All zeros for ``SingleRun`` (no-op).
             * ``new_rng_key``: Advanced PRNG key carry (scalar).
         """
-        if not self._descriptor.is_batched:
+        if not self._batcher.is_batched:
             # SingleRun: no-op
             new_key = jax.random.split(rng_key)[0]
             return ns_state, dict(_EMPTY_STATS), new_key
 
         rng_key, swap_key = jax.random.split(rng_key)
 
-        if isinstance(self._descriptor, PmapVmapRuns):
+        if isinstance(self._batcher, PmapVmapRuns):
             new_ns_state, swap_stats = self._apply_pmap_vmap(ns_state, swap_key)
         else:
             # VmapRuns
@@ -418,7 +430,7 @@ class InterREManager:
 
         return jit_vmap, jit_pmap
 
-    def _extract_swap_inputs(self, ns_state: Any):
+    def _extract_swap_inputs(self, ns_state: NSState):
         """Extract swap inputs from state.
 
         For VmapRuns the population has shape ``(n_runs, K, ...)``.
@@ -434,105 +446,61 @@ class InterREManager:
         """
         pop = ns_state.population
 
-        positions = pop.positions   # (R, K, n_atoms, 3) or (G, P, K, n_atoms, 3)
+        positions = pop.positions   # (*shape_prefix, K, n_atoms, 3)
         types = pop.types           # varies
-        energies = pop.energy       # (R, K) or (G, P, K)
-        cells = pop.cell            # (R, K, 3, 3) or (G, P, K, 3, 3)
+        energies = pop.energy       # (*shape_prefix, K)
+        cells = pop.cell            # (*shape_prefix, K, 3, 3)
 
-        # emax per run: max over the walker axis.
-        # VmapRuns: walker axis = 1 → shape (R,)
-        # PmapVmapRuns: walker axis = 2 → shape (G, P)
-        if isinstance(self._descriptor, PmapVmapRuns):
-            emax = jnp.max(energies, axis=2)  # (G, P)
-        else:
-            emax = jnp.max(energies, axis=1)  # (R,)
+        # Per-replica Emax via the descriptor's walker-axis reduction.
+        emax = self._batcher.reduce_emax(energies)
 
         # Pressures, composition_targets, chemical_potentials: extract from
-        # ensemble_params.  After vmapping init_ns, scalar per-run values have
-        # shape (n_runs, n_walkers) or (G, P, n_walkers).  We need per-run
-        # vectors: take first-walker slice.
+        # ensemble_params.  After vmapping init_ns, per-replica scalar values
+        # carry an extra walker axis (shape ``(*shape_prefix, K)``); per-replica
+        # vectors carry it before the trailing per-replica vector axis.  Drop
+        # the walker axis when present.
+        n_prefix = len(self._batcher.shape_prefix)
+        walker_axis = self._batcher.walker_axis
+
+        def _drop_walker_axis_if_present(arr: jnp.ndarray, has_vector: bool) -> jnp.ndarray:
+            target_ndim = n_prefix + (1 if has_vector else 0)
+            if arr.ndim == target_ndim + 1:
+                return jnp.take(arr, 0, axis=walker_axis)
+            return arr
+
         pressures = None
         composition_targets = None
         chemical_potentials = None
         ep = getattr(pop, "ensemble_params", None)
         if ep is not None and isinstance(ep, dict):
             if "pressure" in ep:
-                p_val = ep["pressure"]
-                arr = jnp.asarray(p_val)
+                arr = jnp.asarray(ep["pressure"])
                 if arr.ndim == 0:
-                    # Scalar pressure — replicate across all runs.
-                    if isinstance(self._descriptor, PmapVmapRuns):
-                        G, P = self._descriptor.n_gpu, self._descriptor.n_per_gpu
-                        pressures = jnp.broadcast_to(arr, (G, P))
-                    else:
-                        pressures = jnp.broadcast_to(arr, (self._descriptor.n_runs,))
-                elif arr.ndim == 1:
-                    # Already (n_runs,) — use directly.
-                    pressures = arr
-                elif arr.ndim == 2:
-                    # (n_runs, n_walkers) or (G, P) — take first walker per run.
-                    if isinstance(self._descriptor, PmapVmapRuns):
-                        pressures = arr
-                    else:
-                        pressures = arr[:, 0]
-                elif arr.ndim == 3:
-                    # (G, P, n_walkers) for PmapVmapRuns — take first walker.
-                    pressures = arr[:, :, 0]
+                    # Scalar pressure — replicate across all replicas.
+                    pressures = jnp.broadcast_to(
+                        arr, self._batcher.shape_prefix or (1,),
+                    )
+                else:
+                    pressures = _drop_walker_axis_if_present(arr, has_vector=False)
 
             if "target_composition" in ep and self._is_xrens:
-                # target_composition per run: shape (n_runs, n_walkers, n_species)
-                # after vmapping — take first walker's composition per run.
-                tc_val = ep["target_composition"]
-                tc_arr = jnp.asarray(tc_val, dtype=jnp.int32)
-                # VmapRuns: (n_runs, n_walkers, n_species) → (n_runs, n_species)
-                # PmapVmapRuns: (G, P, n_walkers, n_species) → (G, P, n_species)
-                if isinstance(self._descriptor, PmapVmapRuns):
-                    if tc_arr.ndim == 4:
-                        # (G, P, n_walkers, n_species)
-                        composition_targets = tc_arr[:, :, 0, :]
-                    elif tc_arr.ndim == 3:
-                        # (G, P, n_species) — already per-run
-                        composition_targets = tc_arr
-                    else:
-                        composition_targets = tc_arr
-                else:
-                    if tc_arr.ndim == 3:
-                        # (n_runs, n_walkers, n_species) → (n_runs, n_species)
-                        composition_targets = tc_arr[:, 0, :]
-                    elif tc_arr.ndim == 2:
-                        # (n_runs, n_species) — already per-run
-                        composition_targets = tc_arr
-                    else:
-                        composition_targets = tc_arr
+                tc_arr = jnp.asarray(ep["target_composition"], dtype=jnp.int32)
+                composition_targets = _drop_walker_axis_if_present(
+                    tc_arr, has_vector=True,
+                )
 
             if "chemical_potentials" in ep and self._is_semi_grand:
-                # chemical_potentials per run: shape (n_runs, n_walkers, n_species)
-                # after vmapping — take first walker's vector per run.
-                cp_val = ep["chemical_potentials"]
-                cp_arr = jnp.asarray(cp_val, dtype=jnp.float32)
-                # VmapRuns: (n_runs, n_walkers, n_species) → (n_runs, n_species)
-                # PmapVmapRuns: (G, P, n_walkers, n_species) → (G, P, n_species)
-                if isinstance(self._descriptor, PmapVmapRuns):
-                    if cp_arr.ndim == 4:
-                        chemical_potentials = cp_arr[:, :, 0, :]
-                    elif cp_arr.ndim == 3:
-                        chemical_potentials = cp_arr
-                    else:
-                        chemical_potentials = cp_arr
-                else:
-                    if cp_arr.ndim == 3:
-                        chemical_potentials = cp_arr[:, 0, :]
-                    elif cp_arr.ndim == 2:
-                        chemical_potentials = cp_arr
-                    else:
-                        chemical_potentials = cp_arr
+                cp_arr = jnp.asarray(ep["chemical_potentials"], dtype=jnp.float32)
+                chemical_potentials = _drop_walker_axis_if_present(
+                    cp_arr, has_vector=True,
+                )
 
         return (
             positions, types, energies, cells, emax,
             pressures, composition_targets, chemical_potentials,
         )
 
-    def _apply_vmap(self, ns_state: Any, swap_key: jax.Array):
+    def _apply_vmap(self, ns_state: NSState, swap_key: Key[Array, ""]) -> tuple[NSState, SwapStats]:
         """Apply swap pass for VmapRuns descriptor.
 
         State population has shape ``(n_runs, K, ...)``.
@@ -579,7 +547,7 @@ class InterREManager:
         stats = self._build_stats(swap_info)
         return new_ns_state, stats
 
-    def _apply_pmap_vmap(self, ns_state: Any, swap_key: jax.Array):
+    def _apply_pmap_vmap(self, ns_state: NSState, swap_key: Key[Array, ""]) -> tuple[NSState, SwapStats]:
         """Apply swap pass for PmapVmapRuns descriptor.
 
         Population has shape ``(G, P, K, ...)``.  Uses ``lax.all_gather``
@@ -593,7 +561,7 @@ class InterREManager:
          pressures, composition_targets, chemical_potentials) = (
             self._extract_swap_inputs(ns_state)
         )
-        G = self._descriptor.n_gpu
+        G = self._batcher.n_gpu
 
         # Broadcast the same rng_key to all devices so every device makes
         # identical swap decisions (deterministic = same output on all devices).
@@ -645,7 +613,7 @@ class InterREManager:
         return new_ns_state, stats
 
     @staticmethod
-    def _build_stats(swap_info: dict) -> dict:
+    def _build_stats(swap_info: dict[str, Any]) -> SwapStats:
         """Convert ``replica_exchange_step`` swap_info to the public stats dict.
 
         Args:

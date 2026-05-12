@@ -4,13 +4,14 @@ Subcommands
 -----------
 run        Load YAML, validate, resolve, execute NS.
 validate   Load YAML, validate only; print OK summary.
-dump-schema  Print JSON schema for RootConfig.
+dump-schema  Print JSON schema for RootSpec.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 from pathlib import Path
@@ -19,8 +20,10 @@ from typing import Any
 import yaml
 
 from jaxrens.cli.resolve import expand_cohort, resolve
-from jaxrens.cli.run import run_from_config
-from jaxrens.cli.schema import RootConfig
+from jaxrens.cli.run import configure_file_logging, run_from_config
+from jaxrens.cli.schema import RootSpec
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -91,12 +94,12 @@ def _apply_overrides(raw: dict[str, Any], overrides: list[str]) -> dict[str, Any
 # Subcommand implementations
 # ---------------------------------------------------------------------------
 
-def _load_and_validate(config_path: str, overrides: list[str]) -> RootConfig:
+def _load_and_validate(config_path: str, overrides: list[str]) -> RootSpec:
     with open(config_path) as fh:
         raw: dict[str, Any] = yaml.safe_load(fh)
     if overrides:
         raw = _apply_overrides(raw, overrides)
-    return RootConfig.model_validate(raw)
+    return RootSpec.model_validate(raw)
 
 
 def _run_one(resolved, *, cohort_label: str = "") -> None:
@@ -163,6 +166,27 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     root = _load_and_validate(args.config, args.set)
 
+    # Hoist file logging before the resolver: heavy backends (NeuralIL,
+    # MACE, nequix) spend many minutes in the resolver placing walkers
+    # and JIT-compiling, and the resolver already emits ``logger.info``
+    # progress messages.  Configuring the log handlers here means those
+    # messages reach ``<prefix>.log`` and stderr at second 1 of the
+    # run, instead of being dropped until ``run_*_from_config`` runs
+    # the same call.
+    #
+    # Log files live in the *parent* of ``working_dir`` (i.e. the
+    # experiment root, next to ``config.yaml`` and ``submit.slurm``)
+    # rather than inside the output dir — keeps them visible from the
+    # top of the experiment tree without ``cd output/``.
+    root.output.working_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = root.output.working_dir.parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+    configure_file_logging(
+        working_dir=log_dir,
+        prefix=root.output.out_file_prefix,
+        level=root.output.log_level,
+    )
+
     from jaxrens.cli.resolve import (
         ResolvedMultiRunConfig,
         expand_multi_run_or_cohort,
@@ -172,16 +196,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     resolved_any = expand_multi_run_or_cohort(root)
 
     if isinstance(resolved_any, ResolvedMultiRunConfig):
-        print(
-            f"[multi-run] n_gpu={resolved_any.ns.n_gpu} "
-            f"n_per_gpu={resolved_any.ns.n_per_gpu} "
-            f"n_total={resolved_any.ns.n_gpu * resolved_any.ns.n_per_gpu} "
-            f"pressures="
-            + ", ".join(
+        logger.info(
+            "[multi-run] n_gpu=%d n_per_gpu=%d n_total=%d pressures=%s",
+            resolved_any.ns.n_gpu,
+            resolved_any.ns.n_per_gpu,
+            resolved_any.ns.n_gpu * resolved_any.ns.n_per_gpu,
+            ", ".join(
                 f"{p.get('pressure'):.4g}"
                 if p.get('pressure') is not None else "—"
                 for p in resolved_any.ensemble_params_per_run
-            )
+            ),
         )
         run_multi_gpu_from_config(resolved_any)
         return 0
@@ -192,9 +216,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         _run_one(cohort[0])
     else:
         for i, resolved in enumerate(cohort):
-            print(
-                f"[cohort {i + 1}/{n}] pressure={resolved.ensemble_params.get('pressure')} "
-                f"seed={resolved.ns.seed}"
+            logger.info(
+                "[cohort %d/%d] pressure=%s seed=%d",
+                i + 1, n,
+                resolved.ensemble_params.get('pressure'),
+                resolved.ns.seed,
             )
             _run_one(resolved, cohort_label=f"{i + 1}/{n}")
     return 0
@@ -244,7 +270,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 
 def _cmd_dump_schema(args: argparse.Namespace) -> int:
-    schema = RootConfig.model_json_schema()
+    schema = RootSpec.model_json_schema()
     fmt = getattr(args, "format", "json")
     if fmt == "json":
         print(json.dumps(schema, indent=2))
@@ -260,7 +286,7 @@ def _cmd_migrate_ns_inp(args: argparse.Namespace) -> int:
     stdout captures clean YAML.
 
     If ``--validate`` is passed, the migrated YAML is round-tripped through
-    ``RootConfig.model_validate``; any validation error is printed to stderr
+    ``RootSpec.model_validate``; any validation error is printed to stderr
     and the command returns exit code 1.
     """
     from jaxrens.cli.migrate import migrate_ns_inp
@@ -310,7 +336,7 @@ def _cmd_migrate_ns_inp(args: argparse.Namespace) -> int:
     # Optional validation round-trip --------------------------------------
     if args.validate:
         try:
-            RootConfig.model_validate(yaml.safe_load(yaml_text))
+            RootSpec.model_validate(yaml.safe_load(yaml_text))
         except Exception as exc:
             print(f"Validation failed: {exc}", file=sys.stderr)
             return 1
@@ -352,7 +378,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_val.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
 
     # -- dump-schema --
-    p_dump = sub.add_parser("dump-schema", help="Print the JSON schema for RootConfig.")
+    p_dump = sub.add_parser("dump-schema", help="Print the JSON schema for RootSpec.")
     p_dump.add_argument("--format", choices=["json"], default="json")
 
     # -- migrate-ns-inp --
@@ -377,7 +403,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "After migrating, round-trip through RootConfig.model_validate and "
+            "After migrating, round-trip through RootSpec.model_validate and "
             "exit non-zero if validation fails."
         ),
     )

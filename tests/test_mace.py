@@ -26,15 +26,6 @@ mace_required = pytest.mark.skipif(
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "mace_mp_small"
 
 
-def fixture_available():
-    return (
-        FIXTURE_DIR.exists()
-        and (FIXTURE_DIR / "reference.npz").exists()
-        and (FIXTURE_DIR / "config.json").exists()
-        and (FIXTURE_DIR / "params.msgpack").exists()
-    )
-
-
 # ---------------------------------------------------------------------------
 # Supercell edge finding (no model needed)
 # ---------------------------------------------------------------------------
@@ -159,8 +150,6 @@ class TestSupercellEdges:
 class TestMACEBackend:
     @pytest.fixture
     def backend(self):
-        if not fixture_available():
-            pytest.skip("MACE fixture not found. Run save_mace_test_fixture.py.")
         from jaxrens.backends.mace import create_mace
 
         return create_mace(
@@ -170,8 +159,6 @@ class TestMACEBackend:
 
     @pytest.fixture
     def reference(self):
-        if not fixture_available():
-            pytest.skip("MACE fixture not found.")
         return np.load(FIXTURE_DIR / "reference.npz")
 
     def test_protocol_compliance(self, backend):
@@ -232,8 +219,6 @@ class TestMACENSStep:
 
     @pytest.fixture
     def mace_ns_setup(self):
-        if not fixture_available():
-            pytest.skip("MACE fixture not found. Run save_mace_test_fixture.py.")
         from jaxrens.backends.mace import create_mace
         from jaxrens.sampling.move_kernel import MoveKernel
         from jaxrens.sampling.moves import random_walk
@@ -289,6 +274,5 @@ class TestMACENSStep:
         new_state, info = jit_step(s["state"], s["step_fn"], 5, 0)
 
         assert new_state.iteration == 1
-        assert new_state.n_dead == 1
         assert jnp.isfinite(info["emax"])
         assert 0 <= info["acceptance_rate"] <= 1.0

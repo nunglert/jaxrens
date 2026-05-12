@@ -12,7 +12,7 @@ them from here.
 Design invariants
 -----------------
 - ``_run_loop`` is pure-Python control flow; every JAX call inside it is
-  either already JIT-compiled (``jit_ns_step`` from ``descriptor.wrap_step``)
+  either already JIT-compiled (``jit_ns_step`` from ``batcher.wrap_step``)
   or is a Python-level numpy / host operation.
 - The descriptor carries all shape differences (single vs. vmap); there is NO
   ``isinstance`` sniffing inside ``_run_loop``.
@@ -23,15 +23,20 @@ Design invariants
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jaxtyping import Array, Float, Key
 
 from jaxrens.sampling.adaptation.manager import AdaptationManager
-from jaxrens.sampling.batch_descriptor import BatchDescriptor, PmapVmapRuns, VmapRuns
+from jaxrens.sampling.batch_descriptor import BatchDescriptor
+from jaxrens.sampling.inter_re_manager import InterREManager
+from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.termination import PriorMassTermination, check_any
+from jaxrens.state.ns import NSState
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +47,8 @@ logger = logging.getLogger(__name__)
 
 
 def _bump_cumulative_counters(
-    cumulative: dict,
-    info: dict,
+    cumulative: dict[str, np.ndarray],
+    info: dict[str, Any],
     *,
     include_trial: bool = False,
 ) -> None:
@@ -80,7 +85,9 @@ def _bump_cumulative_counters(
         )
 
 
-def _inject_cumulative_into_info(info: dict, cumulative: dict) -> None:
+def _inject_cumulative_into_info(
+    info: dict[str, Any], cumulative: dict[str, np.ndarray],
+) -> None:
     """Write cumulative counter snapshots into *info* for downstream callbacks.
 
     Sets ``info["cumulative_n_evaluations_per_move"]`` and
@@ -99,19 +106,11 @@ def _inject_cumulative_into_info(info: dict, cumulative: dict) -> None:
 
 
 def _pack_adjustment_info(
-    info: dict,
+    info: dict[str, Any],
     *,
-    current_step_sizes,
-    per_move_rates: list,
-    per_move_counts: list,
-    per_move_n_rounds: list,
-    per_move_converged: list,
-    per_move_cap_hits: list,
-    per_move_floor_hits: list,
-    per_move_bracket_detected: list,
-    per_move_trial_n_evals: list,
-    per_move_trial_n_grad_evals: list,
-    move_descriptors: list,
+    current_step_sizes: Float[Array, "*B n_moves"],
+    adjust_info: dict[str, Any],
+    move_descriptors: list[MoveKernel],
 ) -> None:
     """Pack per-move adjustment diagnostics into *info*.
 
@@ -120,37 +119,38 @@ def _pack_adjustment_info(
     ``"trial_n_grad_evaluations_per_move"``) that
     ``_bump_cumulative_counters`` consumes when ``include_trial=True``.
 
+    All array values are passed through with shape ``(*shape_prefix,
+    n_moves, ...)`` exactly as ``AdaptationManager.apply`` returned
+    them — no list-of-scalars round-trip — so this works uniformly for
+    SingleRun (``(n_moves,)`` / ``(n_moves, 4)``), VmapRuns
+    (``(n_runs, n_moves, ...)``), and PmapVmapRuns (``(G, P,
+    n_moves, ...)``).  Downstream ``AdaptationCallback`` calls
+    ``batcher.flatten`` to coerce these to ``(n_runs_total, n_moves,
+    ...)`` for the HDF5 writer.
+
     Args:
         info: Info dict to update.
-        current_step_sizes: Current per-move step sizes array ``(n_moves,)``.
-        per_move_rates: List of float acceptance rates, one per move.
-        per_move_counts: List of reject-count arrays, one per move.
-        per_move_n_rounds: List of bisection round counts, one per move.
-        per_move_converged: List of bool convergence flags, one per move.
-        per_move_cap_hits: List of int cap-hit counts, one per move.
-        per_move_floor_hits: List of int floor-hit counts, one per move.
-        per_move_bracket_detected: List of bool flags, one per move.
-        per_move_trial_n_evals: List of int trial eval counts, one per move.
-        per_move_trial_n_grad_evals: List of int trial grad-eval counts, one per move.
+        current_step_sizes: Per-move step sizes after the adjust call,
+            shape ``(*shape_prefix, n_moves)``.
+        adjust_info: Dict returned by ``AdaptationManager.apply`` —
+            keys ``rate``, ``counts``, ``n_rounds``, ``converged``,
+            ``cap_hits``, ``floor_hits``, ``bracket_detected``,
+            ``trial_n_evaluations``, ``trial_n_grad_evaluations``.
         move_descriptors: MoveKernel descriptors (provide ``.name`` and
             ``.reject_reasons``).
     """
-    trial_n_evals_arr = np.array(
-        [int(v) for v in per_move_trial_n_evals], dtype=np.int64
-    )
-    trial_n_grad_evals_arr = np.array(
-        [int(v) for v in per_move_trial_n_grad_evals], dtype=np.int64
-    )
     info["step_sizes_per_move"] = current_step_sizes
-    info["acceptance_rates_per_move"] = jnp.array(per_move_rates)
-    info["reject_counts_per_move"] = jnp.stack(per_move_counts, axis=0)
-    info["adjustment_n_rounds"] = jnp.array(per_move_n_rounds, dtype=jnp.int32)
-    info["adjustment_converged"] = jnp.array(per_move_converged)
-    info["adjustment_cap_hits"] = jnp.array(per_move_cap_hits, dtype=jnp.int32)
-    info["adjustment_floor_hits"] = jnp.array(per_move_floor_hits, dtype=jnp.int32)
-    info["adjustment_bracket_detected"] = jnp.array(per_move_bracket_detected)
-    info["trial_n_evaluations_per_move"] = trial_n_evals_arr
-    info["trial_n_grad_evaluations_per_move"] = trial_n_grad_evals_arr
+    info["acceptance_rates_per_move"] = adjust_info["rate"]
+    info["reject_counts_per_move"] = adjust_info["counts"]
+    info["adjustment_n_rounds"] = adjust_info["n_rounds"]
+    info["adjustment_converged"] = adjust_info["converged"]
+    info["adjustment_cap_hits"] = adjust_info["cap_hits"]
+    info["adjustment_floor_hits"] = adjust_info["floor_hits"]
+    info["adjustment_bracket_detected"] = adjust_info["bracket_detected"]
+    info["trial_n_evaluations_per_move"] = adjust_info["trial_n_evaluations"]
+    info["trial_n_grad_evaluations_per_move"] = adjust_info[
+        "trial_n_grad_evaluations"
+    ]
     info["move_names"] = [d.name for d in move_descriptors]
     info["move_reject_reasons"] = tuple(
         frozenset(d.reject_reasons) for d in move_descriptors
@@ -160,8 +160,8 @@ def _pack_adjustment_info(
 def _dispatch_callbacks(
     callbacks: list,
     iteration: int,
-    ns_state: Any,
-    info: dict,
+    ns_state: NSState,
+    info: dict[str, Any],
 ) -> None:
     """Call ``on_iteration`` on every callback that exposes it.
 
@@ -212,27 +212,27 @@ def _pick_next_bucket(
 
 def _run_loop(
     *,
-    descriptor: BatchDescriptor,
+    batcher: BatchDescriptor,
     adapt_mgr: AdaptationManager,
-    ns_state: Any,
-    step_fn,
+    ns_state: NSState,
+    step_fn: Callable,
     n_mcmc_steps: int,
     n_extra: int,
     termination_criteria: list,
     callbacks: list,
     n_moves: int,
-    move_descriptors: Any,
-    rng_key,
+    move_descriptors: list[MoveKernel] | None,
+    rng_key: Key[Array, "*B"],
     info_interval: int,
-    inter_re_mgr: Any = None,
+    inter_re_mgr: InterREManager | None = None,
     max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
-) -> tuple[Any, Any, dict]:
+) -> tuple[NSState, Key[Array, "*B"], dict[str, np.ndarray]]:
     """Unified NS outer loop shared by ``run_ns`` and ``run_ns_parallel``.
 
     All shape differences between single-run and multi-run execution are
-    encapsulated by *descriptor*; ``_run_loop`` contains no ``isinstance``
-    checks on *descriptor*.
+    encapsulated by *batcher*; ``_run_loop`` contains no ``isinstance``
+    checks on *batcher*.
 
     Per-iteration culled walker data lives only in the ``info`` dict —
     callbacks that need it (``EnergyLogger``, ``TrajectoryCallback``) read
@@ -242,7 +242,7 @@ def _run_loop(
     those callbacks.
 
     Args:
-        descriptor: ``BatchDescriptor`` instance controlling JIT-compilation,
+        batcher: ``BatchDescriptor`` instance controlling JIT-compilation,
             key splitting, and termination reduction.
         adapt_mgr: ``AdaptationManager`` instance. May be inactive
             (``is_active=False``) when no step-size adaptation is configured.
@@ -282,46 +282,23 @@ def _run_loop(
     from jaxrens.sampling.nested_sampling import ns_step  # avoid circular at module level
 
     # JIT-compile ns_step once before the loop.
-    jit_ns_step = descriptor.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
+    jit_ns_step = batcher.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
 
-    # Classify the descriptor for shape-dispatch below.
-    # PmapVmapRuns: (G, P, K, ...)  — two leading batch dims.
-    # VmapRuns:     (n_runs, K, ...) — one leading batch dim.
-    # SingleRun:    (K, ...)          — no leading batch dim.
-    is_pmap_vmap = isinstance(descriptor, PmapVmapRuns)
-    is_vmap = isinstance(descriptor, VmapRuns)
-
-    # Extract current step sizes from population.
-    # SingleRun:    pop.step_sizes shape (K, n_moves)       -> take [0]       -> (n_moves,)
-    # VmapRuns:     pop.step_sizes shape (R, K, n_moves)    -> take [:, 0, :] -> (R, n_moves)
-    # PmapVmapRuns: pop.step_sizes shape (G, P, K, n_moves) -> take [:,:,0,:] -> (G, P, n_moves)
+    # Per-replica step sizes: pop.step_sizes is (*shape_prefix, K, n_moves).
+    # The descriptor drops the walker axis to give (*shape_prefix, n_moves).
     pop = ns_state.population
-    if is_pmap_vmap:
-        current_step_sizes = pop.step_sizes[:, :, 0, :]  # (G, P, n_moves)
-    elif is_vmap:
-        current_step_sizes = pop.step_sizes[:, 0, :]  # (n_runs, n_moves)
-    else:
-        current_step_sizes = pop.step_sizes[0]  # (n_moves,)
+    current_step_sizes = batcher.extract_step_sizes(pop)
 
-    # Cumulative evaluation counters.
-    # Shape: (n_moves,) for SingleRun, (R, n_moves) for VmapRuns,
-    #        (G, P, n_moves) for PmapVmapRuns.
-    if is_pmap_vmap:
-        cumulative: dict = {
-            "n_evaluations": np.zeros(descriptor.shape_prefix + (n_moves,), dtype=np.int64),
-            "n_grad_evaluations": np.zeros(descriptor.shape_prefix + (n_moves,), dtype=np.int64),
-        }
-    elif is_vmap:
-        n_runs = descriptor.n_runs
-        cumulative = {
-            "n_evaluations": np.zeros((n_runs, n_moves), dtype=np.int64),
-            "n_grad_evaluations": np.zeros((n_runs, n_moves), dtype=np.int64),
-        }
-    else:
-        cumulative = {
-            "n_evaluations": np.zeros(n_moves, dtype=np.int64),
-            "n_grad_evaluations": np.zeros(n_moves, dtype=np.int64),
-        }
+    # Cumulative evaluation counters: shape (*shape_prefix, n_moves).
+    # Empty prefix collapses to (n_moves,) for SingleRun.
+    cumulative: dict = {
+        "n_evaluations": np.zeros(
+            batcher.shape_prefix + (n_moves,), dtype=np.int64,
+        ),
+        "n_grad_evaluations": np.zeros(
+            batcher.shape_prefix + (n_moves,), dtype=np.int64,
+        ),
+    }
 
     # Dedicated scalar PRNG key for inter-RE swaps.
     # The adaptation ``rng_key`` may be (n_runs,) shaped for VmapRuns; we need
@@ -330,16 +307,24 @@ def _run_loop(
     # descriptors we take the first per-run key.
     inter_re_key = None
     if inter_re_mgr is not None and inter_re_mgr.is_active:
-        rng_key_scalar = rng_key.reshape(-1)[0] if jnp.asarray(rng_key).ndim > 0 else rng_key
-        inter_re_key = jax.random.split(rng_key_scalar, 1)[0]
+        inter_re_key = jax.random.split(batcher.scalar_key(rng_key), 1)[0]
 
     # ---- on_start callbacks (fired once, post-init, pre-loop) ----
     # CheckpointCallback uses this hook to snapshot the fully-initialised
     # NSState before iteration 0, giving a reproducible entry point for
-    # post-hoc debugging of init/overflow issues.
+    # post-hoc debugging of init/overflow issues.  AdaptationCallback uses
+    # it to write the mandatory iter-0 step-size baseline row.
+    #
+    # ``start_info`` carries ``_batcher`` and the initial
+    # ``step_sizes_per_move`` so callbacks can reuse the same shape
+    # coercion they apply on ``on_iteration`` info dicts.
+    start_info = {
+        "_batcher": batcher,
+        "step_sizes_per_move": current_step_sizes,
+    }
     for cb in callbacks:
         if hasattr(cb, "on_start"):
-            cb.on_start(ns_state)
+            cb.on_start(ns_state, start_info)
 
     i = 0
     while True:
@@ -347,53 +332,30 @@ def _run_loop(
         adjust_info = None
         if adapt_mgr.fires(i):
             pop = ns_state.population
-            if is_pmap_vmap:
-                emax = jnp.max(pop.energy, axis=2)  # (G, P) — walker axis is 2
-            elif is_vmap:
-                emax = jnp.max(pop.energy, axis=1)  # (n_runs,)
-            else:
-                emax = jnp.max(pop.energy)  # scalar
+            emax = batcher.reduce_emax(pop.energy)
             # adapt_mgr.apply does its own key splitting internally;
             # pass rng_key directly and get back the advanced carry.
             current_step_sizes, per_move_outputs, rng_key = adapt_mgr.apply(
                 pop, emax, rng_key, current_step_sizes,
             )
-            # Broadcast updated step sizes back into population.
-            if is_pmap_vmap:
-                # current_step_sizes: (G, P, n_moves)
-                # pop.step_sizes: (G, P, K, n_moves) — insert axis 2 for K.
-                n_walkers = pop.step_sizes.shape[2]
-                new_ss_pop = jnp.broadcast_to(
-                    current_step_sizes[:, :, None, :],
-                    descriptor.shape_prefix + (n_walkers, n_moves),
-                )
-            elif is_vmap:
-                n_runs_local = descriptor.n_runs
-                n_walkers = pop.step_sizes.shape[1]
-                new_ss_pop = jnp.broadcast_to(
-                    current_step_sizes[:, None, :],
-                    (n_runs_local, n_walkers, n_moves),
-                )
-            else:
-                n_walkers = pop.step_sizes.shape[0]
-                new_ss_pop = jnp.broadcast_to(
-                    current_step_sizes,
-                    (n_walkers, current_step_sizes.shape[0]),
-                )
+            # Re-broadcast updated step sizes across the walker axis.
+            n_walkers = pop.step_sizes.shape[batcher.walker_axis]
+            new_ss_pop = batcher.broadcast_step_sizes(
+                current_step_sizes, n_walkers,
+            )
             ns_state = ns_state.set(population=pop.set(step_sizes=new_ss_pop))
             adjust_info = per_move_outputs
 
         # ---- NS step ----
-        # PmapVmapRuns and VmapRuns: the callable already closed over step_fn etc.
-        # SingleRun: the callable is a plain jit'd function expecting explicit args.
-        if is_pmap_vmap or is_vmap:
+        # Batched callables (vmap / pmap-vmap) close over step_fn etc.;
+        # the SingleRun callable is a plain jit'd fn expecting explicit args.
+        if batcher.is_batched:
             new_ns_state, info = jit_ns_step(ns_state)
         else:
             new_ns_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps, n_extra)
 
         # ---- Overflow retry ----
         # For PmapVmapRuns, any overflow across any (G, P) shard triggers a retry.
-        # TODO: for multi-GPU, consider per-shard retry rather than stop-the-world.
         if jnp.any(new_ns_state.population.overflow):
             true_max = int(new_ns_state.population.max_neighbor_count.max())
             current = int(ns_state.population.max_neighbors)
@@ -435,39 +397,37 @@ def _run_loop(
         # ---- Cumulative counters (chain phase) ----
         _bump_cumulative_counters(cumulative, info)
 
-        # ---- Pack adjustment info (only when fires this iter, single-run only) ----
-        # VmapRuns/PmapVmapRuns: per_move_outputs have shape (n_runs, n_moves, ...) or
-        # (G, P, n_moves, ...) which is incompatible with the scalar-per-move pattern
-        # of _pack_adjustment_info.  Only SingleRun invokes it.
-        if adjust_info is not None and not is_vmap and not is_pmap_vmap:
+        # ---- Pack adjustment info (only when fires this iter) ----
+        # Works uniformly for SingleRun, VmapRuns, and PmapVmapRuns:
+        # adjust_info values are already shaped ``(*shape_prefix, n_moves, ...)``
+        # straight from ``AdaptationManager.apply``; the packer is shape-agnostic
+        # and ``AdaptationCallback.on_iteration`` will call ``batcher.flatten``
+        # to land them in ``(n_runs_total, n_moves, ...)`` before HDF5.
+        if adjust_info is not None:
             _pack_adjustment_info(
                 info,
                 current_step_sizes=current_step_sizes,
-                per_move_rates=list(adjust_info["rate"]),
-                per_move_counts=list(adjust_info["counts"]),
-                per_move_n_rounds=list(adjust_info["n_rounds"]),
-                per_move_converged=list(adjust_info["converged"]),
-                per_move_cap_hits=list(adjust_info["cap_hits"]),
-                per_move_floor_hits=list(adjust_info["floor_hits"]),
-                per_move_bracket_detected=list(adjust_info["bracket_detected"]),
-                per_move_trial_n_evals=list(adjust_info["trial_n_evaluations"]),
-                per_move_trial_n_grad_evals=list(adjust_info["trial_n_grad_evaluations"]),
+                adjust_info=adjust_info,
                 move_descriptors=move_descriptors or [],
             )
-            # Also accumulate trial-phase evals into cumulative counters
+            # Also accumulate trial-phase evals into cumulative counters.
+            # cumulative has shape (*shape_prefix, n_moves); the trial arrays
+            # already match, so the in-place add is shape-correct for all
+            # batchers (numpy broadcasting handles the SingleRun case where
+            # shape_prefix is empty).
             _bump_cumulative_counters(cumulative, info, include_trial=True)
 
         # ---- Inject cumulative snapshot ----
         _inject_cumulative_into_info(info, cumulative)
 
-        # ---- Attach descriptor so callbacks can introspect ----
-        info["_batch"] = descriptor
+        # ---- Attach the batcher so callbacks can introspect ----
+        info["_batcher"] = batcher
 
         # ---- Callback dispatch ----
         _dispatch_callbacks(callbacks, i, ns_state, info)
 
         # ---- Termination ----
-        log_z_scalar, hmax_scalar = descriptor.reduce_for_termination(
+        log_z_scalar, hmax_scalar = batcher.reduce_for_termination(
             ns_state.log_evidence, info.get("hmax", jnp.inf),
         )
         for criterion in termination_criteria:

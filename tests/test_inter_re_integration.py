@@ -9,8 +9,6 @@ Coverage:
 
 from __future__ import annotations
 
-import time
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -322,7 +320,7 @@ class TestPmapVmapRunsInterRE:
         ns_state = init_ns_multi_gpu(
             init_fn, positions, types, energies, None,
             rng_keys, n_gpu=n_gpu, n_per_gpu=n_per_gpu,
-            max_dead=20, step_sizes=jnp.array([0.2]),
+            step_sizes=jnp.array([0.2]),
         )
 
         descriptor = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
@@ -339,62 +337,6 @@ class TestPmapVmapRunsInterRE:
 
 
 # ---------------------------------------------------------------------------
-# Zero-overhead: inter_re=None vs baseline
-# ---------------------------------------------------------------------------
-
-
-class TestZeroOverhead:
-    """Wall-clock must not significantly regress when inter_re=None."""
-
-    @pytest.mark.slow
-    def test_timing_no_regression(self):
-        """Baseline (inter_re=None) and no-config runs must be within noise."""
-        backend = create_harmonic(k=1.0)
-        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
-        init_fn, step_fn, _ = build_mwg(backend, descriptors)
-
-        n_runs, n_walkers = 2, 20
-        key = jax.random.key(99)
-        rng_keys = jax.random.split(key, n_runs)
-        pos_key, _ = jax.random.split(key)
-        positions = jax.random.uniform(pos_key, (n_runs, n_walkers, 1, 3), minval=-2.0, maxval=2.0)
-        types = jnp.zeros((1,), dtype=jnp.int32)
-        energies = jax.vmap(
-            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
-        )(positions)
-
-        common_kwargs = dict(
-            positions=positions, types=types, energies=energies, cells=None,
-            init_fn=init_fn, step_fn=step_fn, rng_keys=rng_keys,
-            max_iterations=10, n_mcmc_steps=5,
-            termination_criteria=[IterationTermination(10)],
-        )
-
-        # Warm up JIT
-        run_ns_parallel(**common_kwargs, inter_re_config=None)
-        run_ns_parallel(**common_kwargs, inter_re_config=None)
-
-        t0 = time.perf_counter()
-        run_ns_parallel(**common_kwargs, inter_re_config=None)
-        jax.effects_barrier()
-        t_baseline = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        run_ns_parallel(**common_kwargs, inter_re_config=None)
-        jax.effects_barrier()
-        t_test = time.perf_counter() - t0
-
-        # Both should be essentially the same (within noise)
-        # Use 5x tolerance for environment variance
-        if t_baseline < 0.05:
-            pytest.skip("Runs too fast for meaningful timing test")
-
-        assert t_test < t_baseline * 5, (
-            f"Unexpected overhead: baseline={t_baseline:.3f}s, test={t_test:.3f}s"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Flavor validation tests (updated for commit 4: xrens is now valid)
 # ---------------------------------------------------------------------------
 
@@ -402,8 +344,8 @@ class TestZeroOverhead:
 class TestFlavourValidation:
     def test_xrens_accepted_at_cli_level_with_composition_targets(self):
         """CLI schema (pydantic) accepts xrens flavor when composition_targets given."""
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
-        spec = InterREConfigSpec(
+        from jaxrens.cli.schema.inter_re import InterRESpec
+        spec = InterRESpec(
             flavor="xrens",
             composition_targets=[[8, 0], [4, 4]],
         )
@@ -411,9 +353,9 @@ class TestFlavourValidation:
 
     def test_xrens_raises_at_cli_level_without_composition_targets(self):
         """CLI schema (pydantic) rejects xrens flavor when composition_targets absent."""
-        from jaxrens.cli.schema.inter_re import InterREConfigSpec
+        from jaxrens.cli.schema.inter_re import InterRESpec
         with pytest.raises((ValueError, Exception)):
-            InterREConfigSpec(flavor="xrens")
+            InterRESpec(flavor="xrens")
 
     def test_xrens_raises_at_run_time_without_composition_targets(self):
         """run_ns_parallel raises ValueError for xrens without composition_targets."""

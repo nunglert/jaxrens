@@ -1,4 +1,4 @@
-"""Tests for jaxrens.init.burn_in.initial_walk.
+"""Tests for jaxrens.init.burn_in.initial_walk — core semantics.
 
 Covers:
 - n_walks=0 is a no-op (returns input unchanged)
@@ -8,14 +8,11 @@ Covers:
 - JIT: inner chain is JIT-compiled with no retrace per outer walk
 - Step-size adjustment called the correct number of times
 - Adaptation disabled (per_move_fns=None) runs without error
-- Walker chunking: walker_batch_size divides evenly -> same result as full vmap
-- Walker chunking: walker_batch_size does not divide n_walkers -> ValueError
-- walker_batch_size == n_walkers behaves like full vmap
-- Batched (multi-run): output shapes are (n_runs, n_walkers, ...)
-- Batched + run_batch_size: same result as full vmap over runs
-- Batched + run_batch_size not dividing n_runs -> ValueError
-- Run independence under batched=True
-- Combined batched + walker_batch_size + run_batch_size
+- Batched (multi-run): output shape + run independence
+
+Walker/run chunking tests (walker_batch_size, run_batch_size, combined,
+trial-vmap chunking inside adjust_step_size) live in
+``test_init_burn_in_chunking.py``.
 """
 
 from __future__ import annotations
@@ -76,7 +73,7 @@ def _build_ns_state(
     )(positions)
 
     ns_state = init_ns(
-        init_fn, positions, types, energies, cells, key, max_dead=200
+        init_fn, positions, types, energies, cells, key
     )
     return ns_state, step_fn, per_move_fns, backend
 
@@ -119,7 +116,7 @@ def _build_batched_ns_state(
 
     rng_keys = jax.random.split(key, n_runs)
     ns_states = init_ns_parallel(
-        init_fn, positions, types, energies, cells, rng_keys, max_dead=200
+        init_fn, positions, types, energies, cells, rng_keys
     )
     return ns_states, step_fn, per_move_fns, backend
 
@@ -176,7 +173,6 @@ class TestNoOp:
             n_atoms=2,
         )
         assert int(result.iteration) == int(ns_state.iteration)
-        assert int(result.n_dead) == int(ns_state.n_dead)
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +222,8 @@ class TestShapeInvariance:
         )
         assert result.population.step_sizes.shape == ns_state.population.step_sizes.shape
 
-    def test_dead_point_arrays_untouched(self):
+    def test_iteration_counter_unchanged(self):
+        """Burn-in does not advance the NS iteration counter."""
         ns_state, step_fn, _, _ = _build_ns_state(n_walkers=4, n_atoms=2)
         result = initial_walk(
             jax.random.key(42),
@@ -238,11 +235,6 @@ class TestShapeInvariance:
             emax_offset_per_atom=0.0,
             n_atoms=2,
         )
-        np.testing.assert_array_equal(
-            np.array(result.dead_energies),
-            np.array(ns_state.dead_energies),
-        )
-        assert int(result.n_dead) == int(ns_state.n_dead)
         assert int(result.iteration) == int(ns_state.iteration)
 
 
@@ -494,79 +486,7 @@ class TestAdaptationDisabled:
 
 
 # ---------------------------------------------------------------------------
-# 8. walker_batch_size that divides evenly: same output as full vmap
-# ---------------------------------------------------------------------------
-
-class TestWalkerChunking:
-    def test_walker_batch_size_divides_evenly_same_result(self):
-        """walker_batch_size=2 on n_walkers=4: same result as full vmap."""
-        n_walkers, n_atoms = 4, 2
-        ns_state, step_fn, _, _ = _build_ns_state(n_walkers=n_walkers, n_atoms=n_atoms)
-        key = jax.random.key(7)
-
-        result_full = initial_walk(
-            key, ns_state, step_fn,
-            n_walks=2, walklength=5, adjust_interval=100,
-            emax_offset_per_atom=0.5, n_atoms=n_atoms,
-            walker_batch_size=None,
-        )
-        result_chunked = initial_walk(
-            key, ns_state, step_fn,
-            n_walks=2, walklength=5, adjust_interval=100,
-            emax_offset_per_atom=0.5, n_atoms=n_atoms,
-            walker_batch_size=2,
-        )
-
-        np.testing.assert_allclose(
-            np.array(result_full.population.positions),
-            np.array(result_chunked.population.positions),
-            atol=1e-5,
-        )
-        np.testing.assert_allclose(
-            np.array(result_full.population.energy),
-            np.array(result_chunked.population.energy),
-            atol=1e-5,
-        )
-
-    def test_walker_batch_size_not_dividing_raises(self):
-        """walker_batch_size=3 on n_walkers=4: raises ValueError."""
-        ns_state, step_fn, _, _ = _build_ns_state(n_walkers=4, n_atoms=2)
-        with pytest.raises(ValueError, match="walker_batch_size"):
-            initial_walk(
-                jax.random.key(0), ns_state, step_fn,
-                n_walks=1, walklength=2, adjust_interval=100,
-                emax_offset_per_atom=0.0, n_atoms=2,
-                walker_batch_size=3,
-            )
-
-    def test_walker_batch_size_equals_n_walkers_same_as_full_vmap(self):
-        """walker_batch_size == n_walkers: same result as full vmap."""
-        n_walkers, n_atoms = 4, 2
-        ns_state, step_fn, _, _ = _build_ns_state(n_walkers=n_walkers, n_atoms=n_atoms)
-        key = jax.random.key(13)
-
-        result_full = initial_walk(
-            key, ns_state, step_fn,
-            n_walks=2, walklength=4, adjust_interval=100,
-            emax_offset_per_atom=0.0, n_atoms=n_atoms,
-            walker_batch_size=None,
-        )
-        result_equal = initial_walk(
-            key, ns_state, step_fn,
-            n_walks=2, walklength=4, adjust_interval=100,
-            emax_offset_per_atom=0.0, n_atoms=n_atoms,
-            walker_batch_size=n_walkers,
-        )
-
-        np.testing.assert_allclose(
-            np.array(result_full.population.positions),
-            np.array(result_equal.population.positions),
-            atol=1e-5,
-        )
-
-
-# ---------------------------------------------------------------------------
-# 11. Batched (multi-run): output shapes are (n_runs, n_walkers, ...)
+# Batched (multi-run): output shapes are (n_runs, n_walkers, ...)
 # ---------------------------------------------------------------------------
 
 class TestBatchedRuns:
@@ -591,47 +511,6 @@ class TestBatchedRuns:
 
         assert result.population.positions.shape == (n_runs, n_walkers, n_atoms, 3)
         assert result.population.energy.shape == (n_runs, n_walkers)
-
-    def test_batched_run_batch_size_divides_evenly_same_result(self):
-        """batched=True, run_batch_size=1 on n_runs=3: same result as full vmap."""
-        n_runs, n_walkers, n_atoms = 3, 4, 2
-        ns_states, step_fn, _, _ = _build_batched_ns_state(
-            n_runs=n_runs, n_walkers=n_walkers, n_atoms=n_atoms
-        )
-        key = jax.random.key(42)
-
-        result_full = initial_walk(
-            key, ns_states, step_fn,
-            n_walks=2, walklength=4, adjust_interval=100,
-            emax_offset_per_atom=0.0, n_atoms=n_atoms,
-            batched=True, run_batch_size=None,
-        )
-        result_chunked = initial_walk(
-            key, ns_states, step_fn,
-            n_walks=2, walklength=4, adjust_interval=100,
-            emax_offset_per_atom=0.0, n_atoms=n_atoms,
-            batched=True, run_batch_size=1,
-        )
-
-        np.testing.assert_allclose(
-            np.array(result_full.population.positions),
-            np.array(result_chunked.population.positions),
-            atol=1e-5,
-        )
-
-    def test_batched_run_batch_size_not_dividing_raises(self):
-        """run_batch_size=2 on n_runs=3: raises ValueError."""
-        n_runs, n_walkers, n_atoms = 3, 4, 2
-        ns_states, step_fn, _, _ = _build_batched_ns_state(
-            n_runs=n_runs, n_walkers=n_walkers, n_atoms=n_atoms
-        )
-        with pytest.raises(ValueError, match="run_batch_size"):
-            initial_walk(
-                jax.random.key(0), ns_states, step_fn,
-                n_walks=1, walklength=2, adjust_interval=100,
-                emax_offset_per_atom=0.0, n_atoms=n_atoms,
-                batched=True, run_batch_size=2,
-            )
 
     def test_batched_run_independence(self):
         """Three runs with distinct initial populations stay distinct (no cross-contamination)."""
@@ -661,111 +540,3 @@ class TestBatchedRuns:
         )
 
 
-# ---------------------------------------------------------------------------
-# 15. Combined: batched + walker_batch_size + run_batch_size
-# ---------------------------------------------------------------------------
-
-class TestCombinedChunking:
-    def test_combined_walker_and_run_batch_size(self):
-        """batched=True, walker_batch_size=2, run_batch_size=1: shape preserved."""
-        n_runs, n_walkers, n_atoms = 3, 4, 2
-        ns_states, step_fn, _, _ = _build_batched_ns_state(
-            n_runs=n_runs, n_walkers=n_walkers, n_atoms=n_atoms
-        )
-
-        result = initial_walk(
-            jax.random.key(0),
-            ns_states,
-            step_fn,
-            n_walks=2,
-            walklength=3,
-            adjust_interval=100,
-            emax_offset_per_atom=0.0,
-            n_atoms=n_atoms,
-            batched=True,
-            walker_batch_size=2,
-            run_batch_size=1,
-        )
-
-        assert result.population.positions.shape == (n_runs, n_walkers, n_atoms, 3)
-        assert result.population.energy.shape == (n_runs, n_walkers)
-        assert jnp.all(jnp.isfinite(result.population.positions))
-
-
-# ---------------------------------------------------------------------------
-# Adaptation chunking: trial vmap (walker_batch_size) and run vmap
-# (run_batch_size) inside _apply_adaptation must give the same answer as the
-# unchunked vmaps when the chunk evenly divides the source axis.
-# ---------------------------------------------------------------------------
-
-
-class TestAdaptationChunking:
-    def _run_with(
-        self,
-        *,
-        walker_batch_size: int | None,
-        run_batch_size: int | None,
-    ):
-        from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
-
-        n_runs, n_walkers, n_atoms = 4, 4, 2
-        ns_states, step_fn, per_move_fns, _ = _build_batched_ns_state(
-            n_runs=n_runs, n_walkers=n_walkers, n_atoms=n_atoms,
-        )
-        policy = ResolvedAdaptationPolicy(
-            min_rate=0.25, max_rate=0.75, adjust_factor=1.5, step_size_max=10.0,
-        )
-        result = initial_walk(
-            jax.random.key(2026),
-            ns_states,
-            step_fn,
-            n_walks=3,
-            walklength=4,
-            adjust_interval=1,
-            emax_offset_per_atom=2.0,
-            n_atoms=n_atoms,
-            batched=True,
-            walker_batch_size=walker_batch_size,
-            run_batch_size=run_batch_size,
-            per_move_fns=per_move_fns,
-            adaptation_policies=(policy,),
-            adjust_n_samples=8,
-            adjust_max_rounds=4,
-        )
-        return result
-
-    def test_walker_batch_size_matches_full_vmap(self):
-        """trial_batch_size=walker_batch_size vs None must match exactly.
-
-        Same PRNG key on both sides; the trial vmap inside adjust_step_size
-        switches between vmap and lax.map(batch_size=...) but the operation is
-        independent per trial so outputs are bit-identical.
-        """
-        baseline = self._run_with(walker_batch_size=None, run_batch_size=None)
-        chunked = self._run_with(walker_batch_size=2, run_batch_size=None)
-        np.testing.assert_array_equal(
-            np.array(baseline.population.step_sizes),
-            np.array(chunked.population.step_sizes),
-        )
-
-    def test_run_batch_size_matches_full_vmap(self):
-        """run_batch_size set vs None must produce the same step sizes.
-
-        Replaces vmap-over-runs with lax.map(batch_size=...); per-run
-        independence makes the outputs identical.
-        """
-        baseline = self._run_with(walker_batch_size=None, run_batch_size=None)
-        chunked = self._run_with(walker_batch_size=None, run_batch_size=2)
-        np.testing.assert_array_equal(
-            np.array(baseline.population.step_sizes),
-            np.array(chunked.population.step_sizes),
-        )
-
-    def test_combined_chunking_matches_full_vmap(self):
-        """walker_batch_size + run_batch_size both set must still match."""
-        baseline = self._run_with(walker_batch_size=None, run_batch_size=None)
-        chunked = self._run_with(walker_batch_size=2, run_batch_size=2)
-        np.testing.assert_array_equal(
-            np.array(baseline.population.step_sizes),
-            np.array(chunked.population.step_sizes),
-        )

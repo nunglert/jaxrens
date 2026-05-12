@@ -20,7 +20,7 @@ def load_backend(
 
     Args:
         backend_type: One of "harmonic", "double_well", "gaussian_mixture",
-            "lj", "neuralil", "mace".
+            "lj", "neuralil", "mace", "jaxmd".
         **kwargs: Backend-specific keyword arguments.
 
     Returns:
@@ -54,8 +54,12 @@ def load_backend(
             from jaxrens.backends.mace import create_mace
 
             return create_mace(**kwargs)
+        case "jaxmd":
+            from jaxrens.backends.jaxmd import create_jaxmd
+
+            return create_jaxmd(**kwargs)
         case _:
             raise ValueError(
                 f"Unknown backend: {backend_type!r}. "
-                f"Available: harmonic, double_well, gaussian_mixture, lj, neuralil, mace"
+                f"Available: harmonic, double_well, gaussian_mixture, lj, neuralil, mace, jaxmd"
             )

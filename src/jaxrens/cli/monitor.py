@@ -137,7 +137,7 @@ def _format_reject_breakdown(
 def _is_batched(ns_state: Any, info: "dict | None" = None) -> bool:
     """Return True when ns_state holds multiple parallel runs.
 
-    Prefers ``info["_batch"].is_batched`` when the *info* dict is provided
+    Prefers ``info["_batcher"].is_batched`` when the *info* dict is provided
     and the key is present (commit 4+).  Falls back to the legacy ndim-sniff
     on ``ns_state.log_evidence`` for backward compatibility with callers that
     do not pass an info dict.
@@ -145,23 +145,25 @@ def _is_batched(ns_state: Any, info: "dict | None" = None) -> bool:
     Args:
         ns_state: ``NSState`` or result dict.
         info: Optional info dict from the NS outer loop.  When present and
-            contains ``"_batch"``, the descriptor's ``is_batched`` property
+            contains ``"_batcher"``, the batcher's ``is_batched`` property
             is authoritative.
 
     Returns:
         ``True`` for multi-run (batched) NS runs.
     """
     if info is not None:
-        batch = info.get("_batch")
-        if batch is not None:
-            return batch.is_batched
+        batcher = info.get("_batcher")
+        if batcher is not None:
+            return batcher.is_batched
 
-    # Fallback: ndim-sniff on log_evidence (backward compat)
+    # Fallback: recover the batcher from log_evidence's shape prefix.
+    from jaxrens.sampling.batch_descriptor import from_shape_prefix
+
     if isinstance(ns_state, NSState):
-        return jnp.asarray(ns_state.log_evidence).ndim > 0
-    # dict form (run_ns_parallel result)
-    ev = ns_state.get("log_evidence", jnp.array(0.0))
-    return jnp.asarray(ev).ndim > 0
+        log_ev = jnp.asarray(ns_state.log_evidence)
+    else:
+        log_ev = jnp.asarray(ns_state.get("log_evidence", jnp.array(0.0)))
+    return from_shape_prefix(log_ev.shape).is_batched
 
 
 class ProgressCallback:
@@ -286,20 +288,27 @@ class ProgressCallback:
                 # This handles both VmapRuns (ndim==2) and PmapVmapRuns (ndim==3,
                 # shape (G,P,n_moves)).
                 if batched and ss.ndim >= 2:
-                    # Flatten all leading dims: (G, P, n_moves) -> (G*P, n_moves)
-                    n_moves_here = ss.shape[-1]
-                    ss_flat = ss.reshape(-1, n_moves_here)
-                    acc_flat = acc.reshape(-1, n_moves_here)
+                    # Flatten leading shape-prefix dims to a single (n_runs,) axis.
+                    # Prefer the batcher when present; legacy callers without
+                    # info["_batcher"] fall back to a plain reshape.
+                    batcher = info.get("_batcher") if info is not None else None
+                    if batcher is not None:
+                        ss_flat = batcher.flatten(ss)
+                        acc_flat = batcher.flatten(acc)
+                        rc_flat = batcher.flatten(jnp.asarray(rc)) if rc is not None else None
+                    else:
+                        n_moves_here = ss.shape[-1]
+                        ss_flat = ss.reshape(-1, n_moves_here)
+                        acc_flat = acc.reshape(-1, n_moves_here)
+                        rc_flat = (
+                            jnp.asarray(rc).reshape(-1, n_moves_here, 4)
+                            if rc is not None else None
+                        )
                     ss_mean = jnp.mean(ss_flat, axis=0)
                     ss_std = jnp.std(ss_flat, axis=0)
                     acc_mean = jnp.mean(acc_flat, axis=0)
                     acc_std = jnp.std(acc_flat, axis=0)
-                    # Reject counts: flatten leading dims, then sum over runs.
-                    if rc is not None:
-                        rc_flat = jnp.asarray(rc).reshape(-1, n_moves_here, 4)
-                        rc_sum = jnp.sum(rc_flat, axis=0)  # (n_moves, 4)
-                    else:
-                        rc_sum = None
+                    rc_sum = jnp.sum(rc_flat, axis=0) if rc_flat is not None else None
                     for k, name in enumerate(move_names):
                         row = (
                             f"  {name:<16}  ss={float(ss_mean[k]):>9.3e}±{float(ss_std[k]):>8.2e}"
@@ -343,46 +352,30 @@ class ProgressCallback:
     def on_finish(self, ns_state: Any) -> None:
         elapsed = time.time() - self._start_time
         if isinstance(ns_state, NSState):
-            # For batched runs (VmapRuns/PmapVmapRuns), iteration and log_evidence
-            # may have shape (n_runs,) or (G, P).  Report aggregate stats.
             iteration_arr = jnp.asarray(ns_state.iteration)
             log_z_arr = jnp.asarray(ns_state.log_evidence)
-            if iteration_arr.ndim > 0:
-                logger.info(
-                    "NS finished: iter=[%d..%d], log_Z=[%.4f..%.4f], elapsed=%.1fs",
-                    int(jnp.min(iteration_arr)),
-                    int(jnp.max(iteration_arr)),
-                    float(jnp.min(log_z_arr)),
-                    float(jnp.max(log_z_arr)),
-                    elapsed,
-                )
-            else:
-                logger.info(
-                    "NS finished: %d iterations, log_Z=%.4f, elapsed=%.1fs",
-                    int(iteration_arr),
-                    float(log_z_arr),
-                    elapsed,
-                )
         else:
             log_z_arr = jnp.asarray(ns_state.get("log_evidence", float("-inf")))
-            iteration_val = ns_state.get("iteration", 0)
-            iter_arr = jnp.asarray(iteration_val)
-            if iter_arr.ndim > 0:
-                logger.info(
-                    "NS finished: iter=[%d..%d], log_Z=[%.4f..%.4f], elapsed=%.1fs",
-                    int(jnp.min(iter_arr)),
-                    int(jnp.max(iter_arr)),
-                    float(jnp.min(log_z_arr)),
-                    float(jnp.max(log_z_arr)),
-                    elapsed,
-                )
-            else:
-                logger.info(
-                    "NS finished: %d iterations, log_Z=%.4f, elapsed=%.1fs",
-                    int(iter_arr),
-                    float(log_z_arr),
-                    elapsed,
-                )
+            iteration_arr = jnp.asarray(ns_state.get("iteration", 0))
+
+        # Iterations stay in lock-step across replicas (outer Python loop
+        # advances all runs by 1 per tick), so a single int suffices.
+        iter_n = int(jnp.max(iteration_arr))
+        if log_z_arr.ndim > 0:
+            logger.info(
+                "NS finished: %d iterations, log_Z=[%.4f..%.4f], elapsed=%.1fs",
+                iter_n,
+                float(jnp.min(log_z_arr)),
+                float(jnp.max(log_z_arr)),
+                elapsed,
+            )
+        else:
+            logger.info(
+                "NS finished: %d iterations, log_Z=%.4f, elapsed=%.1fs",
+                iter_n,
+                float(log_z_arr),
+                elapsed,
+            )
 
 
 class AdaptationCallback:
@@ -400,6 +393,64 @@ class AdaptationCallback:
     def __init__(self, logger_obj: Any) -> None:
         self._adaptation_logger = logger_obj
 
+    def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
+        """Write the mandatory iter-0 baseline row.
+
+        This pins the initial step sizes for post-hoc reconstruction:
+        active ss at iter k = last row whose ``iter <= k``.  Without
+        this row, a non-``full_auto`` run would produce an empty file
+        (no adjustment events ever fire), and a ``full_auto`` run
+        would mis-attribute the pre-first-adjust period to the first
+        adjustment event's step size.
+
+        Adjustment-event-only fields (``n_rounds``, ``cap_hits``,
+        ``floor_hits``, ``converged``, ``bracket_detected``,
+        ``reject_reason_counts``) are written as zeros / ``True`` to
+        signal "no bisection ran for this row".  Evaluation counters
+        are zero too.
+
+        Acceptance rates default to 0 here: real chain rates are
+        absent at iter 0 (no NS step has run yet), and the trial-phase
+        rates from bisection don't exist either.  Downstream readers
+        should ignore acc rates on the iter-0 row.
+        """
+        if start_info is None:
+            return
+        ss = start_info.get("step_sizes_per_move")
+        if ss is None:
+            return
+        ss_arr = jnp.asarray(ss)
+        batcher = start_info.get("_batcher")
+        if batcher is not None:
+            ss_flat = batcher.flatten(ss_arr)
+        else:
+            ss_flat = ss_arr[None, :] if ss_arr.ndim == 1 else ss_arr
+
+        n_runs = self._adaptation_logger.n_runs
+        n_moves = self._adaptation_logger.n_moves
+        ss_np = np.asarray(ss_flat, dtype=np.float32)
+        acc_np = np.zeros((n_runs, n_moves), dtype=np.float32)
+
+        zero_int = np.zeros((n_runs, n_moves), dtype=np.int32)
+        zero_int64 = np.zeros((n_runs, n_moves), dtype=np.int64)
+        baseline_adj_stats = {
+            "n_rounds": zero_int,
+            # converged=True signals "no bisection needed / not run".
+            "converged": np.ones((n_runs, n_moves), dtype=bool),
+            "cap_hits": zero_int,
+            "floor_hits": zero_int,
+            "bracket_detected": np.zeros((n_runs, n_moves), dtype=bool),
+            "reject_reason_counts": np.zeros((n_runs, n_moves, 4), dtype=np.int32),
+        }
+        self._adaptation_logger.write_entry(
+            iteration=0,
+            step_sizes=ss_np,
+            acceptance_rates=acc_np,
+            adjustment_stats=baseline_adj_stats,
+            n_evaluations=zero_int64,
+            n_grad_evaluations=zero_int64,
+        )
+
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
         ss = info.get("step_sizes_per_move")
         acc = info.get("acceptance_rates_per_move")
@@ -409,18 +460,43 @@ class AdaptationCallback:
         ss_np = jnp.asarray(ss)
         acc_np = jnp.asarray(acc)
 
-        # Ensure (n_runs, n_moves) shape — logger handles 1D -> (1, n_moves).
-        # PmapVmapRuns produces (G, P, n_moves); flatten to (G*P, n_moves).
-        if ss_np.ndim == 1:
-            ss_np = ss_np[None, :]
-            acc_np = acc_np[None, :]
-        elif ss_np.ndim >= 3:
-            # (G, P, n_moves) or higher — flatten all leading dims
-            n_moves_here = ss_np.shape[-1]
-            ss_np = ss_np.reshape(-1, n_moves_here)
-            acc_np = acc_np.reshape(-1, n_moves_here)
+        # Ensure (n_runs, n_moves) shape via the batcher when available;
+        # legacy callers (no info["_batcher"]) fall back to ndim-based reshape.
+        batcher = info.get("_batcher")
+        if batcher is not None:
+            ss_np = batcher.flatten(ss_np)
+            acc_np = batcher.flatten(acc_np)
+        else:
+            if ss_np.ndim == 1:
+                ss_np = ss_np[None, :]
+                acc_np = acc_np[None, :]
+            elif ss_np.ndim >= 3:
+                n_moves_here = ss_np.shape[-1]
+                ss_np = ss_np.reshape(-1, n_moves_here)
+                acc_np = acc_np.reshape(-1, n_moves_here)
 
-        # Collect per-adjust-call diagnostic stats when present (v2 schema)
+        # Collect per-adjust-call diagnostic stats when present (v2 schema).
+        # All values arrive shaped ``(*shape_prefix, n_moves[, 4])`` straight
+        # from ``AdaptationManager.apply`` — for PmapVmapRuns(G, P) that's
+        # ``(G, P, n_moves[, 4])``.  Coerce to the flat ``(n_runs, ...)``
+        # layout the HDF5 schema expects using the same ``batcher.flatten``
+        # the ss/acc path uses above.  Without this the dataset is created
+        # at the correct shape on the iter-0 baseline row (which is already
+        # flat) but real adjust events would fail with a broadcast error.
+        def _flatten_for_hdf5(arr):
+            arr = np.asarray(arr)
+            if batcher is not None:
+                return np.asarray(batcher.flatten(arr))
+            # No batcher available: fall back to ndim-based reshape.
+            if arr.ndim == 1:
+                return arr[None, :]
+            if arr.ndim >= 3:
+                # Last 1 or 2 axes are payload (n_moves[, 4]); rest is prefix.
+                # Heuristic: reject_reason_counts has trailing 4, others trail at n_moves.
+                tail = arr.shape[-2:] if arr.shape[-1] == 4 else arr.shape[-1:]
+                return arr.reshape((-1,) + tail)
+            return arr
+
         adjustment_stats: "dict[str, np.ndarray] | None" = None
         _adj_keys = (
             "adjustment_n_rounds",
@@ -443,7 +519,7 @@ class AdaptationCallback:
             if val is not None:
                 if adjustment_stats is None:
                     adjustment_stats = {}
-                adjustment_stats[_adj_rename[info_key]] = np.asarray(val)
+                adjustment_stats[_adj_rename[info_key]] = _flatten_for_hdf5(val)
 
         # Collect per-iter evaluation counts for v3 schema (shape (n_runs, n_moves))
         n_evals_raw = info.get("n_evaluations_per_move")
@@ -451,12 +527,13 @@ class AdaptationCallback:
         n_evals_np: "np.ndarray | None" = None
         n_grad_evals_np: "np.ndarray | None" = None
         if n_evals_raw is not None:
-            arr = np.asarray(n_evals_raw, dtype=np.int64)
-            # Ensure (n_runs, n_moves) shape
-            n_evals_np = arr[None, :] if arr.ndim == 1 else arr
+            n_evals_np = np.asarray(
+                _flatten_for_hdf5(n_evals_raw), dtype=np.int64,
+            )
         if n_grad_evals_raw is not None:
-            arr = np.asarray(n_grad_evals_raw, dtype=np.int64)
-            n_grad_evals_np = arr[None, :] if arr.ndim == 1 else arr
+            n_grad_evals_np = np.asarray(
+                _flatten_for_hdf5(n_grad_evals_raw), dtype=np.int64,
+            )
 
         self._adaptation_logger.write_entry(
             iteration=iteration,
@@ -469,6 +546,63 @@ class AdaptationCallback:
 
     def on_finish(self, ns_state: Any) -> None:
         self._adaptation_logger.close()
+
+
+class AccRatesCallback:
+    """Writes per-iteration chain-phase per-move acceptance counts to HDF5.
+
+    Independent of ``full_auto``: the chain counters ``n_accepted_per_move``
+    and ``n_proposed_per_move`` are populated by ``ns_step`` on every
+    iteration, so this callback fires regardless of whether bisection
+    adaptation is active.  ``AdaptationCallback`` complements this by
+    capturing the *sparse* step-size event series; this callback captures
+    the *dense* per-iter chain-rate series.
+
+    Stores raw counts (not derived rates) so downstream code can
+    re-aggregate over arbitrary windows.
+
+    Args:
+        logger_obj: A ready-to-use ``AccRatesLogger`` instance.
+        interval: Fire every ``interval`` iterations.  Default ``1``
+            (every iter); set higher to reduce I/O on long runs.
+    """
+
+    def __init__(self, logger_obj: Any, interval: int = 1) -> None:
+        self._logger = logger_obj
+        self._interval = max(1, int(interval))
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        if iteration % self._interval != 0:
+            return
+        n_acc = info.get("n_accepted_per_move")
+        n_prop = info.get("n_proposed_per_move")
+        if n_acc is None or n_prop is None:
+            return
+
+        n_acc_arr = jnp.asarray(n_acc)
+        n_prop_arr = jnp.asarray(n_prop)
+
+        batcher = info.get("_batcher")
+        if batcher is not None:
+            n_acc_arr = batcher.flatten(n_acc_arr)
+            n_prop_arr = batcher.flatten(n_prop_arr)
+        else:
+            if n_acc_arr.ndim == 1:
+                n_acc_arr = n_acc_arr[None, :]
+                n_prop_arr = n_prop_arr[None, :]
+            elif n_acc_arr.ndim >= 3:
+                n_moves_here = n_acc_arr.shape[-1]
+                n_acc_arr = n_acc_arr.reshape(-1, n_moves_here)
+                n_prop_arr = n_prop_arr.reshape(-1, n_moves_here)
+
+        self._logger.write_entry(
+            iteration=iteration,
+            n_accepted=np.asarray(n_acc_arr, dtype=np.int64),
+            n_proposed=np.asarray(n_prop_arr, dtype=np.int64),
+        )
+
+    def on_finish(self, ns_state: Any) -> None:
+        self._logger.close()
 
 
 class EnergyCheckCallback:
@@ -510,7 +644,7 @@ class CheckpointCallback:
         self.prefix = prefix
         self.symbol_map = symbol_map
 
-    def on_start(self, ns_state: Any) -> None:
+    def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
         from jaxrens.io.checkpoint import save_checkpoint
 
         path = self.working_dir / f"{self.prefix}.initial.checkpoint.h5"
@@ -569,7 +703,7 @@ class MemProfileCallback:
         p = Path(self.out_path)
         return str(p.with_name(p.stem + ".baseline" + p.suffix))
 
-    def on_start(self, ns_state: Any) -> None:
+    def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
         import jax
 
         jax.profiler.save_device_memory_profile(self._baseline_path())
@@ -681,19 +815,25 @@ class BatchedTrajectoryCallback:
         self.traj_interval = traj_interval
         self.snapshot_interval = snapshot_interval
 
-    @staticmethod
-    def _flatten_leading(x: jnp.ndarray, n_batch_axes: int) -> jnp.ndarray:
-        if n_batch_axes == 1:
-            return x
-        return x.reshape((-1,) + x.shape[n_batch_axes:])
-
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
-        # Detect batch axes from ns_state.log_evidence shape.  The
-        # PmapVmapRuns dispatch stores (G, P, ...) arrays; VmapRuns stores
-        # (n_runs, ...).  Flatten leading axes to n_runs for replica slicing.
-        le = jnp.asarray(ns_state.log_evidence)
-        n_batch_axes = max(1, int(le.ndim))
-        n_runs = int(np.prod(le.shape)) if le.ndim >= 1 else 1
+        # Use the batcher (when present in info) to flatten ``(*shape_prefix, …)``
+        # arrays to ``(n_runs, …)`` for per-replica indexing.  Fall back to the
+        # legacy ndim-sniff when callers don't pass info["_batcher"].
+        batcher = info.get("_batcher") if info is not None else None
+        if batcher is not None:
+            n_runs = batcher.n_runs
+            flatten = batcher.flatten
+        else:
+            le = jnp.asarray(ns_state.log_evidence)
+            n_batch_axes = max(1, int(le.ndim))
+            n_runs = int(np.prod(le.shape)) if le.ndim >= 1 else 1
+
+            def flatten(x):
+                arr = x if isinstance(x, np.ndarray) else jnp.asarray(x)
+                if n_batch_axes == 1:
+                    return arr
+                return arr.reshape((-1,) + arr.shape[n_batch_axes:])
+
         if n_runs != len(self.writers):
             raise RuntimeError(
                 f"BatchedTrajectoryCallback: ns_state has {n_runs} replicas "
@@ -701,23 +841,22 @@ class BatchedTrajectoryCallback:
             )
 
         pop = ns_state.population
-        types = self._flatten_leading(pop.types, n_batch_axes)
-        cells = self._flatten_leading(pop.cell, n_batch_axes)
+        types = flatten(pop.types)
+        cells = flatten(pop.cell)
 
-        # info["emax"] is (G, P) or (n_runs,) when batched; flatten.
+        # info["emax"] is (*shape_prefix,) when batched; flatten via the
+        # batcher (or by ravel for the legacy fallback).
         emax_arr = jnp.asarray(info.get("emax", 0.0))
-        emax_flat = (
-            emax_arr.reshape(-1) if emax_arr.ndim >= 1 else emax_arr[None]
-        )
-        # Latest culled position per replica — sourced from info, batched the
-        # same way as emax.  Shape is (*batch, n_atoms, 3); flatten leading
-        # batch dims to (n_runs, n_atoms, 3) for per-replica indexing.
+        if batcher is not None:
+            emax_flat = batcher.flatten(emax_arr)
+        else:
+            emax_flat = (
+                emax_arr.reshape(-1) if emax_arr.ndim >= 1 else emax_arr[None]
+            )
+        # Latest culled position per replica — sourced from info, shape
+        # ``(*shape_prefix, n_atoms, 3)``; flatten leading dims for indexing.
         latest_pos = np.asarray(info["dead_position"])
-        latest_pos_flat = (
-            latest_pos.reshape((-1,) + latest_pos.shape[n_batch_axes:])
-            if n_batch_axes > 1 or latest_pos.ndim > 2
-            else latest_pos
-        )
+        latest_pos_flat = np.asarray(flatten(latest_pos))
         # For SingleRun (n_batch_axes=0 effectively but we set min 1), the
         # batched callback shouldn't be used; assume we always have a batch.
 
@@ -754,8 +893,8 @@ class BatchedTrajectoryCallback:
             and iteration > 0
             and iteration % self.snapshot_interval == 0
         ):
-            positions_flat = self._flatten_leading(pop.positions, n_batch_axes)
-            energies_flat = self._flatten_leading(pop.energy, n_batch_axes)
+            positions_flat = flatten(pop.positions)
+            energies_flat = flatten(pop.energy)
             for r in range(n_runs):
                 # Live-walker snapshot only.  Dead-point history lives on
                 # disk via the per-iteration writers above.

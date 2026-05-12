@@ -8,7 +8,7 @@ library core.  Cohort expansion (pressure sweeps, seed sweeps) lives in
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -17,11 +17,13 @@ import jax.numpy as jnp
 import numpy as np
 
 from jaxrens.backends.base import EnergyBackend
-from jaxrens.cli.schema.adaptation import AdaptationConfig, ResolvedAdaptationPolicy
-from jaxrens.cli.schema.cell import CellConfig
+from jaxrens.sampling.batch_descriptor import BatchDescriptor, PmapVmapRuns, SingleRun
+from jaxrens.cli.schema.adaptation import AdaptationSpec, ResolvedAdaptationPolicy
+from jaxrens.cli.schema.cell import CellSpec
 from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-from jaxrens.cli.schema.init import InitConfig
-from jaxrens.cli.schema.root import RootConfig
+from jaxrens.cli.schema.init import InitSpec
+from jaxrens.cli.schema.root import RootSpec
+from jaxrens.cli.schema.termination import IterationTerminationSpec
 from jaxrens.init.cells import cell_shape_walk, sample_initial_volume
 from jaxrens.init.positions import grid_positions_in_cell, uniform_positions_in_cell
 from jaxrens.init.rejection import rejection_sample_positions
@@ -29,6 +31,7 @@ from jaxrens.init.restart import RestartBundle, load_restart
 from jaxrens.init.structure import load_structure
 from jaxrens.init.walker_set import load_walker_set
 from jaxrens.sampling.move_kernel import MoveKernel
+from jaxrens.sampling.nested_sampling import _choose_starting_bucket
 from jaxrens.sampling.termination import (
     IterationTermination,
     PriorMassTermination,
@@ -36,19 +39,103 @@ from jaxrens.sampling.termination import (
 )
 from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
 from jaxrens.utils.cell import get_volume, min_aspect_ratio
+from jaxrens.cli.schema.backend import LJBackendSpec
 
 logger = logging.getLogger(__name__)
 
-# Output fields that are accepted by OutputSchema but not yet consumed by the
+# Output fields that are accepted by OutputSpec but not yet consumed by the
 # runtime callback layer.
 _DEFERRED_OUTPUT_FIELDS: tuple[str, ...] = (
     "snapshot_time",
     "snapshot_clean",
     "wrap_atoms",
-    "save_stepsizes",
     "write_traj_db",
     "write_walkers_db",
 )
+
+
+# ---------------------------------------------------------------------------
+# Interval-unit scaling (RootSpec.interval_units = "absolute" | "per_walker")
+# ---------------------------------------------------------------------------
+
+
+def _scale_interval(v: int | float | None, *, factor: int) -> int | None:
+    """Scale one iteration-counted field for the resolver.
+
+    * ``None`` (e.g. unset ``run.max_iterations``) passes through unchanged.
+    * Numeric values are multiplied by ``factor`` and cast to int via
+      ``round``; the result is clamped to ``>= 1`` so that a per-walker
+      ``snapshot_interval: 0.001`` does not collapse to zero.
+    """
+    if v is None:
+        return None
+    scaled = round(float(v) * factor)
+    return max(1, int(scaled))
+
+
+def _apply_interval_units(root: RootSpec) -> RootSpec:
+    """Return a new RootSpec with the 8 interval fields scaled to absolute iters.
+
+    When ``root.interval_units == "absolute"`` this is a no-op apart from
+    rounding any float values down to int (so the downstream runtime
+    dataclasses always see ints).  When ``"per_walker"`` every affected field
+    is multiplied by ``root.run.n_live`` first.
+
+    The eight scaled fields:
+        output.{info,traj,snapshot,checkpoint}_interval
+        run.max_iterations  (None preserved)
+        termination[iteration].max_iterations
+        inter_re.every
+        adaptation.adjust_interval
+    """
+    factor = root.run.n_live if root.interval_units == "per_walker" else 1
+
+    output_upd = {
+        name: _scale_interval(getattr(root.output, name), factor=factor)
+        for name in (
+            "info_interval",
+            "traj_interval",
+            "snapshot_interval",
+            "checkpoint_interval",
+        )
+    }
+    run_upd = {
+        "max_iterations": _scale_interval(root.run.max_iterations, factor=factor),
+    }
+    adaptation_upd = {
+        "adjust_interval": _scale_interval(
+            root.adaptation.adjust_interval, factor=factor,
+        ),
+    }
+
+    update: dict[str, Any] = {
+        "output": root.output.model_copy(update=output_upd),
+        "run": root.run.model_copy(update=run_upd),
+        "adaptation": root.adaptation.model_copy(update=adaptation_upd),
+    }
+
+    if root.inter_re is not None:
+        update["inter_re"] = root.inter_re.model_copy(
+            update={"every": _scale_interval(root.inter_re.every, factor=factor)},
+        )
+
+    if root.termination is not None:
+        update["termination"] = [
+            (
+                t.model_copy(
+                    update={
+                        "max_iterations": _scale_interval(
+                            t.max_iterations, factor=factor,
+                        ),
+                    },
+                )
+                if isinstance(t, IterationTerminationSpec)
+                else t
+            )
+            for t in root.termination
+        ]
+
+    return root.model_copy(update=update)
 
 
 # ---------------------------------------------------------------------------
@@ -73,12 +160,12 @@ class ResolvedInit:
 
 
 def _build_cells(
-    init: InitConfig,
+    init: InitSpec,
     n_live: int,
     shape_key: jax.Array,
     base_cell: jnp.ndarray,
     n_atoms: int,
-    cell_cfg: CellConfig,
+    cell_cfg: CellSpec,
 ) -> jnp.ndarray:
     """Produce (n_live, 3, 3) cells from a base cell.
 
@@ -116,7 +203,7 @@ def _build_cells(
 def _describe_cell_violation(
     cell: jnp.ndarray,
     n_atoms: int,
-    cell_cfg: CellConfig,
+    cell_cfg: CellSpec,
 ) -> str | None:
     """Return a human-readable reason why ``cell`` fails ``check_cell_shape``.
 
@@ -147,7 +234,7 @@ def _describe_cell_violation(
 def _validate_input_cell(
     cell: jnp.ndarray,
     n_atoms: int,
-    cell_cfg: CellConfig,
+    cell_cfg: CellSpec,
     source: str,
 ) -> None:
     """Reject a user-provided base cell that already violates ``cell_cfg``.
@@ -169,10 +256,60 @@ def _validate_input_cell(
     )
 
 
+def _warn_if_lj_cutoff_unsafe(
+    backend_spec: Any,
+    cell_cfg: CellSpec,
+    n_atoms: int,
+) -> None:
+    """Warn if the LJ cutoff cannot be honoured by the smallest legal cell.
+
+    Triggers only for the LJ backend with a finite cutoff. The smallest cell
+    permitted by the prior is the one at ``min_volume_per_atom`` with the
+    worst-case aspect ratio. For an isotropic cubic cell at that volume, the
+    perpendicular distance equals the cube side; allowing the aspect ratio to
+    drop to ``min_aspect_ratio`` shrinks this proportionally. The MIC + image
+    sum is correct iff ``perp · min(supercell_trafo) >= 2 · cutoff``.
+    """
+    if not isinstance(backend_spec, LJBackendSpec):
+        return
+    if backend_spec.cutoff is None:
+        return
+
+    sc_min = min(backend_spec.supercell_trafo)
+    if sc_min <= 0:
+        return
+
+    vmin = cell_cfg.min_volume_per_atom * n_atoms
+    cubic_side = vmin ** (1.0 / 3.0)
+    # Worst-case perpendicular distance under the prior: shrinks linearly
+    # with min_aspect_ratio relative to the equal-axis cubic shape.
+    worst_perp = cubic_side * cell_cfg.min_aspect_ratio
+    required = 2.0 * backend_spec.cutoff
+
+    if worst_perp * sc_min < required:
+        logger.warning(
+            "LJ cutoff vs cell-prior bounds: smallest legal cell has worst-case "
+            "perpendicular distance %.4f A (n_atoms=%d, min_volume_per_atom=%.4f, "
+            "min_aspect_ratio=%.4f); with supercell_trafo=%s the effective span "
+            "is %.4f A, below the required 2 * cutoff = %.4f A. LJ energies will "
+            "undercount neighbours on the tight end of the cell-prior range. "
+            "Mitigate by raising cell.min_volume_per_atom, raising "
+            "cell.min_aspect_ratio, lowering backend.cutoff, or bumping "
+            "backend.supercell_trafo.",
+            worst_perp,
+            n_atoms,
+            cell_cfg.min_volume_per_atom,
+            cell_cfg.min_aspect_ratio,
+            backend_spec.supercell_trafo,
+            worst_perp * sc_min,
+            required,
+        )
+
+
 def _validate_cells(
     cells: jnp.ndarray,
     n_atoms: int,
-    cell_cfg: CellConfig,
+    cell_cfg: CellSpec,
 ) -> None:
     """Raise ``RuntimeError`` if any walker cell fails check_cell_shape."""
     n_live = cells.shape[0]
@@ -190,77 +327,162 @@ def _finalise_initial_energies_and_counts(
     positions: jnp.ndarray,
     types: jnp.ndarray,
     cells: jnp.ndarray,
+    batcher: BatchDescriptor | None = None,
+    ladder: tuple[int, ...] | None = None,
+    offset: int = 0,
+    pressures: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray | None, jnp.ndarray | None]:
     """Compute per-walker initial ``(energies, max_neighbor_counts)``.
 
-    For backends that expose ``max_neighbors_for`` (currently MACE), this
-    computes each walker's true max neighbor count from geometry alone and
-    then evaluates the backend once per walker with ``max_neighbors`` sized
-    to the global max.  That avoids the degenerate case where the resolver
-    previously passed ``max_neighbors=0`` — causing MACE to run on an
-    edge-less graph and return isolated-atom energies — and gives the NS
-    loop a correctly-sized starting bucket plus accurate per-walker
-    ``max_neighbor_count`` without a separate config parameter.
+    Dispatch is routed through ``batcher.wrap_for_batch`` so the
+    compute uses ``jax.jit`` / ``jax.jit(vmap)`` / ``pmap(vmap)``
+    appropriate for the call site:
 
-    For backends without ``max_neighbors_for`` (LJ, toy), the bucket is
-    irrelevant: ``max_neighbors=0`` is passed through and counts returned
-    as ``None``.
+    * Cohort path (``_resolve_one``) → ``SingleRun()`` (default).
+      ``positions`` shape ``(K, N, 3)``, ``cells`` ``(K, 3, 3)``.
+    * Multi-run path (``_resolve_multi_run``) →
+      ``PmapVmapRuns(G, P)`` (the same ``batcher`` instance stored on
+      ``ResolvedMultiRunConfig.batcher``).  ``positions`` shape
+      ``(G, P, K, N, 3)``, ``cells`` ``(G, P, K, 3, 3)``.  Energy
+      compile happens in parallel across G GPUs and at the same shape
+      burn-in + NS step use, so all three stages share one JIT cache
+      slot.
+
+    For backends that expose ``max_neighbors_for`` (MACE, NeuralIL),
+    per-walker neighbor counts are computed geometry-only.  The energy
+    compile is then sized to the bucket
+    ``_choose_starting_bucket(counts, ladder, offset)`` so the resolver
+    and ``cli/run.py``'s starting-bucket choice agree.  When
+    ``ladder``/``offset`` are not supplied, the legacy
+    ``int(jnp.max(counts))`` fallback is used.
+
+    For backends without ``max_neighbors_for`` (LJ, toy, jax-md), the
+    bucket is irrelevant and ``max_neighbors=0`` is passed through;
+    ``counts`` is returned as ``None``.
+
+    ``types`` (shape ``(N,)``) is closed over by the per-replica
+    function, not vmap-axis aligned — it's identical across walkers
+    and across replicas.
+
+    ``pressures`` (shape ``batcher.shape_prefix``) carries per-replica
+    pressure values for NPT runs.  When supplied with a PmapVmapRuns
+    batcher and an EnsembleBackend, the per-call
+    ``ensemble_params={"pressure": ...}`` kwarg flows through so each
+    replica's initial energy reflects its own P·V term — even though
+    a single EnsembleBackend instance handles all replicas in the
+    consolidated finalize.  When ``None``, the backend's own closured
+    pressure is used (cohort path).
 
     Returns ``(energies, counts)``; either or both may be ``None``.
     """
     if energy_backend is None:
         return None, None
 
-    if types.ndim == 1:
-        types_b = jnp.broadcast_to(types[None, :], (positions.shape[0],) + types.shape)
-    else:
-        types_b = types
+    if batcher is None:
+        batcher = SingleRun()
 
     backend_label = type(energy_backend).__name__
+    shape_prefix = batcher.shape_prefix
+    n_walkers_total = (
+        int(np.prod(positions.shape[: len(shape_prefix) + 1]))
+        if len(shape_prefix) > 0
+        else positions.shape[0]
+    )
+    n_atoms = positions.shape[-2]
+
     if hasattr(energy_backend, "max_neighbors_for"):
         logger.info(
             "[resolve] computing per-walker initial neighbor counts and energies "
-            "(%s, n_walkers=%d, n_atoms=%d)",
-            backend_label, positions.shape[0], positions.shape[1],
+            "(%s, n_walkers=%d, n_atoms=%d, batcher=%s)",
+            backend_label, n_walkers_total, n_atoms,
+            type(batcher).__name__,
         )
-        counts = jax.vmap(energy_backend.max_neighbors_for)(positions, cells)
-        init_bucket = int(jnp.max(counts))
+
+        def per_replica_counts(pos_K, cells_K):
+            return jax.vmap(energy_backend.max_neighbors_for)(pos_K, cells_K)
+
+        batched_counts = batcher.wrap_for_batch(per_replica_counts)
+        counts = batched_counts(positions, cells)
+
+        if ladder is not None:
+            init_bucket = _choose_starting_bucket(counts, tuple(ladder), int(offset))
+        else:
+            init_bucket = int(jnp.max(counts))
+
         logger.info(
             "[resolve] initial neighbor counts: max=%d → init bucket=%d; "
             "evaluating backend energies",
-            init_bucket, init_bucket,
+            int(jnp.max(counts)), init_bucket,
         )
-        energies = jax.vmap(
-            lambda p, t, c: energy_backend(p, t, c, init_bucket)[0]
-        )(positions, types_b, cells)
+
+        if pressures is None:
+            def per_replica_energy(pos_K, cells_K):
+                return jax.vmap(
+                    lambda p, c: energy_backend(p, types, c, init_bucket)[0]
+                )(pos_K, cells_K)
+
+            batched_energy = batcher.wrap_for_batch(per_replica_energy)
+            energies = batched_energy(positions, cells)
+        else:
+            def per_replica_energy_p(pos_K, cells_K, pressure_scalar):
+                ep = {"pressure": pressure_scalar}
+                return jax.vmap(
+                    lambda p, c: energy_backend(
+                        p, types, c, init_bucket, ensemble_params=ep,
+                    )[0]
+                )(pos_K, cells_K)
+
+            batched_energy = batcher.wrap_for_batch(per_replica_energy_p)
+            energies = batched_energy(positions, cells, pressures)
         return energies, counts
 
     logger.info(
-        "[resolve] computing initial energies (%s, n_walkers=%d, n_atoms=%d)",
-        backend_label, positions.shape[0], positions.shape[1],
+        "[resolve] computing initial energies (%s, n_walkers=%d, n_atoms=%d, "
+        "batcher=%s)",
+        backend_label, n_walkers_total, n_atoms,
+        type(batcher).__name__,
     )
-    energies = jax.vmap(
-        lambda p, t, c: energy_backend(p, t, c, 0)[0]
-    )(positions, types_b, cells)
+
+    if pressures is None:
+        def per_replica_energy_no_nl(pos_K, cells_K):
+            return jax.vmap(
+                lambda p, c: energy_backend(p, types, c, 0)[0]
+            )(pos_K, cells_K)
+
+        batched_energy = batcher.wrap_for_batch(per_replica_energy_no_nl)
+        energies = batched_energy(positions, cells)
+    else:
+        def per_replica_energy_no_nl_p(pos_K, cells_K, pressure_scalar):
+            ep = {"pressure": pressure_scalar}
+            return jax.vmap(
+                lambda p, c: energy_backend(
+                    p, types, c, 0, ensemble_params=ep,
+                )[0]
+            )(pos_K, cells_K)
+
+        batched_energy = batcher.wrap_for_batch(per_replica_energy_no_nl_p)
+        energies = batched_energy(positions, cells, pressures)
     return energies, None
 
 
 def _sample_per_walker_positions(
-    init: InitConfig,
+    init: InitSpec,
     n_live: int,
     pos_key: jax.Array,
     initial_cells: jnp.ndarray,
     initial_types: jnp.ndarray,
     n_atoms: int,
     energy_backend: EnergyBackend | None,
-) -> tuple[jnp.ndarray, list | None]:
-    """Sample per-walker positions (and optionally energies) via grid or rejection.
+) -> jnp.ndarray:
+    """Sample per-walker positions via grid or rejection.
 
-    Returns:
-        (initial_positions, energies_list):
-          - initial_positions: (n_live, n_atoms, 3)
-          - energies_list: list of n_live energy scalars if energy_backend is
-            not None; otherwise None.
+    Returns only positions of shape ``(n_live, n_atoms, 3)``.  Energies
+    are recomputed downstream in
+    ``_finalise_initial_energies_and_counts`` at the right bucket size,
+    so this function does not return them.  For rejection mode the
+    energy is consumed internally by
+    ``rejection_sample_positions``'s ceiling check; for grid mode no
+    energy evaluation is needed at all.
     """
     logger.info(
         "[resolve] sampling per-walker positions: n_walkers=%d, n_atoms=%d, "
@@ -270,7 +492,6 @@ def _sample_per_walker_positions(
     start_energy_ceiling = init.start_energy_ceiling_per_atom * n_atoms
     walker_pos_keys = jax.random.split(pos_key, n_live)
     positions_list = []
-    energies_list: list | None = [] if energy_backend is not None else None
 
     for wi in range(n_live):
         w_cell = initial_cells[wi]
@@ -280,11 +501,8 @@ def _sample_per_walker_positions(
                 walker_pos_keys[wi], w_cell, n_atoms, init.grid_distance
             )
             positions_list.append(pos)
-            if energy_backend is not None:
-                e, _, _ = energy_backend(pos, initial_types, w_cell, 0)
-                energies_list.append(e)
         else:
-            pos, e = rejection_sample_positions(
+            pos, _ = rejection_sample_positions(
                 walker_pos_keys[wi],
                 cell=w_cell,
                 types=initial_types,
@@ -297,19 +515,21 @@ def _sample_per_walker_positions(
                 grid_distance=init.grid_distance,
             )
             positions_list.append(pos)
-            if energy_backend is not None:
-                energies_list.append(e)
 
-    return jnp.stack(positions_list, axis=0), energies_list
+    return jnp.stack(positions_list, axis=0)
 
 
 def _resolve_init_walker_set(
-    init: InitConfig,
-    cell_cfg: CellConfig,
+    init: InitSpec,
+    cell_cfg: CellSpec,
     n_live: int,
-    energy_backend: EnergyBackend | None,
 ) -> ResolvedInit:
-    """Mode C: load a pre-computed set of N walker configurations from disk."""
+    """Mode C: load a pre-computed set of N walker configurations from disk.
+
+    Returns structural-init only.  ``initial_energies`` and
+    ``initial_max_neighbor_counts`` are left as ``None``; the caller
+    (``_resolve_one`` / ``_resolve_multi_run``) finalises them once.
+    """
     logger.info(
         "[resolve] init mode C: loading walker set from %s (n_live=%d)",
         init.start_walker_set, n_live,
@@ -325,27 +545,27 @@ def _resolve_init_walker_set(
 
     _validate_cells(walker_set.cells, n_atoms, cell_cfg)
 
-    energies, counts = _finalise_initial_energies_and_counts(
-        energy_backend, walker_set.positions, walker_set.types, walker_set.cells,
-    )
-
     return ResolvedInit(
         initial_positions=walker_set.positions,
         initial_types=walker_set.types,
         initial_cells=walker_set.cells,
-        initial_energies=energies,
-        initial_max_neighbor_counts=counts,
+        initial_energies=None,
+        initial_max_neighbor_counts=None,
         symbol_map=walker_set.symbol_map,
     )
 
 
 def _resolve_init_restart(
-    init: InitConfig,
-    cell_cfg: CellConfig,
+    init: InitSpec,
+    cell_cfg: CellSpec,
     n_live: int,
-    energy_backend: EnergyBackend | None,
 ) -> ResolvedInit:
-    """Mode D: resume an NS run from a checkpoint file (restart_file)."""
+    """Mode D: resume an NS run from a checkpoint file (restart_file).
+
+    Returns structural-init only.  ``initial_energies`` and
+    ``initial_max_neighbor_counts`` are left as ``None``; the caller
+    (``_resolve_one`` / ``_resolve_multi_run``) finalises them once.
+    """
     logger.info(
         "[resolve] init mode D: restarting from checkpoint %s (n_live=%d)",
         init.restart_file, n_live,
@@ -361,69 +581,84 @@ def _resolve_init_restart(
 
     _validate_cells(walker_set.cells, n_atoms, cell_cfg)
 
-    energies, counts = _finalise_initial_energies_and_counts(
-        energy_backend, walker_set.positions, walker_set.types, walker_set.cells,
-    )
-
     return ResolvedInit(
         initial_positions=walker_set.positions,
         initial_types=walker_set.types,
         initial_cells=walker_set.cells,
-        initial_energies=energies,
-        initial_max_neighbor_counts=counts,
+        initial_energies=None,
+        initial_max_neighbor_counts=None,
         symbol_map=walker_set.symbol_map,
         restart_state=restart_bundle,
     )
 
 
 def _resolve_init(
-    init: InitConfig,
+    init: InitSpec,
     n_live: int,
     seed: int,
     energy_backend: EnergyBackend | None = None,
-    cell_cfg: CellConfig | None = None,
+    cell_cfg: CellSpec | None = None,
 ) -> ResolvedInit:
-    """Resolve an ``InitConfig`` into concrete initial-state arrays.
+    """Resolve an ``InitSpec`` into concrete initial-state arrays.
 
     Supports ``start_species`` (Mode A), ``start_config_file`` (Mode B),
     ``start_walker_set`` (Mode C), and ``restart_file`` (Mode D).
 
+    Returns structural-init only — ``initial_energies`` and
+    ``initial_max_neighbor_counts`` are left as ``None`` on the returned
+    ``ResolvedInit``.  The caller (``_resolve_one`` or
+    ``_resolve_multi_run``) performs a single consolidated finalize via
+    ``_finalise_initial_energies_and_counts`` after this returns.
+
     Args:
-        init: Validated ``InitConfig``.
+        init: Validated ``InitSpec``.
         n_live: Number of live walkers (from ``NSConfig.n_live``).
         seed: PRNG seed.
-        energy_backend: Backend used to compute initial energies.  When
-            ``None``, ``initial_energies`` is left as ``None``.
-        cell_cfg: ``CellConfig`` carrying cell-geometry constraints.  When
-            ``None`` a default ``CellConfig()`` is used.
+        energy_backend: Backend used by rejection-mode position placement
+            (mode A / mode B) for the internal ceiling check.  Not used
+            for energy finalize — that is the caller's responsibility.
+        cell_cfg: ``CellSpec`` carrying cell-geometry constraints.  When
+            ``None`` a default ``CellSpec()`` is used.
 
     Returns:
-        ``ResolvedInit`` with arrays populated for the chosen mode.
+        ``ResolvedInit`` with positions / types / cells / symbol_map /
+        (optionally) ``restart_state`` populated; energies and neighbor
+        counts left as ``None``.
     """
     if cell_cfg is None:
-        cell_cfg = CellConfig()
+        cell_cfg = CellSpec()
 
     if init.start_walker_set is not None:
-        return _resolve_init_walker_set(init, cell_cfg, n_live, energy_backend)
+        return _resolve_init_walker_set(init, cell_cfg, n_live)
 
     if init.restart_file is not None:
-        return _resolve_init_restart(init, cell_cfg, n_live, energy_backend)
+        return _resolve_init_restart(init, cell_cfg, n_live)
 
     if init.start_config_file is not None:
-        return _resolve_init_config_file(init, n_live, seed, energy_backend, cell_cfg)
+        return _resolve_init_config_file(
+            init, n_live, seed, energy_backend, cell_cfg,
+        )
 
     assert init.start_species is not None
-    return _resolve_init_species(init, n_live, seed, energy_backend, cell_cfg)
+    return _resolve_init_species(
+        init, n_live, seed, energy_backend, cell_cfg,
+    )
 
 
 def _resolve_init_species(
-    init: InitConfig,
+    init: InitSpec,
     n_live: int,
     seed: int,
     energy_backend: EnergyBackend | None,
-    cell_cfg: CellConfig,
+    cell_cfg: CellSpec,
 ) -> ResolvedInit:
-    """Mode A: initialise from a species string (start_species)."""
+    """Mode A: initialise from a species string (start_species).
+
+    Returns structural-init only.  ``initial_energies`` and
+    ``initial_max_neighbor_counts`` are left as ``None``; the caller
+    finalises them once.  ``energy_backend`` is still required for the
+    rejection-mode ceiling check inside ``_sample_per_walker_positions``.
+    """
     species_counts = init.parsed_species()
     assert species_counts is not None
     logger.info(
@@ -510,38 +745,38 @@ def _resolve_init_species(
         initial_positions = jnp.broadcast_to(
             single_pos[None], (n_live, n_atoms, 3)
         )
-        energies_list = None
     else:
-        initial_positions, energies_list = _sample_per_walker_positions(
+        initial_positions = _sample_per_walker_positions(
             init, n_live, pos_key, initial_cells, initial_types, n_atoms, energy_backend
         )
 
-    # Finalise initial energies with a correctly sized neighbor bucket.
-    # The per-walker values collected during sampling (``energies_list``) were
-    # computed with ``max_neighbors=0`` — fine for rejection-sampling ceiling
-    # checks but wrong for the MCState's initial energy on GNN backends.
-    initial_energies, initial_counts = _finalise_initial_energies_and_counts(
-        energy_backend, initial_positions, initial_types, initial_cells,
-    )
-
+    # Energies and neighbor counts are computed once at the correct
+    # bucket size by the caller via ``_finalise_initial_energies_and_counts``
+    # — this helper returns structural-init only.
     return ResolvedInit(
         initial_positions=initial_positions,
         initial_types=initial_types,
         initial_cells=initial_cells,
-        initial_energies=initial_energies,
-        initial_max_neighbor_counts=initial_counts,
+        initial_energies=None,
+        initial_max_neighbor_counts=None,
         symbol_map=symbol_map,
     )
 
 
 def _resolve_init_config_file(
-    init: InitConfig,
+    init: InitSpec,
     n_live: int,
     seed: int,
     energy_backend: EnergyBackend | None,
-    cell_cfg: CellConfig,
+    cell_cfg: CellSpec,
 ) -> ResolvedInit:
-    """Mode B: initialise from a founder structure file (start_config_file)."""
+    """Mode B: initialise from a founder structure file (start_config_file).
+
+    Returns structural-init only.  ``initial_energies`` and
+    ``initial_max_neighbor_counts`` are left as ``None``; the caller
+    finalises them once.  ``energy_backend`` is still required for the
+    rejection-mode ceiling check inside ``_sample_per_walker_positions``.
+    """
     logger.info(
         "[resolve] init mode B: loading structure from %s (n_live=%d, seed=%d)",
         init.start_config_file, n_live, seed,
@@ -563,27 +798,23 @@ def _resolve_init_config_file(
         logger.warning(
             "start_config_file with random_initialise_pos=False: all %d walkers "
             "start with identical positions. They are fully correlated; enable "
-            "burn-in (InitialWalkConfig.n_walks > 0) or set random_initialise_pos=True.",
+            "burn-in (InitialWalkSpec.n_walks > 0) or set random_initialise_pos=True.",
             n_live,
         )
         initial_positions = jnp.broadcast_to(
             positions_single[None], (n_live, n_atoms, 3)
         )
     else:
-        initial_positions, _ = _sample_per_walker_positions(
+        initial_positions = _sample_per_walker_positions(
             init, n_live, pos_key, initial_cells, types_single, n_atoms, energy_backend
         )
-
-    initial_energies, initial_counts = _finalise_initial_energies_and_counts(
-        energy_backend, initial_positions, types_single, initial_cells,
-    )
 
     return ResolvedInit(
         initial_positions=initial_positions,
         initial_types=types_single,
         initial_cells=initial_cells,
-        initial_energies=initial_energies,
-        initial_max_neighbor_counts=initial_counts,
+        initial_energies=None,
+        initial_max_neighbor_counts=None,
         symbol_map=symbol_map,
     )
 
@@ -603,16 +834,15 @@ def _null_energy_fn(
 # ---------------------------------------------------------------------------
 
 def _warn_unused_output_fields(output_schema: Any) -> None:
-    """Emit warnings for deferred ``OutputSchema`` fields that are non-default.
+    """Emit warnings for deferred ``OutputSpec`` fields that are non-default.
 
     Args:
-        output_schema: An ``OutputSchema`` instance.
+        output_schema: An ``OutputSpec`` instance.
     """
     deferred_defaults: dict[str, Any] = {
         "snapshot_time": None,
         "snapshot_clean": False,
         "wrap_atoms": False,
-        "save_stepsizes": False,
         "write_traj_db": False,
         "write_walkers_db": False,
     }
@@ -653,14 +883,14 @@ class ResolvedConfig:
     termination: tuple[TerminationCriterion, ...]
     adaptation_policies: tuple[ResolvedAdaptationPolicy, ...]
     init: ResolvedInit
-    cell: CellConfig
+    cell: CellSpec
     cohort_index: int = 0
     ensemble_params: dict = field(default_factory=dict)
     initial_walk_config: Any = None
     adaptation_cfg: Any = None
 
 
-def _cohort_size(root: RootConfig) -> int:
+def _cohort_size(root: RootSpec) -> int:
     """Return the number of cohort elements implied by the ensemble spec."""
     from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
     if isinstance(root.ensemble, NPTEnsembleSpec):
@@ -668,7 +898,7 @@ def _cohort_size(root: RootConfig) -> int:
     return 1
 
 
-def _seed_list(root: RootConfig, n: int) -> list[int]:
+def _seed_list(root: RootSpec, n: int) -> list[int]:
     """Return a list of *n* seeds derived from ``root.run.seed``.
 
     If ``run.seed`` is a scalar, generate ``[seed + i for i in range(n)]``.
@@ -676,8 +906,12 @@ def _seed_list(root: RootConfig, n: int) -> list[int]:
     return [root.run.seed + i for i in range(n)]
 
 
-def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
+def _resolve_one(root: RootSpec, cohort_index: int = 0) -> ResolvedConfig:
     """Resolve ``root`` into library dataclasses for a single cohort element."""
+    # Scale iteration-counted fields once at the top so every downstream read
+    # of root.{output,run,adaptation,inter_re,termination} sees absolute-iter
+    # values (see ``_apply_interval_units`` for the field list).
+    root = _apply_interval_units(root)
     ensemble_params = root.ensemble.to_ensemble_params(cohort_index=cohort_index)
     pressure = ensemble_params.get("pressure", None)
 
@@ -719,6 +953,8 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
         out_file_prefix=root.output.out_file_prefix,
         working_dir=Path(root.output.working_dir),
         log_level=root.output.log_level,
+        save_acc_rates=root.output.save_acc_rates,
+        acc_rates_interval=int(root.output.acc_rates_interval),
     )
 
     _warn_unused_output_fields(root.output)
@@ -753,9 +989,31 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
         cell_cfg=root.cell,
     )
 
+    # Single consolidated finalize for the single-run path.  Multi-run has
+    # its own equivalent seam in ``_resolve_multi_run`` after stacking.
+    # Passes ``ladder``/``offset`` from the backend config so the chosen
+    # initial bucket matches ``cli/run.py``'s starting-bucket pick
+    # (previously this path used the legacy ``int(max(counts))`` fallback).
+    initial_energies, initial_counts = _finalise_initial_energies_and_counts(
+        init_energy_backend,
+        resolved_init.initial_positions,
+        resolved_init.initial_types,
+        resolved_init.initial_cells,
+        batcher=SingleRun(),
+        ladder=tuple(backend.max_neighbors_list),
+        offset=int(backend.max_neighbors_offset),
+    )
+    resolved_init = replace(
+        resolved_init,
+        initial_energies=initial_energies,
+        initial_max_neighbor_counts=initial_counts,
+    )
+
     # Derive n_atoms from the resolved initial positions rather than from a
     # config field — this is the single canonical source of truth.
     n_atoms = int(resolved_init.initial_positions.shape[-2])
+
+    _warn_if_lj_cutoff_unsafe(root.backend, root.cell, n_atoms)
 
     import dataclasses as _dc
 
@@ -788,8 +1046,8 @@ def _resolve_one(root: RootConfig, cohort_index: int = 0) -> ResolvedConfig:
     )
 
 
-def expand_cohort(root: RootConfig) -> list[ResolvedConfig]:
-    """Expand a ``RootConfig`` into one ``ResolvedConfig`` per cohort element.
+def expand_cohort(root: RootSpec) -> list[ResolvedConfig]:
+    """Expand a ``RootSpec`` into one ``ResolvedConfig`` per cohort element.
 
     Cohort axes are defined by the ensemble spec (e.g. a list of pressures in
     ``NPTEnsembleSpec``).  Scalar specs produce a single-element cohort.
@@ -803,7 +1061,7 @@ def expand_cohort(root: RootConfig) -> list[ResolvedConfig]:
     reproducible from the base seed.
 
     Args:
-        root: Fully validated ``RootConfig``.
+        root: Fully validated ``RootSpec``.
 
     Returns:
         List of ``ResolvedConfig`` objects, one per cohort element.  The list
@@ -827,8 +1085,8 @@ def expand_cohort(root: RootConfig) -> list[ResolvedConfig]:
     return results
 
 
-def resolve(root: RootConfig) -> ResolvedConfig:
-    """Translate a validated ``RootConfig`` into library dataclasses.
+def resolve(root: RootSpec) -> ResolvedConfig:
+    """Translate a validated ``RootSpec`` into library dataclasses.
 
     This is a thin wrapper around ``expand_cohort`` for single-element cohorts.
     For multi-element cohorts (pressure sweeps etc.) use ``expand_cohort``
@@ -882,13 +1140,18 @@ class ResolvedMultiRunConfig:
     termination: tuple[TerminationCriterion, ...]
     adaptation_policies: tuple[ResolvedAdaptationPolicy, ...]
     init: ResolvedInit
-    cell: CellConfig
+    cell: CellSpec
     # Per-replica ensemble_params, flat list of length n_total.  Ordering is
     # ``flat_idx = g * n_per_gpu + p`` — matches ``init_ns_multi_gpu``.
     ensemble_params_per_run: tuple[dict, ...]
     initial_walk_config: Any = None
     adaptation_cfg: Any = None
     inter_re_config: Any = None  # InterREConfig | None
+    # Batcher describing the (n_gpu, n_per_gpu) topology.  Carries the same
+    # information as ``ns.n_gpu``/``ns.n_per_gpu`` but in the canonical form
+    # consumed by ``_run_loop``, ``AdaptationManager``, ``InterREManager``,
+    # and (post-§C) ``initial_walk``.
+    batcher: BatchDescriptor | None = None
 
 
 def _local_device_count() -> int:
@@ -897,7 +1160,7 @@ def _local_device_count() -> int:
 
 
 def _derive_replica_axes(
-    root: RootConfig,
+    root: RootSpec,
 ) -> tuple[int, int, int, list[dict]]:
     """Compute (n_total, n_gpu, n_per_gpu, ensemble_params_per_run).
 
@@ -1005,7 +1268,7 @@ def _derive_replica_axes(
     return n_total, n_gpu, n_per_gpu, params_per_run
 
 
-def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
+def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
     """Resolve ``root`` into a ``ResolvedMultiRunConfig``.
 
     Builds per-replica initial positions / cells / energies by calling
@@ -1016,6 +1279,8 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
     This intentionally mirrors the single-run :func:`_resolve_one` — the two
     paths diverge only in the init loop.
     """
+    # Scale iteration-counted fields once up-front; ditto _resolve_one.
+    root = _apply_interval_units(root)
     n_total, n_gpu, n_per_gpu, params_per_run = _derive_replica_axes(root)
     if n_total < 2:
         raise ValueError(
@@ -1027,12 +1292,24 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
         "device(s), n_per_gpu=%d", n_total, n_gpu, n_per_gpu,
     )
 
+    # Single batcher instance shared by the consolidated initial-energy
+    # finalize below and the ResolvedMultiRunConfig dataclass we
+    # construct at the end of this function — so resolver, burn-in,
+    # and NS step all dispatch through the *same* PmapVmapRuns(G, P)
+    # instance.  Burn-in / NS step pick it up from
+    # ``ResolvedMultiRunConfig.batcher`` (see ``run_multi_gpu_from_config``).
+    batcher = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+
     # Base (unwrapped) backend — the multi-GPU dispatch wraps it once.
     logger.info("[resolve] building base backend (%s)", root.backend.__class__.__name__)
     base_backend = root.backend.build_backend()
     backend_cfg = root.backend.to_backend_config()
 
-    # Build a per-replica EnsembleBackend for initial-energy evaluation.
+    # Build a per-replica EnsembleBackend for the *rejection-mode*
+    # ceiling check inside ``_sample_per_walker_positions`` (grid mode
+    # doesn't use it).  The actual initial-energy compute is deferred
+    # to a single consolidated call below — per-replica pressure flows
+    # through ``ensemble_params`` rather than separate backend objects.
     from jaxrens.backends.ensemble import EnsembleBackend
 
     per_run_init: list[ResolvedInit] = []
@@ -1059,10 +1336,11 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
         )
         per_run_init.append(init_r)
 
-    # Validate shapes and stack along axis 0.
+    # Validate structural shapes (energies/counts are None at this
+    # point — the consolidated finalize fills them in below).
     ref = per_run_init[0]
     for r, init_r in enumerate(per_run_init):
-        for field_name in ("initial_positions", "initial_types", "initial_cells", "initial_energies"):
+        for field_name in ("initial_positions", "initial_types", "initial_cells"):
             a = getattr(ref, field_name)
             b = getattr(init_r, field_name)
             if a is None or b is None:
@@ -1082,16 +1360,62 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
         jnp.stack([x.initial_cells for x in per_run_init], axis=0)
         if per_run_init[0].initial_cells is not None else None
     )
-    initial_energies = (
-        jnp.stack([x.initial_energies for x in per_run_init], axis=0)
-        if per_run_init[0].initial_energies is not None else None
-    )
-    initial_max_neighbor_counts = (
-        jnp.stack([x.initial_max_neighbor_counts for x in per_run_init], axis=0)
-        if per_run_init[0].initial_max_neighbor_counts is not None else None
-    )
     # Types are identical across replicas (same start_species).
     initial_types = per_run_init[0].initial_types
+
+    # --- Consolidated finalize on stacked (G, P, K, ...) arrays -----------
+    # Reshape (n_total, K, ...) → (G, P, K, ...) and run a single
+    # PmapVmapRuns finalize.  This parallel-compiles the energy
+    # function across G GPUs at the same shape burn-in / NS step use,
+    # so all three stages share one JIT cache slot.
+    K_axis = initial_positions.shape[1]
+    n_atoms = initial_positions.shape[2]
+    reshaped_positions = initial_positions.reshape(n_gpu, n_per_gpu, K_axis, n_atoms, 3)
+    reshaped_cells = (
+        initial_cells.reshape(n_gpu, n_per_gpu, K_axis, 3, 3)
+        if initial_cells is not None else None
+    )
+
+    pressures = jnp.asarray(
+        [float(params_per_run[r].get("pressure", 0.0)) for r in range(n_total)],
+        dtype=jnp.float32,
+    ).reshape(n_gpu, n_per_gpu)
+
+    # Use a single base-or-ensemble backend for the consolidated call.
+    # If any replica has a pressure, all replicas share the same
+    # EnsembleBackend wrapper and per-replica pressure flows through
+    # ``ensemble_params``; otherwise use the raw base backend.
+    any_pressure = any(p.get("pressure") is not None for p in params_per_run)
+    if any_pressure:
+        finalize_backend = EnsembleBackend(base_backend, pressure=0.0)
+    else:
+        finalize_backend = base_backend
+
+    initial_energies, initial_counts = _finalise_initial_energies_and_counts(
+        finalize_backend,
+        reshaped_positions,
+        initial_types,
+        reshaped_cells,
+        batcher=batcher,
+        ladder=tuple(backend_cfg.max_neighbors_list),
+        offset=int(backend_cfg.max_neighbors_offset),
+        pressures=pressures if any_pressure else None,
+    )
+
+    # Collapse the (G, P, K, ...) shape back to (n_total, K, ...) so
+    # downstream code (e.g. the dispatcher) sees the layout it
+    # already handles.  ``init_ns_multi_gpu`` accepts both shapes.
+    initial_positions = reshaped_positions.reshape(n_total, K_axis, n_atoms, 3)
+    initial_cells = (
+        reshaped_cells.reshape(n_total, K_axis, 3, 3)
+        if reshaped_cells is not None else None
+    )
+    if initial_energies is not None:
+        initial_energies = initial_energies.reshape(n_total, K_axis)
+    if initial_counts is not None:
+        initial_max_neighbor_counts = initial_counts.reshape(n_total, K_axis)
+    else:
+        initial_max_neighbor_counts = None
 
     # symbol_map, restart_state from ref (must be identical across replicas).
     symbol_map = per_run_init[0].symbol_map
@@ -1131,6 +1455,8 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
         out_file_prefix=root.output.out_file_prefix,
         working_dir=Path(root.output.working_dir),
         log_level=root.output.log_level,
+        save_acc_rates=root.output.save_acc_rates,
+        acc_rates_interval=int(root.output.acc_rates_interval),
     )
     _warn_unused_output_fields(root.output)
 
@@ -1154,6 +1480,8 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
     )
 
     n_atoms = int(stacked_init.initial_positions.shape[-2])
+    _warn_if_lj_cutoff_unsafe(root.backend, root.cell, n_atoms)
+
     import dataclasses as _dc
 
     moves = tuple(m.to_move_config() for m in root.moves)
@@ -1184,11 +1512,12 @@ def _resolve_multi_run(root: RootConfig) -> ResolvedMultiRunConfig:
         inter_re_config=(
             root.inter_re.to_inter_re_config() if root.inter_re is not None else None
         ),
+        batcher=batcher,
     )
 
 
 def expand_multi_run_or_cohort(
-    root: RootConfig,
+    root: RootSpec,
 ) -> list[ResolvedConfig] | ResolvedMultiRunConfig:
     """Dispatch between multi-run and single-run (cohort) resolution.
 

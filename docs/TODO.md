@@ -1,1 +1,12 @@
-- In the nested-sampling loop page: The inner loop should be inside the outer loop box. The overflow box should have an additional error that points to the inner loop again. The inner loop box should have a differen background color. the Termination should be at the bottom
+- [x] In the nested-sampling loop page: The inner loop should be inside the outer loop box. The overflow box should have an additional error that points to the inner loop again. The inner loop box should have a differen background color. the Termination should be at the bottom
+- [x] For the walker pytree article, could we first of all update, and also restructure the tree visualization? I would like to have third layer leaves to be stacked vertically, insetad of horizontally
+- [x] zoom controls do not work
+- [x] RE 4 GPU visualization is buggy, only shows a large violet patch with a darker violet bar on top
+- [x] In the NS loop figure, also draw a orange JIT box around the step-size adjustion and maybe encapsulate both inner loop and stepsize adjustion into one logical block
+- [x] walker pytree graph trhows Syntax error in textmermaid version 11.12.1
+- [x] theres no zoom control now at all ...
+- [x] in ns_loop figure, Also group the stepsize adjustion into an outer orange box with sth like "Stepsize adjustion - JIT" and an inner box in the same blueish as the ns_step box with "AdaptionManager.apply" as the called function. The "every adjust_interval" shouzld be on the arrow towards the box
+- [x] For teh mwg article, I would also like to have a flow chart for the stepsize adjusting code, similar to what we have done for the RE flowchart
+- [x] For the walker pytree vis, can we make the MCState less linear so it takes less place?
+- [] clicking on core concepts doesnt load atm. Check why
+- [] 

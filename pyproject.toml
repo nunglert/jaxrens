@@ -20,6 +20,7 @@ dependencies = [
     "ase>=3.22",
     "pydantic>=2.0",
     "pyyaml>=6.0",
+    "jaxtyping>=0.2",
 ]
 
 [project.optional-dependencies]
@@ -28,10 +29,12 @@ mace = [
     "mace-jax[gpu,torch] @ git+https://github.com/nunglert/mace-jax.git@fix_install"
 ]
 nequix = ["nequix @ git+https://github.com/atomicarchitects/nequix.git@main"]
+jaxmd = ["jax-md>=0.2.28"]
 dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.5",
     "pytest-cov>=5.0",
+    "beartype>=0.18",
 ]
 docs = [
     "sphinx>=8.1",
@@ -58,12 +61,13 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not heavy and not mace and not neuralil and not nequix'"
+addopts = "-m 'not heavy and not mace and not neuralil and not nequix and not jaxmd and not multi_gpu' --jaxtyping-packages=jaxrens.state,jaxrens.sampling,beartype.beartype"
 markers = [
     "heavy: marks tests as heavy/slow (run with '-m heavy' or '-m \"\"' to include)",
     "gpu: marks tests requiring GPU",
-    "multi_gpu: marks tests requiring multiple GPUs",
+    "multi_gpu: marks tests requiring multiple GPUs (opt-in via '-m multi_gpu'; needs >=2 local devices)",
     "mace: marks tests that exercise the MACE backend; opt-in only via '-m mace' (needs mace_jax + GPU)",
     "neuralil: marks tests that exercise the NeuralIL backend; opt-in only via '-m neuralil' (needs neuralil)",
     "nequix: marks tests that exercise the nequix backend; opt-in only via '-m nequix' (needs nequix package + bundled or path-loaded model)",
+    "jaxmd: marks tests that exercise the jax-md backend (Tersoff/EAM); opt-in only via '-m jaxmd' (needs jax-md package)",
 ]

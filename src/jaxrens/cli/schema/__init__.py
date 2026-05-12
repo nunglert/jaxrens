@@ -1,7 +1,7 @@
 """Pydantic v2 schemas for jaxrens YAML configuration."""
 
 from jaxrens.cli.schema.adaptation import (
-    AdaptationConfig,
+    AdaptationSpec,
     AdaptationPolicy,
     ResolvedAdaptationPolicy,
 )
@@ -15,20 +15,19 @@ from jaxrens.cli.schema.backend import (
     MACEBackendSpec,
     NeuralILBackendSpec,
 )
-from jaxrens.cli.schema.cell import CellConfig
+from jaxrens.cli.schema.cell import CellSpec
 from jaxrens.cli.schema.ensemble import (
     BaseEnsembleSpec,
     EnsembleSpec,
     NPTEnsembleSpec,
     NVTEnsembleSpec,
 )
-from jaxrens.cli.schema.init import InitConfig, InitialWalkConfig
+from jaxrens.cli.schema.init import InitSpec, InitialWalkSpec
 from jaxrens.cli.schema.moves import (
     AlchemicalMorphMoveSpec,
     AlchemicalShiftMoveSpec,
     BaseMoveSpec,
-    GalileanMoveSpec,
-    GmcMoveSpec,
+    GMCMoveSpec,
     HMCMoveSpec,
     MoveSpec,
     MoveType,
@@ -40,9 +39,9 @@ from jaxrens.cli.schema.moves import (
     StretchMoveSpec,
     VolumeMoveSpec,
 )
-from jaxrens.cli.schema.output import OutputSchema
-from jaxrens.cli.schema.root import RootConfig
-from jaxrens.cli.schema.run import RunSchema
+from jaxrens.cli.schema.output import OutputSpec
+from jaxrens.cli.schema.root import RootSpec
+from jaxrens.cli.schema.run import RunSpec
 from jaxrens.cli.schema.termination import (
     BaseTerminationSpec,
     EnergyTerminationSpec,
@@ -53,7 +52,7 @@ from jaxrens.cli.schema.termination import (
 )
 
 __all__ = [
-    "AdaptationConfig",
+    "AdaptationSpec",
     "AdaptationPolicy",
     "AlchemicalMorphMoveSpec",
     "AlchemicalShiftMoveSpec",
@@ -62,17 +61,16 @@ __all__ = [
     "BaseEnsembleSpec",
     "BaseMoveSpec",
     "BaseTerminationSpec",
-    "CellConfig",
+    "CellSpec",
     "DoubleWellBackendSpec",
     "EnergyTerminationSpec",
     "EnsembleSpec",
-    "GalileanMoveSpec",
+    "GMCMoveSpec",
     "GaussianMixtureBackendSpec",
-    "GmcMoveSpec",
     "HMCMoveSpec",
     "HarmonicBackendSpec",
-    "InitConfig",
-    "InitialWalkConfig",
+    "InitSpec",
+    "InitialWalkSpec",
     "IterationTerminationSpec",
     "LJBackendSpec",
     "MACEBackendSpec",
@@ -81,12 +79,12 @@ __all__ = [
     "NPTEnsembleSpec",
     "NVTEnsembleSpec",
     "NeuralILBackendSpec",
-    "OutputSchema",
+    "OutputSpec",
     "PriorMassTerminationSpec",
     "RandomWalkMoveSpec",
     "ResolvedAdaptationPolicy",
-    "RootConfig",
-    "RunSchema",
+    "RootSpec",
+    "RunSpec",
     "ShearMoveSpec",
     "SingleAtomMoveSpec",
     "SingleAtomSweepMoveSpec",

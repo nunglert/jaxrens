@@ -22,6 +22,7 @@ from jaxrens.sampling.batch_descriptor import (
     PmapVmapRuns,
     SingleRun,
     VmapRuns,
+    from_shape_prefix,
 )
 
 
@@ -280,21 +281,28 @@ class TestPmapVmapRuns:
     # --- split_keys ---
 
     def test_split_keys_shape(self):
-        """split_keys returns shape (G, P, n_sub_keys) with typed-key dtype."""
+        """split_keys takes (G, P) keys, returns (G, P, n_sub_keys) — matches the
+        ABC contract `(*B,) -> (*B, n_sub_keys)`.  Production callers (manager,
+        run_loop) always pass the per-replica `NSState.rng_key` of shape (G, P).
+        """
         n_gpu, n_per_gpu = 1, 3
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
         base_key = jax.random.key(0)
-        gpu_keys = jax.random.split(base_key, n_gpu)  # (G,)
-        result = d.split_keys(gpu_keys, 5)
+        per_replica_keys = jax.random.split(base_key, n_gpu * n_per_gpu).reshape(
+            n_gpu, n_per_gpu
+        )
+        result = d.split_keys(per_replica_keys, 5)
         assert result.shape == (n_gpu, n_per_gpu, 5)
 
     def test_split_keys_deterministic(self):
-        """Two calls with the same key produce identical results."""
+        """Two calls with the same (G, P) keys produce identical results."""
         n_gpu, n_per_gpu = 1, 2
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
-        gpu_keys = jax.random.split(jax.random.key(7), n_gpu)
-        r1 = d.split_keys(gpu_keys, 4)
-        r2 = d.split_keys(gpu_keys, 4)
+        per_replica_keys = jax.random.split(jax.random.key(7), n_gpu * n_per_gpu).reshape(
+            n_gpu, n_per_gpu
+        )
+        r1 = d.split_keys(per_replica_keys, 4)
+        r2 = d.split_keys(per_replica_keys, 4)
         np.testing.assert_array_equal(
             np.asarray(jax.random.key_data(r1)),
             np.asarray(jax.random.key_data(r2)),
@@ -303,13 +311,15 @@ class TestPmapVmapRuns:
     def test_split_keys_under_jit(self):
         n_gpu, n_per_gpu = 1, 3
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
-        gpu_keys = jax.random.split(jax.random.key(3), n_gpu)
+        per_replica_keys = jax.random.split(jax.random.key(3), n_gpu * n_per_gpu).reshape(
+            n_gpu, n_per_gpu
+        )
 
         @jax.jit
         def _split(keys):
             return d.split_keys(keys, 4)
 
-        result = _split(gpu_keys)
+        result = _split(per_replica_keys)
         assert result.shape == (n_gpu, n_per_gpu, 4)
 
     # --- reduce_for_termination ---
@@ -350,3 +360,250 @@ class TestPmapVmapRuns:
         out_states, out_infos = jit_step(batched_state)
         assert isinstance(out_states, _FakeState)
         assert out_states.value.shape == (n_gpu, n_per_gpu)
+
+
+# ---------------------------------------------------------------------------
+# Derived helpers (walker_axis, flatten/unflatten, extract_step_sizes,
+# broadcast_step_sizes, reduce_emax) — shared across all three descriptors.
+# ---------------------------------------------------------------------------
+
+
+class _FakePop:
+    """Stand-in for ``WalkerState`` carrying just ``step_sizes``."""
+
+    def __init__(self, step_sizes: jnp.ndarray):
+        self.step_sizes = step_sizes
+
+
+_DESCRIPTOR_CASES = [
+    pytest.param(SingleRun(),                        id="single"),
+    pytest.param(VmapRuns(n_runs=3),                 id="vmap_R3"),
+    pytest.param(PmapVmapRuns(n_gpu=2, n_per_gpu=3), id="pmap_G2P3"),
+]
+
+
+class TestWalkerAxis:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_matches_shape_prefix_length(self, descriptor):
+        assert descriptor.walker_axis == len(descriptor.shape_prefix)
+
+
+class TestFlattenUnflatten:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_roundtrip(self, descriptor):
+        trailing = (4, 5)
+        shape = descriptor.shape_prefix + trailing
+        arr = jnp.arange(int(np.prod(shape)), dtype=jnp.float32).reshape(shape)
+        out = descriptor.unflatten(descriptor.flatten(arr))
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(arr))
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_flatten_shape(self, descriptor):
+        trailing = (7,)
+        shape = descriptor.shape_prefix + trailing
+        arr = jnp.zeros(shape)
+        flat = descriptor.flatten(arr)
+        assert flat.shape == (descriptor.n_runs,) + trailing
+
+
+class TestExtractStepSizes:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_shape(self, descriptor):
+        K, n_moves = 5, 3
+        shape = descriptor.shape_prefix + (K, n_moves)
+        pop = _FakePop(jnp.zeros(shape))
+        ss = descriptor.extract_step_sizes(pop)
+        assert ss.shape == descriptor.shape_prefix + (n_moves,)
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_picks_walker_zero(self, descriptor):
+        K, n_moves = 4, 2
+        shape = descriptor.shape_prefix + (K, n_moves)
+        # Fill with the walker index along the K axis so we can verify
+        # extract_step_sizes pulls walker 0 specifically.
+        walker_idx = jnp.broadcast_to(
+            jnp.arange(K, dtype=jnp.float32).reshape(
+                (1,) * len(descriptor.shape_prefix) + (K, 1)
+            ),
+            shape,
+        )
+        pop = _FakePop(walker_idx)
+        ss = descriptor.extract_step_sizes(pop)
+        np.testing.assert_array_equal(np.asarray(ss), np.zeros(ss.shape))
+
+
+class TestBroadcastStepSizes:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_shape(self, descriptor):
+        K, n_moves = 6, 4
+        per_move_ss = jnp.ones(descriptor.shape_prefix + (n_moves,))
+        out = descriptor.broadcast_step_sizes(per_move_ss, K)
+        assert out.shape == descriptor.shape_prefix + (K, n_moves)
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_value_replicated(self, descriptor):
+        K, n_moves = 3, 2
+        per_move_ss = jnp.arange(
+            int(np.prod(descriptor.shape_prefix + (n_moves,))),
+            dtype=jnp.float32,
+        ).reshape(descriptor.shape_prefix + (n_moves,))
+        out = descriptor.broadcast_step_sizes(per_move_ss, K)
+        # Pull walker w; should equal per_move_ss for every w.
+        for w in range(K):
+            slicer = (slice(None),) * len(descriptor.shape_prefix) + (w,)
+            np.testing.assert_array_equal(
+                np.asarray(out[slicer]), np.asarray(per_move_ss)
+            )
+
+
+class TestReduceEmax:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_shape(self, descriptor):
+        K = 5
+        energy = jnp.zeros(descriptor.shape_prefix + (K,))
+        out = descriptor.reduce_emax(energy)
+        assert out.shape == descriptor.shape_prefix
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_value(self, descriptor):
+        K = 4
+        # Energy with the maximum sitting at walker K-1 in every replica.
+        ramp = jnp.arange(K, dtype=jnp.float32)
+        energy = jnp.broadcast_to(
+            ramp.reshape((1,) * len(descriptor.shape_prefix) + (K,)),
+            descriptor.shape_prefix + (K,),
+        )
+        out = descriptor.reduce_emax(energy)
+        expected = jnp.full(descriptor.shape_prefix, K - 1, dtype=jnp.float32)
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
+
+
+class TestScalarKey:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_returns_scalar_key(self, descriptor):
+        # Build a per-replica key tree of the right shape, then ensure the
+        # result is a scalar (ndim == 0) — caller can feed it to scalar APIs
+        # like ``replica_exchange_step``.
+        n_per_replica = descriptor.n_runs
+        if n_per_replica == 1 and descriptor.shape_prefix == ():
+            # SingleRun: scalar input.
+            key = jax.random.key(0)
+        else:
+            flat = jax.random.split(jax.random.key(0), n_per_replica)
+            key = flat.reshape(descriptor.shape_prefix)
+        out = descriptor.scalar_key(key)
+        assert jnp.asarray(out).ndim == 0
+
+    def test_singlerun_passthrough(self):
+        d = SingleRun()
+        key = jax.random.key(7)
+        assert jnp.asarray(d.scalar_key(key)).ndim == 0
+        # Same bits going in and out for a scalar input.
+        out = d.scalar_key(key)
+        assert jax.random.key_data(out).tolist() == jax.random.key_data(key).tolist()
+
+    def test_batched_takes_replica_zero(self):
+        d = VmapRuns(n_runs=4)
+        flat = jax.random.split(jax.random.key(11), 4)
+        out = d.scalar_key(flat)
+        # The first replica's key should match.
+        assert jax.random.key_data(out).tolist() == jax.random.key_data(flat[0]).tolist()
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_jit(self, descriptor):
+        if descriptor.shape_prefix == ():
+            key = jax.random.key(0)
+        else:
+            flat = jax.random.split(jax.random.key(0), descriptor.n_runs)
+            key = flat.reshape(descriptor.shape_prefix)
+        out = jax.jit(descriptor.scalar_key)(key)
+        assert jnp.asarray(out).ndim == 0
+
+
+class TestFromShapePrefix:
+    def test_scalar_returns_singlerun(self):
+        out = from_shape_prefix(())
+        assert isinstance(out, SingleRun)
+
+    def test_rank1_returns_vmapruns(self):
+        out = from_shape_prefix((7,))
+        assert isinstance(out, VmapRuns)
+        assert out.n_runs == 7
+
+    def test_rank2_returns_pmapvmapruns(self):
+        out = from_shape_prefix((2, 3))
+        assert isinstance(out, PmapVmapRuns)
+        assert out.n_gpu == 2
+        assert out.n_per_gpu == 3
+
+    def test_rank3_raises(self):
+        with pytest.raises(ValueError, match="rank-0/1/2"):
+            from_shape_prefix((1, 2, 3))
+
+    def test_roundtrip_via_shape_prefix(self):
+        for d in (SingleRun(), VmapRuns(n_runs=4), PmapVmapRuns(n_gpu=2, n_per_gpu=3)):
+            assert from_shape_prefix(d.shape_prefix).shape_prefix == d.shape_prefix
+
+
+class TestWrapForBatch:
+    """``wrap_for_batch`` mirrors ``wrap_step`` but for arbitrary callables."""
+
+    def _square(self, x):
+        return x * x
+
+    def test_singlerun_runs_on_scalar(self):
+        d = SingleRun()
+        wrapped = d.wrap_for_batch(self._square)
+        out = wrapped(jnp.asarray(3.0))
+        assert jnp.allclose(out, 9.0)
+
+    def test_vmap_runs_on_batch_axis(self):
+        d = VmapRuns(n_runs=4)
+        wrapped = d.wrap_for_batch(self._square)
+        out = wrapped(jnp.arange(4, dtype=jnp.float32))
+        np.testing.assert_array_equal(np.asarray(out), np.array([0.0, 1.0, 4.0, 9.0]))
+
+    def test_pmap_vmap_runs_on_GP_batch(self):
+        n_devices = jax.local_device_count()
+        d = PmapVmapRuns(n_gpu=n_devices, n_per_gpu=3)
+        # Force n_gpu==local_devices since pmap requires that.
+        wrapped = d.wrap_for_batch(self._square)
+        x = jnp.arange(n_devices * 3, dtype=jnp.float32).reshape(n_devices, 3)
+        out = wrapped(x)
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(x * x))
+
+
+class TestDerivedHelpersJIT:
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_extract_and_broadcast_jit(self, descriptor):
+        K, n_moves = 3, 2
+        ss_shape = descriptor.shape_prefix + (K, n_moves)
+        ss = jnp.ones(ss_shape)
+
+        @jax.jit
+        def _roundtrip(step_sizes):
+            pop = _FakePop(step_sizes)
+            per_move = descriptor.extract_step_sizes(pop)
+            return descriptor.broadcast_step_sizes(per_move, K)
+
+        out = _roundtrip(ss)
+        assert out.shape == ss.shape
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_reduce_emax_jit(self, descriptor):
+        K = 5
+        energy = jnp.ones(descriptor.shape_prefix + (K,))
+        emax = jax.jit(descriptor.reduce_emax)(energy)
+        assert emax.shape == descriptor.shape_prefix
+
+    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
+    def test_flatten_unflatten_jit(self, descriptor):
+        trailing = (4,)
+        arr = jnp.ones(descriptor.shape_prefix + trailing)
+
+        @jax.jit
+        def _round(x):
+            return descriptor.unflatten(descriptor.flatten(x))
+
+        out = _round(arr)
+        assert out.shape == arr.shape

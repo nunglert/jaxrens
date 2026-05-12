@@ -123,10 +123,6 @@ class TestGoldenEquivalence:
             f"log_evidence not deterministic: {r1['log_evidence']} vs {r2['log_evidence']}"
         )
         assert r1["n_dead"] == r2["n_dead"]
-        np.testing.assert_array_equal(
-            np.asarray(r1["dead_energies"][:r1["n_dead"]]),
-            np.asarray(r2["dead_energies"][:r2["n_dead"]]),
-        )
 
     def test_golden_log_evidence_finite(self):
         """log_evidence after 10 iters must be finite."""
@@ -140,14 +136,10 @@ class TestGoldenEquivalence:
         r = self._run_short_ns(seed=42, n_iter=10)
         assert r["n_dead"] == 10, f"Expected n_dead=10, got {r['n_dead']}"
 
-    def test_golden_dead_energies_nonincreasing(self):
-        """Dead energies are collected largest-first (NS removes worst each iter),
-        so the sequence should be non-increasing."""
-        r = self._run_short_ns(seed=42, n_iter=10)
-        de = np.asarray(r["dead_energies"][:r["n_dead"]])
-        assert np.all(np.diff(de) <= 1e-7), (
-            f"Dead energies not non-increasing (NS removes worst first): {de}"
-        )
+    # NOTE: ``test_golden_dead_energies_nonincreasing`` removed — result
+    # dicts no longer carry ``dead_energies`` (canonical record is the
+    # streamed ``.energies`` file via ``EnergyLogger`` callback, exercised
+    # by the integration suite).
 
     # ------------------------------------------------------------------
     # Parallel parity: run_ns_parallel(n_runs=1) vs run_ns
@@ -189,11 +181,10 @@ class TestGoldenEquivalence:
         return result
 
     def test_parallel_n_runs_1_matches_single_within_tolerance(self):
-        """run_ns_parallel(n_runs=1) must agree with run_ns within 1e-12.
-
-        Both start from the same initial population but use different RNG
-        paths (vmap introduces potential float-nondeterminism).
-        Start at tolerance 0.0; relax to 1e-12 if needed.
+        """run_ns_parallel(n_runs=1) must agree with run_ns within a tight
+        bound. The two paths plumb RNG keys differently (vmap split vs
+        straight split), so bit-identity isn't expected, but the difference
+        should be << 1 log-unit on a small problem with a fixed seed.
         """
         r_par = self._run_parallel_n1(seed=77, n_iter=60)
         r_seq = self._run_single(seed=77, n_iter=60)
@@ -201,15 +192,10 @@ class TestGoldenEquivalence:
         log_z_par = float(r_par["log_evidence"][0])
         log_z_seq = float(r_seq["log_evidence"])
 
-        # Both must be finite
         assert jnp.isfinite(jnp.array(log_z_par))
         assert jnp.isfinite(jnp.array(log_z_seq))
 
-        # Tolerance: start at 1e-12; if vmap introduces floating-point
-        # nondeterminism across JAX versions, relax to 1e-6.
-        # Physicist-generous bound: within 5 log-units (both must sample
-        # the same region to be meaningful).
-        assert abs(log_z_par - log_z_seq) < 5.0, (
+        assert abs(log_z_par - log_z_seq) < 1.0, (
             f"run_ns_parallel(n_runs=1) log_Z={log_z_par:.4f} "
             f"vs run_ns log_Z={log_z_seq:.4f} (diff={abs(log_z_par-log_z_seq):.4f})"
         )
@@ -233,18 +219,18 @@ class TestGoldenEquivalence:
 
 
 class TestBatchDescriptorInInfo:
-    """Verify info["_batch"] is attached and has correct is_batched property."""
+    """Verify info["_batcher"] is attached and has correct is_batched property."""
 
     def test_single_run_info_batch_is_single(self):
-        """run_ns attaches a SingleRun descriptor as info['_batch']."""
+        """run_ns attaches a SingleRun descriptor as info['_batcher']."""
         s = _build_harmonic_setup(seed=10, n_walkers=15)
 
         captured_batches = []
 
         class _Capture:
             def on_iteration(self, iteration, ns_state, info):
-                if "_batch" in info:
-                    captured_batches.append(info["_batch"])
+                if "_batcher" in info:
+                    captured_batches.append(info["_batcher"])
             def on_finish(self, ns_state):
                 pass
 
@@ -320,7 +306,6 @@ class TestOverflowRetry:
         ns_state = init_ns(
             init_fn, s["positions"], s["types"], s["energies"],
             cells=None, rng_key=s["key"],
-            max_dead=50,
             step_sizes=jnp.full(1, 0.3),
         )
 
@@ -347,11 +332,11 @@ class TestOverflowRetry:
             def wrap_step(self, ns_step_fn, step_fn_inner, n_mcmc_steps, n_extra):
                 return lambda state, sfn, nm, ne: patched_step_fn(state, sfn, nm, ne)
 
-        descriptor = _PatchedSingleRun()
+        batcher = _PatchedSingleRun()
         adapt_mgr = AdaptationManager(
             move_descriptors=[],
             per_move_fns=None,
-            batch_descriptor=descriptor,
+            batcher=batcher,
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -364,13 +349,12 @@ class TestOverflowRetry:
         ]
 
         final_state, _, _ = _run_loop(
-            descriptor=descriptor,
+            batcher=batcher,
             adapt_mgr=adapt_mgr,
             ns_state=ns_state,
             step_fn=s["step_fn"],
             n_mcmc_steps=3,
             n_extra=0,
-            max_iterations=n_iter,
             termination_criteria=termination_criteria,
             callbacks=[],
             n_moves=1,
@@ -379,14 +363,19 @@ class TestOverflowRetry:
             info_interval=10,
         )
 
-        # Total calls = n_iter (one overflow call + 5 successful).
-        assert call_count[0] == n_iter, (
-            f"Expected {n_iter} calls (one overflow + 5 successful), got {call_count[0]}"
+        # New ``_run_loop`` semantics: on overflow, ``continue`` retries the
+        # same ``i`` (no advance), so the overflow adds one extra step call
+        # on top of the n_iter successful steps. Old ``for i in range(...)``
+        # semantics consumed the ``i`` slot regardless.
+        assert call_count[0] == n_iter + 1, (
+            f"Expected {n_iter + 1} calls ({n_iter} successful + 1 overflow), "
+            f"got {call_count[0]}"
         )
-        # Final ns_state.iteration = n_iter - 1 = 5 (one successful step lost to overflow).
-        # IterationTermination(6) fires at i >= 5 (after i=5 the 5th successful step).
-        assert int(final_state.iteration) == n_iter - 1, (
-            f"Expected iteration={n_iter - 1} (5 successful steps), got {int(final_state.iteration)}"
+        # ``IterationTermination(n_iter)`` fires at i >= n_iter - 1 (i.e. after
+        # the n_iter-th successful step), and ``ns_state.iteration`` advances
+        # once per successful step → final iteration == n_iter.
+        assert int(final_state.iteration) == n_iter, (
+            f"Expected iteration={n_iter}, got {int(final_state.iteration)}"
         )
 
     def test_overflow_retry_increases_max_neighbors(self):
@@ -402,7 +391,6 @@ class TestOverflowRetry:
         ns_state = init_ns(
             init_fn, s["positions"], s["types"], s["energies"],
             cells=None, rng_key=s["key"],
-            max_dead=50,
             step_sizes=jnp.full(1, 0.3),
         )
 
@@ -432,11 +420,11 @@ class TestOverflowRetry:
             def wrap_step(self, ns_step_fn, step_fn_inner, n_mcmc_steps, n_extra):
                 return lambda state, sfn, nm, ne: patched_step_fn(state, sfn, nm, ne)
 
-        descriptor = _PatchedSingleRun()
+        batcher = _PatchedSingleRun()
         adapt_mgr = AdaptationManager(
             move_descriptors=[],
             per_move_fns=None,
-            batch_descriptor=descriptor,
+            batcher=batcher,
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
@@ -448,13 +436,12 @@ class TestOverflowRetry:
         ]
 
         _run_loop(
-            descriptor=descriptor,
+            batcher=batcher,
             adapt_mgr=adapt_mgr,
             ns_state=ns_state,
             step_fn=s["step_fn"],
             n_mcmc_steps=3,
             n_extra=0,
-            max_iterations=5,
             termination_criteria=termination_criteria,
             callbacks=[],
             n_moves=1,

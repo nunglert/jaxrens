@@ -33,6 +33,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.scipy.special import logsumexp
 
 
@@ -121,7 +122,15 @@ def _heat_capacity_1d(
     n_live: int | jnp.ndarray,
     n_cull: int = 1,
 ) -> jnp.ndarray:
-    """Heat capacity for a single 1-D dead_energies array."""
+    """Heat capacity for a single 1-D dead_energies array.
+
+    Computes ``β² · Var(E)`` where ``Var(E) = Σ w_i (E_i - <E>)²``.  The
+    deviation form is used in place of the algebraic ``<E²> - <E>²``
+    identity to avoid catastrophic cancellation at low T (where the
+    distribution collapses onto a single walker, so both moments are
+    close to ``E_min²`` and their difference is dominated by float noise
+    — visible as wild spikes / negative Cv in fp32).
+    """
     n_dead = dead_energies.shape[0]
     log_w_dead = _calc_log_weights_1d(n_dead, n_live, n_cull)
     log_w_live = _calc_log_weights_live_1d(n_dead, n_live, n_cull)
@@ -135,8 +144,8 @@ def _heat_capacity_1d(
     w = jnp.exp(log_unnorm - log_Z)
 
     mean_E = jnp.sum(w * all_E)
-    mean_E2 = jnp.sum(w * all_E**2)
-    return beta**2 * (mean_E2 - mean_E**2)
+    var_E = jnp.sum(w * (all_E - mean_E) ** 2)
+    return beta**2 * var_E
 
 
 def _expectation_1d(
@@ -167,39 +176,44 @@ def _expectation_1d(
 # ---------------------------------------------------------------------------
 
 
-def _batch_apply(fn_1d, dead_energies: jnp.ndarray, *args, **kwargs) -> jnp.ndarray:
+def _batch_apply(fn_1d, *replica_arrays: jnp.ndarray) -> jnp.ndarray:
     """Apply a 1-D per-run function across any leading batch dims.
 
+    The first positional array's leading shape (minus its last axis) defines
+    the batch prefix.  Subsequent arrays either share that prefix or are
+    1-D (broadcast over the batch).
+
     Args:
-        fn_1d: Function ``(dead_energies_1d, *args, **kwargs) -> scalar``.
-            ``dead_energies_1d`` has shape ``(max_dead,)``.
-        dead_energies: Shape ``(*batch, max_dead)``.  When ``batch`` is empty
-            (1-D input) the function is called directly without vmap.
-        *args, **kwargs: Forwarded to ``fn_1d`` as-is (must be compatible
-            with the flattened batch — callers are responsible for matching
-            leading dims on any additional array arguments).
+        fn_1d: Function whose positional arguments correspond 1-to-1 with
+            ``replica_arrays`` after flattening to single-replica shape.
+            Returns a scalar (or any pytree of scalars) per replica.
+        *replica_arrays: One or more per-replica arrays.  Each has either
+            a ``(*batch, last)`` shape (gets flattened to ``(n_flat, last)``)
+            or a ``(last,)`` shape (gets broadcast to ``(n_flat, last)``).
 
     Returns:
         Output with shape ``batch``.  Scalar (0-D) for 1-D input.
     """
-    dead_energies = jnp.asarray(dead_energies)
-    batch_shape = dead_energies.shape[:-1]
-    max_dead = dead_energies.shape[-1]
+    if len(replica_arrays) == 0:
+        raise ValueError("_batch_apply requires at least one replica array")
+
+    primary = jnp.asarray(replica_arrays[0])
+    batch_shape = primary.shape[:-1]
 
     if len(batch_shape) == 0:
-        # 1-D input: call directly, return scalar.
-        return fn_1d(dead_energies, *args, **kwargs)
+        # 1-D primary: skip vmap, call directly (callers expect a scalar).
+        return fn_1d(*(jnp.asarray(a) for a in replica_arrays))
 
-    # Flatten leading dims: (*batch, max_dead) -> (n_flat, max_dead)
-    n_flat = 1
-    for d in batch_shape:
-        n_flat *= d
-    dead_flat = dead_energies.reshape(n_flat, max_dead)
+    n_flat = int(np.prod(batch_shape))
+    flat = []
+    for a in replica_arrays:
+        a = jnp.asarray(a)
+        if a.ndim == 1:
+            flat.append(jnp.broadcast_to(a[None], (n_flat, a.shape[0])))
+        else:
+            flat.append(a.reshape((n_flat,) + a.shape[len(batch_shape):]))
 
-    # vmap over the flattened batch axis.
-    out_flat = jax.vmap(lambda de: fn_1d(de, *args, **kwargs))(dead_flat)
-
-    # Restore original batch shape.
+    out_flat = jax.vmap(fn_1d)(*flat)
     return out_flat.reshape(batch_shape)
 
 
@@ -279,29 +293,10 @@ def log_evidence(
     Returns:
         Log Z with shape ``batch`` — scalar for 1-D input.
     """
-    dead_energies = jnp.asarray(dead_energies)
-    live_energies = jnp.asarray(live_energies)
-    batch_shape = dead_energies.shape[:-1]
-
-    if len(batch_shape) == 0:
-        return _log_evidence_1d(dead_energies, live_energies, n_live, n_cull)
-
-    n_flat = 1
-    for d in batch_shape:
-        n_flat *= d
-
-    dead_flat = dead_energies.reshape(n_flat, dead_energies.shape[-1])
-    # live_energies: broadcast if 1-D, else flatten matching batch dims.
-    if live_energies.ndim == 1:
-        live_flat = jnp.broadcast_to(live_energies[None], (n_flat, live_energies.shape[0]))
-    else:
-        live_flat = live_energies.reshape(n_flat, live_energies.shape[-1])
-
-    out_flat = jax.vmap(
-        lambda de, le: _log_evidence_1d(de, le, n_live, n_cull)
-    )(dead_flat, live_flat)
-
-    return out_flat.reshape(batch_shape)
+    return _batch_apply(
+        lambda de, le: _log_evidence_1d(de, le, n_live, n_cull),
+        dead_energies, live_energies,
+    )
 
 
 def partition_function(
@@ -336,57 +331,35 @@ def partition_function(
         Log Z(beta) with shape ``batch`` — scalar for 1-D input.
     """
     beta = jnp.asarray(beta)
-    dead_energies = jnp.asarray(dead_energies)
-    live_energies = jnp.asarray(live_energies)
-    batch_shape = dead_energies.shape[:-1]
-
-    if len(batch_shape) == 0:
-        return _partition_function_1d(
-            beta, dead_energies, live_energies, n_live, n_cull,
-            dead_volumes, live_volumes,
+    # The four-way None dispatch keeps optional volumes out of the vmap
+    # signature; ``_batch_apply`` then handles flatten/vmap/reshape uniformly.
+    if dead_volumes is not None and live_volumes is not None:
+        return _batch_apply(
+            lambda de, le, dv, lv: _partition_function_1d(
+                beta, de, le, n_live, n_cull, dv, lv,
+            ),
+            dead_energies, live_energies, dead_volumes, live_volumes,
         )
-
-    n_flat = 1
-    for d in batch_shape:
-        n_flat *= d
-
-    dead_flat = dead_energies.reshape(n_flat, dead_energies.shape[-1])
-    if live_energies.ndim == 1:
-        live_flat = jnp.broadcast_to(live_energies[None], (n_flat, live_energies.shape[0]))
-    else:
-        live_flat = live_energies.reshape(n_flat, live_energies.shape[-1])
-
-    dv_flat = None
-    lv_flat = None
     if dead_volumes is not None:
-        dv_flat = jnp.asarray(dead_volumes).reshape(n_flat, dead_energies.shape[-1])
+        return _batch_apply(
+            lambda de, le, dv: _partition_function_1d(
+                beta, de, le, n_live, n_cull, dv, None,
+            ),
+            dead_energies, live_energies, dead_volumes,
+        )
     if live_volumes is not None:
-        lv_np = jnp.asarray(live_volumes)
-        if lv_np.ndim == 1:
-            lv_flat = jnp.broadcast_to(lv_np[None], (n_flat, lv_np.shape[0]))
-        else:
-            lv_flat = lv_np.reshape(n_flat, lv_np.shape[-1])
-
-    # Build per-run closures to accommodate optional volume arrays.
-    # We always pass them explicitly to avoid closure capture issues under vmap.
-    if dv_flat is not None and lv_flat is not None:
-        out_flat = jax.vmap(
-            lambda de, le, dv, lv: _partition_function_1d(beta, de, le, n_live, n_cull, dv, lv)
-        )(dead_flat, live_flat, dv_flat, lv_flat)
-    elif dv_flat is not None:
-        out_flat = jax.vmap(
-            lambda de, le, dv: _partition_function_1d(beta, de, le, n_live, n_cull, dv, None)
-        )(dead_flat, live_flat, dv_flat)
-    elif lv_flat is not None:
-        out_flat = jax.vmap(
-            lambda de, le, lv: _partition_function_1d(beta, de, le, n_live, n_cull, None, lv)
-        )(dead_flat, live_flat, lv_flat)
-    else:
-        out_flat = jax.vmap(
-            lambda de, le: _partition_function_1d(beta, de, le, n_live, n_cull, None, None)
-        )(dead_flat, live_flat)
-
-    return out_flat.reshape(batch_shape)
+        return _batch_apply(
+            lambda de, le, lv: _partition_function_1d(
+                beta, de, le, n_live, n_cull, None, lv,
+            ),
+            dead_energies, live_energies, live_volumes,
+        )
+    return _batch_apply(
+        lambda de, le: _partition_function_1d(
+            beta, de, le, n_live, n_cull, None, None,
+        ),
+        dead_energies, live_energies,
+    )
 
 
 def heat_capacity(
@@ -415,28 +388,10 @@ def heat_capacity(
         C_v with shape ``batch`` — scalar for 1-D input.
     """
     beta = jnp.asarray(beta)
-    dead_energies = jnp.asarray(dead_energies)
-    live_energies = jnp.asarray(live_energies)
-    batch_shape = dead_energies.shape[:-1]
-
-    if len(batch_shape) == 0:
-        return _heat_capacity_1d(beta, dead_energies, live_energies, n_live, n_cull)
-
-    n_flat = 1
-    for d in batch_shape:
-        n_flat *= d
-
-    dead_flat = dead_energies.reshape(n_flat, dead_energies.shape[-1])
-    if live_energies.ndim == 1:
-        live_flat = jnp.broadcast_to(live_energies[None], (n_flat, live_energies.shape[0]))
-    else:
-        live_flat = live_energies.reshape(n_flat, live_energies.shape[-1])
-
-    out_flat = jax.vmap(
-        lambda de, le: _heat_capacity_1d(beta, de, le, n_live, n_cull)
-    )(dead_flat, live_flat)
-
-    return out_flat.reshape(batch_shape)
+    return _batch_apply(
+        lambda de, le: _heat_capacity_1d(beta, de, le, n_live, n_cull),
+        dead_energies, live_energies,
+    )
 
 
 def expectation(
@@ -467,34 +422,13 @@ def expectation(
         <O> with shape ``batch`` — scalar for 1-D input.
     """
     beta = jnp.asarray(beta)
-    dead_energies = jnp.asarray(dead_energies)
-    live_energies = jnp.asarray(live_energies)
-    observable_values = jnp.asarray(observable_values)
-    batch_shape = dead_energies.shape[:-1]
-
-    if len(batch_shape) == 0:
-        return _expectation_1d(observable_values, beta, dead_energies, live_energies, n_live, n_cull)
-
-    n_flat = 1
-    for d in batch_shape:
-        n_flat *= d
-
-    dead_flat = dead_energies.reshape(n_flat, dead_energies.shape[-1])
-    if live_energies.ndim == 1:
-        live_flat = jnp.broadcast_to(live_energies[None], (n_flat, live_energies.shape[0]))
-    else:
-        live_flat = live_energies.reshape(n_flat, live_energies.shape[-1])
-
-    if observable_values.ndim == 1:
-        obs_flat = jnp.broadcast_to(observable_values[None], (n_flat, observable_values.shape[0]))
-    else:
-        obs_flat = observable_values.reshape(n_flat, observable_values.shape[-1])
-
-    out_flat = jax.vmap(
-        lambda obs, de, le: _expectation_1d(obs, beta, de, le, n_live, n_cull)
-    )(obs_flat, dead_flat, live_flat)
-
-    return out_flat.reshape(batch_shape)
+    # ``_batch_apply`` keys the batch shape off its first replica array;
+    # passing ``dead_energies`` first matches the public batch convention
+    # (output shape mirrors ``dead_energies.shape[:-1]``).
+    return _batch_apply(
+        lambda de, le, obs: _expectation_1d(obs, beta, de, le, n_live, n_cull),
+        dead_energies, live_energies, observable_values,
+    )
 
 
 def free_energy(

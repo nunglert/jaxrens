@@ -32,6 +32,8 @@ import numpy as np
 import pytest
 import yaml
 
+from . import multi_gpu_n_devices
+
 
 _FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "neuralil_tiny"
 _MODEL_PKL = _FIXTURE / "model.pkl"
@@ -76,7 +78,7 @@ termination:
 # Adaptation must not fire mid-run; set adjust interval > max.
 adaptation:
   full_auto: true
-  full_auto_steps: 100
+  adjust_interval: 100
   defaults:
     min_rate: 0.3
     max_rate: 0.5
@@ -142,13 +144,13 @@ def test_neuralil_full_pipeline(tmp_path: Path) -> None:
         expand_multi_run_or_cohort,
     )
     from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootConfig
+    from jaxrens.cli.schema import RootSpec
 
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["backend"]["checkpoint_path"] = str(_MODEL_PKL)
     raw["output"]["working_dir"] = str(tmp_path / "out")
 
-    root = RootConfig.model_validate(raw)
+    root = RootSpec.model_validate(raw)
     resolved = expand_multi_run_or_cohort(root)
 
     # Two-pressure list → multi-run dispatcher.
@@ -202,10 +204,9 @@ def test_neuralil_full_pipeline(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Multi-GPU variant — 8 pressure replicas distributed 2-per-device on 4 GPUs.
+# Multi-GPU variant — pressure replicas distributed 2-per-device on
+# whatever JAX exposes (either 2 or 4 local devices).
 # ---------------------------------------------------------------------------
-
-_REQUIRED_DEVICES = 4
 
 
 _NEURALIL_MULTI_GPU_CONFIG_YAML = """
@@ -250,7 +251,7 @@ termination:
 
 adaptation:
   full_auto: true
-  full_auto_steps: 100
+  adjust_interval: 100
   defaults:
     min_rate: 0.3
     max_rate: 0.5
@@ -293,13 +294,14 @@ output:
 @pytest.mark.gpu
 @pytest.mark.heavy
 def test_neuralil_multi_gpu_pipeline(tmp_path: Path) -> None:
-    """NeuralIL NPT NS with 8 pressure replicas distributed 2-per-GPU on 4 GPUs.
+    """NeuralIL NPT NS with pressure replicas distributed 2-per-GPU.
 
-    Same code path as :func:`test_neuralil_full_pipeline` but with four
-    real devices and an inner vmap of width 2.  Exercises the full
-    pmap(vmap(vmap)) hierarchy with the NeuralIL backend whose dynamics
-    model is now built once at construction time (post-cache-refactor)
-    and dispatched across devices via the resolver's ``base_backend``.
+    Same code path as :func:`test_neuralil_full_pipeline` but with
+    multiple real devices and an inner vmap of width 2.  Exercises the
+    full pmap(vmap(vmap)) hierarchy with the NeuralIL backend whose
+    dynamics model is now built once at construction time
+    (post-cache-refactor) and dispatched across devices via the
+    resolver's ``base_backend``.  Runs on either 2 or 4 local devices.
     """
     pytest.importorskip("neuralil")
 
@@ -308,16 +310,20 @@ def test_neuralil_multi_gpu_pipeline(tmp_path: Path) -> None:
         expand_multi_run_or_cohort,
     )
     from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootConfig
+    from jaxrens.cli.schema import RootSpec
+
+    n_gpu = multi_gpu_n_devices()
+    n_total = n_gpu * 2
 
     raw = yaml.safe_load(_NEURALIL_MULTI_GPU_CONFIG_YAML)
     raw["backend"]["checkpoint_path"] = str(_MODEL_PKL)
     raw["output"]["working_dir"] = str(tmp_path / "out")
+    raw["ensemble"]["pressure"] = raw["ensemble"]["pressure"][:n_total]
 
-    root = RootConfig.model_validate(raw)
+    root = RootSpec.model_validate(raw)
     resolved = expand_multi_run_or_cohort(root)
     assert isinstance(resolved, ResolvedMultiRunConfig)
-    assert resolved.ns.n_gpu == _REQUIRED_DEVICES
+    assert resolved.ns.n_gpu == n_gpu
     assert resolved.ns.n_per_gpu == 2
 
     run_multi_gpu_from_config(resolved)
@@ -342,8 +348,8 @@ def test_neuralil_multi_gpu_pipeline(tmp_path: Path) -> None:
 
     state = load_checkpoint(final_ckpt)
     log_z = np.asarray(state["log_evidence"])
-    assert log_z.shape == (_REQUIRED_DEVICES, 2)
+    assert log_z.shape == (n_gpu, 2)
     assert np.all(np.isfinite(log_z))
 
     saved_positions = np.asarray(state["positions"])
-    assert saved_positions.shape == (_REQUIRED_DEVICES, 2, 4, 8, 3)
+    assert saved_positions.shape == (n_gpu, 2, 4, 8, 3)

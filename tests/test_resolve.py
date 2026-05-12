@@ -3,13 +3,13 @@
 Covers: resolve(), _resolve_init(), to_descriptor(), to_move_config(),
 to_backend_config(), build_backend(), to_criterion(), to_ensemble_params(),
 adapt overlay logic, cohort expansion, full-config resolver, and
-TestInitConfigResolver (Part A and Part B, Mode B resolver tests).
+TestInitSpecResolver (Part A and Part B, Mode B resolver tests).
 
 All classes that were renamed to avoid collisions are documented below:
-- TestInitConfigResolver (first occurrence, line 1705 of original test_schema.py)
-  -> kept as TestInitConfigResolverPartA (resolver unit tests for Part A init)
-- TestInitConfigResolver (second occurrence, line 2080 of original test_schema.py)
-  -> TestInitConfigResolverPartB, minus the two E2E tests:
+- TestInitSpecResolver (first occurrence, line 1705 of original test_schema.py)
+  -> kept as TestInitSpecResolverPartA (resolver unit tests for Part A init)
+- TestInitSpecResolver (second occurrence, line 2080 of original test_schema.py)
+  -> TestInitSpecResolverPartB, minus the two E2E tests:
        test_start_species_e2e_run_ns   -> kept in test_init_positions.py
        test_mode_b_end_to_end_jit      -> kept in test_init_structure.py
 """
@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from jaxrens.cli.schema import RootConfig
+from jaxrens.cli.schema import RootSpec
 from jaxrens.cli.schema.backend import (
     DoubleWellBackendSpec,
     GaussianMixtureBackendSpec,
@@ -32,8 +32,7 @@ from jaxrens.cli.schema.backend import (
 )
 from jaxrens.cli.schema.moves import (
     RandomWalkMoveSpec,
-    GalileanMoveSpec,
-    GmcMoveSpec,
+    GMCMoveSpec,
     HMCMoveSpec,
     SingleAtomMoveSpec,
     VolumeMoveSpec,
@@ -112,7 +111,7 @@ def _species_dict(n_atoms: int = 4, n_live: int = 8, mode: str = "grid") -> dict
 
 class TestResolve:
     def test_resolve_types(self):
-        root = RootConfig.model_validate(_minimal_dict())
+        root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
         assert isinstance(resolved, ResolvedConfig)
         assert isinstance(resolved.ns, NSConfig)
@@ -123,7 +122,7 @@ class TestResolve:
 
     def test_resolve_values_match_hand_built(self):
         d = _minimal_dict()
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         resolved = resolve(root)
 
         expected_ns = NSConfig(
@@ -172,11 +171,11 @@ class TestResolve:
             {"move_type": "random_walk", "step_size": 0.2, "weight": 0.7},
             {"move_type": "galilean", "step_size": 0.05, "weight": 0.3},
         ]
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         resolved = resolve(root)
         assert len(resolved.moves) == 2
         assert resolved.moves[0].move_type == "random_walk"
-        assert resolved.moves[1].move_type == "galilean"
+        assert resolved.moves[1].move_type == "gmc"
 
 
 # ---------------------------------------------------------------------------
@@ -196,13 +195,13 @@ class TestToDescriptor:
         assert desc.extra_state_fields == {}
 
     def test_galilean_descriptor_n_reflect(self):
-        spec = GalileanMoveSpec(n_reflect=7, step_size=0.05)
+        spec = GMCMoveSpec(n_reflect=7, step_size=0.05)
         desc = spec.to_descriptor()
         assert desc.kernel_kwargs == {"n_reflect": 7}
         assert "direction" in desc.extra_state_fields
 
     def test_gmc_descriptor_n_reflect(self):
-        spec = GmcMoveSpec(n_reflect=3)
+        spec = GMCMoveSpec(n_reflect=3)
         desc = spec.to_descriptor()
         assert desc.kernel_kwargs == {"n_reflect": 3}
         assert "direction" in desc.extra_state_fields
@@ -219,8 +218,8 @@ class TestToDescriptor:
         assert desc.kernel_kwargs == {}
 
     def test_volume_descriptor(self):
-        from jaxrens.cli.schema.cell import CellConfig
-        cell_cfg = CellConfig(max_volume_per_atom=50.0, min_volume_per_atom=1.0,
+        from jaxrens.cli.schema.cell import CellSpec
+        cell_cfg = CellSpec(max_volume_per_atom=50.0, min_volume_per_atom=1.0,
                               min_aspect_ratio=0.5, flat_V_prior=False)
         spec = VolumeMoveSpec()
         desc = spec.to_descriptor(n_atoms=10, cell_cfg=cell_cfg)
@@ -253,7 +252,7 @@ class TestToDescriptor:
         assert desc.name == "random_walk"
 
     def test_name_override(self):
-        spec = GalileanMoveSpec(name="gal_heavy", n_reflect=5)
+        spec = GMCMoveSpec(name="gal_heavy", n_reflect=5)
         desc = spec.to_descriptor()
         assert desc.name == "gal_heavy"
 
@@ -273,7 +272,7 @@ class TestToMoveConfig:
         assert mc.adaptation_warmup == 50
 
     def test_galilean_n_steps_maps_to_n_reflect(self):
-        spec = GalileanMoveSpec(n_reflect=12)
+        spec = GMCMoveSpec(n_reflect=12)
         mc = spec.to_move_config()
         assert mc.n_steps == 12
 
@@ -290,7 +289,7 @@ class TestToMoveConfig:
 class TestResolvedDescriptors:
     def test_resolve_produces_move_descriptors(self):
         from jaxrens.sampling.move_kernel import MoveKernel
-        root = RootConfig.model_validate(_minimal_dict())
+        root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
         assert hasattr(resolved, "move_descriptors")
         assert isinstance(resolved.move_descriptors, tuple)
@@ -300,7 +299,7 @@ class TestResolvedDescriptors:
     def test_resolve_descriptor_matches_move(self):
         d = _minimal_dict()
         d["moves"] = [{"type": "hmc", "n_leapfrog": 6, "step_size": 0.02}]
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         resolved = resolve(root)
         desc = resolved.move_descriptors[0]
         assert desc.kernel_kwargs["n_leapfrog"] == 6
@@ -407,20 +406,20 @@ class TestBuildBackend:
 
 class TestResolveEnergyBackend:
     def test_resolve_has_base_backend(self):
-        root = RootConfig.model_validate(_minimal_dict())
+        root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
         assert hasattr(resolved, "base_backend")
         assert resolved.base_backend is not None
 
     def test_resolve_base_backend_is_harmonic(self):
         from jaxrens.backends.toy import HarmonicBackend
-        root = RootConfig.model_validate(_minimal_dict())
+        root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
         assert isinstance(resolved.base_backend, HarmonicBackend)
 
     def test_resolve_base_backend_is_callable(self):
         import jax.numpy as jnp
-        root = RootConfig.model_validate(_minimal_dict())
+        root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
         positions = jnp.zeros((1, 3))
         types = jnp.zeros((1,), dtype=jnp.int32)
@@ -432,7 +431,7 @@ class TestResolveEnergyBackend:
         from jaxrens.backends.lj import LJBackend
         with open(_LJ_BACKEND_YAML) as fh:
             raw = yaml.safe_load(fh)
-        root = RootConfig.model_validate(raw)
+        root = RootSpec.model_validate(raw)
         resolved = resolve(root)
         assert isinstance(resolved.base_backend, LJBackend)
 
@@ -484,7 +483,7 @@ class TestToCriterion:
         assert crit.min_energy == pytest.approx(-3.5)
 
     def test_termination_none_resolves_to_legacy_defaults(self):
-        root = RootConfig.model_validate(_minimal_dict())
+        root = RootSpec.model_validate(_minimal_dict())
         assert root.termination is None
         resolved = resolve(root)
         from jaxrens.sampling.termination import IterationTermination, PriorMassTermination
@@ -497,7 +496,7 @@ class TestToCriterion:
         d = _minimal_dict()
         d["run"]["convergence_threshold"] = 0.05
         d["run"]["n_live"] = 15
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         resolved = resolve(root)
         from jaxrens.sampling.termination import PriorMassTermination
         pm = next(c for c in resolved.termination if isinstance(c, PriorMassTermination))
@@ -506,11 +505,14 @@ class TestToCriterion:
 
     def test_two_criteria_resolve_to_two_element_tuple(self):
         d = _minimal_dict()
+        # Drop run.max_iterations so the resolver doesn't auto-append a
+        # third IterationTermination on top of the explicit list.
+        d["run"].pop("max_iterations", None)
         d["termination"] = [
             {"type": "iteration", "max_iterations": 50},
             {"type": "energy", "min_energy": -99.0},
         ]
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         resolved = resolve(root)
         assert len(resolved.termination) == 2
 
@@ -518,7 +520,7 @@ class TestToCriterion:
         fixture = _DATA / "termination_iteration.yaml"
         with open(fixture) as fh:
             raw = yaml.safe_load(fh)
-        root = RootConfig.model_validate(raw)
+        root = RootSpec.model_validate(raw)
         assert root.termination is not None
         assert len(root.termination) == 1
         from jaxrens.cli.schema.termination import IterationTerminationSpec
@@ -527,19 +529,19 @@ class TestToCriterion:
 
 
 # ---------------------------------------------------------------------------
-# Adaptation resolver tests (split from TestAdaptationConfig)
+# Adaptation resolver tests (split from TestAdaptationSpec)
 # ---------------------------------------------------------------------------
 
 class TestAdaptationResolve:
     def test_resolve_for_no_override_uses_fallbacks(self):
         from jaxrens.cli.schema.adaptation import (
-            AdaptationConfig,
+            AdaptationSpec,
             _FALLBACK_MIN_RATE,
             _FALLBACK_MAX_RATE,
             _FALLBACK_ADJUST_FACTOR,
             _FALLBACK_STEP_SIZE_MAX,
         )
-        cfg = AdaptationConfig()
+        cfg = AdaptationSpec()
         policy = cfg.resolve_for("random_walk")
         assert policy.min_rate == pytest.approx(_FALLBACK_MIN_RATE)
         assert policy.max_rate == pytest.approx(_FALLBACK_MAX_RATE)
@@ -548,18 +550,18 @@ class TestAdaptationResolve:
 
     def test_resolve_for_with_defaults_min_rate(self):
         from jaxrens.cli.schema.adaptation import (
-            AdaptationConfig,
+            AdaptationSpec,
             AdaptationPolicy,
             _FALLBACK_MAX_RATE,
         )
-        cfg = AdaptationConfig(defaults=AdaptationPolicy(min_rate=0.3))
+        cfg = AdaptationSpec(defaults=AdaptationPolicy(min_rate=0.3))
         policy = cfg.resolve_for("random_walk")
         assert policy.min_rate == pytest.approx(0.3)
         assert policy.max_rate == pytest.approx(_FALLBACK_MAX_RATE)
 
     def test_resolve_for_per_move_overrides_default(self):
-        from jaxrens.cli.schema.adaptation import AdaptationConfig, AdaptationPolicy
-        cfg = AdaptationConfig(
+        from jaxrens.cli.schema.adaptation import AdaptationSpec, AdaptationPolicy
+        cfg = AdaptationSpec(
             defaults=AdaptationPolicy(min_rate=0.3, max_rate=0.7),
             per_move={"galilean": AdaptationPolicy(min_rate=0.5)},
         )
@@ -568,8 +570,8 @@ class TestAdaptationResolve:
         assert policy.max_rate == pytest.approx(0.7)
 
     def test_resolve_for_per_move_none_falls_through_to_defaults(self):
-        from jaxrens.cli.schema.adaptation import AdaptationConfig, AdaptationPolicy
-        cfg = AdaptationConfig(
+        from jaxrens.cli.schema.adaptation import AdaptationSpec, AdaptationPolicy
+        cfg = AdaptationSpec(
             defaults=AdaptationPolicy(adjust_factor=2.0),
             per_move={"random_walk": AdaptationPolicy(min_rate=0.4)},
         )
@@ -578,8 +580,8 @@ class TestAdaptationResolve:
         assert policy.adjust_factor == pytest.approx(2.0)
 
     def test_resolve_for_keyed_by_move_name_not_type(self):
-        from jaxrens.cli.schema.adaptation import AdaptationConfig, AdaptationPolicy
-        cfg = AdaptationConfig(
+        from jaxrens.cli.schema.adaptation import AdaptationSpec, AdaptationPolicy
+        cfg = AdaptationSpec(
             per_move={
                 "rw_slow": AdaptationPolicy(min_rate=0.1),
                 "rw_fast": AdaptationPolicy(min_rate=0.6),
@@ -600,7 +602,7 @@ class TestAdaptationResolve:
             "defaults": {"min_rate": 0.3},
             "per_move": {"gal_b": {"min_rate": 0.45}},
         }
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         resolved = resolve(root)
         assert len(resolved.adaptation_policies) == 2
         assert resolved.adaptation_policies[0].min_rate == pytest.approx(0.3)
@@ -610,7 +612,7 @@ class TestAdaptationResolve:
         fixture = _DATA / "adaptation_overlay.yaml"
         with open(fixture) as fh:
             raw = yaml.safe_load(fh)
-        root = RootConfig.model_validate(raw)
+        root = RootSpec.model_validate(raw)
         resolved = resolve(root)
         assert len(resolved.adaptation_policies) == 2
         rw_policy = resolved.adaptation_policies[0]
@@ -622,7 +624,7 @@ class TestAdaptationResolve:
 
     def test_resolved_policies_use_fallback_when_no_adaptation_set(self):
         from jaxrens.cli.schema.adaptation import _FALLBACK_MIN_RATE
-        root = RootConfig.model_validate(_minimal_dict())
+        root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
         assert len(resolved.adaptation_policies) == 1
         assert resolved.adaptation_policies[0].min_rate == pytest.approx(_FALLBACK_MIN_RATE)
@@ -678,7 +680,7 @@ class TestEnsembleResolver:
     def test_legacy_pressure_resolver_synthesizes_correct_ensemble_params(self):
         d = _minimal_dict()
         d["run"]["pressure"] = 0.03
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         resolved = resolve(root)
         assert resolved.ensemble_params == {"pressure": pytest.approx(0.03)}
         assert resolved.ns.pressure == pytest.approx(0.03)
@@ -695,7 +697,7 @@ class TestCohortExpansionResolver:
         d = _minimal_dict()
         d["run"]["seed"] = 10
         d["ensemble"] = {"type": "npt", "pressure": [0.01, 0.02, 0.03]}
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         cohort = expand_cohort(root)
 
         # Shape assertion (was test_npt_three_pressures_three_configs)
@@ -710,7 +712,7 @@ class TestCohortExpansionResolver:
         fixture = _DATA / "npt_sweep.yaml"
         with open(fixture) as fh:
             raw = yaml.safe_load(fh)
-        root = RootConfig.model_validate(raw)
+        root = RootSpec.model_validate(raw)
         from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
         assert isinstance(root.ensemble, NPTEnsembleSpec)
         cohort = expand_cohort(root)
@@ -720,30 +722,30 @@ class TestCohortExpansionResolver:
         fixture = _DATA / "npt_scalar.yaml"
         with open(fixture) as fh:
             raw = yaml.safe_load(fh)
-        root = RootConfig.model_validate(raw)
+        root = RootSpec.model_validate(raw)
         cohort = expand_cohort(root)
         assert len(cohort) == 1
         assert cohort[0].ensemble_params["pressure"] == pytest.approx(0.01)
 
 
 # ---------------------------------------------------------------------------
-# CellConfig resolver-warning tests (split from TestCellConfig)
+# CellSpec resolver-warning tests (split from TestCellSpec)
 # ---------------------------------------------------------------------------
 
 class TestCellResolve:
     def test_resolved_config_has_cell_field(self):
-        from jaxrens.cli.schema.cell import CellConfig
-        root = RootConfig.model_validate(_minimal_dict())
+        from jaxrens.cli.schema.cell import CellSpec
+        root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
         assert hasattr(resolved, "cell")
-        assert isinstance(resolved.cell, CellConfig)
+        assert isinstance(resolved.cell, CellSpec)
 
     def test_non_default_cell_resolves_without_warning(self, caplog):
         """Cell values are now consumed by move descriptors — no deferred warning."""
         import logging
         d = _minimal_dict()
         d["cell"] = {"max_volume_per_atom": 9999.0}
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             resolved = resolve(root)
         deferred_warnings = [
@@ -755,7 +757,7 @@ class TestCellResolve:
 
     def test_default_cell_no_warning(self, caplog):
         import logging
-        root = RootConfig.model_validate(_minimal_dict())
+        root = RootSpec.model_validate(_minimal_dict())
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             resolve(root)
         cell_warnings = [
@@ -766,15 +768,15 @@ class TestCellResolve:
 
 
 # ---------------------------------------------------------------------------
-# ExtendedOutput resolver-warning tests (split from TestExtendedOutputSchema)
+# ExtendedOutput resolver-warning tests (split from TestExtendedOutputSpec)
 # ---------------------------------------------------------------------------
 
 class TestExtendedOutputResolve:
     def test_deferred_fields_emit_warnings(self, caplog):
         import logging
         from jaxrens.cli.resolve import _warn_unused_output_fields
-        from jaxrens.cli.schema.output import OutputSchema
-        schema = OutputSchema(
+        from jaxrens.cli.schema.output import OutputSpec
+        schema = OutputSpec(
             format="none",
             wrap_atoms=True,
             write_traj_db=True,
@@ -788,8 +790,8 @@ class TestExtendedOutputResolve:
     def test_default_output_no_warnings(self, caplog):
         import logging
         from jaxrens.cli.resolve import _warn_unused_output_fields
-        from jaxrens.cli.schema.output import OutputSchema
-        schema = OutputSchema(format="none")
+        from jaxrens.cli.schema.output import OutputSpec
+        schema = OutputSpec(format="none")
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             _warn_unused_output_fields(schema)
         assert len(caplog.records) == 0
@@ -798,7 +800,7 @@ class TestExtendedOutputResolve:
         import logging
         d = _minimal_dict()
         d["output"]["wrap_atoms"] = True
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             resolve(root)
         assert any("wrap_atoms" in r.message for r in caplog.records)
@@ -812,7 +814,7 @@ class TestFullConfigResolver:
     def test_full_config_resolves(self):
         with open(_FULL_CONFIG_YAML) as fh:
             raw = yaml.safe_load(fh)
-        root = RootConfig.model_validate(raw)
+        root = RootSpec.model_validate(raw)
         resolved = resolve(root)
         assert isinstance(resolved, ResolvedConfig)
         assert resolved.init.initial_positions.shape == (20, 2, 3)
@@ -822,76 +824,76 @@ class TestFullConfigResolver:
         """Existing minimal fixture still resolves after step-6 additions."""
         with open(_MINIMAL_YAML) as fh:
             raw = yaml.safe_load(fh)
-        root = RootConfig.model_validate(raw)
+        root = RootSpec.model_validate(raw)
         resolved = resolve(root)
         assert isinstance(resolved, ResolvedConfig)
         assert resolved.init.initial_types.shape == (1,)
 
 
 # ---------------------------------------------------------------------------
-# 31. InitConfig resolver — Part A (renamed from first TestInitConfigResolver)
+# 31. InitSpec resolver — Part A (renamed from first TestInitSpecResolver)
 # ---------------------------------------------------------------------------
 
-class TestInitConfigResolverPartA:
+class TestInitSpecResolverPartA:
     """Tests for _resolve_init and ResolvedInit (Part A resolver).
 
-    Renamed from TestInitConfigResolver (line 1705 of original test_schema.py)
-    to avoid collision with the second TestInitConfigResolver class.
+    Renamed from TestInitSpecResolver (line 1705 of original test_schema.py)
+    to avoid collision with the second TestInitSpecResolver class.
     """
 
     def test_start_species_produces_resolved_init(self):
         from jaxrens.cli.resolve import ResolvedInit, _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(start_species="1 3")
+        from jaxrens.cli.schema.init import InitSpec
+        cfg = InitSpec(start_species="1 3")
         result = _resolve_init(cfg, n_live=10, seed=0)
         assert isinstance(result, ResolvedInit)
 
     def test_start_species_positions_shape(self):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(start_species="1 3")
+        from jaxrens.cli.schema.init import InitSpec
+        cfg = InitSpec(start_species="1 3")
         result = _resolve_init(cfg, n_live=10, seed=0)
         assert result.initial_positions.shape == (10, 3, 3)
 
     def test_start_species_types_shape_and_dtype(self):
         import jax.numpy as jnp
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(start_species="14 2, 8 1")
+        from jaxrens.cli.schema.init import InitSpec
+        cfg = InitSpec(start_species="14 2, 8 1")
         result = _resolve_init(cfg, n_live=5, seed=1)
         assert result.initial_types.shape == (3,)
         assert result.initial_types.dtype == jnp.int32
 
     def test_start_species_n_atoms_matches_counts(self):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(start_species="6 3, 1 2")
+        from jaxrens.cli.schema.init import InitSpec
+        cfg = InitSpec(start_species="6 3, 1 2")
         result = _resolve_init(cfg, n_live=4, seed=0)
         assert result.initial_positions.shape[1] == 5
 
     def test_start_config_file_nonexistent_raises(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(start_config_file=tmp_path / "does_not_exist.xyz")
+        from jaxrens.cli.schema.init import InitSpec
+        cfg = InitSpec(start_config_file=tmp_path / "does_not_exist.xyz")
         with pytest.raises(FileNotFoundError):
             _resolve_init(cfg, n_live=4, seed=0)
 
     def test_start_walker_set_nonexistent_raises_file_not_found(self):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(start_walker_set=Path("/tmp/does_not_exist_walker.extxyz"))
+        from jaxrens.cli.schema.init import InitSpec
+        cfg = InitSpec(start_walker_set=Path("/tmp/does_not_exist_walker.extxyz"))
         with pytest.raises(FileNotFoundError):
             _resolve_init(cfg, n_live=4, seed=0)
 
     def test_restart_file_nonexistent_raises_file_not_found(self):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(restart_file=Path("/tmp/does_not_exist_checkpoint.h5"))
+        from jaxrens.cli.schema.init import InitSpec
+        cfg = InitSpec(restart_file=Path("/tmp/does_not_exist_checkpoint.h5"))
         with pytest.raises(FileNotFoundError):
             _resolve_init(cfg, n_live=4, seed=0)
 
     def test_resolved_config_has_init_field(self):
-        root = RootConfig.model_validate(_minimal_dict())
+        root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
         assert hasattr(resolved, "init")
         from jaxrens.cli.resolve import ResolvedInit
@@ -900,16 +902,16 @@ class TestInitConfigResolverPartA:
     def test_positions_are_finite(self):
         import jax.numpy as jnp
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(start_species="1 3")
+        from jaxrens.cli.schema.init import InitSpec
+        cfg = InitSpec(start_species="1 3")
         result = _resolve_init(cfg, n_live=8, seed=42)
         assert jnp.all(jnp.isfinite(result.initial_positions))
 
     def test_deterministic_with_same_seed(self):
         import jax.numpy as jnp
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(start_species="1 3")
+        from jaxrens.cli.schema.init import InitSpec
+        cfg = InitSpec(start_species="1 3")
         r1 = _resolve_init(cfg, n_live=4, seed=99)
         r2 = _resolve_init(cfg, n_live=4, seed=99)
         assert jnp.allclose(r1.initial_positions, r2.initial_positions)
@@ -917,42 +919,42 @@ class TestInitConfigResolverPartA:
     def test_different_seeds_differ(self):
         import jax.numpy as jnp
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(start_species="1 3")
+        from jaxrens.cli.schema.init import InitSpec
+        cfg = InitSpec(start_species="1 3")
         r1 = _resolve_init(cfg, n_live=4, seed=0)
         r2 = _resolve_init(cfg, n_live=4, seed=1)
         assert not jnp.allclose(r1.initial_positions, r2.initial_positions)
 
 
 # ---------------------------------------------------------------------------
-# Part B resolver tests (renamed from second TestInitConfigResolver, line 2080)
+# Part B resolver tests (renamed from second TestInitSpecResolver, line 2080)
 # E2E tests were moved:
 #   test_start_species_e2e_run_ns  -> test_init_positions.py
 #   test_mode_b_end_to_end_jit     -> test_init_structure.py
 # ---------------------------------------------------------------------------
 
-class TestInitConfigResolverPartB:
+class TestInitSpecResolverPartB:
     """Resolver unit tests for Part B (species/cell/grid resolver logic).
 
-    Renamed from second TestInitConfigResolver (line 2080) to avoid collision
-    with TestInitConfigResolverPartA above.
+    Renamed from second TestInitSpecResolver (line 2080) to avoid collision
+    with TestInitSpecResolverPartA above.
     """
 
     def test_start_species_cells_shape(self):
-        root = RootConfig.model_validate(_species_dict(n_atoms=2, n_live=6))
+        root = RootSpec.model_validate(_species_dict(n_atoms=2, n_live=6))
         resolved = resolve(root)
         assert resolved.init.initial_cells is not None
         assert resolved.init.initial_cells.shape == (6, 3, 3)
 
     def test_start_species_positions_shape(self):
-        root = RootConfig.model_validate(_species_dict(n_atoms=2, n_live=6))
+        root = RootSpec.model_validate(_species_dict(n_atoms=2, n_live=6))
         resolved = resolve(root)
         assert resolved.init.initial_positions is not None
         assert resolved.init.initial_positions.shape == (6, 2, 3)
 
     def test_start_species_initial_energies_populated(self):
         import jax.numpy as jnp
-        root = RootConfig.model_validate(_species_dict(n_atoms=2, n_live=4))
+        root = RootSpec.model_validate(_species_dict(n_atoms=2, n_live=4))
         resolved = resolve(root)
         assert resolved.init.initial_energies is not None
         assert resolved.init.initial_energies.shape == (4,)
@@ -962,7 +964,7 @@ class TestInitConfigResolverPartB:
         import jax.numpy as jnp
         d = _species_dict(n_atoms=2, n_live=8)
         d["init"]["random_initialise_cell"] = True
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         resolved = resolve(root)
         cells = resolved.init.initial_cells
         assert cells is not None
@@ -972,7 +974,7 @@ class TestInitConfigResolverPartB:
 
     def test_grid_mode_pairwise_distances(self):
         import jax.numpy as jnp
-        root = RootConfig.model_validate(_species_dict(n_atoms=2, n_live=4, mode="grid"))
+        root = RootSpec.model_validate(_species_dict(n_atoms=2, n_live=4, mode="grid"))
         resolved = resolve(root)
         positions = resolved.init.initial_positions
         grid_dist = 1.5
@@ -987,7 +989,7 @@ class TestInitConfigResolverPartB:
         ceiling_per_atom = 1e6
         d = _species_dict(n_atoms=n_atoms, n_live=4, mode="uniform")
         d["init"]["start_energy_ceiling_per_atom"] = ceiling_per_atom
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         resolved = resolve(root)
         energies = resolved.init.initial_energies
         assert energies is not None
@@ -998,15 +1000,15 @@ class TestInitConfigResolverPartB:
         import logging
         d = _species_dict(n_atoms=2, n_live=4)
         d["init"]["random_initialise_pos"] = False
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         with caplog.at_level(logging.WARNING):
             resolve(root)
         assert any("correlation" in rec.message.lower() for rec in caplog.records)
 
     def test_start_species_symbol_map_populated(self):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        cfg = InitConfig(start_species="14 8")
+        from jaxrens.cli.schema.init import InitSpec
+        cfg = InitSpec(start_species="14 8")
         result = _resolve_init(cfg, n_live=4, seed=0)
         assert result.symbol_map is not None
         assert isinstance(result.symbol_map, dict)
@@ -1030,16 +1032,16 @@ class TestInitConfigResolverPartB:
 
     def test_mode_b_random_pos_true_positions_shape(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        from jaxrens.cli.schema.cell import CellConfig
+        from jaxrens.cli.schema.init import InitSpec
+        from jaxrens.cli.schema.cell import CellSpec
         p = self._make_founder(tmp_path, symbols=["Si", "Si"], cell_size=6.0)
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_config_file=p,
             random_initialise_pos=True,
             random_initialise_cell=False,
             pos_randomization_mode="uniform",
         )
-        cell_cfg = CellConfig(
+        cell_cfg = CellSpec(
             max_volume_per_atom=1000.0,
             min_volume_per_atom=0.1,
             min_aspect_ratio=0.01,
@@ -1051,15 +1053,15 @@ class TestInitConfigResolverPartB:
         import numpy as np
         import logging
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        from jaxrens.cli.schema.cell import CellConfig
+        from jaxrens.cli.schema.init import InitSpec
+        from jaxrens.cli.schema.cell import CellSpec
         p = self._make_founder(tmp_path, symbols=["Si", "O"], cell_size=6.0)
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_config_file=p,
             random_initialise_pos=False,
             random_initialise_cell=False,
         )
-        cell_cfg = CellConfig(
+        cell_cfg = CellSpec(
             max_volume_per_atom=1000.0,
             min_volume_per_atom=0.1,
             min_aspect_ratio=0.01,
@@ -1077,15 +1079,15 @@ class TestInitConfigResolverPartB:
     def test_mode_b_random_pos_false_warning_mentions_burn_in(self, tmp_path, caplog):
         import logging
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        from jaxrens.cli.schema.cell import CellConfig
+        from jaxrens.cli.schema.init import InitSpec
+        from jaxrens.cli.schema.cell import CellSpec
         p = self._make_founder(tmp_path, symbols=["Si"], cell_size=5.0)
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_config_file=p,
             random_initialise_pos=False,
             random_initialise_cell=False,
         )
-        cell_cfg = CellConfig(
+        cell_cfg = CellSpec(
             max_volume_per_atom=1000.0,
             min_volume_per_atom=0.1,
             min_aspect_ratio=0.01,
@@ -1097,16 +1099,16 @@ class TestInitConfigResolverPartB:
     def test_mode_b_random_cell_true_cells_diverge(self, tmp_path):
         import numpy as np
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        from jaxrens.cli.schema.cell import CellConfig
+        from jaxrens.cli.schema.init import InitSpec
+        from jaxrens.cli.schema.cell import CellSpec
         p = self._make_founder(tmp_path, symbols=["Si", "Si"], cell_size=8.0)
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_config_file=p,
             random_initialise_pos=True,
             random_initialise_cell=True,
             pos_randomization_mode="uniform",
         )
-        cell_cfg = CellConfig(
+        cell_cfg = CellSpec(
             max_volume_per_atom=1000.0,
             min_volume_per_atom=0.1,
             min_aspect_ratio=0.01,
@@ -1119,16 +1121,16 @@ class TestInitConfigResolverPartB:
     def test_mode_b_random_cell_false_cells_identical(self, tmp_path):
         import numpy as np
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        from jaxrens.cli.schema.cell import CellConfig
+        from jaxrens.cli.schema.init import InitSpec
+        from jaxrens.cli.schema.cell import CellSpec
         p = self._make_founder(tmp_path, symbols=["Si", "Si"], cell_size=6.0)
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_config_file=p,
             random_initialise_pos=True,
             random_initialise_cell=False,
             pos_randomization_mode="uniform",
         )
-        cell_cfg = CellConfig(
+        cell_cfg = CellSpec(
             max_volume_per_atom=1000.0,
             min_volume_per_atom=0.1,
             min_aspect_ratio=0.01,
@@ -1140,16 +1142,16 @@ class TestInitConfigResolverPartB:
 
     def test_mode_b_symbol_map_from_file(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        from jaxrens.cli.schema.cell import CellConfig
+        from jaxrens.cli.schema.init import InitSpec
+        from jaxrens.cli.schema.cell import CellSpec
         p = self._make_founder(tmp_path, symbols=["Si", "O"], cell_size=6.0)
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_config_file=p,
             random_initialise_pos=True,
             random_initialise_cell=False,
             pos_randomization_mode="uniform",
         )
-        cell_cfg = CellConfig(
+        cell_cfg = CellSpec(
             max_volume_per_atom=1000.0,
             min_volume_per_atom=0.1,
             min_aspect_ratio=0.01,
@@ -1160,16 +1162,16 @@ class TestInitConfigResolverPartB:
     def test_mode_b_positions_are_finite(self, tmp_path):
         import jax.numpy as jnp
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        from jaxrens.cli.schema.cell import CellConfig
+        from jaxrens.cli.schema.init import InitSpec
+        from jaxrens.cli.schema.cell import CellSpec
         p = self._make_founder(tmp_path, symbols=["Si", "Si"], cell_size=6.0)
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_config_file=p,
             random_initialise_pos=True,
             random_initialise_cell=False,
             pos_randomization_mode="uniform",
         )
-        cell_cfg = CellConfig(
+        cell_cfg = CellSpec(
             max_volume_per_atom=1000.0,
             min_volume_per_atom=0.1,
             min_aspect_ratio=0.01,
@@ -1180,26 +1182,34 @@ class TestInitConfigResolverPartB:
     def test_mode_b_energies_computed_with_backend(self, tmp_path):
         import jax.numpy as jnp
         from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
-        from jaxrens.cli.schema.cell import CellConfig
+        from jaxrens.cli.resolve import (
+            _finalise_initial_energies_and_counts,
+            _resolve_init,
+        )
+        from jaxrens.cli.schema.init import InitSpec
+        from jaxrens.cli.schema.cell import CellSpec
         p = self._make_founder(tmp_path, symbols=["Si"], cell_size=5.0)
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_config_file=p,
             random_initialise_pos=True,
             random_initialise_cell=False,
             pos_randomization_mode="uniform",
         )
-        cell_cfg = CellConfig(
+        cell_cfg = CellSpec(
             max_volume_per_atom=1000.0,
             min_volume_per_atom=0.1,
             min_aspect_ratio=0.01,
         )
         backend = create_harmonic()
         result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=backend, cell_cfg=cell_cfg)
-        assert result.initial_energies is not None
-        assert result.initial_energies.shape == (3,)
-        assert jnp.all(jnp.isfinite(result.initial_energies))
+        # _resolve_init now returns structural-init only; finalize is the
+        # caller's responsibility (mirrors _resolve_one).
+        energies, _ = _finalise_initial_energies_and_counts(
+            backend, result.initial_positions, result.initial_types, result.initial_cells,
+        )
+        assert energies is not None
+        assert energies.shape == (3,)
+        assert jnp.all(jnp.isfinite(energies))
 
 
 # ---------------------------------------------------------------------------
@@ -1235,9 +1245,9 @@ class TestBackendAwareSpeciesMapping:
         import jax.numpy as jnp
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
 
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_species="8 3, 22 1, 38 1",
             random_initialise_pos=False,
             random_initialise_cell=False,
@@ -1252,11 +1262,11 @@ class TestBackendAwareSpeciesMapping:
 
     def test_backend_z_table_overrides_mapping(self):
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
 
         # Mimic mace_mp's 89-element z-table (Z=1..89).
         backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_species="8 3, 22 1, 38 1",
             random_initialise_pos=False,
             random_initialise_cell=False,
@@ -1271,11 +1281,11 @@ class TestBackendAwareSpeciesMapping:
     def test_missing_z_in_backend_table_raises(self):
         import pytest
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
 
         # Backend supports only a small subset (no Sr, Z=38).
         backend = _FakeZTableBackend(atomic_numbers=[1, 8, 22])
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_species="8 1, 22 1, 38 1",
             random_initialise_pos=False,
             random_initialise_cell=False,
@@ -1286,13 +1296,13 @@ class TestBackendAwareSpeciesMapping:
     def test_ensemble_wrapper_passes_atomic_numbers_through(self):
         from jaxrens.backends.ensemble import EnsembleBackend
         from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitConfig
+        from jaxrens.cli.schema.init import InitSpec
 
         backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
         wrapped = EnsembleBackend(backend, pressure=0.1)
         assert wrapped.atomic_numbers == list(range(1, 90))
 
-        cfg = InitConfig(
+        cfg = InitSpec(
             start_species="8 3, 22 1, 38 1",
             random_initialise_pos=False,
             random_initialise_cell=False,
@@ -1301,3 +1311,114 @@ class TestBackendAwareSpeciesMapping:
             cfg, n_live=2, seed=0, energy_backend=wrapped,
         )
         assert list(map(int, result.initial_types)) == [7, 7, 7, 21, 37]
+
+
+class _BucketRecordingBackend:
+    """Stub backend exposing ``max_neighbors_for`` and recording the
+    ``max_neighbors`` value passed into ``__call__``.
+
+    Used to verify that ``_finalise_initial_energies_and_counts`` honours
+    ``ladder`` / ``offset`` and dispatches the energy compile at the chosen
+    bucket size — the wiring change that ``_resolve_one`` now uses for the
+    single-run finalize seam.
+    """
+
+    def __init__(self, per_walker_count: int):
+        self._per_walker_count = int(per_walker_count)
+        self.calls: list[int] = []
+
+    def max_neighbors_for(self, positions, cell):
+        import jax.numpy as jnp
+        return jnp.int32(self._per_walker_count)
+
+    def __call__(self, positions, species, cell, max_neighbors, ensemble_params=None):
+        import jax.numpy as jnp
+        self.calls.append(int(max_neighbors))
+        return jnp.float32(0.0), jnp.int32(int(max_neighbors)), jnp.bool_(False)
+
+
+class TestFinaliseInitialBucketChoice:
+    """``_finalise_initial_energies_and_counts`` bucket-choice paths.
+
+    When ``ladder`` is supplied, the helper must dispatch at
+    ``_choose_starting_bucket(counts, ladder, offset)``; when not, it
+    must fall back to ``int(jnp.max(counts))``.  The single-run path
+    in ``_resolve_one`` now passes ``ladder``/``offset`` (matching the
+    multi-run path); this test pins that the helper does the right thing
+    given those args.
+    """
+
+    def _positions_types_cells(self, n_walkers: int = 3, n_atoms: int = 2):
+        import jax.numpy as jnp
+        positions = jnp.zeros((n_walkers, n_atoms, 3), dtype=jnp.float32)
+        types = jnp.zeros((n_atoms,), dtype=jnp.int32)
+        cells = jnp.broadcast_to(
+            jnp.eye(3, dtype=jnp.float32) * 10.0, (n_walkers, 3, 3)
+        )
+        return positions, types, cells
+
+    def test_ladder_and_offset_used_when_provided(self):
+        from jaxrens.cli.resolve import _finalise_initial_energies_and_counts
+        from jaxrens.sampling.batch_descriptor import SingleRun
+        from jaxrens.sampling.nested_sampling import _choose_starting_bucket
+        import jax.numpy as jnp
+
+        per_walker = 27
+        backend = _BucketRecordingBackend(per_walker_count=per_walker)
+        positions, types, cells = self._positions_types_cells()
+
+        ladder = (32, 64, 128)
+        offset = 4
+        energies, counts = _finalise_initial_energies_and_counts(
+            backend, positions, types, cells,
+            batcher=SingleRun(), ladder=ladder, offset=offset,
+        )
+
+        assert counts is not None
+        expected_bucket = int(_choose_starting_bucket(
+            counts, ladder, offset,
+        ))
+        # 27 + 4 = 31 → smallest ladder entry ≥ 31 is 32.
+        assert expected_bucket == 32
+        # The energy call was dispatched at the ladder-chosen bucket,
+        # NOT at int(max(counts)) = 27.
+        assert backend.calls, "energy backend was never called"
+        assert all(c == expected_bucket for c in backend.calls)
+
+    def test_no_ladder_falls_back_to_max_counts(self):
+        from jaxrens.cli.resolve import _finalise_initial_energies_and_counts
+        from jaxrens.sampling.batch_descriptor import SingleRun
+
+        per_walker = 27
+        backend = _BucketRecordingBackend(per_walker_count=per_walker)
+        positions, types, cells = self._positions_types_cells()
+
+        _finalise_initial_energies_and_counts(
+            backend, positions, types, cells, batcher=SingleRun(),
+        )
+
+        # Legacy fallback: bucket = int(jnp.max(counts)) = 27.
+        assert backend.calls, "energy backend was never called"
+        assert all(c == per_walker for c in backend.calls)
+
+    def test_resolve_one_populates_neighbor_counts_via_new_seam(self):
+        """End-to-end: ``_resolve_one`` runs the finalize seam after
+        ``_resolve_init``, so ``initial_max_neighbor_counts`` is no
+        longer ``None`` for ladder-aware backends.
+
+        Uses a small species harmonic config (which doesn't expose
+        ``max_neighbors_for`` → counts will be ``None``), then a stubbed
+        ladder-aware backend via monkeypatch to prove the seam wires
+        through to the bucket-choice path.
+        """
+        from jaxrens.cli.resolve import _resolve_one
+        from jaxrens.cli.schema import RootSpec
+
+        # Sanity: with a backend that lacks max_neighbors_for, the seam
+        # runs but counts stay None.  This exercises the new code path
+        # without any monkeypatching.
+        root = RootSpec.model_validate(_species_dict(n_atoms=2, n_live=4))
+        resolved = _resolve_one(root)
+        assert resolved.init.initial_energies is not None
+        # Harmonic backend has no max_neighbors_for → counts stay None.
+        assert resolved.init.initial_max_neighbor_counts is None

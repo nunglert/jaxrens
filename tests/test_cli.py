@@ -99,37 +99,25 @@ class TestRun:
         assert jnp.isfinite(result["log_evidence"])
 
 
-# ---------------------------------------------------------------------------
-# Public API imports
-# ---------------------------------------------------------------------------
+class TestConfigureFileLogging:
+    """``configure_file_logging`` is called exactly once, early, from
+    ``cli._cmd_run`` so the resolver phase reaches the log file from
+    second 1.  Regression: previously called a second time inside
+    ``run_*_from_config`` which truncated the resolver content (see
+    jaxmd_si16_2 slurm-453556 where the file started at burn-in).
+    """
+    def test_writes_to_file(self, tmp_path):
+        import logging
+        from jaxrens.cli.run import configure_file_logging
 
-
-class TestPublicAPI:
-    def test_top_level_imports(self):
-        from jaxrens import (
-            load_backend,
-            run_ns,
+        configure_file_logging(
+            working_dir=tmp_path, prefix="run", level="info",
         )
-        assert callable(load_backend)
-        assert callable(run_ns)
+        logging.getLogger("jaxrens").info("hello")
 
-    def test_low_level_imports(self):
-        from jaxrens.sampling.moves import random_walk, galilean
-        assert hasattr(random_walk, "build_kernel")
-        assert hasattr(galilean, "build_kernel")
+        for h in list(logging.getLogger("jaxrens").handlers):
+            if getattr(h, "_jaxrens_managed", False):
+                logging.getLogger("jaxrens").removeHandler(h)
+                h.close()
 
-    def test_backend_imports(self):
-        from jaxrens.backends import loader
-        assert hasattr(loader, "load_backend")
-
-    def test_parser_public_api(self):
-        """parse_input_file is still importable; raw_to_configs is gone."""
-        from jaxrens.cli.parser import parse_input_file
-        assert callable(parse_input_file)
-
-        with pytest.raises(ImportError):
-            from jaxrens.cli.parser import raw_to_configs  # noqa: F401
-
-    def test_migrate_importable(self):
-        from jaxrens.cli.migrate import migrate_ns_inp
-        assert callable(migrate_ns_inp)
+        assert "hello" in (tmp_path / "run.log").read_text()

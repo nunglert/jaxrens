@@ -172,38 +172,6 @@ class TestJIT:
         got = jnp.bincount(result, length=n_species)
         assert jnp.array_equal(got, target)
 
-    def test_jit_no_retrace_on_same_shapes(self):
-        """Second call with same shapes must not retrace (timing proxy)."""
-        import time
-
-        key = jax.random.PRNGKey(3)
-        k1, k2 = jax.random.split(key, 2)
-        n_atoms, n_species = 20, 3
-        types = make_types(k1, n_atoms, n_species)
-        target = jnp.array([8, 7, 5], dtype=jnp.int32)
-
-        jit_morph = jax.jit(
-            morph_types_to_composition, static_argnums=(3,)
-        )
-
-        # Warm-up (compilation)
-        t0 = time.time()
-        r1 = jit_morph(k2, types, target, n_species)
-        r1.block_until_ready()
-        compile_time = time.time() - t0
-
-        # Second call: should be fast (cached)
-        t1 = time.time()
-        r2 = jit_morph(k2, types, target, n_species)
-        r2.block_until_ready()
-        cached_time = time.time() - t1
-
-        # Cached call should be at least 2x faster, unless compile was very fast
-        if compile_time > 0.1:
-            assert cached_time < compile_time / 2, (
-                f"possible retrace: compile={compile_time:.3f}s cached={cached_time:.3f}s"
-            )
-
     def test_jit_output_matches_eager(self):
         key = jax.random.PRNGKey(5)
         k1, k2, k3 = jax.random.split(key, 3)

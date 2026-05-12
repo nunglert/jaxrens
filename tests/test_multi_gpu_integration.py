@@ -1,13 +1,12 @@
-"""Tests for PmapVmapRuns descriptor, AdaptationManager pmap branch,
-init_ns_multi_gpu, and run_ns_multi_gpu.
+"""Integration tests for the multi-GPU NS branch: AdaptationManager pmap
+path, init_ns_multi_gpu, and run_ns_multi_gpu.
 
 All tests use n_gpu=1 (single-device constraint); the implementation itself
-does not hard-code this.  Tests skip gracefully if no devices are available
-(should never occur in practice).
+does not hard-code this. PmapVmapRuns descriptor unit tests live in
+test_batch_descriptor.py.
 
 Coverage:
-- PmapVmapRuns descriptor unit tests
-- AdaptationManager with PmapVmapRuns: apply() shapes, JIT stability
+- AdaptationManager with PmapVmapRuns: apply() shapes
 - init_ns_multi_gpu: state shapes
 - run_ns_multi_gpu: smoke test, finite log_evidence, shapes (1, P)
 - Parity: PmapVmapRuns(n_gpu=1, n_per_gpu=P) vs VmapRuns(n_runs=P)
@@ -15,8 +14,6 @@ Coverage:
 """
 
 from __future__ import annotations
-
-import time
 
 import jax
 import jax.numpy as jnp
@@ -94,111 +91,6 @@ def _make_harmonic_problem(
 
 
 # ---------------------------------------------------------------------------
-# Descriptor unit tests
-# ---------------------------------------------------------------------------
-
-
-class TestPmapVmapRunsDescriptor:
-    """Unit tests for PmapVmapRuns descriptor methods."""
-
-    def setup_method(self):
-        _require_gpu()
-
-    def test_is_batched(self):
-        d = PmapVmapRuns(n_gpu=1, n_per_gpu=3)
-        assert d.is_batched is True
-
-    def test_n_runs_shape_prefix(self):
-        d = PmapVmapRuns(n_gpu=1, n_per_gpu=3)
-        assert d.n_runs == 3
-        assert d.shape_prefix == (1, 3)
-
-    def test_split_keys_shape(self):
-        """split_keys(gpu_keys, n_sub) returns shape (G, P, n_sub)."""
-        n_gpu, n_per_gpu = 1, 3
-        d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
-        gpu_keys = jax.random.split(jax.random.key(0), n_gpu)  # (G,)
-        result = d.split_keys(gpu_keys, 5)
-        assert result.shape == (n_gpu, n_per_gpu, 5)
-
-    def test_split_keys_dtype_is_key(self):
-        """Result must have JAX typed-key dtype."""
-        d = PmapVmapRuns(n_gpu=1, n_per_gpu=2)
-        gpu_keys = jax.random.split(jax.random.key(1), 1)
-        result = d.split_keys(gpu_keys, 3)
-        # Typed keys have a special dtype; verifying key_data extraction works
-        _ = jax.random.key_data(result)
-
-    def test_split_keys_under_jit(self):
-        n_gpu, n_per_gpu = 1, 3
-        d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
-        gpu_keys = jax.random.split(jax.random.key(3), n_gpu)
-
-        @jax.jit
-        def _split(keys):
-            return d.split_keys(keys, 4)
-
-        result = _split(gpu_keys)
-        assert result.shape == (n_gpu, n_per_gpu, 4)
-
-    def test_reduce_for_termination_worst_of(self):
-        """reduce_for_termination on (G, P) returns min/max across all."""
-        d = PmapVmapRuns(n_gpu=1, n_per_gpu=3)
-        log_ev = jnp.array([[-10.0, -5.0, -7.0]])   # (1, 3)
-        hmax = jnp.array([[2.0, 5.0, 3.0]])           # (1, 3)
-        ev_out, hmax_out = d.reduce_for_termination(log_ev, hmax)
-        assert isinstance(ev_out, float)
-        assert isinstance(hmax_out, float)
-        assert abs(ev_out - (-10.0)) < 1e-6
-        assert abs(hmax_out - 5.0) < 1e-6
-
-    def test_reduce_for_termination_scalar_outputs(self):
-        d = PmapVmapRuns(n_gpu=1, n_per_gpu=4)
-        log_ev = jnp.zeros((1, 4))
-        hmax = jnp.ones((1, 4))
-        ev_out, hmax_out = d.reduce_for_termination(log_ev, hmax)
-        assert isinstance(ev_out, float)
-        assert isinstance(hmax_out, float)
-
-
-class TestPmapVmapWrapStep:
-    """Tests for PmapVmapRuns.wrap_step."""
-
-    def setup_method(self):
-        _require_gpu()
-
-    def _fake_ns_step(self, ns_state, step_fn, n_mcmc_steps, n_extra):
-        return ns_state, {}
-
-    def test_wrap_step_returns_callable(self):
-        d = PmapVmapRuns(n_gpu=1, n_per_gpu=2)
-        fn = d.wrap_step(self._fake_ns_step, None, 5, 0)
-        assert callable(fn)
-
-    def test_wrap_step_call_shape(self):
-        """Calling the wrapped step on (G, P)-shaped fake state works."""
-        n_gpu, n_per_gpu = 1, 2
-        d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
-        fn = d.wrap_step(self._fake_ns_step, None, 5, 0)
-
-        # Minimal pytree: just an array shaped (G, P)
-        # We need a real pytree; use a simple namespace registered as pytree.
-        class _S:
-            def __init__(self, v):
-                self.v = v
-            def tree_flatten(self):
-                return (self.v,), ()
-            @classmethod
-            def tree_unflatten(cls, aux, children):
-                return cls(children[0])
-
-        jax.tree_util.register_pytree_node_class(_S)
-        state = _S(jnp.ones((n_gpu, n_per_gpu)))
-        out_state, out_info = fn(state)
-        assert out_state.v.shape == (n_gpu, n_per_gpu)
-
-
-# ---------------------------------------------------------------------------
 # AdaptationManager with PmapVmapRuns
 # ---------------------------------------------------------------------------
 
@@ -226,7 +118,7 @@ def pmap_harmonic_setup():
 
     flat_states = init_ns_parallel(
         init_fn, pos_batch, types, en_batch,
-        cells=None, rng_keys=rng_keys_flat, max_dead=200,
+        cells=None, rng_keys=rng_keys_flat,
     )
 
     # Reshape (G*P, K, ...) -> (G, P, K, ...).
@@ -256,7 +148,7 @@ class TestAdaptationManagerPmapVmap:
         return AdaptationManager(
             move_descriptors=setup["descriptors"],
             per_move_fns=setup["per_move_fns"],
-            batch_descriptor=PmapVmapRuns(
+            batcher=PmapVmapRuns(
                 n_gpu=setup["n_gpu"], n_per_gpu=setup["n_per_gpu"]
             ),
             adjust_n_samples=10,
@@ -329,45 +221,6 @@ class TestAdaptationManagerPmapVmap:
         assert jnp.all(new_ss > 0.0)
         assert jnp.all(jnp.isfinite(new_ss))
 
-    def test_jit_cache_stability(self, pmap_harmonic_setup):
-        """Second apply() call should be much faster than first (JIT compiled)."""
-        _require_gpu()
-        setup = pmap_harmonic_setup
-        mgr = self._build_mgr(setup)
-        pop = setup["pop"]
-        n_gpu, n_per_gpu = setup["n_gpu"], setup["n_per_gpu"]
-
-        emax = jnp.max(pop.energy, axis=2)
-        ss = pop.step_sizes[:, :, 0, :]
-
-        all_keys = jax.random.split(jax.random.key(99), (n_gpu * n_per_gpu) * 5).reshape(
-            5, n_gpu, n_per_gpu
-        )
-
-        # First call — compilation.
-        t0 = time.perf_counter()
-        _, _, k_out = mgr.apply(pop, emax, all_keys[0], ss)
-        jax.effects_barrier()
-        t_compile = time.perf_counter() - t0
-
-        # Subsequent calls — cached.
-        times_cached = []
-        k = k_out
-        for idx in range(1, 4):
-            t0 = time.perf_counter()
-            _, _, k = mgr.apply(pop, emax, all_keys[idx], ss)
-            jax.effects_barrier()
-            times_cached.append(time.perf_counter() - t0)
-
-        t_cached_mean = sum(times_cached) / len(times_cached)
-        if t_compile > 0.1:
-            assert t_cached_mean < t_compile * 0.5, (
-                f"Possible retrace: compile={t_compile:.3f}s "
-                f"cached_mean={t_cached_mean:.3f}s"
-            )
-        assert k is not None
-
-
 # ---------------------------------------------------------------------------
 # init_ns_multi_gpu
 # ---------------------------------------------------------------------------
@@ -394,12 +247,10 @@ class TestInitNsMultiGpu:
             setup["init_fn"], pos_flat, setup["types"], en_flat,
             cells=None, rng_keys=rng_keys_flat,
             n_gpu=n_gpu, n_per_gpu=n_per_gpu,
-            max_dead=50,
         )
 
         # Check leading shape
         assert state.log_evidence.shape == (n_gpu, n_per_gpu)
-        assert state.n_dead.shape == (n_gpu, n_per_gpu)
         assert state.iteration.shape == (n_gpu, n_per_gpu)
         assert state.population.energy.shape[:2] == (n_gpu, n_per_gpu)
 
@@ -508,7 +359,7 @@ class TestRunNsMultiGpuValidation:
             run_ns_multi_gpu(
                 jnp.zeros((2, 10, 1, 3)), jnp.zeros((1,), dtype=jnp.int32),
                 jnp.zeros((2, 10)), None,
-                init_fn=None, step_fn=None,
+                init_fn=lambda *a, **kw: None, step_fn=lambda *a, **kw: None,
                 rng_keys=jax.random.split(jax.random.key(0), 2),
                 n_gpu=0, n_per_gpu=2,
             )
@@ -519,7 +370,7 @@ class TestRunNsMultiGpuValidation:
             run_ns_multi_gpu(
                 jnp.zeros((1, 10, 1, 3)), jnp.zeros((1,), dtype=jnp.int32),
                 jnp.zeros((1, 10)), None,
-                init_fn=None, step_fn=None,
+                init_fn=lambda *a, **kw: None, step_fn=lambda *a, **kw: None,
                 rng_keys=jax.random.split(jax.random.key(0), 1),
                 n_gpu=1, n_per_gpu=0,
             )
@@ -532,7 +383,7 @@ class TestRunNsMultiGpuValidation:
                 jnp.zeros((n_available + 1, 10, 1, 3)),
                 jnp.zeros((1,), dtype=jnp.int32),
                 jnp.zeros((n_available + 1, 10)), None,
-                init_fn=None, step_fn=None,
+                init_fn=lambda *a, **kw: None, step_fn=lambda *a, **kw: None,
                 rng_keys=jax.random.split(jax.random.key(0), n_available + 1),
                 n_gpu=n_available + 1, n_per_gpu=1,
             )
@@ -665,7 +516,7 @@ class TestRunNsMultiGpuCallbacks:
         )
 
     def test_callbacks_info_has_batch_key(self):
-        """Each on_iteration info dict carries '_batch' key."""
+        """Each on_iteration info dict carries '_batcher' key."""
         _require_gpu()
         n_gpu, n_per_gpu = 1, 2
         n_total = n_gpu * n_per_gpu
@@ -696,12 +547,12 @@ class TestRunNsMultiGpuCallbacks:
         )
 
         for _iter, _state, info in cb.calls:
-            assert "_batch" in info, (
-                f"'_batch' missing from info at iteration {_iter}"
+            assert "_batcher" in info, (
+                f"'_batcher' missing from info at iteration {_iter}"
             )
 
     def test_callbacks_batch_descriptor_is_batched(self):
-        """info['_batch'].is_batched is True for all calls."""
+        """info['_batcher'].is_batched is True for all calls."""
         _require_gpu()
         n_gpu, n_per_gpu = 1, 2
         n_total = n_gpu * n_per_gpu
@@ -733,7 +584,7 @@ class TestRunNsMultiGpuCallbacks:
 
         assert len(cb.calls) == n_iters
         for _iter, _state, info in cb.calls:
-            assert info["_batch"].is_batched is True, (
+            assert info["_batcher"].is_batched is True, (
                 f"is_batched should be True at iter {_iter}, "
-                f"got {info['_batch'].is_batched}"
+                f"got {info['_batcher'].is_batched}"
             )

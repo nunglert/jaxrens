@@ -47,7 +47,7 @@ print("JAX devices:", jax.devices())
 # %% [markdown]
 # ## The config
 #
-# We build a `RootConfig` programmatically from a dict. Fields map
+# We build a `RootSpec` programmatically from a dict. Fields map
 # 1-to-1 to YAML keys; see `jaxrens dump-schema` for the full list.
 
 # %%
@@ -135,9 +135,9 @@ config_dict = {
 # %%
 from jaxrens.cli.resolve import resolve
 from jaxrens.cli.run import run_from_config
-from jaxrens.cli.schema import RootConfig
+from jaxrens.cli.schema import RootSpec
 
-root = RootConfig.model_validate(config_dict)
+root = RootSpec.model_validate(config_dict)
 resolved = resolve(root)
 
 print(f"n_atoms         = {resolved.init.initial_positions.shape[-2]}")

@@ -28,6 +28,8 @@ import numpy as np
 import pytest
 import yaml
 
+from . import multi_gpu_n_devices
+
 
 _CONFIG_YAML = """
 run:
@@ -74,7 +76,7 @@ termination:
 # full_auto with adjust_interval=10 → bisection fires at iter 10 / 20.
 adaptation:
   full_auto: true
-  full_auto_steps: 10
+  adjust_interval: 10
   defaults:
     min_rate: 0.3
     max_rate: 0.5
@@ -133,12 +135,12 @@ def test_lj_full_pipeline(tmp_path: Path) -> None:
         expand_multi_run_or_cohort,
     )
     from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootConfig
+    from jaxrens.cli.schema import RootSpec
 
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["output"]["working_dir"] = str(tmp_path / "out")
 
-    root = RootConfig.model_validate(raw)
+    root = RootSpec.model_validate(raw)
     resolved = expand_multi_run_or_cohort(root)
     assert isinstance(resolved, ResolvedMultiRunConfig), (
         "Two-pressure config should route through the multi-GPU dispatcher."
@@ -219,7 +221,7 @@ def test_lj_pipeline_smoke_variants(tmp_path: Path, missing: str) -> None:
         expand_multi_run_or_cohort,
     )
     from jaxrens.cli.run import run_from_config, run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootConfig
+    from jaxrens.cli.schema import RootSpec
 
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["output"]["working_dir"] = str(tmp_path / "out")
@@ -231,7 +233,7 @@ def test_lj_pipeline_smoke_variants(tmp_path: Path, missing: str) -> None:
     elif missing == "inter_re":
         raw.pop("inter_re", None)  # multi-run path without RENS
 
-    root = RootConfig.model_validate(raw)
+    root = RootSpec.model_validate(raw)
     resolved = expand_multi_run_or_cohort(root)
 
     if isinstance(resolved, ResolvedMultiRunConfig):
@@ -251,10 +253,9 @@ def test_lj_pipeline_smoke_variants(tmp_path: Path, missing: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Multi-GPU variant — 4 pressure replicas distributed 1-per-device.
+# Multi-GPU variant — pressure replicas distributed 2-per-device on
+# whatever JAX exposes (either 2 or 4 local devices).
 # ---------------------------------------------------------------------------
-
-_REQUIRED_DEVICES = 4
 
 
 _LJ_MULTI_GPU_CONFIG_YAML = """
@@ -297,7 +298,7 @@ termination:
 
 adaptation:
   full_auto: true
-  full_auto_steps: 10
+  adjust_interval: 10
   defaults:
     min_rate: 0.3
     max_rate: 0.5
@@ -337,31 +338,37 @@ output:
 
 @pytest.mark.multi_gpu
 @pytest.mark.gpu
+@pytest.mark.lj
 @pytest.mark.heavy
 def test_lj_multi_gpu_pipeline(tmp_path: Path) -> None:
-    """LJ NPT NS with 8 pressure replicas distributed 2-per-GPU on 4 GPUs.
+    """LJ NPT NS with pressure replicas distributed 2-per-GPU.
 
-    Same code path as :func:`test_lj_full_pipeline` but with four real
-    devices and an inner vmap of width 2, exercising the full
+    Same code path as :func:`test_lj_full_pipeline` but with multiple
+    real devices and an inner vmap of width 2, exercising the full
     pmap(vmap(vmap)) hierarchy rather than the degenerate
     ``n_per_gpu=1`` case.  Hits cross-device pmap communication for
-    pressure-RENS swaps and ``full_auto`` bisection adaptation.
+    pressure-RENS swaps and ``full_auto`` bisection adaptation.  Runs on
+    either 2 or 4 local devices.
     """
     from jaxrens.cli.resolve import (
         ResolvedMultiRunConfig,
         expand_multi_run_or_cohort,
     )
     from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootConfig
+    from jaxrens.cli.schema import RootSpec
+
+    n_gpu = multi_gpu_n_devices()
+    n_total = n_gpu * 2
 
     raw = yaml.safe_load(_LJ_MULTI_GPU_CONFIG_YAML)
     raw["output"]["working_dir"] = str(tmp_path / "out")
+    raw["ensemble"]["pressure"] = raw["ensemble"]["pressure"][:n_total]
 
-    root = RootConfig.model_validate(raw)
+    root = RootSpec.model_validate(raw)
     resolved = expand_multi_run_or_cohort(root)
     assert isinstance(resolved, ResolvedMultiRunConfig)
-    assert resolved.ns.n_gpu == _REQUIRED_DEVICES, (
-        f"expected n_gpu={_REQUIRED_DEVICES}, got {resolved.ns.n_gpu}"
+    assert resolved.ns.n_gpu == n_gpu, (
+        f"expected n_gpu={n_gpu}, got {resolved.ns.n_gpu}"
     )
     assert resolved.ns.n_per_gpu == 2, (
         f"expected n_per_gpu=2, got {resolved.ns.n_per_gpu}"
@@ -370,7 +377,7 @@ def test_lj_multi_gpu_pipeline(tmp_path: Path) -> None:
     result = run_multi_gpu_from_config(resolved)
 
     log_z = np.asarray(result["log_evidence"])
-    assert log_z.shape == (_REQUIRED_DEVICES, 2)
+    assert log_z.shape == (n_gpu, 2)
     assert np.all(np.isfinite(log_z))
 
     n_dead = np.asarray(result["n_dead"])

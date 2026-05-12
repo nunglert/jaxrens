@@ -148,17 +148,17 @@ class TestGridPositionsInCell:
 
 
 # ---------------------------------------------------------------------------
-# E2E test moved from test_schema.py::TestInitConfigResolver (line 2080)
+# E2E test moved from test_schema.py::TestInitSpecResolver (line 2080)
 # ---------------------------------------------------------------------------
 
 class TestStartSpeciesE2ERunNS:
-    """test_start_species_e2e_run_ns moved from second TestInitConfigResolver."""
+    """test_start_species_e2e_run_ns moved from second TestInitSpecResolver."""
 
     def test_start_species_e2e_run_ns(self, tmp_path):
         """Resolver output feeds directly into run_from_config without error."""
         import jax.numpy as jnp
         from jaxrens.cli.resolve import resolve
-        from jaxrens.cli.schema import RootConfig
+        from jaxrens.cli.schema import RootSpec
         from jaxrens.cli.run import run_from_config
 
         d = {
@@ -187,7 +187,7 @@ class TestStartSpeciesE2ERunNS:
                 "pos_autoscale_cells": False,
             },
         }
-        root = RootConfig.model_validate(d)
+        root = RootSpec.model_validate(d)
         resolved = resolve(root)
 
         result = run_from_config(

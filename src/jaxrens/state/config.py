@@ -54,6 +54,11 @@ class OutputConfig:
     out_file_prefix: str = "ns"
     working_dir: Path = field(default_factory=lambda: Path("."))
     log_level: str = "info"  # "info" | "debug"
+    # Per-iter chain acceptance logging.  ``True`` registers an
+    # ``AccRatesCallback`` writing ``<prefix>.acc_rates.h5`` every
+    # ``acc_rates_interval`` iterations.  Decoupled from full_auto.
+    save_acc_rates: bool = False
+    acc_rates_interval: int = 1
 
 
 @dataclass(frozen=True)

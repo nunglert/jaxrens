@@ -26,6 +26,8 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jaxtyping import Array, Float, Shaped
 
 
 class BatchDescriptor(ABC):
@@ -57,7 +59,7 @@ class BatchDescriptor(ABC):
     def is_batched(self) -> bool:
         """True when this descriptor represents multiple parallel NS runs.
 
-        Used by ``_run_loop`` to attach ``info["_batch"]`` and by
+        Used by ``_run_loop`` to attach ``info["_batcher"]`` and by
         ``_is_batched`` in ``cli/monitor.py`` to prefer a descriptor-based
         check over the ndim-sniff fallback.
 
@@ -132,8 +134,8 @@ class BatchDescriptor(ABC):
     @abstractmethod
     def reduce_for_termination(
         self,
-        log_evidence: jax.Array,
-        hmax: jax.Array,
+        log_evidence: jax.typing.ArrayLike,
+        hmax: jax.typing.ArrayLike,
     ) -> tuple[float, float]:
         """Reduce batched scalars for the termination-check interface.
 
@@ -158,6 +160,110 @@ class BatchDescriptor(ABC):
               ``(float(jnp.min(log_evidence)), float(jnp.max(hmax)))``.
             * **PmapVmapRuns** — raises ``NotImplementedError``.
         """
+
+    # ------------------------------------------------------------------
+    # Derived helpers (shape-prefix-driven; concrete classes inherit)
+    # ------------------------------------------------------------------
+
+    @property
+    def walker_axis(self) -> int:
+        """Axis index of the per-walker (K) dimension in population arrays.
+
+        ``0`` for SingleRun, ``1`` for VmapRuns, ``2`` for PmapVmapRuns.
+        """
+        return len(self.shape_prefix)
+
+    def flatten(
+        self, arr: Shaped[np.ndarray | Array, "*P ..."]
+    ) -> Shaped[np.ndarray | Array, "n_runs ..."]:
+        """Collapse the leading shape-prefix dims into a single ``(n_runs,)`` axis.
+
+        For SingleRun (no prefix) prepends a length-1 axis so the output is
+        always ``(n_runs, *trailing)``.
+        """
+        n_prefix = len(self.shape_prefix)
+        if n_prefix == 0:
+            return arr[None, ...]
+        if n_prefix == 1:
+            return arr
+        return arr.reshape((self.n_runs,) + arr.shape[n_prefix:])
+
+    def unflatten(
+        self, arr_flat: Shaped[np.ndarray | Array, "n_runs ..."]
+    ) -> Shaped[np.ndarray | Array, "*P ..."]:
+        """Inverse of :meth:`flatten`."""
+        n_prefix = len(self.shape_prefix)
+        if n_prefix == 0:
+            return arr_flat[0]
+        if n_prefix == 1:
+            return arr_flat
+        return arr_flat.reshape(self.shape_prefix + arr_flat.shape[1:])
+
+    def extract_step_sizes(self, pop) -> jnp.ndarray:
+        """Per-replica step sizes from ``pop.step_sizes (*prefix, K, n_moves)``.
+
+        Returns shape ``(*shape_prefix, n_moves)`` — walker axis dropped.
+        """
+        return jnp.take(pop.step_sizes, 0, axis=self.walker_axis)
+
+    def broadcast_step_sizes(
+        self, per_move_ss: jnp.ndarray, n_walkers: int,
+    ) -> jnp.ndarray:
+        """Inverse of :meth:`extract_step_sizes` — re-insert the walker axis.
+
+        Given ``per_move_ss`` of shape ``(*shape_prefix, n_moves)``, returns
+        shape ``(*shape_prefix, K, n_moves)`` broadcast across the walker axis.
+        """
+        n_moves = per_move_ss.shape[-1]
+        target_shape = self.shape_prefix + (n_walkers, n_moves)
+        return jnp.broadcast_to(
+            jnp.expand_dims(per_move_ss, axis=self.walker_axis),
+            target_shape,
+        )
+
+    def reduce_emax(
+        self, energy: Float[Array, "*P K"]
+    ) -> Float[Array, "*P"]:
+        """Per-replica Emax: ``max`` along the walker axis.
+
+        Returns scalar for SingleRun, ``(*shape_prefix,)`` otherwise.
+        """
+        return jnp.max(energy, axis=self.walker_axis)
+
+    def scalar_key(self, rng_key: jax.Array) -> jax.Array:
+        """Reduce a per-replica key array to a single scalar key.
+
+        Identity for SingleRun (already scalar); takes replica ``(0,)``
+        for VmapRuns / PmapVmapRuns.  Used by ``_run_loop`` to derive the
+        single key the inter-RE swap path needs from the per-replica
+        adaptation key carry.
+        """
+        arr = jnp.asarray(rng_key)
+        return arr if arr.ndim == 0 else arr.reshape(-1)[0]
+
+    def wrap_for_batch(self, per_element_fn):
+        """Wrap a per-replica callable with jit/vmap/pmap as appropriate.
+
+        Generic version of :meth:`wrap_step` for callables that don't take
+        ``static_argnums``-style sentinels.  *per_element_fn* receives its
+        arguments at single-replica shape; the returned callable accepts
+        them at ``(*shape_prefix, ...)`` shape:
+
+        * **SingleRun** — ``jax.jit(per_element_fn)``.
+        * **VmapRuns** — ``jax.jit(jax.vmap(per_element_fn))``.
+        * **PmapVmapRuns** — ``jax.pmap(jax.vmap(per_element_fn), axis_name="gpu")``.
+
+        Default implementation routes by ``shape_prefix`` length so concrete
+        classes inherit unchanged.
+        """
+        n_prefix = len(self.shape_prefix)
+        if n_prefix == 0:
+            return jax.jit(per_element_fn)
+        if n_prefix == 1:
+            return jax.jit(jax.vmap(per_element_fn))
+        # n_prefix == 2 (PmapVmapRuns): outer pmap over G, inner vmap over P.
+        # pmap is self-JIT-compiling — do NOT wrap in jax.jit.
+        return jax.pmap(jax.vmap(per_element_fn), axis_name="gpu")
 
 
 # ---------------------------------------------------------------------------
@@ -214,8 +320,8 @@ class SingleRun(BatchDescriptor):
 
     def reduce_for_termination(
         self,
-        log_evidence: jax.Array,
-        hmax: jax.Array,
+        log_evidence: jax.typing.ArrayLike,
+        hmax: jax.typing.ArrayLike,
     ) -> tuple[float, float]:
         """Identity reduction — single run has no worst-case to aggregate.
 
@@ -298,8 +404,8 @@ class VmapRuns(BatchDescriptor):
 
     def reduce_for_termination(
         self,
-        log_evidence: jax.Array,
-        hmax: jax.Array,
+        log_evidence: jax.typing.ArrayLike,
+        hmax: jax.typing.ArrayLike,
     ) -> tuple[float, float]:
         """Worst-of reduction across all runs.
 
@@ -416,49 +522,34 @@ class PmapVmapRuns(BatchDescriptor):
         return jax.pmap(per_device, axis_name="gpu")
 
     def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
-        """Split a PRNG key array into ``(G, P, n_sub_keys)`` shape.
+        """Split a per-replica PRNG key array into ``(G, P, n_sub_keys)``.
 
-        Two nested splits:
-
-        1. Split ``rng_key`` (shape ``(G,)``) into ``(G, P+1)`` — first
-           column becomes the per-GPU carry, remaining columns become
-           ``(G, P)`` run keys.
-        2. vmap over G: for each GPU's ``(P,)`` key array, split each of
-           the P keys into ``n_sub_keys`` sub-keys, producing
-           ``(G, P, n_sub_keys)``.
+        Matches the ABC contract: input shape equals ``shape_prefix``
+        (``(G, P)`` here), output prepends an ``n_sub_keys`` axis at the end.
+        Implemented as a 2-D vmap (one for each prefix axis) of
+        ``jax.random.split``.
 
         Parameters
         ----------
         rng_key : jax.Array
-            Shape ``(G,)`` — one key per GPU device.
+            Shape ``(G, P)`` — one key per replica.  Same convention as
+            ``NSState.rng_key`` for PmapVmapRuns.
         n_sub_keys : int
-            Number of sub-keys per run.
+            Number of sub-keys per replica.
 
         Returns
         -------
         jax.Array
             Shape ``(G, P, n_sub_keys)`` with typed-key dtype.
         """
-        n_per_gpu = self.n_per_gpu
-
-        # Step 1: split each GPU key into n_per_gpu sub-keys.
-        # vmap over G: jax.random.split(k, n_per_gpu) → (P,) per GPU → (G, P)
-        per_gpu_keys = jax.vmap(
-            lambda k: jax.random.split(k, n_per_gpu)
-        )(rng_key)  # (G, P)
-
-        # Step 2: for each (g, p) key, split into n_sub_keys.
-        # vmap over G then over P.
-        sub_keys = jax.vmap(
-            jax.vmap(lambda k: jax.random.split(k, n_sub_keys))
-        )(per_gpu_keys)  # (G, P, n_sub_keys)
-
-        return sub_keys
+        return jax.vmap(jax.vmap(
+            lambda k: jax.random.split(k, n_sub_keys)
+        ))(rng_key)
 
     def reduce_for_termination(
         self,
-        log_evidence: jax.Array,
-        hmax: jax.Array,
+        log_evidence: jax.typing.ArrayLike,
+        hmax: jax.typing.ArrayLike,
     ) -> tuple[float, float]:
         """Worst-of reduction across both G and P axes.
 
@@ -475,3 +566,37 @@ class PmapVmapRuns(BatchDescriptor):
             Worst-case scalars across all runs on all GPUs.
         """
         return float(jnp.min(log_evidence)), float(jnp.max(hmax))
+
+
+# ---------------------------------------------------------------------------
+# Module-level factory
+# ---------------------------------------------------------------------------
+
+
+def from_shape_prefix(shape_prefix: tuple[int, ...]) -> BatchDescriptor:
+    """Return the batcher whose ``shape_prefix`` matches *shape_prefix*.
+
+    * ``()``      → :class:`SingleRun`.
+    * ``(R,)``    → :class:`VmapRuns(n_runs=R)`.
+    * ``(G, P)``  → :class:`PmapVmapRuns(n_gpu=G, n_per_gpu=P)`.
+
+    Used by ``init/restart.py``, ``io/checkpoint.py``, and ``cli/monitor.py``
+    to recover the batcher from a stored array's leading shape (``log_evidence``
+    is the canonical witness — its shape is always exactly the prefix).
+
+    Raises
+    ------
+    ValueError
+        If *shape_prefix* has more than two leading dims.
+    """
+    prefix = tuple(int(d) for d in shape_prefix)
+    if len(prefix) == 0:
+        return SingleRun()
+    if len(prefix) == 1:
+        return VmapRuns(n_runs=prefix[0])
+    if len(prefix) == 2:
+        return PmapVmapRuns(n_gpu=prefix[0], n_per_gpu=prefix[1])
+    raise ValueError(
+        f"from_shape_prefix: only rank-0/1/2 prefixes are supported, got "
+        f"shape_prefix={shape_prefix} (rank {len(prefix)})."
+    )

@@ -2,7 +2,7 @@
 
 The entry point is ``migrate_ns_inp(raw)``.  It accepts the flat ``str->str``
 dict produced by ``parse_input_file`` and returns a nested dict suitable for
-``RootConfig.model_validate(...)``, plus a list of diagnostic log entries.
+``RootSpec.model_validate(...)``, plus a list of diagnostic log entries.
 
 Usage::
 
@@ -131,7 +131,7 @@ _DROPPED: dict[str, str] = {
     "b": "Jagla potential; not in jaxrens",
     "r_cut": "Jagla potential; not in jaxrens",
     "use_smooth_gradient": "Jagla potential; not in jaxrens",
-    "random_initialise_pos": "init randomization; not yet exposed in InitConfig",
+    "random_initialise_pos": "init randomization; not yet exposed in InitSpec",
 }
 
 # ---------------------------------------------------------------------------
@@ -146,7 +146,11 @@ _DEFERRED: dict[str, tuple[tuple[str, ...], Any]] = {
     "write_walkers_db": (("output", "write_walkers_db"), _str_to_bool),
     "wrap_atoms": (("output", "wrap_atoms"), _str_to_bool),
     "snapshot_clean": (("output", "snapshot_clean"), _str_to_bool),
-    "save_stepsizes": (("output", "save_stepsizes"), _str_to_bool),
+    # ``save_stepsizes`` is intentionally dropped: in jaxrens, step
+    # sizes are recoverable from ``<prefix>.adaptation.h5`` (iter-0
+    # baseline row + bisection events), so a dedicated step-size
+    # trajectory file is redundant.  Legacy configs that set it will
+    # have the value preserved under ``_unknown`` for manual review.
     "snapshot_time": (("output", "snapshot_time"), float),
     # Cell config (deferred: not threaded into move kernels yet)
     "max_volume_per_atom": (("cell", "max_volume_per_atom"), float),
@@ -391,7 +395,9 @@ def _handle_full_auto_step_sizes(value: str, cfg: dict, logs: list) -> None:
 
 
 def _handle_full_auto_steps(value: str, cfg: dict, logs: list) -> None:
-    _nest(cfg, "adaptation", "full_auto_steps", value=int(value))
+    # Legacy ns.inp key ``full_auto_steps`` maps to the renamed YAML field
+    # ``adaptation.adjust_interval`` (see schema/adaptation.py).
+    _nest(cfg, "adaptation", "adjust_interval", value=int(value))
 
 
 def _handle_GMC_adjust_min_rate(value: str, cfg: dict, logs: list) -> None:
@@ -634,7 +640,7 @@ def _handle_working_dir(value: str, cfg: dict, logs: list) -> None:
 def _handle_snapshot_seq_pairs(value: str, cfg: dict, logs: list) -> None:
     logs.append({
         "level": "INFO",
-        "message": f"snapshot_seq_pairs is not in OutputSchema; dropped",
+        "message": f"snapshot_seq_pairs is not in OutputSpec; dropped",
     })
 
 
@@ -793,7 +799,7 @@ def _handle_delta_random_seed(value: str, cfg: dict, logs: list) -> None:
         _nest(cfg, "run", "seed", value=seeds[0])
     elif len(seeds) > 1:
         # Multi-seed cohort: store list; only first is used for now since
-        # RunSchema.seed is scalar. Warn about partial support.
+        # RunSpec.seed is scalar. Warn about partial support.
         _nest(cfg, "run", "seed", value=seeds[0])
         logs.append({
             "level": "WARNING",
@@ -1004,10 +1010,10 @@ def _strip_private_keys(cfg: dict) -> None:
 
 
 def _ensure_required_sections(cfg: dict) -> None:
-    """Guarantee sections that RootConfig requires are present with defaults."""
-    # RootConfig.output has no default_factory — must always be present.
+    """Guarantee sections that RootSpec requires are present with defaults."""
+    # RootSpec.output has no default_factory — must always be present.
     cfg.setdefault("output", {})
-    # RootConfig.run and RootConfig.backend must be present.
+    # RootSpec.run and RootSpec.backend must be present.
     cfg.setdefault("run", {})
     cfg.setdefault("backend", {})
 
@@ -1017,10 +1023,10 @@ def _ensure_required_sections(cfg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def migrate_ns_inp(raw: dict[str, str]) -> dict[str, Any]:
-    """Migrate a flat key->str dict from an old ns.inp file to a RootConfig dict.
+    """Migrate a flat key->str dict from an old ns.inp file to a RootSpec dict.
 
     The returned dict has two keys:
-      - ``"config"``  — nested dict ready for ``RootConfig.model_validate``
+      - ``"config"``  — nested dict ready for ``RootSpec.model_validate``
       - ``"logs"``    — list of dicts with ``"level"`` and ``"message"`` keys
 
     Severity levels used in logs:

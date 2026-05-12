@@ -24,18 +24,18 @@ The project uses a conda env. Always invoke the env's python explicitly:
 
 ```bash
 # Interpreter:
-/home/nunglert/miniconda3/envs/jaxrens/bin/python
+/home/nico.unglert/miniconda3/envs/jaxrens/bin/python
 
 # Full test suite (from jaxrens/):
-cd jaxrens && /home/nunglert/miniconda3/envs/jaxrens/bin/python -m pytest tests/ -v
+cd jaxrens && /home/nico.unglert/miniconda3/envs/jaxrens/bin/python -m pytest tests/ -v
 
 # Single test file / single test:
-/home/nunglert/miniconda3/envs/jaxrens/bin/python -m pytest tests/test_cell_moves.py -v
-/home/nunglert/miniconda3/envs/jaxrens/bin/python -m pytest tests/test_cell_moves.py::test_volume_move_jit -v
+/home/nico.unglert/miniconda3/envs/jaxrens/bin/python -m pytest tests/test_cell_moves.py -v
+/home/nico.unglert/miniconda3/envs/jaxrens/bin/python -m pytest tests/test_cell_moves.py::test_volume_move_jit -v
 
 # Heavy tests are excluded by default. To include them:
-/home/nunglert/miniconda3/envs/jaxrens/bin/python -m pytest tests/ -m heavy
-/home/nunglert/miniconda3/envs/jaxrens/bin/python -m pytest tests/ -m ""    # all markers
+/home/nico.unglert/miniconda3/envs/jaxrens/bin/python -m pytest tests/ -m heavy
+/home/nico.unglert/miniconda3/envs/jaxrens/bin/python -m pytest tests/ -m ""    # all markers
 ```
 
 Run tests scoped to the edit, not the full suite, unless asked otherwise.

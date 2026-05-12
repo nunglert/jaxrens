@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from jaxrens.io.trajectory import create_trajectory_writer
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import (
+    init_ns_multi_gpu,
     init_ns_parallel,
     run_ns,
     run_ns_multi_gpu,
@@ -43,18 +45,23 @@ logger = logging.getLogger(__name__)
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
-def _configure_file_logging(
+def configure_file_logging(
     *,
     working_dir: Path,
     prefix: str,
     level: str,
 ) -> None:
-    """Attach file handlers to the ``jaxrens`` logger.
+    """Attach file + stderr handlers to the ``jaxrens`` logger.
 
-    Always writes INFO+ to ``<working_dir>/<prefix>.log``. If ``level`` is
-    ``debug``, additionally writes DEBUG+ to ``<working_dir>/<prefix>.debug.log``.
-    Idempotent: removes any prior handlers this function attached before
-    re-attaching, so repeated calls (e.g. across cohort runs) stay clean.
+    Always writes INFO+ to ``<working_dir>/<prefix>.log`` and mirrors
+    INFO+ to stderr.  If ``level`` is ``debug``, additionally writes
+    DEBUG+ to ``<working_dir>/<prefix>.debug.log``.
+
+    Should be called once per process, early.  ``cli._cmd_run`` hoists
+    this before the resolver so resolver-phase logs (which can take
+    many minutes on heavy backends) reach the file from second 1.
+    Direct callers of ``run_*_from_config`` (tests, scripts) may call
+    this themselves if they want file output.
     """
     root = logging.getLogger("jaxrens")
     root.setLevel(logging.DEBUG if level == "debug" else logging.INFO)
@@ -69,6 +76,12 @@ def _configure_file_logging(
     info_h.setFormatter(logging.Formatter(_LOG_FORMAT))
     info_h._jaxrens_managed = True  # type: ignore[attr-defined]
     root.addHandler(info_h)
+
+    stream_h = logging.StreamHandler(sys.stderr)
+    stream_h.setLevel(logging.INFO)
+    stream_h.setFormatter(logging.Formatter(_LOG_FORMAT))
+    stream_h._jaxrens_managed = True  # type: ignore[attr-defined]
+    root.addHandler(stream_h)
 
     if level == "debug":
         debug_h = logging.FileHandler(working_dir / f"{prefix}.debug.log", mode="w")
@@ -144,8 +157,7 @@ def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
     """
     from jaxrens.cli.schema.moves import (
         AlchemicalShiftMoveSpec,
-        GalileanMoveSpec,
-        GmcMoveSpec,
+        GMCMoveSpec,
         HMCMoveSpec,
         RandomWalkMoveSpec,
         SingleAtomMoveSpec,
@@ -154,8 +166,8 @@ def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
 
     _SIMPLE_SPEC_MAP: dict[str, Any] = {
         "random_walk": RandomWalkMoveSpec,
-        "galilean": GalileanMoveSpec,
-        "gmc": GmcMoveSpec,
+        "galilean": GMCMoveSpec,
+        "gmc": GMCMoveSpec,
         "hmc": HMCMoveSpec,
         "single_atom": SingleAtomMoveSpec,
         "single_atom_swap": SingleAtomSwapMoveSpec,
@@ -286,11 +298,10 @@ def run_from_config(
     working_dir = output_config.working_dir
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    _configure_file_logging(
-        working_dir=working_dir,
-        prefix=output_config.out_file_prefix,
-        level=output_config.log_level,
-    )
+    # File logging is configured once, early, by ``cli._cmd_run`` so the
+    # resolver phase reaches the log file.  Direct callers (tests,
+    # scripts) that want a log file should call ``configure_file_logging``
+    # before invoking this function.
 
     # Set up callbacks
     callbacks = [
@@ -326,8 +337,12 @@ def run_from_config(
         )
     )
 
-    # Wire adaptation logger when full_auto is active
-    if adaptation_config is not None and adaptation_config.full_auto and move_descriptors is not None:
+    # Wire the adaptation logger unconditionally when move descriptors
+    # exist.  The callback's ``on_start`` writes a mandatory iter-0
+    # baseline row carrying the initial step sizes, so a non-full_auto
+    # run still produces a useful 1-row artefact documenting the
+    # constant ss; full_auto runs append on every bisection event.
+    if move_descriptors is not None:
         from jaxrens.io.adaptation_log import AdaptationLogger
 
         adapt_log_path = working_dir / f"{output_config.out_file_prefix}.adaptation.h5"
@@ -338,6 +353,24 @@ def run_from_config(
             n_runs=1,
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
+
+    # Wire per-iter chain-acceptance logger when requested (independent
+    # of full_auto — the chain counters are populated by ns_step every
+    # iter regardless of adaptation).
+    if move_descriptors is not None and getattr(output_config, "save_acc_rates", False):
+        from jaxrens.io.acc_rates_log import AccRatesLogger
+        from jaxrens.cli.monitor import AccRatesCallback
+
+        acc_log_path = working_dir / f"{output_config.out_file_prefix}.acc_rates.h5"
+        acc_logger = AccRatesLogger(
+            path=acc_log_path,
+            move_names=[d.name for d in move_descriptors],
+            n_runs=1,
+        )
+        callbacks.append(AccRatesCallback(
+            acc_logger,
+            interval=int(getattr(output_config, "acc_rates_interval", 1)),
+        ))
 
     first_mc = move_config[0] if isinstance(move_config, list) else move_config
 
@@ -403,7 +436,6 @@ def run_from_config(
             adjust_interval=burn_in_cfg.adjust_interval,
             emax_offset_per_atom=burn_in_cfg.emax_offset_per_atom,
             n_atoms=n_atoms,
-            batched=False,
             walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
             run_batch_size=getattr(burn_in_cfg, "run_batch_size", None),
             per_move_fns=burn_per_move_fns,
@@ -451,7 +483,7 @@ def run_from_config(
         full_auto_kwargs = dict(
             per_move_fns=per_move_fns,
             move_descriptors=list(move_descriptors) if move_descriptors is not None else None,
-            adjust_interval=adaptation_config.full_auto_steps,
+            adjust_interval=adaptation_config.adjust_interval,
             adjust_n_samples=adaptation_config.adjust_n_samples,
             adjust_max_rounds=adaptation_config.adjust_max_rounds,
             adjust_factor=adjust_factor,
@@ -527,11 +559,10 @@ def run_multi_gpu_from_config(resolved) -> dict:
     working_dir = resolved.output.working_dir
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    _configure_file_logging(
-        working_dir=working_dir,
-        prefix=resolved.output.out_file_prefix,
-        level=resolved.output.log_level,
-    )
+    # File logging is configured once, early, by ``cli._cmd_run`` so the
+    # resolver phase reaches the log file.  Direct callers (tests,
+    # scripts) that want a log file should call ``configure_file_logging``
+    # before invoking this function.
 
     n_live = ns.n_live
     positions = resolved.init.initial_positions  # (n_total, K, A, 3)
@@ -574,16 +605,17 @@ def run_multi_gpu_from_config(resolved) -> dict:
         rng_keys = jax.random.split(key_init, n_total)
         step_sizes = jnp.full(len(resolved.move_descriptors), resolved.moves[0].step_size)
 
-        logger.debug("[stage] init_ns_parallel (burn-in NSState): starting")
-        ns_state_burn = init_ns_parallel(
+        logger.debug("[stage] init_ns_multi_gpu (burn-in NSState): starting")
+        ns_state_burn = init_ns_multi_gpu(
             init_fn,
             positions, types, energies, cells, rng_keys,
+            n_gpu, n_per_gpu,
             step_sizes=step_sizes,
             ensemble_params_per_run=list(resolved.ensemble_params_per_run),
             max_neighbors=starting_bucket,
             max_neighbor_counts=_init_counts,
         )
-        _barrier("init_ns_parallel", ns_state_burn.population.positions)
+        _barrier("init_ns_multi_gpu", ns_state_burn.population.positions)
 
         n_atoms = positions.shape[-2]
         adaptation_policies = resolved.adaptation_policies
@@ -609,7 +641,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
             adjust_interval=burn_in_cfg.adjust_interval,
             emax_offset_per_atom=burn_in_cfg.emax_offset_per_atom,
             n_atoms=n_atoms,
-            batched=True,
+            batcher=resolved.batcher,
             walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
             run_batch_size=getattr(burn_in_cfg, "run_batch_size", None),
             per_move_fns=burn_per_move_fns,
@@ -618,9 +650,18 @@ def run_multi_gpu_from_config(resolved) -> dict:
             adjust_max_rounds=getattr(resolved.adaptation_cfg, "adjust_max_rounds", 15),
         )
         pop = ns_state_burn.population
-        positions = pop.positions
-        energies = pop.energy
-        cells = pop.cell
+        # Burn-in operated on (G, P, K, ...) state via the PmapVmapRuns batcher.
+        # Downstream code (``_recompute_max_neighbor_counts``, ``run_ns_multi_gpu``
+        # input adapters) consumes the flat ``(n_total, K, ...)`` form, so flatten
+        # the leading G×P axes back here.
+        def _flatten_GP(arr):
+            if arr is None:
+                return None
+            return arr.reshape((n_total,) + arr.shape[2:])
+
+        positions = _flatten_GP(pop.positions)
+        energies = _flatten_GP(pop.energy)
+        cells = _flatten_GP(pop.cell)
         _barrier("initial_walk", positions, energies, cells)
         logger.info("Burn-in complete")
 
@@ -684,7 +725,11 @@ def run_multi_gpu_from_config(resolved) -> dict:
         )
     )
 
-    if resolved.adaptation_cfg is not None and resolved.adaptation_cfg.full_auto:
+    # Register unconditionally — the iter-0 baseline row makes the
+    # adaptation file useful even when full_auto is off (single-row
+    # artefact documenting the constant step size).  See
+    # ``run_from_config`` for the matching wire-up on the single-run path.
+    if resolved.move_descriptors:
         adapt_log_path = (
             working_dir / f"{resolved.output.out_file_prefix}.adaptation.h5"
         )
@@ -696,6 +741,26 @@ def run_multi_gpu_from_config(resolved) -> dict:
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
 
+    # Per-iter chain-acceptance logger (multi-run path).
+    if resolved.move_descriptors and getattr(
+        resolved.output, "save_acc_rates", False,
+    ):
+        from jaxrens.io.acc_rates_log import AccRatesLogger
+        from jaxrens.cli.monitor import AccRatesCallback
+
+        acc_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.acc_rates.h5"
+        )
+        acc_logger = AccRatesLogger(
+            path=acc_log_path,
+            move_names=[d.name for d in resolved.move_descriptors],
+            n_runs=n_total,
+        )
+        callbacks.append(AccRatesCallback(
+            acc_logger,
+            interval=int(getattr(resolved.output, "acc_rates_interval", 1)),
+        ))
+
     first_mc = resolved.moves[0]
     full_auto_kwargs: dict[str, Any] = {}
     if resolved.adaptation_cfg is not None and resolved.adaptation_cfg.full_auto:
@@ -706,7 +771,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
         )
         full_auto_kwargs = dict(
             per_move_fns=per_move_fns,
-            adjust_interval=resolved.adaptation_cfg.full_auto_steps,
+            adjust_interval=resolved.adaptation_cfg.adjust_interval,
             adjust_n_samples=resolved.adaptation_cfg.adjust_n_samples,
             adjust_max_rounds=resolved.adaptation_cfg.adjust_max_rounds,
             adjust_factor=adjust_factor,
@@ -714,7 +779,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
 
     logger.info(
         "Starting multi-GPU NS: n_gpu=%d, n_per_gpu=%d (n_total=%d), "
-        "n_walkers=%d, n_mcmc=%d, max_iter=%d",
+        "n_walkers=%d, n_mcmc=%d, max_iter=%s",
         n_gpu, n_per_gpu, n_total, n_live,
         ns.n_mcmc_steps, ns.max_iterations,
     )
@@ -745,6 +810,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
         max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
         max_neighbors_offset=resolved.backend.max_neighbors_offset,
         initial_max_neighbor_counts=post_burn_in_counts,
+        batcher=resolved.batcher,
         **full_auto_kwargs,
     )
     return result

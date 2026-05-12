@@ -20,10 +20,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
-# InitialWalkConfig (deferred: n_walks > 0 is not yet consumed by runtime)
+# InitialWalkSpec (deferred: n_walks > 0 is not yet consumed by runtime)
 # ---------------------------------------------------------------------------
 
-class InitialWalkConfig(BaseModel):
+class InitialWalkSpec(BaseModel):
     """Parameters for optional fixed-Emax burn-in walks before nested sampling.
 
     When ``n_walks > 0``, ``run_from_config`` runs ``initial_walk`` between
@@ -33,7 +33,8 @@ class InitialWalkConfig(BaseModel):
     Memory-control knobs:
         ``walker_batch_size``: chunk the per-walker vmap via ``lax.map``.
             ``None`` = full vmap over all walkers (default; fastest).
-            Must divide ``n_walkers`` evenly or ``initial_walk`` raises.
+            Any positive int; non-divisors of ``n_walkers`` are handled
+            internally by padding.
         ``run_batch_size``: chunk the per-run vmap when ``batched=True``.
             ``None`` = full vmap over all runs (default).
             Must divide ``n_runs`` evenly. Ignored for single-run configs.
@@ -56,7 +57,8 @@ class InitialWalkConfig(BaseModel):
         description=(
             "Chunk walkers during burn-in vmap for memory control. "
             "None = full vmap over all walkers (max speed). "
-            "Must divide n_walkers evenly."
+            "Any positive int; non-divisors of n_walkers are padded "
+            "internally."
         ),
     )
     run_batch_size: int | None = Field(
@@ -70,7 +72,7 @@ class InitialWalkConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# InitConfig
+# InitSpec
 # ---------------------------------------------------------------------------
 
 def _parse_species_string(s: str) -> dict[int, int]:
@@ -162,7 +164,7 @@ def _parse_species_string(s: str) -> dict[int, int]:
     return counts
 
 
-class InitConfig(BaseModel):
+class InitSpec(BaseModel):
     """System-initialization parameters.
 
     Exactly one of {start_species, start_config_file, start_walker_set,
@@ -190,10 +192,10 @@ class InitConfig(BaseModel):
     pos_autoscale_cells: bool = False
 
     # -- Burn-in (active when n_walks > 0; skipped for restart_file) --
-    initial_walk: InitialWalkConfig = Field(default_factory=InitialWalkConfig)
+    initial_walk: InitialWalkSpec = Field(default_factory=InitialWalkSpec)
 
     @model_validator(mode="after")
-    def _exactly_one_source(self) -> "InitConfig":
+    def _exactly_one_source(self) -> "InitSpec":
         """Enforce that exactly one source-of-atoms field is set."""
         sources = {
             "start_species": self.start_species,

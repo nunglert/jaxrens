@@ -21,18 +21,24 @@ from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float, Int, Key
+
+from jaxrens.utils.padding import pad_to_multiple
 
 
 def _process_rate_jax(
-    rate: jnp.ndarray,
-    step_size: jnp.ndarray,
-    step_size_prev: jnp.ndarray,
-    rate_prev: jnp.ndarray,
+    rate: Float[Array, ""],
+    step_size: Float[Array, ""],
+    step_size_prev: Float[Array, ""],
+    rate_prev: Float[Array, ""],
     min_rate: float,
     max_rate: float,
     adjust_factor: float,
     max_step_size: float,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[
+    Float[Array, ""], Bool[Array, ""], Bool[Array, ""],
+    Bool[Array, ""], Bool[Array, ""], Bool[Array, ""],
+]:
     """Branchless rate processing for step size adjustment.
 
     Given an acceptance rate and the target window [min_rate, max_rate],
@@ -89,9 +95,9 @@ def _process_rate_jax(
 def adjust_step_size(
     population: Any,
     move_fn: Callable,
-    step_size: jnp.ndarray,
-    emax: jnp.ndarray,
-    rng_key: jax.Array,
+    step_size: Float[Array, ""],
+    emax: Float[Array, ""],
+    rng_key: Key[Array, ""],
     n_samples: int,
     min_rate: float,
     max_rate: float,
@@ -101,9 +107,9 @@ def adjust_step_size(
     *,
     trial_batch_size: int | None = None,
 ) -> tuple[
-    jnp.ndarray, jnp.ndarray, jnp.ndarray,
-    jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray,
-    jnp.ndarray, jnp.ndarray,
+    Float[Array, ""], Float[Array, ""], Int[Array, "4"],
+    Int[Array, ""], Bool[Array, ""], Int[Array, ""], Int[Array, ""], Bool[Array, ""],
+    Int[Array, ""], Int[Array, ""],
 ]:
     """Adjust step size for one move type until acceptance rate is in window.
 
@@ -133,7 +139,11 @@ def adjust_step_size(
             ``jax.lax.map(..., batch_size=trial_batch_size)`` so peak memory
             scales with the chunk rather than ``n_samples`` — needed when the
             move's backward tape (e.g. galilean ``value_and_grad`` × n_reflect
-            on MACE) makes the full vmap exceed device memory.
+            on MACE) makes the full vmap exceed device memory.  Any positive
+            int is accepted; if ``n_samples`` is not a multiple of
+            ``trial_batch_size`` the trial population is padded with copies
+            of the last sample and the pad is sliced off before rate/count
+            aggregation.
 
     Returns:
         (new_step_size, final_rate, final_counts, n_rounds, converged,
@@ -201,11 +211,25 @@ def adjust_step_size(
             # Chunked-vmap: lax.map vmaps within a chunk and scans across
             # chunks.  Bounds peak memory at trial_batch_size × per-trial
             # backward tape, regardless of n_samples.  Equivalent output.
+            # When n_samples % trial_batch_size != 0, pad the inputs by
+            # repeating the last entry and slice the dummies off the output;
+            # n_pad is Python-static so JIT shapes stay concrete.
+            padded_sample, n_pad = pad_to_multiple(
+                sample, n_samples, trial_batch_size
+            )
+            padded_trial_keys, _ = pad_to_multiple(
+                trial_keys, n_samples, trial_batch_size
+            )
             accepted, reasons, n_evals_per_sample, n_grad_evals_per_sample = jax.lax.map(
                 lambda x: trial_one(x[0], x[1]),
-                (sample, trial_keys),
+                (padded_sample, padded_trial_keys),
                 batch_size=trial_batch_size,
             )
+            if n_pad > 0:
+                accepted = accepted[:n_samples]
+                reasons = reasons[:n_samples]
+                n_evals_per_sample = n_evals_per_sample[:n_samples]
+                n_grad_evals_per_sample = n_grad_evals_per_sample[:n_samples]
         rate = jnp.mean(accepted.astype(jnp.float32))
 
         # Per-reason counts (code 0=accepted, 1=energy, 2=cell, 3=prior)

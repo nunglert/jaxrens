@@ -9,18 +9,18 @@ load-bearing.
 
 ## What NS computes
 
-For a prior $\pi(\theta)$ and likelihood $L(\theta) = e^{-H(\theta)}$,
+For a prior $\pi(r)$ and likelihood $L(r) = e^{-H(r)}$,
 the evidence is
 
 $$
-Z = \int L(\theta)\,\pi(\theta)\,\mathrm{d}\theta
+Z = \int L(r)\,\pi(r)\,\mathrm{d}r
   = \int_0^1 L(X)\,\mathrm{d}X,
 $$
 
 where the transformation
 
 $$
-X(L^\star) = \int_{L(\theta) > L^\star} \pi(\theta)\,\mathrm{d}\theta
+X(L^\star) = \int_{L(r) > L^\star} \pi(r)\,\mathrm{d}r
 $$
 
 collapses every equi-likelihood shell into a scalar *prior mass*
@@ -59,7 +59,7 @@ as a hard constraint.
 Every NS iteration needs to do three things:
 
 1. **Pick the worst live walker** (Python-side argmax; cheap).
-2. **Run `n_mcmc_steps` of MWG sampling** to produce a new walker
+2. **Run `n_mcmc_steps` of [MWG sampling](moves_mwg.md)** to produce a new walker
    under the updated likelihood constraint (dense JAX compute).
 3. **Adapt step sizes** every `adjust_interval` iterations, retry
    on MLIP neighbor-buffer overflow, check termination, and dispatch
@@ -77,23 +77,90 @@ jaxrens puts step 2 inside a JIT'd `ns_step` and leaves steps 1 and
 3 in Python:
 
 ```{mermaid}
+%%{init: {"layout": "elk"}}%%
 flowchart TB
-    subgraph outer["Outer loop (Python)"]
-        direction TB
-        T["Termination check"]
-        A["Step-size adaptation<br/>(every adjust_interval)"]
-        O["Overflow retry<br/>(max_neighbors escalation)"]
-        C["Callback dispatch<br/>(monitor / trajectory / checkpoint)"]
-    end
-    subgraph inner["Inner loop (JIT + lax.scan)"]
-        S["ns_step:<br/>n_mcmc_steps × MWG over all walkers"]
-    end
-    T -->|"not terminated"| S
-    S -->|"info (emax, acc, counters)"| A
-    A --> O
-    O --> C
+ subgraph inner["Inner loop — JIT"]
+        S["ns_step<br>n_mcmc_steps × MWG<br>over all walkers"]
+  end
+ subgraph adapt["Stepsize adjustion — JIT"]
+        AM["AdaptationManager.apply"]
+  end
+ subgraph jit_region["Core"]
+    direction TB
+        inner
+        adapt
+  end
+  START["Start (i = 1)"]
+  DOT@{ shape: f-circ }
+  STOP["Done"]
+ subgraph outer["Outer loop (Python)"]
+    direction TB
+        jit_region
+        ITER(["Iteration i"])
+        O{"Neighbor-buffer<br>overflow?"}
+        ESC["escalate max_neighbors,<br>re-run inner loop"]
+        C["Callback dispatch<br>(monitor / trajectory / checkpoint)"]
+        T{"Termination<br>satisfied?"}
+        EVERY{"adjust_interval<br>satisfied?"}
+  end
+    START --> DOT
+    ITER --> EVERY
+    EVERY -- yes --> AM
+    EVERY -- no --> S
+    AM --> S
+    S --> O
+    O -- yes --> ESC
+    O -- no --> C
     C --> T
+    T -- yes --> STOP
+    ESC --> EVERY
+    T -- no — i ← i+1 --> DOT
+    DOT --> ITER
+
+     inner:::jitBox
+     adapt:::jitBox
+     jit_region:::regionBox
+     O:::decision
+     ESC:::escBox
+     T:::decision
+    classDef jitBox fill:#fff7e0,stroke:#a07000,color:#222
+    classDef regionBox fill:#fff3c4,stroke:#a07000,color:#5a3a00,stroke-dasharray:6 4
+    classDef outerBox fill:#f5f5f5,stroke:#888,color:#222
+    classDef decision fill:#eef5ff,stroke:#1565c0,color:#222
+    classDef escBox fill:#ffe0e0,stroke:#c62828,color:#5a0000
+    linkStyle 8 stroke:#888,stroke-dasharray:3 3,fill:none
+    linkStyle 9 stroke:#000000,fill:none
+    linkStyle 10 stroke:#000000,fill:none
 ```
+
+The dashed **Core** region groups the two JIT-compiled pieces of
+work as amber subgraphs around the actual function calls:
+`ns_step` (the inner `lax.scan` over all walkers) and
+`AdaptationManager.apply` (one `jax.jit`-compiled
+`adjust_step_size` call per move kernel, dispatched through
+{class}`~jaxrens.sampling.adaptation.manager.AdaptationManager`).
+The blue diamond above Core — `adjust_interval satisfied?` — is
+the modulus check that gates the adaptation; on a non-firing
+iteration the path skips straight into `ns_step`, otherwise it
+routes through `AdaptationManager.apply` first. The red
+**escalate max_neighbors** node lives outside Core on the
+*overflow* back-edge — when `ns_step` reports a neighbor-list
+overflow, the outer loop bumps `max_neighbors` to the next bucket
+and re-enters the same iteration's `adjust_interval` check (so
+the run stays cached on the new `(max_neighbors, kernel)` pair —
+each escalation triggers exactly one recompile and is then cached
+for the rest of the run).
+
+`Start (i = 1)` and `Done` sit outside the outer-loop box as the
+overall entry / exit; the small black dot is a routing junction
+that gives the cycle a clean rejoin point — both the initial
+entry and the dashed grey "no — i ← i+1" loop-back from
+`Termination` flow into it before continuing as `Iteration i`.
+The dot is purely a layout aid (its `f-circ` shape is just so
+ELK has a non-trivial node to anchor the back-edge on); without
+it the cycle-breaker would route the long return arrow across
+the diagram and disturb the forward flow. See {doc}`moves_mwg`
+for what happens inside `AdaptationManager.apply`.
 
 The handoff payload is the `info` dict emitted by `ns_step`:
 `emax`, per-move acceptance / proposal counters, reject-reason
@@ -111,7 +178,7 @@ accumulates per-move acceptance counts.
 Concretely, at iteration $i$ the worst walker's energy $E_i$
 becomes the new *energy maximum* $E_\mathrm{max}$, and all MCMC
 steps in the next iteration run under the constraint
-$H(\theta) < E_\mathrm{max}$. Over many iterations, $E_\mathrm{max}$
+$H(r) < E_\mathrm{max}$. Over many iterations, $E_\mathrm{max}$
 decreases monotonically — nesting the likelihood shells — and the
 walker distribution concentrates toward the ground state of $H$.
 

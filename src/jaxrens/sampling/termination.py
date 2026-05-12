@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import jax.numpy as jnp
 
@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 KB_EV = 8.6173324e-5
 
 
+@runtime_checkable
 class TerminationCriterion(Protocol):
     """Protocol for termination criteria.
 
