@@ -352,46 +352,30 @@ class ProgressCallback:
     def on_finish(self, ns_state: Any) -> None:
         elapsed = time.time() - self._start_time
         if isinstance(ns_state, NSState):
-            # For batched runs (VmapRuns/PmapVmapRuns), iteration and log_evidence
-            # may have shape (n_runs,) or (G, P).  Report aggregate stats.
             iteration_arr = jnp.asarray(ns_state.iteration)
             log_z_arr = jnp.asarray(ns_state.log_evidence)
-            if iteration_arr.ndim > 0:
-                logger.info(
-                    "NS finished: iter=[%d..%d], log_Z=[%.4f..%.4f], elapsed=%.1fs",
-                    int(jnp.min(iteration_arr)),
-                    int(jnp.max(iteration_arr)),
-                    float(jnp.min(log_z_arr)),
-                    float(jnp.max(log_z_arr)),
-                    elapsed,
-                )
-            else:
-                logger.info(
-                    "NS finished: %d iterations, log_Z=%.4f, elapsed=%.1fs",
-                    int(iteration_arr),
-                    float(log_z_arr),
-                    elapsed,
-                )
         else:
             log_z_arr = jnp.asarray(ns_state.get("log_evidence", float("-inf")))
-            iteration_val = ns_state.get("iteration", 0)
-            iter_arr = jnp.asarray(iteration_val)
-            if iter_arr.ndim > 0:
-                logger.info(
-                    "NS finished: iter=[%d..%d], log_Z=[%.4f..%.4f], elapsed=%.1fs",
-                    int(jnp.min(iter_arr)),
-                    int(jnp.max(iter_arr)),
-                    float(jnp.min(log_z_arr)),
-                    float(jnp.max(log_z_arr)),
-                    elapsed,
-                )
-            else:
-                logger.info(
-                    "NS finished: %d iterations, log_Z=%.4f, elapsed=%.1fs",
-                    int(iter_arr),
-                    float(log_z_arr),
-                    elapsed,
-                )
+            iteration_arr = jnp.asarray(ns_state.get("iteration", 0))
+
+        # Iterations stay in lock-step across replicas (outer Python loop
+        # advances all runs by 1 per tick), so a single int suffices.
+        iter_n = int(jnp.max(iteration_arr))
+        if log_z_arr.ndim > 0:
+            logger.info(
+                "NS finished: %d iterations, log_Z=[%.4f..%.4f], elapsed=%.1fs",
+                iter_n,
+                float(jnp.min(log_z_arr)),
+                float(jnp.max(log_z_arr)),
+                elapsed,
+            )
+        else:
+            logger.info(
+                "NS finished: %d iterations, log_Z=%.4f, elapsed=%.1fs",
+                iter_n,
+                float(log_z_arr),
+                elapsed,
+            )
 
 
 class AdaptationCallback:

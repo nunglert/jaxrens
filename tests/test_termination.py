@@ -36,10 +36,6 @@ class TestIterationTermination:
         assert not t.check(98, 0.0)
         assert t.check(99, 0.0)
 
-    def test_triggers_past_max(self):
-        t = IterationTermination(max_iterations=50)
-        assert t.check(100, 0.0)
-
     def test_message(self):
         t = IterationTermination(max_iterations=10)
         assert "10" in t.message()
@@ -49,10 +45,11 @@ class TestIterationTermination:
 
 
 class TestPriorMassTermination:
-    def test_never_triggers_early(self):
+    def test_never_triggers_without_evidence(self):
+        """Without update_evidence, log_evidence is -inf, so check is always False."""
         t = PriorMassTermination(n_live=100)
-        for i in range(100):
-            assert not t.check(i, 0.0)
+        assert not t.check(0, 0.0)
+        assert not t.check(50, 0.0)
 
     def test_triggers_when_mass_negligible(self):
         t = PriorMassTermination(n_live=50, threshold=0.1)

@@ -1345,7 +1345,7 @@ def run_ns_multi_gpu(
 
     for g in range(n_gpu):
         for p in range(n_per_gpu):
-            logger.info(
+            logger.debug(
                 "GPU %d run %d complete: %d dead points, log_Z=%.4f",
                 g, p, int(ns_states.iteration[g, p]),
                 float(ns_states.log_evidence[g, p]),

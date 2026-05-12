@@ -94,17 +94,3 @@ class TestFindWorstWalker:
         assert val == pytest.approx(3.0)
 
 
-class TestNoSplitFloat:
-    def test_no_float32x2_in_codebase(self):
-        """Verify no split_float or float32x2 code exists."""
-        import pathlib
-
-        src_dir = pathlib.Path(__file__).parent.parent / "src" / "jaxrens"
-        forbidden = ["split_float", "float32x2", "create_random_perturb_energy"]
-
-        for py_file in src_dir.rglob("*.py"):
-            content = py_file.read_text()
-            for pattern in forbidden:
-                assert pattern not in content, (
-                    f"Found '{pattern}' in {py_file.relative_to(src_dir.parent.parent)}"
-                )

@@ -173,9 +173,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # messages reach ``<prefix>.log`` and stderr at second 1 of the
     # run, instead of being dropped until ``run_*_from_config`` runs
     # the same call.
+    #
+    # Log files live in the *parent* of ``working_dir`` (i.e. the
+    # experiment root, next to ``config.yaml`` and ``submit.slurm``)
+    # rather than inside the output dir — keeps them visible from the
+    # top of the experiment tree without ``cd output/``.
     root.output.working_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = root.output.working_dir.parent
+    log_dir.mkdir(parents=True, exist_ok=True)
     configure_file_logging(
-        working_dir=root.output.working_dir,
+        working_dir=log_dir,
         prefix=root.output.out_file_prefix,
         level=root.output.log_level,
     )

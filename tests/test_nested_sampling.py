@@ -244,7 +244,11 @@ class TestRunNsParallel:
 
         log_Z_par = float(result_par["log_evidence"][0])
         log_Z_seq = float(result_seq_0["log_evidence"])
-        assert abs(log_Z_par - log_Z_seq) < 5.0, (
+        # run_ns and run_ns_parallel use different internal key plumbing
+        # (vmap split vs straight split). Same problem + same seed should
+        # land at most ~1 log-unit apart; anything larger is a real
+        # regression, not RNG noise.
+        assert abs(log_Z_par - log_Z_seq) < 1.0, (
             f"Parallel log_Z={log_Z_par:.3f} vs sequential log_Z={log_Z_seq:.3f}"
         )
 

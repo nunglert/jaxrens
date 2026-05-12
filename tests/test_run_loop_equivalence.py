@@ -181,11 +181,10 @@ class TestGoldenEquivalence:
         return result
 
     def test_parallel_n_runs_1_matches_single_within_tolerance(self):
-        """run_ns_parallel(n_runs=1) must agree with run_ns within 1e-12.
-
-        Both start from the same initial population but use different RNG
-        paths (vmap introduces potential float-nondeterminism).
-        Start at tolerance 0.0; relax to 1e-12 if needed.
+        """run_ns_parallel(n_runs=1) must agree with run_ns within a tight
+        bound. The two paths plumb RNG keys differently (vmap split vs
+        straight split), so bit-identity isn't expected, but the difference
+        should be << 1 log-unit on a small problem with a fixed seed.
         """
         r_par = self._run_parallel_n1(seed=77, n_iter=60)
         r_seq = self._run_single(seed=77, n_iter=60)
@@ -193,15 +192,10 @@ class TestGoldenEquivalence:
         log_z_par = float(r_par["log_evidence"][0])
         log_z_seq = float(r_seq["log_evidence"])
 
-        # Both must be finite
         assert jnp.isfinite(jnp.array(log_z_par))
         assert jnp.isfinite(jnp.array(log_z_seq))
 
-        # Tolerance: start at 1e-12; if vmap introduces floating-point
-        # nondeterminism across JAX versions, relax to 1e-6.
-        # Physicist-generous bound: within 5 log-units (both must sample
-        # the same region to be meaningful).
-        assert abs(log_z_par - log_z_seq) < 5.0, (
+        assert abs(log_z_par - log_z_seq) < 1.0, (
             f"run_ns_parallel(n_runs=1) log_Z={log_z_par:.4f} "
             f"vs run_ns log_Z={log_z_seq:.4f} (diff={abs(log_z_par-log_z_seq):.4f})"
         )

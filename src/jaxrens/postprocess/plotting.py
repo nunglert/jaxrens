@@ -117,6 +117,7 @@ def plot_heat_capacity(
     T: np.ndarray,
     *,
     ax: "Axes | None" = None,
+    k_B: float = 1.0,
     **kwargs,
 ) -> "Axes":
     """Plot heat capacity C_v vs temperature.
@@ -125,6 +126,8 @@ def plot_heat_capacity(
         monitor: Populated Monitor.
         T: Temperature array, shape (n_T,).
         ax: Existing axes to plot into.  Created if None.
+        k_B: Boltzmann constant in the same energy units as the stored
+            ``dead_energies``.  Defaults to ``1.0``.
         **kwargs: Forwarded to ``ax.plot``.
 
     Returns:
@@ -133,7 +136,7 @@ def plot_heat_capacity(
     ax = _get_ax(ax)
     kwargs.setdefault("label", monitor.label or "Cv")
 
-    Cv = monitor.heat_capacity(T)
+    Cv = monitor.heat_capacity(T, k_B=k_B)
     ax.plot(T, Cv, **kwargs)
     ax.set_xlabel("T")
     ax.set_ylabel("Cv")
@@ -145,6 +148,7 @@ def plot_partition_function(
     T: np.ndarray,
     *,
     ax: "Axes | None" = None,
+    k_B: float = 1.0,
     **kwargs,
 ) -> "Axes":
     """Plot log partition function log Z vs temperature.
@@ -153,6 +157,8 @@ def plot_partition_function(
         monitor: Populated Monitor.
         T: Temperature array, shape (n_T,).
         ax: Existing axes to plot into.  Created if None.
+        k_B: Boltzmann constant in the same energy units as the stored
+            ``dead_energies``.  Defaults to ``1.0``.
         **kwargs: Forwarded to ``ax.plot``.
 
     Returns:
@@ -161,7 +167,7 @@ def plot_partition_function(
     ax = _get_ax(ax)
     kwargs.setdefault("label", monitor.label or "log Z")
 
-    log_Z = monitor.partition_function(T)
+    log_Z = monitor.partition_function(T, k_B=k_B)
     ax.plot(T, log_Z, **kwargs)
     ax.set_xlabel("T")
     ax.set_ylabel("log Z")
@@ -173,6 +179,7 @@ def plot_free_energy(
     T: np.ndarray,
     *,
     ax: "Axes | None" = None,
+    k_B: float = 1.0,
     **kwargs,
 ) -> "Axes":
     """Plot Helmholtz free energy F vs temperature.
@@ -181,6 +188,8 @@ def plot_free_energy(
         monitor: Populated Monitor.
         T: Temperature array, shape (n_T,).
         ax: Existing axes to plot into.  Created if None.
+        k_B: Boltzmann constant in the same energy units as the stored
+            ``dead_energies``.  Defaults to ``1.0``.
         **kwargs: Forwarded to ``ax.plot``.
 
     Returns:
@@ -189,7 +198,7 @@ def plot_free_energy(
     ax = _get_ax(ax)
     kwargs.setdefault("label", monitor.label or "F")
 
-    F = monitor.free_energy(T)
+    F = monitor.free_energy(T, k_B=k_B)
     ax.plot(T, F, **kwargs)
     ax.set_xlabel("T")
     ax.set_ylabel("F")

@@ -97,23 +97,81 @@ class TestRootSpecValidate:
 # ---------------------------------------------------------------------------
 
 class TestExtraForbid:
-    def test_unknown_root_key_raises(self):
-        d = _minimal_dict()
-        d["not_a_key"] = 42
-        with pytest.raises(ValidationError, match="not_a_key"):
-            RootSpec.model_validate(d)
+    """One parametrized test covers ``extra="forbid"`` on every spec class.
 
-    def test_unknown_run_key_raises(self):
-        d = _minimal_dict()
-        d["run"]["typo_field"] = 1
-        with pytest.raises(ValidationError):
-            RootSpec.model_validate(d)
+    Each row is ``(spec_callable, bogus_kwargs)``: invoking the callable
+    with those kwargs MUST raise ``ValidationError`` because the model has
+    ``model_config = ConfigDict(extra="forbid")``.
+    """
 
-    def test_unknown_backend_key_raises(self):
-        d = _minimal_dict()
-        d["backend"]["mystery"] = "x"
+    @pytest.mark.parametrize(
+        "spec_factory,bogus",
+        [
+            # Root-level keys
+            (lambda kw: RootSpec.model_validate({**_minimal_dict(), **kw}),
+             {"not_a_key": 42}),
+            (lambda kw: RootSpec.model_validate(
+                {**_minimal_dict(), "run": {**_minimal_dict()["run"], **kw}}),
+             {"typo_field": 1}),
+            (lambda kw: RootSpec.model_validate(
+                {**_minimal_dict(), "backend": {**_minimal_dict()["backend"], **kw}}),
+             {"mystery": "x"}),
+            # Per-spec extras
+            (lambda kw: RootSpec.model_validate(
+                {**_minimal_dict(), "moves": [{"type": "random_walk", **kw}]}),
+             {"n_reflect": 5}),
+            (lambda kw: __import__("pydantic").TypeAdapter(
+                __import__(
+                    "jaxrens.cli.schema.termination",
+                    fromlist=["TerminationSpec"],
+                ).TerminationSpec,
+            ).validate_python(
+                {"type": "iteration", "max_iterations": 5, **kw}),
+             {"bogus": 1}),
+            (lambda kw: __import__(
+                "jaxrens.cli.schema.adaptation",
+                fromlist=["AdaptationPolicy"],
+            ).AdaptationPolicy(min_rate=0.3, **kw),
+             {"bogus": 1}),
+            (lambda kw: RootSpec.model_validate(
+                {**_minimal_dict(), "adaptation": kw}),
+             {"bogus_field": True}),
+            (lambda kw: __import__(
+                "jaxrens.cli.schema.ensemble",
+                fromlist=["NVTEnsembleSpec"],
+            ).NVTEnsembleSpec(**kw),
+             {"bogus": 1}),
+            (lambda kw: __import__(
+                "jaxrens.cli.schema.ensemble",
+                fromlist=["NPTEnsembleSpec"],
+            ).NPTEnsembleSpec(pressure=0.01, **kw),
+             {"unknown_key": "x"}),
+            (lambda kw: __import__(
+                "jaxrens.cli.schema.init",
+                fromlist=["InitSpec"],
+            ).InitSpec(start_species="1 1", **kw),
+             {"unknown_field": 42}),
+            (lambda kw: __import__(
+                "jaxrens.cli.schema.cell",
+                fromlist=["CellSpec"],
+            ).CellSpec(max_volume_per_atom=100.0, **kw),
+             {"mystery_field": True}),
+            (lambda kw: __import__(
+                "jaxrens.cli.schema.output",
+                fromlist=["OutputSpec"],
+            ).OutputSpec(**kw),
+             {"bogus_output_field": True}),
+        ],
+        ids=[
+            "root", "run", "backend",
+            "move", "termination_iteration", "adaptation_policy",
+            "adaptation", "nvt_ensemble", "npt_ensemble",
+            "init", "cell", "output",
+        ],
+    )
+    def test_extra_field_rejected(self, spec_factory, bogus):
         with pytest.raises(ValidationError):
-            RootSpec.model_validate(d)
+            spec_factory(bogus)
 
 
 # ---------------------------------------------------------------------------
@@ -349,13 +407,6 @@ class TestMixedMoves:
         assert resolved.move_descriptors[1].name == "rw_fast"
         assert resolved.move_descriptors[0].step_size != resolved.move_descriptors[1].step_size
 
-    def test_extra_field_on_spec_raises(self):
-        d = _minimal_dict()
-        d["moves"] = [{"type": "random_walk", "n_reflect": 5}]
-        with pytest.raises(ValidationError):
-            RootSpec.model_validate(d)
-
-
 # ---------------------------------------------------------------------------
 # 16. BackendSpec discriminated union: per-type instantiation
 # ---------------------------------------------------------------------------
@@ -493,20 +544,6 @@ class TestTerminationDiscriminatedUnion:
         with pytest.raises(ValidationError):
             ta.validate_python({"type": "nonexistent_criterion"})
 
-    def test_extra_field_rejected_on_iteration(self):
-        from pydantic import TypeAdapter, ValidationError
-        from jaxrens.cli.schema.termination import TerminationSpec
-        ta = TypeAdapter(TerminationSpec)
-        with pytest.raises(ValidationError):
-            ta.validate_python({"type": "iteration", "max_iterations": 5, "bogus": 1})
-
-    def test_extra_field_rejected_on_energy(self):
-        from pydantic import TypeAdapter, ValidationError
-        from jaxrens.cli.schema.termination import TerminationSpec
-        ta = TypeAdapter(TerminationSpec)
-        with pytest.raises(ValidationError):
-            ta.validate_python({"type": "energy", "min_energy": -5.0, "extra": True})
-
     def test_single_dict_termination_normalized_to_list(self):
         d = _minimal_dict()
         d["termination"] = {"type": "iteration", "max_iterations": 7}
@@ -544,17 +581,6 @@ class TestAdaptationSpec:
             root = RootSpec.model_validate(d)
         assert root.adaptation.adjust_interval == 50
         assert root.adaptation.full_auto is True
-
-    def test_adaptation_extra_field_rejected(self):
-        d = _minimal_dict()
-        d["adaptation"] = {"bogus_field": True}
-        with pytest.raises(ValidationError):
-            RootSpec.model_validate(d)
-
-    def test_adaptation_policy_extra_field_rejected(self):
-        from jaxrens.cli.schema.adaptation import AdaptationPolicy
-        with pytest.raises(ValidationError):
-            AdaptationPolicy(min_rate=0.3, bogus=1)
 
     def test_default_adaptation_config_round_trip(self):
         d = _minimal_dict()
@@ -617,16 +643,6 @@ class TestEnsembleSpec:
         ta = TypeAdapter(EnsembleSpec)
         with pytest.raises(ValidationError):
             ta.validate_python({"type": "nonexistent_ensemble"})
-
-    def test_nvt_extra_field_rejected(self):
-        from jaxrens.cli.schema.ensemble import NVTEnsembleSpec
-        with pytest.raises(ValidationError):
-            NVTEnsembleSpec(bogus=1)
-
-    def test_npt_extra_field_rejected(self):
-        from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-        with pytest.raises(ValidationError):
-            NPTEnsembleSpec(pressure=0.01, unknown_key="x")
 
     def test_nvt_in_root_config_default(self):
         from jaxrens.cli.schema.ensemble import NVTEnsembleSpec
@@ -957,11 +973,6 @@ class TestInitSpec:
         assert cfg.initial_walk.n_walks == 0
         assert cfg.initial_walk.walklength == 100
 
-    def test_extra_field_rejected(self):
-        from jaxrens.cli.schema.init import InitSpec
-        with pytest.raises(ValidationError):
-            InitSpec(start_species="1 1", unknown_field=42)
-
     def test_yaml_round_trip_init(self):
         from jaxrens.cli.schema.init import InitSpec
         cfg = InitSpec(
@@ -993,11 +1004,6 @@ class TestCellSpec:
         assert cfg.min_volume_per_atom == pytest.approx(1.0)
         assert cfg.min_aspect_ratio == pytest.approx(0.8)
         assert cfg.flat_V_prior is False
-
-    def test_extra_field_rejected(self):
-        from jaxrens.cli.schema.cell import CellSpec
-        with pytest.raises(ValidationError):
-            CellSpec(max_volume_per_atom=100.0, mystery_field=True)
 
     def test_custom_values_accepted(self):
         from jaxrens.cli.schema.cell import CellSpec
@@ -1062,11 +1068,6 @@ class TestExtendedOutputSpec:
         schema = OutputSpec(save_acc_rates=True, acc_rates_interval=10)
         assert schema.save_acc_rates is True
         assert schema.acc_rates_interval == 10
-
-    def test_extra_field_still_rejected(self):
-        from jaxrens.cli.schema.output import OutputSpec
-        with pytest.raises(ValidationError):
-            OutputSpec(bogus_output_field=True)
 
     def test_yaml_round_trip_extended_output(self):
         from jaxrens.cli.schema.output import OutputSpec

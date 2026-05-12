@@ -122,7 +122,15 @@ def _heat_capacity_1d(
     n_live: int | jnp.ndarray,
     n_cull: int = 1,
 ) -> jnp.ndarray:
-    """Heat capacity for a single 1-D dead_energies array."""
+    """Heat capacity for a single 1-D dead_energies array.
+
+    Computes ``β² · Var(E)`` where ``Var(E) = Σ w_i (E_i - <E>)²``.  The
+    deviation form is used in place of the algebraic ``<E²> - <E>²``
+    identity to avoid catastrophic cancellation at low T (where the
+    distribution collapses onto a single walker, so both moments are
+    close to ``E_min²`` and their difference is dominated by float noise
+    — visible as wild spikes / negative Cv in fp32).
+    """
     n_dead = dead_energies.shape[0]
     log_w_dead = _calc_log_weights_1d(n_dead, n_live, n_cull)
     log_w_live = _calc_log_weights_live_1d(n_dead, n_live, n_cull)
@@ -136,8 +144,8 @@ def _heat_capacity_1d(
     w = jnp.exp(log_unnorm - log_Z)
 
     mean_E = jnp.sum(w * all_E)
-    mean_E2 = jnp.sum(w * all_E**2)
-    return beta**2 * (mean_E2 - mean_E**2)
+    var_E = jnp.sum(w * (all_E - mean_E) ** 2)
+    return beta**2 * var_E
 
 
 def _expectation_1d(

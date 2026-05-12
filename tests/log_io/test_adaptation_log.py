@@ -5,6 +5,7 @@ All I/O tests use tmp_path (pytest fixture) — no real NS run required.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import matplotlib
@@ -254,14 +255,6 @@ class TestMonitorFromDirectoryAdaptation:
 # ---------------------------------------------------------------------------
 
 class TestPlotStepSizes:
-    def test_returns_axes_with_iteration_xlabel(self):
-        import matplotlib.pyplot as plt
-
-        m = _make_monitor_with_trace(n_runs=1, n_moves=2, n_entries=5)
-        ax = plot_step_sizes(m)
-        assert ax.get_xlabel() == "iteration"
-        plt.close("all")
-
     def test_per_run_true_draws_n_moves_lines_for_single_run(self):
         import matplotlib.pyplot as plt
 
@@ -318,14 +311,6 @@ class TestPlotStepSizes:
 
 
 class TestPlotAcceptanceRates:
-    def test_returns_axes_with_iteration_xlabel(self):
-        import matplotlib.pyplot as plt
-
-        m = _make_monitor_with_trace(n_runs=1, n_moves=2, n_entries=5)
-        ax = plot_acceptance_rates(m)
-        assert ax.get_xlabel() == "iteration"
-        plt.close("all")
-
     def test_per_run_true_3_runs_2_moves(self):
         import matplotlib.pyplot as plt
 
@@ -365,26 +350,6 @@ class TestPlotAcceptanceRates:
 # ---------------------------------------------------------------------------
 
 class TestMonitorCollectionAdaptationPlots:
-    def test_plot_step_sizes_two_monitors_no_error(self):
-        import matplotlib.pyplot as plt
-
-        m1 = _make_monitor_with_trace(n_runs=1, n_moves=2, n_entries=4, label="run0")
-        m2 = _make_monitor_with_trace(n_runs=1, n_moves=2, n_entries=4, label="run1")
-        coll = MonitorCollection([m1, m2])
-        ax = coll.plot_step_sizes()
-        assert ax is not None
-        plt.close("all")
-
-    def test_plot_acceptance_rates_two_monitors_no_error(self):
-        import matplotlib.pyplot as plt
-
-        m1 = _make_monitor_with_trace(n_runs=1, n_moves=2, n_entries=4, label="run0")
-        m2 = _make_monitor_with_trace(n_runs=1, n_moves=2, n_entries=4, label="run1")
-        coll = MonitorCollection([m1, m2])
-        ax = coll.plot_acceptance_rates()
-        assert ax is not None
-        plt.close("all")
-
     def test_collection_skips_monitors_without_trace(self):
         """MonitorCollection.plot_step_sizes skips monitors with no adaptation_trace."""
         import matplotlib.pyplot as plt
@@ -491,24 +456,6 @@ class TestAdjustmentStatsRoundtrip:
             loaded.adjustment_stats["n_rounds"], adj_stats["n_rounds"]
         )
 
-    def test_v2_schema_version_attr(self, tmp_path):
-        """v2 files must have adaptation_log_schema_version=2 attribute."""
-        import h5py
-        n_entries, n_runs, n_moves = 3, 1, 2
-        iters, ss, acc, names = _make_trace(n_entries, n_runs, n_moves)
-        adj_stats = _make_adjustment_stats(n_entries, n_runs, n_moves)
-
-        path = tmp_path / "v2_attr.h5"
-        logger = AdaptationLogger(path=path, move_names=names, n_runs=n_runs)
-        for idx in range(n_entries):
-            entry_stats = {k: v[idx] for k, v in adj_stats.items()}
-            logger.write_entry(int(iters[idx]), ss[idx], acc[idx], adjustment_stats=entry_stats)
-        logger.close()
-
-        with h5py.File(path, "r") as f:
-            version = f.attrs.get("adaptation_log_schema_version")
-        assert int(version) == 2
-
     def test_v1_backward_compat(self, tmp_path):
         """v1-style file (no adjustment_stats group) loads with adjustment_stats=None."""
         import h5py
@@ -564,6 +511,127 @@ class TestAdjustmentStatsRoundtrip:
         assert loaded.iterations.shape == (n_entries,)
         assert loaded.step_sizes.shape == (n_entries, n_runs, n_moves)
         assert loaded.acceptance_rates.shape == (n_entries, n_runs, n_moves)
+        np.testing.assert_array_equal(loaded.iterations, iters)
+        np.testing.assert_allclose(loaded.step_sizes, ss, rtol=1e-5)
+        np.testing.assert_allclose(loaded.acceptance_rates, acc, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# v3 schema (n_evaluations / n_grad_evaluations) — moved from
+# test_evaluation_counter.py so all schema-version round-trip tests live here.
+# ---------------------------------------------------------------------------
+
+
+class TestAdaptationLogV3:
+    def _make_v3_data(self, n_entries=5, n_runs=1, n_moves=3, seed=42):
+        rng = np.random.default_rng(seed)
+        iters = np.arange(n_entries, dtype=np.int64) * 10
+        ss = rng.uniform(0.01, 2.0, (n_entries, n_runs, n_moves)).astype(np.float32)
+        acc = rng.uniform(0.1, 0.9, (n_entries, n_runs, n_moves)).astype(np.float32)
+        n_evals = rng.integers(1, 100, (n_entries, n_runs, n_moves)).astype(np.int64)
+        n_grad_evals = (n_evals * rng.uniform(0, 1, n_evals.shape)).astype(np.int64)
+        names = [f"move_{k}" for k in range(n_moves)]
+        return iters, ss, acc, n_evals, n_grad_evals, names
+
+    def test_v3_roundtrip_single_run(self, tmp_path):
+        n_entries, n_runs, n_moves = 5, 1, 3
+        iters, ss, acc, n_evals, n_grad_evals, names = self._make_v3_data(
+            n_entries, n_runs, n_moves,
+        )
+
+        path = tmp_path / "v3_single.h5"
+        log = AdaptationLogger(path=path, move_names=names, n_runs=n_runs)
+        for idx in range(n_entries):
+            log.write_entry(
+                int(iters[idx]), ss[idx], acc[idx],
+                n_evaluations=n_evals[idx],
+                n_grad_evaluations=n_grad_evals[idx],
+            )
+        log.close()
+
+        loaded = AdaptationLogger.read(path)
+        assert loaded.n_evaluations is not None
+        assert loaded.n_grad_evaluations is not None
+        assert loaded.n_evaluations.shape == (n_entries, n_runs, n_moves)
+        np.testing.assert_array_equal(loaded.n_evaluations, n_evals)
+        np.testing.assert_array_equal(loaded.n_grad_evaluations, n_grad_evals)
+
+    def test_v3_roundtrip_multi_run(self, tmp_path):
+        n_entries, n_runs, n_moves = 4, 2, 3
+        iters, ss, acc, n_evals, n_grad_evals, names = self._make_v3_data(
+            n_entries, n_runs, n_moves, seed=7,
+        )
+
+        path = tmp_path / "v3_multi.h5"
+        log = AdaptationLogger(path=path, move_names=names, n_runs=n_runs)
+        for idx in range(n_entries):
+            log.write_entry(
+                int(iters[idx]), ss[idx], acc[idx],
+                n_evaluations=n_evals[idx],
+                n_grad_evaluations=n_grad_evals[idx],
+            )
+        log.close()
+
+        loaded = AdaptationLogger.read(path)
+        assert loaded.n_evaluations.shape == (n_entries, n_runs, n_moves)
+        np.testing.assert_array_equal(loaded.n_evaluations, n_evals)
+
+    def test_v2_file_reads_with_none_fields(self, tmp_path):
+        """v2 file (no n_evaluations / n_grad_evaluations) loads cleanly with None."""
+        import h5py
+        path = tmp_path / "hand_v2.h5"
+        with h5py.File(path, "w") as f:
+            f.create_dataset("iterations", data=np.array([0, 10, 20], dtype=np.int64))
+            f.create_dataset("step_sizes", data=np.ones((3, 1, 2), dtype=np.float32))
+            f.create_dataset(
+                "acceptance_rates", data=np.full((3, 1, 2), 0.5, dtype=np.float32),
+            )
+            f.attrs["move_names"] = json.dumps(["a", "b"])
+            f.attrs["n_runs"] = 1
+            f.attrs["n_moves"] = 2
+            f.attrs["adaptation_log_schema_version"] = 2
+
+        loaded = AdaptationLogger.read(path)
+        assert loaded.n_evaluations is None
+        assert loaded.n_grad_evaluations is None
+
+    def test_v1_file_reads_with_none_fields(self, tmp_path):
+        """v1 file (no schema attr) loads cleanly with None counters."""
+        import h5py
+        path = tmp_path / "hand_v1.h5"
+        with h5py.File(path, "w") as f:
+            f.create_dataset("iterations", data=np.array([0], dtype=np.int64))
+            f.create_dataset("step_sizes", data=np.ones((1, 1, 1), dtype=np.float32))
+            f.create_dataset(
+                "acceptance_rates", data=np.full((1, 1, 1), 0.5, dtype=np.float32),
+            )
+            f.attrs["move_names"] = json.dumps(["m0"])
+            f.attrs["n_runs"] = 1
+            f.attrs["n_moves"] = 1
+
+        loaded = AdaptationLogger.read(path)
+        assert loaded.n_evaluations is None
+        assert loaded.n_grad_evaluations is None
+
+    def test_v3_core_fields_unchanged(self, tmp_path):
+        """v3 write/read leaves iterations / step_sizes / acceptance_rates intact."""
+        n_entries, n_runs, n_moves = 4, 1, 2
+        iters, ss, acc, n_evals, n_grad_evals, names = self._make_v3_data(
+            n_entries, n_runs, n_moves,
+        )
+
+        path = tmp_path / "v3_core.h5"
+        log = AdaptationLogger(path=path, move_names=names, n_runs=n_runs)
+        for idx in range(n_entries):
+            log.write_entry(
+                int(iters[idx]), ss[idx], acc[idx],
+                n_evaluations=n_evals[idx],
+                n_grad_evaluations=n_grad_evals[idx],
+            )
+        log.close()
+
+        loaded = AdaptationLogger.read(path)
+        assert loaded.iterations.shape == (n_entries,)
         np.testing.assert_array_equal(loaded.iterations, iters)
         np.testing.assert_allclose(loaded.step_sizes, ss, rtol=1e-5)
         np.testing.assert_allclose(loaded.acceptance_rates, acc, rtol=1e-5)

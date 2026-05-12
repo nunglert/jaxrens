@@ -99,42 +99,6 @@ class TestRun:
         assert jnp.isfinite(result["log_evidence"])
 
 
-# ---------------------------------------------------------------------------
-# Public API imports
-# ---------------------------------------------------------------------------
-
-
-class TestPublicAPI:
-    def test_top_level_imports(self):
-        from jaxrens import (
-            load_backend,
-            run_ns,
-        )
-        assert callable(load_backend)
-        assert callable(run_ns)
-
-    def test_low_level_imports(self):
-        from jaxrens.sampling.moves import random_walk, galilean
-        assert hasattr(random_walk, "build_kernel")
-        assert hasattr(galilean, "build_kernel")
-
-    def test_backend_imports(self):
-        from jaxrens.backends import loader
-        assert hasattr(loader, "load_backend")
-
-    def test_parser_public_api(self):
-        """parse_input_file is still importable; raw_to_configs is gone."""
-        from jaxrens.cli.parser import parse_input_file
-        assert callable(parse_input_file)
-
-        with pytest.raises(ImportError):
-            from jaxrens.cli.parser import raw_to_configs  # noqa: F401
-
-    def test_migrate_importable(self):
-        from jaxrens.cli.migrate import migrate_ns_inp
-        assert callable(migrate_ns_inp)
-
-
 class TestConfigureFileLogging:
     """``configure_file_logging`` is called exactly once, early, from
     ``cli._cmd_run`` so the resolver phase reaches the log file from

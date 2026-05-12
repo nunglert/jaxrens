@@ -1,7 +1,12 @@
-"""Unit tests for jaxrens.init.walker_set.load_walker_set.
+"""Unit tests for the structure / walker-set loaders.
 
-Covers extxyz and HDF5 formats, dispatch, error conditions, and round-trip
-correctness.
+Covers:
+- ``jaxrens.init.structure.load_structure`` (single-frame extxyz)
+- ``jaxrens.init.walker_set.load_walker_set`` (multi-frame extxyz, HDF5)
+
+Resolver-level Mode B / Mode C integration tests live alongside the loader
+tests for now; the schema/resolve reorganization (Tier 2.1) will move them
+into ``test_resolve.py``.
 """
 
 from __future__ import annotations
@@ -14,12 +19,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from jaxrens.init.structure import load_structure
 from jaxrens.init.walker_set import WalkerSet, load_walker_set
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Shared helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_frames(
     n_frames: int,
@@ -33,19 +40,29 @@ def _make_frames(
     n_atoms = len(symbols)
     cell = np.eye(3) * cell_size
     rng = np.random.default_rng(0)
-    for i in range(n_frames):
+    for _ in range(n_frames):
         pos = rng.uniform(0.5, cell_size - 0.5, size=(n_atoms, 3)).astype(np.float32)
         atoms = ase.Atoms(symbols=list(symbols), positions=pos, cell=cell, pbc=True)
         frames.append(atoms)
     return frames
 
 
-def _write_extxyz(tmp_path: Path, frames: list, name: str = "walkers.extxyz") -> Path:
+def _write_extxyz(tmp_path: Path, frames, name: str = "walkers.extxyz") -> Path:
     import ase.io
 
     p = tmp_path / name
     ase.io.write(str(p), frames, format="extxyz")
     return p
+
+
+def _write_single_extxyz(
+    path: Path, symbols: list[str], positions: np.ndarray, cell: np.ndarray
+) -> None:
+    """Write a single-frame extxyz file."""
+    import ase
+    import ase.io
+    atoms = ase.Atoms(symbols=symbols, positions=positions, cell=cell, pbc=True)
+    ase.io.write(str(path), atoms)
 
 
 def _write_hdf5(
@@ -66,9 +83,176 @@ def _write_hdf5(
     return p
 
 
-# ---------------------------------------------------------------------------
-# extxyz: round-trip
-# ---------------------------------------------------------------------------
+def _cell_cfg_permissive():
+    from jaxrens.cli.schema.cell import CellSpec
+    return CellSpec(
+        max_volume_per_atom=10000.0,
+        min_volume_per_atom=0.01,
+        min_aspect_ratio=0.001,
+    )
+
+
+# ===========================================================================
+# load_structure (single-frame extxyz)
+# ===========================================================================
+
+
+class TestLoadStructureRoundTrip:
+    def test_positions_shape(self, tmp_path):
+        pos = np.array([[0.0, 0.0, 0.0], [2.5, 2.5, 2.5]], dtype=np.float32)
+        cell = np.diag([5.0, 5.0, 5.0]).astype(np.float32)
+        p = tmp_path / "two_si.extxyz"
+        _write_single_extxyz(p, ["Si", "Si"], pos, cell)
+        positions, _, _, _ = load_structure(p)
+        assert positions.shape == (2, 3)
+
+    def test_positions_values(self, tmp_path):
+        pos = np.array([[0.0, 0.0, 0.0], [2.5, 2.5, 2.5]], dtype=np.float32)
+        cell = np.diag([5.0, 5.0, 5.0]).astype(np.float32)
+        p = tmp_path / "si.extxyz"
+        _write_single_extxyz(p, ["Si", "Si"], pos, cell)
+        positions, _, _, _ = load_structure(p)
+        np.testing.assert_allclose(np.array(positions), pos, atol=1e-5)
+
+    def test_cell_shape(self, tmp_path):
+        pos = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+        cell = np.diag([4.0, 4.0, 4.0]).astype(np.float32)
+        p = tmp_path / "single.extxyz"
+        _write_single_extxyz(p, ["Si"], pos, cell)
+        _, _, loaded_cell, _ = load_structure(p)
+        assert loaded_cell.shape == (3, 3)
+
+    def test_cell_values(self, tmp_path):
+        pos = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+        cell = np.diag([4.0, 5.0, 6.0]).astype(np.float32)
+        p = tmp_path / "single.extxyz"
+        _write_single_extxyz(p, ["Si"], pos, cell)
+        _, _, loaded_cell, _ = load_structure(p)
+        np.testing.assert_allclose(np.array(loaded_cell), cell, atol=1e-5)
+
+    def test_dtypes(self, tmp_path):
+        pos = np.zeros((2, 3), dtype=np.float64)
+        cell = np.eye(3) * 5.0
+        p = tmp_path / "dtype.extxyz"
+        _write_single_extxyz(p, ["Si", "O"], pos, cell)
+        positions, types, loaded_cell, _ = load_structure(p)
+        assert positions.dtype == jnp.float32
+        assert types.dtype == jnp.int32
+        assert loaded_cell.dtype == jnp.float32
+
+    def test_symbol_map_single_element(self, tmp_path):
+        pos = np.zeros((3, 3))
+        cell = np.eye(3) * 5.0
+        p = tmp_path / "three_si.extxyz"
+        _write_single_extxyz(p, ["Si", "Si", "Si"], pos, cell)
+        _, _, _, symbol_map = load_structure(p)
+        assert symbol_map == {0: "Si"}
+
+    def test_single_atom(self, tmp_path):
+        pos = np.zeros((1, 3))
+        cell = np.eye(3) * 4.0
+        p = tmp_path / "one.extxyz"
+        _write_single_extxyz(p, ["Si"], pos, cell)
+        positions, types, _, symbol_map = load_structure(p)
+        assert positions.shape == (1, 3)
+        assert types.shape == (1,)
+        assert symbol_map == {0: "Si"}
+
+    def test_path_as_string(self, tmp_path):
+        pos = np.zeros((1, 3))
+        cell = np.eye(3) * 4.0
+        p = tmp_path / "str.extxyz"
+        _write_single_extxyz(p, ["Si"], pos, cell)
+        positions, _, _, _ = load_structure(str(p))
+        assert positions.shape == (1, 3)
+
+
+class TestLoadStructureMultiElement:
+    def test_si2o3_symbol_map(self, tmp_path):
+        pos = np.zeros((5, 3))
+        pos[1, 0] = 1.5
+        pos[2, 1] = 1.5
+        pos[3, 2] = 1.5
+        pos[4, 0] = 3.0
+        cell = np.eye(3) * 6.0
+        p = tmp_path / "si2o3.extxyz"
+        _write_single_extxyz(p, ["Si", "Si", "O", "O", "O"], pos, cell)
+        _, types, _, symbol_map = load_structure(p)
+        assert symbol_map == {0: "Si", 1: "O"}
+        assert list(np.array(types)) == [0, 0, 1, 1, 1]
+
+    def test_noncontiguous_ordering_first_appearance(self, tmp_path):
+        pos = np.zeros((4, 3))
+        for i in range(4):
+            pos[i, 0] = i * 1.5
+        cell = np.eye(3) * 8.0
+        p = tmp_path / "noncontig.extxyz"
+        _write_single_extxyz(p, ["Si", "O", "Si", "O"], pos, cell)
+        _, types, _, symbol_map = load_structure(p)
+        assert symbol_map[0] == "Si"
+        assert symbol_map[1] == "O"
+        assert list(np.array(types)) == [0, 1, 0, 1]
+
+    def test_three_species(self, tmp_path):
+        pos = np.zeros((3, 3))
+        for i in range(3):
+            pos[i, 0] = i * 2.0
+        cell = np.eye(3) * 7.0
+        p = tmp_path / "ternary.extxyz"
+        _write_single_extxyz(p, ["Si", "O", "N"], pos, cell)
+        _, types, _, symbol_map = load_structure(p)
+        assert symbol_map == {0: "Si", 1: "O", 2: "N"}
+        assert list(np.array(types)) == [0, 1, 2]
+
+
+class TestLoadStructureErrors:
+    def test_nonexistent_path_raises_file_not_found(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="not found"):
+            load_structure(tmp_path / "does_not_exist.extxyz")
+
+    def test_multi_frame_raises_value_error(self, tmp_path):
+        import ase
+        import ase.io
+        pos = np.zeros((1, 3))
+        cell = np.eye(3) * 4.0
+        atoms = ase.Atoms(["Si"], positions=pos, cell=cell, pbc=True)
+        p = tmp_path / "multi.extxyz"
+        ase.io.write(str(p), [atoms, atoms])
+        with pytest.raises(ValueError, match="single-frame"):
+            load_structure(p)
+
+    def test_zero_cell_raises_value_error(self, tmp_path):
+        import ase
+        import ase.io
+        pos = np.zeros((1, 3))
+        atoms = ase.Atoms(["Si"], positions=pos)
+        p = tmp_path / "nocell.extxyz"
+        ase.io.write(str(p), atoms)
+        with pytest.raises(ValueError, match="no simulation cell"):
+            load_structure(p)
+
+    def test_error_message_includes_path(self, tmp_path):
+        missing = tmp_path / "missing_file.xyz"
+        with pytest.raises(FileNotFoundError) as exc_info:
+            load_structure(missing)
+        assert "missing_file.xyz" in str(exc_info.value)
+
+    def test_multi_frame_error_message_includes_count(self, tmp_path):
+        import ase
+        import ase.io
+        pos = np.zeros((1, 3))
+        cell = np.eye(3) * 4.0
+        atoms = ase.Atoms(["Si"], positions=pos, cell=cell, pbc=True)
+        p = tmp_path / "three_frames.extxyz"
+        ase.io.write(str(p), [atoms, atoms, atoms])
+        with pytest.raises(ValueError, match="3"):
+            load_structure(p)
+
+
+# ===========================================================================
+# load_walker_set (multi-frame extxyz / HDF5)
+# ===========================================================================
+
 
 class TestExtxyzRoundTrip:
     def test_positions_shape(self, tmp_path):
@@ -89,23 +273,13 @@ class TestExtxyzRoundTrip:
         ws = load_walker_set(p, n_live_expected=4)
         assert ws.cells.shape == (4, 3, 3)
 
-    def test_positions_dtype(self, tmp_path):
+    def test_dtypes(self, tmp_path):
         frames = _make_frames(4, ["Si"])
         p = _write_extxyz(tmp_path, frames)
         ws = load_walker_set(p, n_live_expected=4)
         assert ws.positions.dtype == jnp.float32
-
-    def test_cells_dtype(self, tmp_path):
-        frames = _make_frames(4, ["Si"])
-        p = _write_extxyz(tmp_path, frames)
-        ws = load_walker_set(p, n_live_expected=4)
-        assert ws.cells.dtype == jnp.float32
-
-    def test_types_dtype(self, tmp_path):
-        frames = _make_frames(4, ["Si"])
-        p = _write_extxyz(tmp_path, frames)
-        ws = load_walker_set(p, n_live_expected=4)
         assert ws.types.dtype == jnp.int32
+        assert ws.cells.dtype == jnp.float32
 
     def test_positions_values_match(self, tmp_path):
         frames = _make_frames(4, ["Si", "O"])
@@ -118,22 +292,12 @@ class TestExtxyzRoundTrip:
                 atol=1e-5,
             )
 
-    def test_n_live_dimension(self, tmp_path):
-        frames = _make_frames(4, ["Si"])
-        p = _write_extxyz(tmp_path, frames)
-        ws = load_walker_set(p, n_live_expected=4)
-        assert ws.positions.shape[0] == 4
-
     def test_returns_walker_set_instance(self, tmp_path):
         frames = _make_frames(3, ["Si"])
         p = _write_extxyz(tmp_path, frames)
         ws = load_walker_set(p, n_live_expected=3)
         assert isinstance(ws, WalkerSet)
 
-
-# ---------------------------------------------------------------------------
-# extxyz: multi-element symbol_map
-# ---------------------------------------------------------------------------
 
 class TestExtxyzSymbolMap:
     def test_si2o3_symbol_map_first_appearance(self, tmp_path):
@@ -162,18 +326,8 @@ class TestExtxyzSymbolMap:
         assert ws.symbol_map == {0: "Si", 1: "O", 2: "N"}
 
 
-# ---------------------------------------------------------------------------
-# extxyz: error conditions
-# ---------------------------------------------------------------------------
-
 class TestExtxyzErrors:
     def test_frame_count_mismatch_raises(self, tmp_path):
-        frames = _make_frames(4, ["Si"])
-        p = _write_extxyz(tmp_path, frames)
-        with pytest.raises(ValueError, match="4"):
-            load_walker_set(p, n_live_expected=5)
-
-    def test_frame_count_mismatch_message_has_expected_count(self, tmp_path):
         frames = _make_frames(4, ["Si"])
         p = _write_extxyz(tmp_path, frames)
         with pytest.raises(ValueError, match="n_live=5"):
@@ -213,10 +367,6 @@ class TestExtxyzErrors:
             load_walker_set(p, n_live_expected=2)
 
 
-# ---------------------------------------------------------------------------
-# HDF5: round-trip
-# ---------------------------------------------------------------------------
-
 class TestHDF5RoundTrip:
     def _make_arrays(self, n_live: int = 4, n_atoms: int = 2):
         rng = np.random.default_rng(1)
@@ -226,40 +376,20 @@ class TestHDF5RoundTrip:
         symbol_map = {0: "Si"}
         return positions, types, cells, symbol_map
 
-    def test_positions_shape(self, tmp_path):
+    def test_shapes(self, tmp_path):
         pos, types, cells, sm = self._make_arrays()
         p = _write_hdf5(tmp_path, pos, types, cells, sm)
         ws = load_walker_set(p, n_live_expected=4)
         assert ws.positions.shape == (4, 2, 3)
-
-    def test_types_shape(self, tmp_path):
-        pos, types, cells, sm = self._make_arrays()
-        p = _write_hdf5(tmp_path, pos, types, cells, sm)
-        ws = load_walker_set(p, n_live_expected=4)
         assert ws.types.shape == (4, 2)
-
-    def test_cells_shape(self, tmp_path):
-        pos, types, cells, sm = self._make_arrays()
-        p = _write_hdf5(tmp_path, pos, types, cells, sm)
-        ws = load_walker_set(p, n_live_expected=4)
         assert ws.cells.shape == (4, 3, 3)
 
-    def test_positions_values(self, tmp_path):
+    def test_values_match(self, tmp_path):
         pos, types, cells, sm = self._make_arrays()
         p = _write_hdf5(tmp_path, pos, types, cells, sm)
         ws = load_walker_set(p, n_live_expected=4)
         np.testing.assert_allclose(np.array(ws.positions), pos, atol=1e-5)
-
-    def test_types_values(self, tmp_path):
-        pos, types, cells, sm = self._make_arrays()
-        p = _write_hdf5(tmp_path, pos, types, cells, sm)
-        ws = load_walker_set(p, n_live_expected=4)
         np.testing.assert_array_equal(np.array(ws.types), types)
-
-    def test_cells_values(self, tmp_path):
-        pos, types, cells, sm = self._make_arrays()
-        p = _write_hdf5(tmp_path, pos, types, cells, sm)
-        ws = load_walker_set(p, n_live_expected=4)
         np.testing.assert_allclose(np.array(ws.cells), cells, atol=1e-5)
 
     def test_symbol_map_restored(self, tmp_path):
@@ -268,22 +398,13 @@ class TestHDF5RoundTrip:
         ws = load_walker_set(p, n_live_expected=4)
         assert ws.symbol_map == {0: "Si"}
 
-    def test_positions_dtype(self, tmp_path):
+    def test_dtypes(self, tmp_path):
         pos, types, cells, sm = self._make_arrays()
         p = _write_hdf5(tmp_path, pos, types, cells, sm)
         ws = load_walker_set(p, n_live_expected=4)
         assert ws.positions.dtype == jnp.float32
-
-    def test_types_dtype(self, tmp_path):
-        pos, types, cells, sm = self._make_arrays()
-        p = _write_hdf5(tmp_path, pos, types, cells, sm)
-        ws = load_walker_set(p, n_live_expected=4)
         assert ws.types.dtype == jnp.int32
 
-
-# ---------------------------------------------------------------------------
-# HDF5: error conditions
-# ---------------------------------------------------------------------------
 
 class TestHDF5Errors:
     def test_missing_positions_raises(self, tmp_path):
@@ -331,27 +452,11 @@ class TestHDF5Errors:
 
         assert isinstance(ws.symbol_map, dict)
         assert any("symbol_map" in r.message for r in caplog.records)
-
-    def test_no_symbol_map_integer_coded_keys(self, tmp_path, caplog):
-        import logging
-
-        pos = np.zeros((2, 2, 3), dtype=np.float32)
-        types = np.array([[0, 1], [0, 1]], dtype=np.int32)
-        cells = np.stack([np.eye(3) * 5.0] * 2).astype(np.float32)
-        p = _write_hdf5(tmp_path, pos, types, cells, symbol_map=None)
-
-        with caplog.at_level(logging.WARNING, logger="jaxrens.init.walker_set"):
-            ws = load_walker_set(p, n_live_expected=2)
-
         assert 0 in ws.symbol_map
         assert 1 in ws.symbol_map
 
 
-# ---------------------------------------------------------------------------
-# Dispatch
-# ---------------------------------------------------------------------------
-
-class TestDispatch:
+class TestWalkerSetDispatch:
     def test_unsupported_extension_raises(self, tmp_path):
         p = tmp_path / "walkers.txt"
         p.write_text("dummy")
@@ -391,82 +496,31 @@ class TestDispatch:
         assert ws.positions.shape == (2, 1, 3)
 
 
-# ---------------------------------------------------------------------------
-# Mode C resolver tests (moved from test_schema.py::TestInitSpecResolverModeC)
-# ---------------------------------------------------------------------------
-
-def _make_walker_set_extxyz(
-    tmp_path: Path,
-    n_live: int = 4,
-    symbols: list[str] | None = None,
-    cell_size: float = 6.0,
-    name: str = "walkers.extxyz",
-) -> Path:
-    """Write a minimal multi-frame extxyz file for Mode C resolver tests."""
-    import ase, ase.io as _ase_io
-
-    if symbols is None:
-        symbols = ["Si"]
-    n_atoms = len(symbols)
-    cell = np.eye(3) * cell_size
-    rng = np.random.default_rng(42)
-    frames = []
-    for _ in range(n_live):
-        pos = rng.uniform(0.5, cell_size - 0.5, (n_atoms, 3)).astype(np.float32)
-        frames.append(ase.Atoms(list(symbols), positions=pos, cell=cell, pbc=True))
-    p = tmp_path / name
-    _ase_io.write(str(p), frames, format="extxyz")
-    return p
-
-
-def _make_walker_set_hdf5_resolver(
-    tmp_path: Path,
-    n_live: int = 4,
-    n_atoms: int = 1,
-    cell_size: float = 6.0,
-    symbol_map: dict | None = None,
-    name: str = "walkers.h5",
-) -> Path:
-    import json as _json
-
-    if symbol_map is None:
-        symbol_map = {0: "Si"}
-    rng = np.random.default_rng(7)
-    positions = rng.uniform(0.5, cell_size - 0.5, (n_live, n_atoms, 3)).astype(np.float32)
-    types = np.zeros((n_live, n_atoms), dtype=np.int32)
-    cells = np.stack([np.eye(3) * cell_size] * n_live).astype(np.float32)
-    p = tmp_path / name
-    with h5py.File(p, "w") as f:
-        f.create_dataset("positions", data=positions)
-        f.create_dataset("types", data=types)
-        f.create_dataset("cells", data=cells)
-        f.attrs["symbol_map"] = _json.dumps({str(k): v for k, v in symbol_map.items()})
-    return p
-
-
-def _cell_cfg_permissive():
-    from jaxrens.cli.schema.cell import CellSpec
-    return CellSpec(
-        max_volume_per_atom=10000.0,
-        min_volume_per_atom=0.01,
-        min_aspect_ratio=0.001,
-    )
+# ===========================================================================
+# Resolver-level Mode B / Mode C tests
+#
+# These belong logically with the resolver (test_resolve.py); they are kept
+# here for the time being so the merge of test_init_walker_set.py +
+# test_init_structure.py doesn't lose coverage. Tier 2.1 of the consolidation
+# plan will relocate them.
+# ===========================================================================
 
 
 class TestInitSpecResolverModeC:
-    """Mode C resolver tests: start_walker_set.
-
-    Moved verbatim from test_schema.py::TestInitSpecResolverModeC.
-    """
+    """Mode C resolver tests: start_walker_set (extxyz / HDF5)."""
 
     def test_extxyz_resolved_init_type(self, tmp_path):
         from jaxrens.cli.resolve import ResolvedInit, _resolve_init
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
-        p = _make_walker_set_extxyz(tmp_path, n_live=4, symbols=["Si"])
+        p = _write_extxyz(tmp_path, _make_frames(4, ["Si"]))
         cfg = InitSpec(start_walker_set=p)
-        result = _resolve_init(cfg, n_live=4, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        result = _resolve_init(
+            cfg, n_live=4, seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_cell_cfg_permissive(),
+        )
         assert isinstance(result, ResolvedInit)
 
     def test_extxyz_positions_shape(self, tmp_path):
@@ -474,9 +528,13 @@ class TestInitSpecResolverModeC:
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
-        p = _make_walker_set_extxyz(tmp_path, n_live=4, symbols=["Si", "Si"])
+        p = _write_extxyz(tmp_path, _make_frames(4, ["Si", "Si"]))
         cfg = InitSpec(start_walker_set=p)
-        result = _resolve_init(cfg, n_live=4, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        result = _resolve_init(
+            cfg, n_live=4, seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_cell_cfg_permissive(),
+        )
         assert result.initial_positions.shape == (4, 2, 3)
 
     def test_extxyz_types_shape(self, tmp_path):
@@ -484,9 +542,13 @@ class TestInitSpecResolverModeC:
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
-        p = _make_walker_set_extxyz(tmp_path, n_live=4, symbols=["Si", "Si"])
+        p = _write_extxyz(tmp_path, _make_frames(4, ["Si", "Si"]))
         cfg = InitSpec(start_walker_set=p)
-        result = _resolve_init(cfg, n_live=4, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        result = _resolve_init(
+            cfg, n_live=4, seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_cell_cfg_permissive(),
+        )
         assert result.initial_types.shape == (4, 2)
 
     def test_extxyz_symbol_map_correct(self, tmp_path):
@@ -494,136 +556,79 @@ class TestInitSpecResolverModeC:
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
-        p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si", "O", "O"])
+        p = _write_extxyz(tmp_path, _make_frames(3, ["Si", "O", "O"]))
         cfg = InitSpec(start_walker_set=p)
-        result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        result = _resolve_init(
+            cfg, n_live=3, seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_cell_cfg_permissive(),
+        )
         assert result.symbol_map == {0: "Si", 1: "O"}
-
-    def test_extxyz_energies_recomputed_not_from_file(self, tmp_path):
-        """Energies in the extxyz are stale; resolver must recompute with the backend."""
-        import ase, ase.io as _ase_io
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
-        cell = np.eye(3, dtype=np.float32) * 6.0
-        rng = np.random.default_rng(0)
-        frames = []
-        for _ in range(3):
-            pos = rng.uniform(0.5, 5.5, (1, 3)).astype(np.float32)
-            atoms = ase.Atoms(["Si"], positions=pos, cell=cell, pbc=True)
-            atoms.info["energy"] = -9999.0
-            frames.append(atoms)
-        p = tmp_path / "stale.extxyz"
-        _ase_io.write(str(p), frames, format="extxyz")
-
-        cfg = InitSpec(start_walker_set=p)
-        backend = create_harmonic()
-        result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=backend, cell_cfg=_cell_cfg_permissive())
-        assert result.initial_energies is not None
-        assert not jnp.any(jnp.isclose(result.initial_energies, jnp.float32(-9999.0)))
 
     def test_hdf5_positions_shape(self, tmp_path):
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
-        p = _make_walker_set_hdf5_resolver(tmp_path, n_live=5, n_atoms=2)
+        rng = np.random.default_rng(7)
+        positions = rng.uniform(0.5, 5.5, (5, 2, 3)).astype(np.float32)
+        types = np.zeros((5, 2), dtype=np.int32)
+        cells = np.stack([np.eye(3) * 6.0] * 5).astype(np.float32)
+        p = _write_hdf5(tmp_path, positions, types, cells, {0: "Si"})
         cfg = InitSpec(start_walker_set=p)
-        result = _resolve_init(cfg, n_live=5, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+        result = _resolve_init(
+            cfg, n_live=5, seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_cell_cfg_permissive(),
+        )
         assert result.initial_positions.shape == (5, 2, 3)
 
-    def test_hdf5_symbol_map_correct(self, tmp_path):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.backends.toy import create_harmonic
-
-        p = _make_walker_set_hdf5_resolver(tmp_path, n_live=3, n_atoms=1, symbol_map={0: "O"})
-        cfg = InitSpec(start_walker_set=p)
-        result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
-        assert result.symbol_map == {0: "O"}
-
-    def test_hdf5_energies_recomputed(self, tmp_path):
-        """Resolver must recompute energies regardless of what is stored in the file."""
-        import json as _json
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
-        rng = np.random.default_rng(5)
-        positions = rng.uniform(0, 5, (4, 1, 3)).astype(np.float32)
-        types = np.zeros((4, 1), dtype=np.int32)
-        cells = np.stack([np.eye(3) * 6.0] * 4).astype(np.float32)
-        p = tmp_path / "stale.h5"
-        with h5py.File(p, "w") as f:
-            f.create_dataset("positions", data=positions)
-            f.create_dataset("types", data=types)
-            f.create_dataset("cells", data=cells)
-            f.create_dataset("energies", data=np.full(4, -9999.0, dtype=np.float32))
-            f.attrs["symbol_map"] = _json.dumps({"0": "Si"})
-
-        cfg = InitSpec(start_walker_set=p)
-        backend = create_harmonic()
-        result = _resolve_init(cfg, n_live=4, seed=0, energy_backend=backend, cell_cfg=_cell_cfg_permissive())
-        assert result.initial_energies is not None
-        assert not jnp.any(jnp.isclose(result.initial_energies, jnp.float32(-9999.0)))
-
-    def test_random_initialise_pos_true_warning(self, tmp_path, caplog):
-        import logging
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.backends.toy import create_harmonic
-
-        p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si"])
-        cfg = InitSpec(start_walker_set=p, random_initialise_pos=True)
-        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
-        assert any("random_initialise_pos" in r.message or "randomiz" in r.message.lower()
-                   for r in caplog.records)
-
-    def test_random_initialise_pos_true_positions_verbatim(self, tmp_path, caplog):
+    def test_random_initialise_pos_true_keeps_file_positions(self, tmp_path, caplog):
         """With random_initialise_pos=True, positions must still come from the file."""
         import logging
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
-        p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si"])
+        p = _write_extxyz(tmp_path, _make_frames(3, ["Si"]))
         cfg = InitSpec(start_walker_set=p, random_initialise_pos=True)
         ws = load_walker_set(p, n_live_expected=3)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+            result = _resolve_init(
+                cfg, n_live=3, seed=0,
+                energy_backend=create_harmonic(),
+                cell_cfg=_cell_cfg_permissive(),
+            )
+        assert any(
+            "random_initialise_pos" in r.message or "randomiz" in r.message.lower()
+            for r in caplog.records
+        )
         np.testing.assert_allclose(
             np.array(result.initial_positions),
             np.array(ws.positions),
             atol=1e-5,
         )
 
-    def test_random_initialise_cell_true_warning(self, tmp_path, caplog):
-        import logging
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.backends.toy import create_harmonic
-
-        p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si"])
-        cfg = InitSpec(start_walker_set=p, random_initialise_cell=True)
-        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
-        assert any("random_initialise_cell" in r.message or "randomiz" in r.message.lower()
-                   for r in caplog.records)
-
-    def test_random_initialise_cell_true_cells_verbatim(self, tmp_path, caplog):
+    def test_random_initialise_cell_true_keeps_file_cells(self, tmp_path, caplog):
         """With random_initialise_cell=True, cells must still come from the file."""
         import logging
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.backends.toy import create_harmonic
 
-        p = _make_walker_set_extxyz(tmp_path, n_live=3, symbols=["Si"])
+        p = _write_extxyz(tmp_path, _make_frames(3, ["Si"]))
         cfg = InitSpec(start_walker_set=p, random_initialise_cell=True)
         ws = load_walker_set(p, n_live_expected=3)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=create_harmonic(), cell_cfg=_cell_cfg_permissive())
+            result = _resolve_init(
+                cfg, n_live=3, seed=0,
+                energy_backend=create_harmonic(),
+                cell_cfg=_cell_cfg_permissive(),
+            )
+        assert any(
+            "random_initialise_cell" in r.message or "randomiz" in r.message.lower()
+            for r in caplog.records
+        )
         np.testing.assert_allclose(
             np.array(result.initial_cells),
             np.array(ws.cells),
@@ -632,8 +637,7 @@ class TestInitSpecResolverModeC:
 
     def test_cell_config_violation_raises(self, tmp_path):
         """A walker cell that violates CellSpec bounds must raise RuntimeError."""
-        import ase, ase.io as _ase_io
-        import pytest as _pytest
+        import ase, ase.io
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.cli.schema.cell import CellSpec
@@ -641,7 +645,7 @@ class TestInitSpecResolverModeC:
         cell = np.eye(3, dtype=np.float32) * 6.0
         atoms = ase.Atoms(["Si"], positions=[[3.0, 3.0, 3.0]], cell=cell, pbc=True)
         p = tmp_path / "toosmall.extxyz"
-        _ase_io.write(str(p), [atoms], format="extxyz")
+        ase.io.write(str(p), [atoms], format="extxyz")
 
         strict_cfg = CellSpec(
             max_volume_per_atom=1.0,
@@ -649,52 +653,6 @@ class TestInitSpecResolverModeC:
             min_aspect_ratio=0.001,
         )
         cfg = InitSpec(start_walker_set=p)
-        with _pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError):
             _resolve_init(cfg, n_live=1, seed=0, cell_cfg=strict_cfg)
 
-    def test_mode_c_end_to_end_jit(self, tmp_path):
-        """Mode C resolver -> run_ns -> ns_step under JIT."""
-        import jax
-        import jax.numpy as _jnp
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import init_ns, ns_step
-        from jaxrens.sampling.move_kernel import MoveKernel
-        import jaxrens.sampling.moves.random_walk as rw_mod
-
-        p = _make_walker_set_extxyz(tmp_path, n_live=6, symbols=["Si"])
-        cfg = InitSpec(start_walker_set=p)
-        backend = create_harmonic()
-        result = _resolve_init(
-            cfg,
-            n_live=6,
-            seed=0,
-            energy_backend=backend,
-            cell_cfg=_cell_cfg_permissive(),
-        )
-
-        desc = MoveKernel(
-            name="random_walk",
-            build_kernel=rw_mod.build_kernel,
-            step_size=0.3,
-            weight=1.0,
-            kernel_kwargs={},
-            extra_state_fields={},
-        )
-        init_fn, step_fn, _ = build_mwg(backend, [desc])
-
-        key = jax.random.key(77)
-        ns_state = init_ns(
-            init_fn,
-            result.initial_positions,
-            result.initial_types,
-            result.initial_energies,
-            cells=result.initial_cells,
-            rng_key=key,
-        )
-
-        jit_ns_step = jax.jit(ns_step, static_argnames=("step_fn", "n_mcmc_steps"))
-        new_state, _ = jit_ns_step(ns_state, step_fn, n_mcmc_steps=2)
-        assert _jnp.isfinite(new_state.log_evidence) or new_state.n_dead == 0

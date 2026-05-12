@@ -57,6 +57,167 @@ class MonitorCollection:
             monitors.append(Monitor.from_directory(p, label=label, prefix=prefix))
         return cls(monitors)
 
+    @classmethod
+    def from_multi_run_directory(
+        cls,
+        path: Path | str,
+        *,
+        prefix: str = "ns",
+        prefer_final: bool = True,
+        labels: list[str] | None = None,
+    ) -> "MonitorCollection":
+        """Build a collection from a single multi-run output directory.
+
+        Multi-run NS (``run_ns_parallel`` / ``run_ns_multi_gpu``) writes one
+        combined checkpoint with leading batch shape ``(n_runs,)`` or
+        ``(G, P)`` plus per-replica ``<prefix>.runNN.energies`` files. This
+        constructor flattens the leading batch axes, reads each per-replica
+        energy log, and produces one ``Monitor`` per replica.
+
+        Convention: stored energies are treated as the full thermal variable
+        (``dead_volumes = live_volumes = None``).  When the run used
+        ``EnsembleBackend``, the stored energy is the NPT enthalpy
+        ``H = U + P*V``, so leaving volumes ``None`` yields
+        ``log Z_NPT`` / ``Cp`` / Gibbs ``G`` directly from the standard
+        thermodynamics functions (passing the bare cell volume column would
+        double-count the ``P*V`` term).  The bare cell-volume column from
+        each ``.energies`` log is stashed on each Monitor as
+        ``volume_trace`` so callers can compute ``<V>(T)`` separately.
+
+        For single-run checkpoints (no batch axis) this delegates to
+        ``Monitor.from_directory`` and returns a one-element collection.
+
+        Args:
+            path: Directory produced by ``jaxrens run`` on a multi-run config.
+            prefix: File prefix matching ``output.out_file_prefix``.
+            prefer_final: Prefer ``<prefix>.final.checkpoint.h5`` over the
+                periodic ``<prefix>.checkpoint.h5``; falls back further to
+                ``<prefix>.initial.checkpoint.h5`` when the run is still in
+                flight.  Zero-byte files (mid-write) are skipped.
+            labels: Per-replica display labels, length ``n_total``.  Defaults
+                to ``f"run{i:02d}"``.
+
+        Returns:
+            Populated ``MonitorCollection``.
+
+        Raises:
+            FileNotFoundError: If no usable checkpoint is found, or if any
+                ``<prefix>.runNN.energies`` file is missing.
+            ValueError: If ``labels`` is supplied with the wrong length, or
+                if the checkpoint's leading batch shape is unrecognised.
+        """
+        import json
+
+        import h5py
+
+        from jaxrens.io.checkpoint import load_checkpoint
+        from jaxrens.io.energy_log import EnergyLogger
+
+        path = Path(path)
+
+        # Resolve checkpoint: skip 0-byte stubs from mid-write periodic saves.
+        candidates: list[Path] = []
+        if prefer_final:
+            candidates.extend([
+                path / f"{prefix}.final.checkpoint.h5",
+                path / f"{prefix}.checkpoint.h5",
+                path / f"{prefix}.initial.checkpoint.h5",
+            ])
+        else:
+            candidates.extend([
+                path / f"{prefix}.checkpoint.h5",
+                path / f"{prefix}.final.checkpoint.h5",
+                path / f"{prefix}.initial.checkpoint.h5",
+            ])
+        ckpt_path = next(
+            (p for p in candidates if p.exists() and p.stat().st_size > 0),
+            None,
+        )
+        if ckpt_path is None:
+            raise FileNotFoundError(
+                f"No non-empty checkpoint in {path} (looked for "
+                f"{', '.join(c.name for c in candidates)})"
+            )
+
+        state = load_checkpoint(ckpt_path)
+        live_E = np.asarray(state["energies"])
+        iteration = np.asarray(state["iteration"])
+        log_Z = np.asarray(state["log_evidence"])
+        n_live = int(state["n_walkers"])
+
+        with h5py.File(ckpt_path, "r") as f:
+            raw_symmap = f.attrs.get("symbol_map")
+        symbol_map: dict[int, str] | None = (
+            {int(k): v for k, v in json.loads(raw_symmap).items()}
+            if raw_symmap is not None
+            else None
+        )
+
+        # Single-run checkpoint (no batch axis): delegate.
+        if live_E.ndim == 1:
+            label = labels[0] if labels else None
+            return cls(
+                [Monitor.from_directory(
+                    path, label=label, prefix=prefix, prefer_final=prefer_final,
+                )]
+            )
+
+        # Multi-run: flatten leading batch axes (P,) or (G, P) → n_total.
+        if live_E.ndim == 2:
+            n_total = live_E.shape[0]
+            live_E_flat = live_E
+            log_Z_flat = log_Z
+            iter_flat = iteration
+        elif live_E.ndim == 3:
+            G, P, K = live_E.shape
+            n_total = G * P
+            live_E_flat = live_E.reshape(n_total, K)
+            log_Z_flat = log_Z.reshape(n_total)
+            iter_flat = iteration.reshape(n_total)
+        else:
+            raise ValueError(
+                f"Unexpected `energies` shape {live_E.shape} in "
+                f"{ckpt_path.name}; expected 1, 2, or 3 dims."
+            )
+
+        if labels is not None and len(labels) != n_total:
+            raise ValueError(
+                f"len(labels)={len(labels)} does not match n_total={n_total} "
+                f"derived from checkpoint shape {live_E.shape}"
+            )
+
+        monitors: list[Monitor] = []
+        for i in range(n_total):
+            elog_path = path / f"{prefix}.run{i:02d}.energies"
+            if not elog_path.exists():
+                raise FileNotFoundError(
+                    f"Per-replica energies file missing: {elog_path}"
+                )
+            elog = EnergyLogger.read(elog_path)
+
+            label = labels[i] if labels is not None else f"run{i:02d}"
+            m = Monitor(
+                dead_energies=np.asarray(elog.energies, dtype=np.float64),
+                dead_volumes=None,
+                live_energies=np.asarray(live_E_flat[i], dtype=np.float64),
+                live_volumes=None,
+                log_evidence=float(log_Z_flat[i]),
+                iteration=int(iter_flat[i]),
+                n_live=n_live,
+                n_cull=1,
+                symbol_map=symbol_map,
+                energy_trace=np.asarray(elog.energies, dtype=np.float64),
+                iteration_trace=np.asarray(elog.iterations, dtype=np.int64),
+                adaptation_trace=None,
+                label=label,
+                path=path,
+            )
+            # Bare cell volume series, stashed for separate <V>(T) analysis.
+            m.volume_trace = np.asarray(elog.volumes, dtype=np.float64)
+            monitors.append(m)
+
+        return cls(monitors)
+
     # ------------------------------------------------------------------
     # Mutation
     # ------------------------------------------------------------------
