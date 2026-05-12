@@ -383,6 +383,8 @@ def replica_exchange_step(
     n_odd = odd_pairs.shape[0]
     max_pairs = max(n_even, n_odd) if (n_even > 0 or n_odd > 0) else 0
 
+    n_pairs = max(n_runs - 1, 0)
+
     if max_pairs == 0:
         # No swaps possible (n_runs < 2)
         return (
@@ -390,7 +392,12 @@ def replica_exchange_step(
             all_types,
             all_energies,
             all_cells,
-            {"n_accepted": jnp.array(0), "n_attempted": jnp.array(0)},
+            {
+                "n_accepted": jnp.array(0),
+                "n_attempted": jnp.array(0),
+                "n_accepted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
+                "n_attempted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
+            },
         )
 
     # Pad pairs arrays to max_pairs with dummy pair (0, 0) and mask
@@ -414,7 +421,7 @@ def replica_exchange_step(
 
     def _do_one_phase(carry, phase_input):
         """Process one phase (even or odd) of swap attempts."""
-        positions, types, energies, cells, n_acc, n_att, key = carry
+        positions, types, energies, cells, acc_per_pair, att_per_pair, key = carry
         pairs, mask, phase_key = phase_input
 
         # Generate random walker indices for all pairs
@@ -422,7 +429,7 @@ def replica_exchange_step(
 
         def _attempt_one_swap(carry_inner, swap_input):
             """Attempt a single swap between a pair of runs."""
-            pos, typ, ene, bxs, acc_count = carry_inner
+            pos, typ, ene, bxs, acc_per_pair_in = carry_inner
             pair, valid, swap_key = swap_input
 
             k1, k2 = jax.random.split(swap_key)
@@ -496,37 +503,47 @@ def replica_exchange_step(
             else:
                 new_bxs = bxs
 
-            new_acc = acc_count + valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
+            # Per-pair scatter-add: pair_id = min(run_i, run_j) since
+            # pairs are always (k, k+1).  Even/odd phases write to
+            # disjoint pair_ids; padding entries have valid=False so
+            # contribute zero.
+            pair_id = jnp.minimum(run_i, run_j)
+            delta = valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
+            new_acc_per_pair = acc_per_pair_in.at[pair_id].add(delta)
 
-            return (new_pos, new_typ, new_ene, new_bxs, new_acc), None
+            return (new_pos, new_typ, new_ene, new_bxs, new_acc_per_pair), None
 
         scan_inputs = (pairs, mask, pair_keys)
-        (positions, types, energies, cells, n_acc), _ = jax.lax.scan(
+        (positions, types, energies, cells, acc_per_pair), _ = jax.lax.scan(
             _attempt_one_swap,
-            (positions, types, energies, cells, n_acc),
+            (positions, types, energies, cells, acc_per_pair),
             scan_inputs,
         )
-        n_att = n_att + jnp.sum(mask.astype(jnp.int32))
+        # Per-pair attempted: scatter the phase mask by pair_id.  No
+        # collisions within a phase (each pair_id appears at most once
+        # in the unpadded slice; padded entries have mask=0).
+        pair_ids_phase = jnp.minimum(pairs[:, 0], pairs[:, 1])
+        att_per_pair = att_per_pair.at[pair_ids_phase].add(mask.astype(jnp.int32))
 
-        return (positions, types, energies, cells, n_acc, n_att, key), None
+        return (positions, types, energies, cells, acc_per_pair, att_per_pair, key), None
 
     # Run n_swap_cycles, each with even + odd phase
     def _do_one_cycle(carry, cycle_key):
-        positions, types, energies, cells, n_acc, n_att = carry
+        positions, types, energies, cells, acc_per_pair, att_per_pair = carry
         even_key, odd_key = jax.random.split(cycle_key)
 
         # Even phase
-        (positions, types, energies, cells, n_acc, n_att, _), _ = _do_one_phase(
-            (positions, types, energies, cells, n_acc, n_att, even_key),
+        (positions, types, energies, cells, acc_per_pair, att_per_pair, _), _ = _do_one_phase(
+            (positions, types, energies, cells, acc_per_pair, att_per_pair, even_key),
             (all_pairs[0], all_masks[0], even_key),
         )
         # Odd phase
-        (positions, types, energies, cells, n_acc, n_att, _), _ = _do_one_phase(
-            (positions, types, energies, cells, n_acc, n_att, odd_key),
+        (positions, types, energies, cells, acc_per_pair, att_per_pair, _), _ = _do_one_phase(
+            (positions, types, energies, cells, acc_per_pair, att_per_pair, odd_key),
             (all_pairs[1], all_masks[1], odd_key),
         )
 
-        return (positions, types, energies, cells, n_acc, n_att), None
+        return (positions, types, energies, cells, acc_per_pair, att_per_pair), None
 
     cycle_keys = jax.random.split(rng_key, n_swap_cycles)
     init_carry = (
@@ -534,16 +551,18 @@ def replica_exchange_step(
         types_broadcastable,
         all_energies,
         all_cells,
-        jnp.array(0, dtype=jnp.int32),
-        jnp.array(0, dtype=jnp.int32),
+        jnp.zeros(n_pairs, dtype=jnp.int32),
+        jnp.zeros(n_pairs, dtype=jnp.int32),
     )
-    (new_pos, new_types, new_ene, new_cells, total_acc, total_att), _ = jax.lax.scan(
+    (new_pos, new_types, new_ene, new_cells, acc_per_pair, att_per_pair), _ = jax.lax.scan(
         _do_one_cycle, init_carry, cycle_keys
     )
 
     swap_info = {
-        "n_accepted": total_acc,
-        "n_attempted": total_att,
+        "n_accepted": jnp.sum(acc_per_pair),
+        "n_attempted": jnp.sum(att_per_pair),
+        "n_accepted_per_pair": acc_per_pair,
+        "n_attempted_per_pair": att_per_pair,
     }
 
     return new_pos, new_types, new_ene, new_cells, swap_info
@@ -757,6 +776,7 @@ def xrens_replica_exchange_step(
     n_even = even_pairs.shape[0]
     n_odd = odd_pairs.shape[0]
     max_pairs = max(n_even, n_odd) if (n_even > 0 or n_odd > 0) else 0
+    n_pairs = max(n_runs - 1, 0)
 
     if max_pairs == 0:
         return (
@@ -768,6 +788,8 @@ def xrens_replica_exchange_step(
                 "n_accepted": jnp.array(0),
                 "n_attempted": jnp.array(0),
                 "n_energy_evals": jnp.array(0),
+                "n_accepted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
+                "n_attempted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
             },
         )
 
@@ -786,13 +808,13 @@ def xrens_replica_exchange_step(
 
     def _do_one_phase(carry, phase_input):
         """Process one phase of XRENS swap attempts."""
-        positions, types, energies, cells, n_acc, n_att, n_evals_total, key = carry
+        positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, key = carry
         pairs, mask, phase_key = phase_input
 
         pair_keys = jax.random.split(phase_key, max_pairs)
 
         def _attempt_one_xrens_swap(carry_inner, swap_input):
-            pos, typ, ene, bxs, acc_count, eval_count = carry_inner
+            pos, typ, ene, bxs, acc_per_pair_in, eval_count = carry_inner
             pair, valid, swap_key = swap_input
 
             k1, k2, morph_key = jax.random.split(swap_key, 3)
@@ -877,34 +899,39 @@ def xrens_replica_exchange_step(
             else:
                 new_bxs = bxs
 
-            new_acc = acc_count + valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
+            # Per-pair scatter-add (see replica_exchange_step for the
+            # convention rationale).
+            pair_id = jnp.minimum(run_i, run_j)
+            delta = valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
+            new_acc_per_pair = acc_per_pair_in.at[pair_id].add(delta)
             # We always call propose (2 evals) when valid, regardless of acceptance.
             new_eval_count = eval_count + valid.astype(jnp.int32) * n_e
 
-            return (new_pos, new_typ, new_ene, new_bxs, new_acc, new_eval_count), None
+            return (new_pos, new_typ, new_ene, new_bxs, new_acc_per_pair, new_eval_count), None
 
         scan_inputs = (pairs, mask, pair_keys)
-        (positions, types, energies, cells, n_acc, n_evals_total), _ = jax.lax.scan(
+        (positions, types, energies, cells, acc_per_pair, n_evals_total), _ = jax.lax.scan(
             _attempt_one_xrens_swap,
-            (positions, types, energies, cells, n_acc, n_evals_total),
+            (positions, types, energies, cells, acc_per_pair, n_evals_total),
             scan_inputs,
         )
-        n_att = n_att + jnp.sum(mask.astype(jnp.int32))
-        return (positions, types, energies, cells, n_acc, n_att, n_evals_total, key), None
+        pair_ids_phase = jnp.minimum(pairs[:, 0], pairs[:, 1])
+        att_per_pair = att_per_pair.at[pair_ids_phase].add(mask.astype(jnp.int32))
+        return (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, key), None
 
     def _do_one_cycle(carry, cycle_key):
-        positions, types, energies, cells, n_acc, n_att, n_evals_total = carry
+        positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total = carry
         even_key, odd_key = jax.random.split(cycle_key)
 
-        (positions, types, energies, cells, n_acc, n_att, n_evals_total, _), _ = _do_one_phase(
-            (positions, types, energies, cells, n_acc, n_att, n_evals_total, even_key),
+        (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, _), _ = _do_one_phase(
+            (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, even_key),
             (all_pairs[0], all_masks[0], even_key),
         )
-        (positions, types, energies, cells, n_acc, n_att, n_evals_total, _), _ = _do_one_phase(
-            (positions, types, energies, cells, n_acc, n_att, n_evals_total, odd_key),
+        (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, _), _ = _do_one_phase(
+            (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, odd_key),
             (all_pairs[1], all_masks[1], odd_key),
         )
-        return (positions, types, energies, cells, n_acc, n_att, n_evals_total), None
+        return (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total), None
 
     cycle_keys = jax.random.split(rng_key, n_swap_cycles)
     init_carry = (
@@ -912,18 +939,20 @@ def xrens_replica_exchange_step(
         all_types,
         all_energies,
         all_cells,
-        jnp.array(0, dtype=jnp.int32),
-        jnp.array(0, dtype=jnp.int32),
+        jnp.zeros(n_pairs, dtype=jnp.int32),
+        jnp.zeros(n_pairs, dtype=jnp.int32),
         jnp.array(0, dtype=jnp.int32),
     )
-    (new_pos, new_types, new_ene, new_cells, total_acc, total_att, total_evals), _ = (
+    (new_pos, new_types, new_ene, new_cells, acc_per_pair, att_per_pair, total_evals), _ = (
         jax.lax.scan(_do_one_cycle, init_carry, cycle_keys)
     )
 
     swap_info = {
-        "n_accepted": total_acc,
-        "n_attempted": total_att,
+        "n_accepted": jnp.sum(acc_per_pair),
+        "n_attempted": jnp.sum(att_per_pair),
         "n_energy_evals": total_evals,
+        "n_accepted_per_pair": acc_per_pair,
+        "n_attempted_per_pair": att_per_pair,
     }
     return new_pos, new_types, new_ene, new_cells, swap_info
 
@@ -1161,6 +1190,7 @@ def semi_grand_replica_exchange_step(
     n_even = even_pairs.shape[0]
     n_odd = odd_pairs.shape[0]
     max_pairs = max(n_even, n_odd) if (n_even > 0 or n_odd > 0) else 0
+    n_pairs = max(n_runs - 1, 0)
 
     if max_pairs == 0:
         return (
@@ -1172,6 +1202,8 @@ def semi_grand_replica_exchange_step(
                 "n_accepted": jnp.array(0),
                 "n_attempted": jnp.array(0),
                 "n_energy_evals": jnp.array(0),
+                "n_accepted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
+                "n_attempted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
             },
         )
 
@@ -1190,13 +1222,13 @@ def semi_grand_replica_exchange_step(
 
     def _do_one_phase(carry, phase_input):
         """Process one phase of semi-grand swap attempts."""
-        positions, types, energies, cells, n_acc, n_att = carry
+        positions, types, energies, cells, acc_per_pair, att_per_pair = carry
         pairs, mask, phase_key = phase_input
 
         pair_keys = jax.random.split(phase_key, max_pairs)
 
         def _attempt_one_sg_swap(carry_inner, swap_input):
-            pos, typ, ene, bxs, acc_count = carry_inner
+            pos, typ, ene, bxs, acc_per_pair_in = carry_inner
             pair, valid, swap_key = swap_input
 
             k1, k2 = jax.random.split(swap_key)
@@ -1247,32 +1279,37 @@ def semi_grand_replica_exchange_step(
                 jnp.where(do_swap, proposed["energy_b"], ene[run_j, wj])
             )
 
-            new_acc = acc_count + valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
+            # Per-pair scatter-add (see replica_exchange_step for the
+            # convention rationale).
+            pair_id = jnp.minimum(run_i, run_j)
+            delta = valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
+            new_acc_per_pair = acc_per_pair_in.at[pair_id].add(delta)
 
-            return (pos, typ, new_ene, bxs, new_acc), None
+            return (pos, typ, new_ene, bxs, new_acc_per_pair), None
 
         scan_inputs = (pairs, mask, pair_keys)
-        (positions, types, energies, cells, n_acc), _ = jax.lax.scan(
+        (positions, types, energies, cells, acc_per_pair), _ = jax.lax.scan(
             _attempt_one_sg_swap,
-            (positions, types, energies, cells, n_acc),
+            (positions, types, energies, cells, acc_per_pair),
             scan_inputs,
         )
-        n_att = n_att + jnp.sum(mask.astype(jnp.int32))
-        return (positions, types, energies, cells, n_acc, n_att), None
+        pair_ids_phase = jnp.minimum(pairs[:, 0], pairs[:, 1])
+        att_per_pair = att_per_pair.at[pair_ids_phase].add(mask.astype(jnp.int32))
+        return (positions, types, energies, cells, acc_per_pair, att_per_pair), None
 
     def _do_one_cycle(carry, cycle_key):
-        positions, types, energies, cells, n_acc, n_att = carry
+        positions, types, energies, cells, acc_per_pair, att_per_pair = carry
         even_key, odd_key = jax.random.split(cycle_key)
 
-        (positions, types, energies, cells, n_acc, n_att), _ = _do_one_phase(
-            (positions, types, energies, cells, n_acc, n_att),
+        (positions, types, energies, cells, acc_per_pair, att_per_pair), _ = _do_one_phase(
+            (positions, types, energies, cells, acc_per_pair, att_per_pair),
             (all_pairs[0], all_masks[0], even_key),
         )
-        (positions, types, energies, cells, n_acc, n_att), _ = _do_one_phase(
-            (positions, types, energies, cells, n_acc, n_att),
+        (positions, types, energies, cells, acc_per_pair, att_per_pair), _ = _do_one_phase(
+            (positions, types, energies, cells, acc_per_pair, att_per_pair),
             (all_pairs[1], all_masks[1], odd_key),
         )
-        return (positions, types, energies, cells, n_acc, n_att), None
+        return (positions, types, energies, cells, acc_per_pair, att_per_pair), None
 
     cycle_keys = jax.random.split(rng_key, n_swap_cycles)
     init_carry = (
@@ -1280,16 +1317,18 @@ def semi_grand_replica_exchange_step(
         all_types,
         all_energies,
         all_cells,
-        jnp.array(0, dtype=jnp.int32),
-        jnp.array(0, dtype=jnp.int32),
+        jnp.zeros(n_pairs, dtype=jnp.int32),
+        jnp.zeros(n_pairs, dtype=jnp.int32),
     )
-    (new_pos, new_types, new_ene, new_cells, total_acc, total_att), _ = jax.lax.scan(
+    (new_pos, new_types, new_ene, new_cells, acc_per_pair, att_per_pair), _ = jax.lax.scan(
         _do_one_cycle, init_carry, cycle_keys
     )
 
     swap_info = {
-        "n_accepted": total_acc,
-        "n_attempted": total_att,
+        "n_accepted": jnp.sum(acc_per_pair),
+        "n_attempted": jnp.sum(att_per_pair),
         "n_energy_evals": jnp.array(0, dtype=jnp.int32),
+        "n_accepted_per_pair": acc_per_pair,
+        "n_attempted_per_pair": att_per_pair,
     }
     return new_pos, new_types, new_ene, new_cells, swap_info

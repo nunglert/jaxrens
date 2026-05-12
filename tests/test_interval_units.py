@@ -1,7 +1,7 @@
 """Tests for ``RootSpec.interval_units`` scaling in the resolver.
 
 Covers ``_scale_interval`` and ``_apply_interval_units`` directly, plus the
-end-to-end flow through ``_resolve_one`` to verify the eight iteration-counted
+end-to-end flow through ``resolve`` to verify the eight iteration-counted
 fields are correctly rewritten on the path into the runtime dataclasses
 (``OutputConfig``, ``NSConfig``, ``InterREConfig``, ``IterationTermination``,
 and the full-auto ``adjust_interval`` consumed by ``run_ns``).
@@ -13,8 +13,8 @@ import pytest
 
 from jaxrens.cli.resolve import (
     _apply_interval_units,
-    _resolve_one,
     _scale_interval,
+    resolve,
 )
 from jaxrens.cli.schema import RootSpec
 from jaxrens.cli.schema.termination import IterationTerminationSpec
@@ -48,7 +48,7 @@ def _full_interval_dict(*, n_live: int = 10) -> dict:
             {"type": "iteration", "max_iterations": 4},
         ],
         "adaptation": {"full_auto": True, "adjust_interval": 2},
-        "inter_re": {"flavor": "pressure", "every": 5},
+        "inter_re": {"flavor": "pressure", "re_interval": 5},
     }
 
 
@@ -94,7 +94,7 @@ class TestApplyIntervalUnits:
         assert out.output.checkpoint_interval == 13
         assert out.run.max_iterations == 50
         assert out.adaptation.adjust_interval == 2
-        assert out.inter_re.every == 5
+        assert out.inter_re.re_interval == 5
         assert isinstance(out.termination[0], IterationTerminationSpec)
         assert out.termination[0].max_iterations == 4
 
@@ -110,7 +110,7 @@ class TestApplyIntervalUnits:
         assert out.output.checkpoint_interval == 130
         assert out.run.max_iterations == 500
         assert out.adaptation.adjust_interval == 20
-        assert out.inter_re.every == 50
+        assert out.inter_re.re_interval == 50
         assert out.termination[0].max_iterations == 40
 
     def test_per_walker_accepts_floats(self):
@@ -159,16 +159,23 @@ class TestApplyIntervalUnits:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end via _resolve_one — values reach the runtime dataclasses
+# End-to-end via resolve — values reach the runtime dataclasses
 # ---------------------------------------------------------------------------
 
 
-class TestResolveOneIntervals:
-    def test_per_walker_flows_through_resolve_one(self):
+class TestResolveIntervals:
+    def test_per_walker_flows_through_resolve(self):
         d = _full_interval_dict(n_live=10)
         d["interval_units"] = "per_walker"
+        # The fixture's inter_re=pressure block is there to exercise the
+        # `_apply_interval_units` scaling of `inter_re.re_interval` (see
+        # tests above).  At resolve-time, however, inter_re=pressure
+        # demands a list-valued ensemble.pressure — drop the block here
+        # so the resolver takes the SingleRun path; the interval scaling
+        # we want to verify happens upstream of that branch.
+        d.pop("inter_re", None)
         root = RootSpec.model_validate(d)
-        resolved = _resolve_one(root)
+        resolved = resolve(root)
 
         # Output dataclass receives absolute-iter ints.
         assert resolved.output.info_interval == 70
@@ -197,8 +204,10 @@ class TestResolveOneIntervals:
         assert resolved.adaptation_cfg.adjust_interval == 20
 
     def test_absolute_default_unchanged(self):
-        root = RootSpec.model_validate(_full_interval_dict(n_live=10))
-        resolved = _resolve_one(root)
+        d = _full_interval_dict(n_live=10)
+        d.pop("inter_re", None)
+        root = RootSpec.model_validate(d)
+        resolved = resolve(root)
         assert resolved.output.info_interval == 7
         assert resolved.output.snapshot_interval == 11
         assert resolved.ns.max_iterations == 50

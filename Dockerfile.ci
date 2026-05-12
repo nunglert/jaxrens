@@ -12,20 +12,21 @@ WORKDIR /workspace
 
 # Install deps via editable install. Copy only what's needed so this
 # layer caches on pyproject changes, not source-code changes. The
-# `mace` and `neuralil` extras are pulled in so the corresponding
-# integration tests actually run instead of skipping silently. Cost:
-# `mace-jax[gpu,torch]` adds ~2 GB (torch) to the image; on a cold
-# RunsOn ephemeral builder this adds ~2-3 min to the build.
+# `mace`, `neuralil`, `nequix`, and `jaxmd` extras are pulled in so
+# the corresponding integration tests and bench rows actually run
+# instead of skipping silently. Cost: `mace-jax[gpu,torch]` adds ~2 GB
+# (torch) to the image; on a cold RunsOn ephemeral builder this adds
+# ~2-3 min to the build.
 COPY pyproject.toml ./
 RUN touch README.md
 COPY src ./src
-RUN pip install -e ".[dev,mace,neuralil,nequix]"
+RUN pip install -e ".[dev,mace,neuralil,nequix,jaxmd]"
 
 # Fail the build if any optional backend installed but doesn't import.
 # Without this, ``pytest.importorskip(...)`` would silently skip the
 # corresponding integration tests and CI would report green on a broken
 # install (ABI mismatch, missing native deps, upstream pin drift, etc.).
-RUN python -c "import mace_jax, neuralil, nequix; print('optional backends import OK:', mace_jax, neuralil, nequix)"
+RUN python -c "import mace_jax, neuralil, nequix, jax_md; print('optional backends import OK:', mace_jax, neuralil, nequix, jax_md)"
 
 # Repo code is mounted at /workspace at runtime by the CI workflow,
 # which always overrides the parent image's default CMD with its own

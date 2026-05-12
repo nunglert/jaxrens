@@ -60,6 +60,10 @@ class OutputConfig:
     save_acc_rates: bool = False
     acc_rates_interval: int = 1
 
+    # Per-fire inter-RE swap log; cadence is upstream
+    # ``inter_re.re_interval``.  No-op when ``inter_re`` is not configured.
+    save_re_stats: bool = False
+
 
 @dataclass(frozen=True)
 class InterREConfig:
@@ -74,7 +78,7 @@ class InterREConfig:
             proposal), ``"xrens"`` (composition-morphing), or
             ``"semi_grand"`` (chemical-potential assignment swap, zero backend
             calls).
-        every: Fire a swap pass every this many NS iterations (1 = every iter).
+        re_interval: Fire a swap pass every this many NS iterations (1 = every iter).
         n_swap_cycles: Number of even+odd swap phases per fire.
         composition_targets: XRENS-only — per-run target compositions,
             shape ``(n_runs, n_species)``.  ``None`` for other flavors.
@@ -84,7 +88,7 @@ class InterREConfig:
     """
 
     flavor: str = "pressure"
-    every: int = 1
+    re_interval: int = 1
     n_swap_cycles: int = 1
     # XRENS-only: per-run target compositions, shape (n_runs, n_species).
     # Required when flavor == "xrens"; each row must sum to n_atoms and

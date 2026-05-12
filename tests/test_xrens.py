@@ -403,7 +403,7 @@ class TestXRENSEndToEnd:
 
         inter_re_cfg = InterREConfig(
             flavor="xrens",
-            every=1,
+            re_interval=1,
             n_swap_cycles=1,
             composition_targets=(tuple(target_a), tuple(target_b)),
         )
@@ -598,7 +598,7 @@ class TestInterRESpecXRENS:
         from jaxrens.cli.schema.inter_re import InterRESpec
         spec = InterRESpec(
             flavor="xrens",
-            every=1,
+            re_interval=1,
             n_swap_cycles=1,
             composition_targets=[[8, 0], [4, 4]],
         )

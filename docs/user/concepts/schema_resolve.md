@@ -19,13 +19,12 @@ the type system:
 flowchart TB
     subgraph L1["Layer 1 — wire format (YAML → pydantic)"]
         direction LR
-        Y["config.yaml"] --> RC["RootConfig<br/>(pydantic)"]
+        Y["config.yaml"] --> RC["RootSpec<br/>(pydantic)"]
     end
     subgraph L2["Layer 2 — resolver (pydantic → runtime objects)"]
         direction TB
-        RES["expand_multi_run_or_cohort(root)"]
-        RES --> RO1["ResolvedConfig<br/>single-run"]
-        RES --> RO2["ResolvedMultiRunConfig<br/>multi-replica"]
+        RES["resolve(root)"]
+        RES --> RO["ResolvedConfig<br/>(carries a batcher)"]
     end
     subgraph L3["Layer 3 — core (dataclass → NS state pytrees)"]
         direction LR
@@ -35,8 +34,8 @@ flowchart TB
         RMGC["run_ns_multi_gpu"]:::layer3
     end
     RC --> RES
-    RO1 --> RFC --> RN
-    RO2 --> RMG --> RMGC
+    RO -->|"batcher = SingleRun()"| RFC --> RN
+    RO -->|"batcher = PmapVmapRuns(G, P)"| RMG --> RMGC
     classDef layer3 fill:#e7f1fb,stroke:#666
 ```
 
@@ -47,6 +46,7 @@ flowchart TB
 | YAML key names, types, defaults | **Schema** | `cli/schema/{run,moves,backend,ensemble,inter_re,init,cell,output,adaptation,termination}.py` |
 | Cross-field validators ("XRENS requires composition_targets") | **Schema** | `@model_validator` methods |
 | Unit conversion (`gpa` → `eva3`) | **Schema** | `NPTEnsembleSpec.to_ensemble_params` |
+| Interval-unit scaling (`per_walker` → absolute iters) | **CLI / Resolver** | `_apply_interval_units` (run from cli before the resolver, second pass inside `resolve` is idempotent) |
 | Deprecated-alias migration | **Schema** | `cli/migrate.py` |
 | "Build a MACE backend instance" | **Resolver** | `MACEBackendSpec.build_backend()` |
 | "Compute initial walker energies at the right ensemble scale" | **Resolver** | `_finalise_initial_energies_and_counts` + `EnsembleBackend` wrap |
@@ -57,47 +57,52 @@ flowchart TB
 
 Two asymmetries worth knowing:
 
-- **Schema doesn't import JAX.** You can run `jaxrens validate -c
-  config.yaml` on a CPU-only machine with no GPU initialization.
-  Validation is cheap.
+- **Schema doesn't import JAX.** `jaxrens validate --parse-only -c
+  config.yaml` runs pydantic-only and is cheap; the full `validate`
+  (without `--parse-only`) runs the resolver and may build a backend.
 - **Core doesn't import pydantic.** `run_ns(positions, types, …)`
   takes arrays and a `NSConfig` dataclass. Tests in
   `tests/test_nested_sampling.py` never touch the schema layer, so
   the core is testable without a YAML round-trip.
 
-## The dispatch branch
+## The unified entry point
 
-The CLI's `_cmd_run` delegates to `expand_multi_run_or_cohort`,
-which produces **one of two output types**:
+The resolver exposes **one** public function:
+
+```python
+def resolve(root: RootSpec) -> ResolvedConfig: ...
+```
+
+Whether the YAML describes a single NS run or 16 replicas across 4
+GPUs, the return type is the same — a single `ResolvedConfig` that
+carries a `batcher` field describing the topology. The CLI inspects
+that field to pick the right runtime dispatcher:
 
 ```{mermaid}
 flowchart LR
-    Y["config.yaml"] --> RC["RootConfig"]
-    RC --> DR{"_derive_replica_axes:<br/>n_total > 1 ?"}
-    DR -->|"no"| EC["expand_cohort(root)<br/>→ list[ResolvedConfig]"]
-    DR -->|"yes"| MR["_resolve_multi_run(root)<br/>→ ResolvedMultiRunConfig"]
-    EC -->|"len == 1"| RFC["run_from_config<br/>→ run_ns"]
-    EC -->|"len > 1"| LOOP["sequential cohort loop<br/>one run_from_config per element"]
-    MR --> RMG["run_multi_gpu_from_config<br/>→ run_ns_multi_gpu"]
+    Y["config.yaml"] --> RC["RootSpec"]
+    RC --> RES["resolve(root)"]
+    RES --> RC2["ResolvedConfig"]
+    RC2 -->|"batcher = SingleRun()<br/>n_total = 1"| RFC["run_from_config<br/>→ run_ns"]
+    RC2 -->|"batcher = PmapVmapRuns(G, P)<br/>n_total = G·P"| RMG["run_multi_gpu_from_config<br/>→ run_ns_multi_gpu"]
 ```
 
 `n_total` comes from whichever YAML list implies it:
 `ensemble.pressure` (NPT), `inter_re.composition_targets` (XRENS),
 or `inter_re.chemical_potentials` (semi-grand). See
-{doc}`replicas` for the full derivation.
-
-When `n_total == 1`, `expand_cohort` returns a single-element list —
-the CLI runs it once. A cohort sweep (multiple sequential runs, one
-per pressure) is available but rarely used now that multi-run
-dispatch is automatic: just make the pressure list long enough and
-replicas run *concurrently* instead of serially.
+{doc}`replicas` for the full derivation. When `n_total == 1` the
+batcher is `SingleRun()`; otherwise it is `PmapVmapRuns(G, P)` with
+`G = max(1, len(jax.local_devices()))` clamped to `n_total` and
+`P = n_total // G`.
 
 ## Inside the resolver
 
-Once the dispatcher has picked a branch, both paths do the same three
-jobs — derive the runtime topology, lay out per-walker initial state,
-and price the initial energies on the right ensemble scale — they
-just differ in *where the parallelism lives*.
+`resolve` is a thin dispatcher: it derives the topology and delegates
+to one of two private branches (`_resolve_single_replica` or
+`_resolve_multi_replica`). Both branches do the same three jobs —
+derive the runtime topology, lay out per-walker initial state, and
+price the initial energies on the right ensemble scale — they just
+differ in *where the parallelism lives*.
 
 Both paths walk the same per-iteration setup: look up the iteration's
 pressure, build the base backend, wrap it in
@@ -109,11 +114,11 @@ restart state); finalize is always the caller's responsibility.
 
 The paths then diverge:
 
-- **Single-run / cohort.** Once `_validate_cells` returns,
-  `_resolve_one` calls `_finalise_initial_energies_and_counts`
-  immediately on its single-replica arrays with `batcher=SingleRun()`.
-- **Multi-run.** The structural-init step runs once per replica in a
-  tight Python loop (cheap, no JIT compiles), stacks the resulting
+- **Single-replica.** After `_validate_cells`, `_resolve_single_replica`
+  calls `_finalise_initial_energies_and_counts` immediately on its
+  single-replica arrays with `batcher=SingleRun()`.
+- **Multi-replica.** The structural-init step runs once per replica in
+  a tight Python loop (cheap, no JIT compiles), stacks the resulting
   `(K, …)` arrays into `(n_total, K, …)`, then reshapes to
   `(G, P, K, …)`.  Before finalize the resolver does a *second*
   ensemble wrap — one `EnsembleBackend(base, pressure=0.0)` shared by
@@ -125,103 +130,196 @@ The paths then diverge:
 The helper body is identical between paths — only the `batcher` and
 the per-replica `pressures` argument differ.
 
+### Structural init — `_resolve_init`
+
+Before showing the full `resolve` flow, here is `_resolve_init`
+(resolve.py:604) in isolation. Both branches call it the same way
+— the only difference is *how many times* it runs (once for
+single-replica, n_total times in the multi-replica loop, each with
+its own seed and per-replica `EnsembleBackend` wrapper). The four
+modes are mutually exclusive (the init spec must set exactly one
+of the four discriminator fields) and all converge on
+`_validate_cells`; none of them prices energies — that is the
+caller's job after `_resolve_init` returns.
+
+```{mermaid}
+%%{init: {"layout": "elk"}}%%
+flowchart LR
+    subgraph INIT["_resolve_init"]
+        direction LR
+        IN["init_spec, n_live, seed,<br>energy_backend, cell_cfg"]
+        MODE{"init spec field set"}
+        MA["A: start_species<br>_resolve_init_species<br>(sample cell + positions from priors)"]
+        MB["B: start_config_file<br>_resolve_init_config_file<br>(load founder, replicate to n_live)"]
+        MC["C: start_walker_set<br>_resolve_init_walker_set<br>((n_live, N, 3) verbatim)"]
+        MD["D: restart_file<br>_resolve_init_restart<br>(checkpoint → RestartBundle)"]
+        VAL["_validate_cells<br>(volume/atom + aspect-ratio bounds)"]
+        OUT["ResolvedInit(<br>positions, cells, types,<br>symbol_map, restart_state,<br>energies=None, counts=None)"]
+
+        IN --> MODE
+        MODE -- A --> MA --> VAL
+        MODE -- B --> MB --> VAL
+        MODE -- C --> MC --> VAL
+        MODE -- D --> MD --> VAL
+        VAL --> OUT
+    end
+
+    classDef pyBox fill:#f5f5f5,stroke:#888,color:#222
+    classDef decision fill:#eef5ff,stroke:#1565c0,color:#222
+    classDef initFrame fill:#e0f2f1,stroke:#00897b,stroke-width:2px,color:#004d40
+    IN:::pyBox
+    OUT:::pyBox
+    MA:::pyBox
+    MB:::pyBox
+    MC:::pyBox
+    MD:::pyBox
+    VAL:::pyBox
+    MODE:::decision
+    class INIT initFrame
+```
+
+The `energy_backend` argument is the only place the caller's
+ensemble wrap leaks in — rejection-mode initialization uses it for
+the ceiling check inside `_sample_per_walker_positions`. Grid-mode
+ignores it. The four mode helpers return *structural init only*
+(`energies=None`, `counts=None`); pricing them is the next
+subroutine, `_finalise_initial_energies_and_counts`.
+
+### Initial-energy pricing — `_finalise_initial_energies_and_counts`
+
+The second subroutine called from both branches (resolve.py:333).
+It is the resolver's only JIT-compiled work and the only place
+initial energies are priced. The `batcher` argument is the seam
+through which multi-GPU dispatch enters the resolver:
+`SingleRun()` → plain `jax.jit`; `PmapVmapRuns(G, P)` →
+`jax.pmap(jax.vmap(...))`. Both branches pass the backend's
+`ladder` / `offset` so the chosen `init_bucket` matches what
+burn-in and the NS step will compile against (same JIT cache slot).
+
+```{mermaid}
+%%{init: {"layout": "elk"}}%%
+flowchart LR
+    FN["_finalise_initial_energies_and_counts(<br>backend, positions, types, cells,<br>batcher, ladder, offset,<br>pressures=None)"]
+    HAS{"backend has<br>max_neighbors_for?"}
+    CNT["counts = batcher.wrap_for_batch(<br>vmap(max_neighbors_for))(positions, cells)"]
+    BUCK["init_bucket =<br>_choose_starting_bucket(counts, ladder, offset)"]
+    EN["energies = batcher.wrap_for_batch(<br>vmap(backend(…, init_bucket)))<br>(positions, cells [, ensemble_params])"]
+    EN0["energies = batcher.wrap_for_batch(<br>vmap(backend(…, 0)))<br>(positions, cells [, ensemble_params])"]
+    OUTF["(energies, counts)"]
+
+    FN --> HAS
+    HAS -- yes --> CNT --> BUCK --> EN --> OUTF
+    HAS -- no --> EN0 --> OUTF
+
+    classDef finBox fill:#fff7e0,stroke:#a07000,color:#5a4000
+    classDef finInner fill:#fffbef,stroke:#d8a23e,color:#5a4000
+    classDef decision fill:#eef5ff,stroke:#1565c0,color:#222
+    FN:::finBox
+    OUTF:::finBox
+    CNT:::finInner
+    BUCK:::finInner
+    EN:::finInner
+    EN0:::finInner
+    HAS:::decision
+```
+
+`pressures` is only passed in by the multi-replica branch, where
+it is a `(G, P)` array — each replica's NPT scalar — fed into the
+`ensemble_params` kwarg on the vmap axis. The single-replica
+branch's per-call pressure is already baked into its
+`init_backend` wrapper (one `EnsembleBackend(base, P)`), so the
+kwarg is `None`.
+
+### The full `resolve` flow
+
+In the diagram below, the **teal** boxes (`_resolve_init(...)`)
+and the **amber** boxes (`_finalise_initial_energies_and_counts`)
+are placeholders for the two mini-diagrams above. The matching
+colors are deliberate — the call site in the main flow links
+visually to the subroutine that drew that color.
+
 ```{mermaid}
 %%{init: {"layout": "elk"}}%%
 flowchart TB
+    %% --- resolve(root) prelude (resolve.py:1432) ---
     RS["RootSpec<br>(validated pydantic)"]
-    EMC{"replica-axis<br>list present?"}
+    SCALE["_apply_interval_units(root)<br>(idempotent — CLI already scaled)"]
+    DRA["_derive_replica_axes(root)<br>→ (n_total, n_gpu, n_per_gpu, params_per_run)"]
+    GUARD{"init.restart_file set<br>AND n_total &gt; 1?"}
+    GE["raise ValueError"]
+    BR{"n_total == 1?"}
 
-    subgraph cohort["Cohort path — expand_cohort"]
+    RS --> SCALE --> DRA --> GUARD
+    GUARD -- yes --> GE
+    GUARD -- no --> BR
+
+    %% --- single-replica branch (resolve.py:918) ---
+    subgraph S["_resolve_single_replica"]
         direction TB
-        SIZE["_cohort_size(root)<br>→ n"]
-        COHFOR(["for i in range(n)"])
-        RONE["_resolve_one(root, i)"]
+        S1["base_backend = root.backend.build_backend()"]
+        S2["init_backend =<br>EnsembleBackend(base, P) if P else base<br>(P from ensemble_params)"]
+        S3["init = _resolve_init(<br>root.init, n_live, seed=root.run.seed,<br>init_backend, cell_cfg)"]
+        S4["(energies, counts) =<br>_finalise_initial_energies_and_counts(<br>init_backend, positions, types, cells,<br>batcher=SingleRun(), ladder, offset)"]
+        S5["return ResolvedConfig(<br>batcher=SingleRun(),<br>ensemble_params_per_run=(eparams,))"]
+        S1 --> S2 --> S3 --> S4 --> S5
     end
 
-    subgraph multi["Multi-run path — _resolve_multi_run"]
+    %% --- multi-replica branch (resolve.py:1181) ---
+    subgraph M["_resolve_multi_replica"]
         direction TB
-        DRA["_derive_replica_axes<br>→ (n_gpu, n_per_gpu,<br>params_per_run)"]
-        BATCH["batcher = PmapVmapRuns(G, P)"]
-        MFOR(["for r in range(n_total)"])
+        M1["batcher = PmapVmapRuns(n_gpu, n_per_gpu)"]
+        M2["base_backend = root.backend.build_backend()<br>(once, outside the loop)"]
+        M3(["for r in range(n_total)"])
+        M3a["P_r = params_per_run[r].get('pressure')<br>per_run_backend =<br>EnsembleBackend(base, P_r) if P_r else base"]
+        M3b["init_r = _resolve_init(<br>root.init, n_live,<br>seed=root.run.seed + r,<br>per_run_backend, cell_cfg)"]
+        M4["jnp.stack per-replica init along axis 0<br>→ (n_total, K, …)"]
+        M5["reshape → (G, P, K, …)"]
+        M6["finalize_backend =<br>EnsembleBackend(base, P=0.0) if any_pressure else base"]
+        M7["(energies, counts) =<br>_finalise_initial_energies_and_counts(<br>finalize_backend, (G,P,K,N,3) positions,<br>types, (G,P,K,3,3) cells,<br>batcher=PmapVmapRuns,<br>ladder, offset,<br>pressures=(G,P))"]
+        M8["reshape (G,P,K,…) back to (n_total, K, …)<br>(downstream dispatcher input)"]
+        M9["return ResolvedConfig(<br>batcher=PmapVmapRuns(G,P),<br>ensemble_params_per_run=tuple(params_per_run))"]
+        M1 --> M2 --> M3
+        M3 --> M3a --> M3b
+        M3b -.->|"replica r built;<br>loop continues"| M3
+        M3 -->|"all n_total replicas built"| M4 --> M5 --> M6 --> M7 --> M8 --> M9
     end
 
-    subgraph one["Per-iteration setup<br>(cohort element i / replica r — shared by both paths)"]
-        direction TB
-        EP["pressure = ensemble.to_ensemble_params(<br>cohort_index = i / r).get('pressure')"]
-        BB1["build_backend(spec)<br>→ base_backend (built once per call)"]
-        EBW["wrap EnsembleBackend(base, pressure=P)<br>(rejection-mode ceiling check<br>during structural init)"]
-    end
+    BR -- yes --> S1
+    BR -- no --> M1
 
-    subgraph init["_resolve_init — structural init only"]
-        direction TB
-        MODE{"select mode<br>(A / B / C / D)"}
-        A["A: start_species<br>sample cell + positions"]
-        B["B: start_config_file<br>load + replicate"]
-        C["C: start_walker_set<br>load verbatim"]
-        D["D: restart_file<br>load checkpoint"]
-        VAL["_validate_cells"]
-    end
-
-    subgraph mrwrap["Multi-run only — after the per-replica loop"]
-        direction TB
-        STK["jnp.stack along replica axis<br>(n_total, K, …) → (G, P, K, …)"]
-        EBW0["wrap one EnsembleBackend(base, pressure=0.0)<br>(per-replica P flows via ensemble_params kwarg<br>on the vmap axis)"]
-    end
-
-    subgraph fin["_finalise_initial_energies_and_counts<br>(only place initial energies are priced)"]
-        direction TB
-        HAS{"backend has<br>max_neighbors_for?"}
-        CNT["counts = batcher.wrap_for_batch(<br>vmap(max_neighbors_for))<br>(positions, cells)"]
-        BUCK["init_bucket =<br>_choose_starting_bucket(<br>counts, ladder, offset)"]
-        EN["energies = batcher.wrap_for_batch(<br>vmap(backend(…, init_bucket)))<br>(positions, cells)"]
-        EN0["energies = batcher.wrap_for_batch(<br>vmap(backend(…, 0)))<br>(positions, cells)"]
-    end
-
-    OUT1["ResolvedConfig<br>(or list thereof)"]
-    OUT2["ResolvedMultiRunConfig<br>(carries batcher field)"]
-
-    RS --> EMC
-    EMC -- no --> SIZE
-    EMC -- yes --> DRA
-    SIZE --> COHFOR --> RONE
-    DRA --> BATCH --> MFOR
-    RONE -.calls.-> EP
-    MFOR -.calls.-> EP
-    EP --> BB1 --> EBW --> MODE
-    MODE -- A --> A --> VAL
-    MODE -- B --> B --> VAL
-    MODE -- C --> C --> VAL
-    MODE -- D --> D --> VAL
-    VAL -->|"single-run<br>(SingleRun,<br>ladder + offset)"| HAS
-    VAL -.->|"replica r built;<br>loop continues"| MFOR
-    MFOR -->|"all n_total replicas built"| STK
-    STK --> EBW0 -->|"PmapVmapRuns(G, P),<br>pressures kwarg"| HAS
-    HAS -- yes --> CNT --> BUCK --> EN
-    HAS -- no --> EN0
-    EN --> OUT1
-    EN --> OUT2
-    EN0 --> OUT1
-    EN0 --> OUT2
-
-    cohort:::pyBox
-    multi:::pyBox
-    one:::pyBox
-    init:::pyBox
-    mrwrap:::pyBox
-    fin:::jitBox
-    EMC:::decision
-    MODE:::decision
-    HAS:::decision
     classDef pyBox fill:#f5f5f5,stroke:#888,color:#222
-    classDef jitBox fill:#fff7e0,stroke:#a07000,color:#222
+    classDef initBox fill:#e0f2f1,stroke:#00897b,color:#004d40
+    classDef finBox fill:#fff7e0,stroke:#a07000,color:#5a4000
     classDef decision fill:#eef5ff,stroke:#1565c0,color:#222
+    S:::pyBox
+    M:::pyBox
+    S3:::initBox
+    M3b:::initBox
+    S4:::finBox
+    M7:::finBox
+    GUARD:::decision
+    BR:::decision
 ```
 
-The amber box (`_finalise_initial_energies_and_counts`) is the only
-JIT-compiled work in the resolver — everything else is plain Python
-shuffling pydantic specs into dataclasses. That single helper is
-*also* where multi-GPU dispatch enters the resolver, via the
-`batcher` argument.
+Reading the diagram:
+
+- The prelude (`_apply_interval_units` → `_derive_replica_axes` →
+  restart guard → topology branch) is the first ~30 lines of
+  `resolve()`. After that the two branches are entirely separate.
+- **Teal** boxes (`_resolve_init(...)`) and **amber** boxes
+  (`_finalise_initial_energies_and_counts(...)`) are call sites for
+  the two mini-diagrams above; the color matches the box color used
+  in the corresponding standalone diagram.
+- `_resolve_single_replica` is linear: build backend → wrap → init
+  (teal) → finalize (amber) → return.
+- `_resolve_multi_replica` has the per-replica Python loop on the
+  inside (`build_backend` runs *once* outside it; `EnsembleBackend`
+  wrap and `_resolve_init` (teal) run *n_total* times); then the
+  stack-reshape-finalize (amber)-reshape chain produces the final
+  `(n_total, K, …)` arrays.
+- The amber `_finalise_…` call is the only JIT-compiled work in
+  the resolver. Everything else is plain Python shuffling pydantic
+  specs into dataclasses.
 
 ### Topology derivation
 
@@ -231,12 +329,25 @@ shuffling pydantic specs into dataclasses. That single helper is
 `jax.local_devices()` to pick `n_gpu`, and demands
 `n_total % n_gpu == 0`. The output is the `(n_gpu, n_per_gpu)` shape
 that the rest of the runtime (`pmap(vmap(...))`, `AdaptationManager`,
-`InterREManager`) inherits. Cohort path skips this entirely — its
-topology is `SingleRun()`.
+`InterREManager`) inherits. Single-replica path skips most of this —
+its batcher is `SingleRun()` and there is no replica axis.
 
-### The four init modes
+### Interval-unit scaling
 
-`_resolve_init` is a router. The init spec must set exactly one of:
+`root.interval_units = "per_walker"` lets users express iteration
+counts in walker-sweeps (1 sweep = `n_live` iterations). The resolver
+calls `_apply_interval_units(root)` at the top of `resolve()` to
+multiply the eight affected fields by `n_live`. The CLI already does
+the same call earlier — in `_cmd_run`, right after
+`_load_and_validate` — and flips `root.interval_units` to
+`"absolute"`. The resolver's second pass therefore becomes idempotent
+(factor=1, identical re-rounding). Direct callers of `resolve` (tests,
+scripts) that bypass the CLI still get correct scaling automatically.
+
+### The four init modes (reference)
+
+`_resolve_init` is the router shown in the mini-diagram above. The
+init spec must set exactly one of:
 
 | Mode | YAML key | Helper | What it does |
 |---|---|---|---|
@@ -245,26 +356,27 @@ topology is `SingleRun()`.
 | C | `start_walker_set` | `_resolve_init_walker_set` | Load a pre-computed `(n_live, N, 3)` walker file verbatim |
 | D | `restart_file` | `_resolve_init_restart` | Resume from an NS checkpoint; carries `RestartBundle` |
 
-All four converge on `_validate_cells` (mins/maxes on volume per atom
-and aspect ratio — fail fast on a bad input rather than later in the
-NS loop with a misleading "walker produced invalid cell" message)
-and then return structural init only: positions / cells / types /
-symbol map / (Mode D) restart bundle, with
-`initial_energies = initial_max_neighbor_counts = None`. Pricing the
-energies is the caller's job — `_resolve_one` does it on the
-single-replica arrays it just built, and `_resolve_multi_run` does it
-once on the stacked `(G, P, K, …)` pytree after the per-replica loop
-finishes. Mode helpers therefore see exactly one concern (place the
-walkers) and never have to know whether they were called from the
-single-run or multi-run path.
+`_validate_cells` enforces volume-per-atom and aspect-ratio bounds —
+fail fast on a bad input rather than later in the NS loop with a
+misleading "walker produced invalid cell" message. Pricing the
+energies is the caller's job, not the mode helper's:
+`_resolve_single_replica` does it on the single-replica arrays it
+just built; `_resolve_multi_replica` does it once on the stacked
+`(G, P, K, …)` pytree after the per-replica loop finishes. Mode
+helpers therefore see exactly one concern (place the walkers) and
+never have to know which path called them.
 
-### The consolidated finalize
+Mode D (restart) is incompatible with multi-replica topologies — the
+resolver raises a `ValueError` when `restart_file` is set alongside a
+replica-axis list. Restart is single-NS only by design; the
+checkpoint carries one trajectory, not N.
 
-`_finalise_initial_energies_and_counts` is the resolver's compile
-hot-spot, and the *only* place initial energies are priced.  It is
-called exactly once per resolution path — once from `_resolve_one`
-for the single-run / cohort path, once from `_resolve_multi_run`
-after stacking N replicas.  It earns three optimisations:
+### Why the consolidated finalize matters
+
+The mini-diagram earlier shows *what* `_finalise_initial_energies_and_counts`
+does. This section is the *why* — the three optimisations the
+helper earns by being the single shared entry point for both
+branches:
 
 1. **Bucket-aware compile.** For backends with bucketed kernel
    dispatch (MACE, NeuralIL — see {doc}`backends`), the helper first
@@ -273,21 +385,20 @@ after stacking N replicas.  It earns three optimisations:
    `init_bucket = _choose_starting_bucket(counts, ladder, offset)` —
    the same bucket the NS step's bucket-escalation logic would land
    on. Both resolution paths now pass `ladder = backend.max_neighbors_list`
-   and `offset = backend.max_neighbors_offset` (single-run previously
-   used the legacy `int(max(counts))` fallback; the paths agreed only
-   on the multi-run side). The initial-energy compile therefore lands
-   in the same JIT cache slot the burn-in and the NS step will hit,
-   instead of wasting a compile at `max_neighbors=0`. Backends without
-   `max_neighbors_for` (LJ, toy, jax-md) pass `max_neighbors=0`
-   straight through; the bucket arg is inert for them.
+   and `offset = backend.max_neighbors_offset`. The initial-energy
+   compile therefore lands in the same JIT cache slot the burn-in and
+   the NS step will hit, instead of wasting a compile at
+   `max_neighbors=0`. Backends without `max_neighbors_for` (LJ, toy,
+   jax-md) pass `max_neighbors=0` straight through; the bucket arg is
+   inert for them.
 2. **`batcher.wrap_for_batch(per_replica_fn)` dispatch.** The same
    helper body works for all topologies because the `batcher` argument
    chooses `jax.jit` / `jax.jit(vmap)` / `pmap(vmap)` underneath.
-   Cohort path passes `SingleRun()`; the multi-run path passes the
-   same `PmapVmapRuns(G, P)` instance it stores on
-   `ResolvedMultiRunConfig.batcher` — so the resolver, burn-in, and
-   NS step all dispatch through one shared batcher instance.
-3. **Per-replica pressure under one wrapper.** The multi-run path
+   Single-replica path passes `SingleRun()`; the multi-replica path
+   passes the same `PmapVmapRuns(G, P)` instance it stores on
+   `ResolvedConfig.batcher` — so the resolver, burn-in, and NS step
+   all dispatch through one shared batcher instance.
+3. **Per-replica pressure under one wrapper.** The multi-replica path
    wraps the base backend in a *single* `EnsembleBackend(pressure=0.0)`
    and threads each replica's pressure through the per-call
    `ensemble_params={"pressure": p}` kwarg, vmapped over the replica
@@ -302,25 +413,30 @@ burn-in will use — instead of once per replica at the wrong bucket.
 That's where the resolver's ~10× speedup on heavy-backend configs
 comes from.
 
-## The two resolved types
+## The unified ResolvedConfig
 
-`ResolvedConfig` and `ResolvedMultiRunConfig` are sibling frozen
-dataclasses, not a subclass. The asymmetry is real and intentional:
+`ResolvedConfig` is a single frozen dataclass for both single- and
+multi-replica runs. The shape depends on the batcher:
 
-| Field | `ResolvedConfig` | `ResolvedMultiRunConfig` |
+| Field | `batcher = SingleRun()` | `batcher = PmapVmapRuns(G, P)` |
 |---|---|---|
-| `energy_backend` | wrapped `EnsembleBackend(pressure=P)` | unwrapped base backend |
-| ensemble params | `ensemble_params: dict` (one dict) | `ensemble_params_per_run: tuple[dict, ...]` |
+| `base_backend` | unwrapped backend (e.g. raw MACE / LJ instance) | unwrapped backend |
+| `ensemble_params_per_run` | length-1 tuple | length-`n_total` tuple, flat order `g * P + p` |
 | `init.initial_positions` shape | `(n_live, A, 3)` | `(n_total, n_live, A, 3)` |
 | `init.initial_energies` shape | `(n_live,)` | `(n_total, n_live)` |
+| `batcher` | `SingleRun()` | `PmapVmapRuns(n_gpu, n_per_gpu)` |
 
-Why they differ: in single-run mode the resolver pre-wraps the
-backend at a specific pressure, so the initial walker energies
-already include the `+P·V` term. In multi-run mode we wrap once at
-`pressure=0.0` and the per-call `ensemble_params` dict overrides
-that default, so one backend instance can serve eight replicas at
-eight different pressures without rebuilding. That decision is a
-runtime-object concern — it lives in the resolver, not the schema.
+`base_backend` is always the unwrapped backend. The runtime wraps it
+into an `EnsembleBackend` if needed; the resolver applies the same
+wrapping locally only to compute initial energies on the right scale,
+then discards the wrapper. This means a multi-replica run can serve
+8 different pressures from one `EnsembleBackend(pressure=0.0)`
+instance, with each replica's pressure flowing in through
+`ensemble_params` at call time — no per-replica backend rebuild.
+
+The CLI dispatches on `isinstance(resolved.batcher, SingleRun)`:
+single → `run_from_config`, multi → `run_multi_gpu_from_config`.
+That's the only place the two paths diverge after the resolver.
 
 ## Concrete trace
 
@@ -335,25 +451,28 @@ ensemble:
 
 inter_re:
   flavor: pressure
-  every: 5
+  re_interval: 5
 ```
 
 Step by step:
 
 1. **Load & validate**: `cli/cli.py::_load_and_validate` reads the
-   YAML and calls `RootConfig.model_validate`. pydantic runs all
-   validators; errors surface here with line-accurate messages.
-2. **Unit conversion**: `NPTEnsembleSpec._pressure_list()` returns
+   YAML and calls `RootSpec.model_validate`. pydantic runs all
+   validators; errors surface here with line-accurate messages (and
+   "did you mean" suggestions for typos).
+2. **Interval-unit scaling (CLI)**: `_cmd_run` calls
+   `_apply_interval_units(root)` and flips `interval_units` to
+   `"absolute"`, so the logged "Parsed configuration" block already
+   shows resolved iteration counts.
+3. **Unit conversion**: `NPTEnsembleSpec._pressure_list()` returns
    `[1.0, …, 8.0]`. When called via `to_ensemble_params(i)` with
    `pressure_units="gpa"`, each scalar is multiplied by
    `_GPA_TO_EVA3` (schema-layer concern).
-3. **Dispatcher**: `_cmd_run` calls
-   `expand_multi_run_or_cohort(root)`. It sees the 8-element list
-   and dispatches to `_resolve_multi_run`.
-4. **Topology**: `_derive_replica_axes` computes
-   `n_total = 8`, reads `len(jax.local_devices()) = 4` on a
-   `--gres=gpu:4` SLURM allocation, returns
-   `(n_gpu=4, n_per_gpu=2)`. Divisibility is checked here.
+4. **Resolve**: `_cmd_run` calls `resolve(root)`. The resolver
+   computes `n_total = 8` from the pressure list, reads
+   `len(jax.local_devices()) = 4` on a `--gres=gpu:4` SLURM
+   allocation, returns `(n_gpu=4, n_per_gpu=2)`, and dispatches to
+   `_resolve_multi_replica`. Divisibility is checked here.
 5. **Per-replica structural init**: for each of 8 replicas,
    `_resolve_init` builds positions / cells / types only. A
    per-replica `EnsembleBackend(base, pressure=P_r)` is constructed
@@ -361,7 +480,7 @@ Step by step:
    `_sample_per_walker_positions`, but no initial energies are
    computed yet. Per-replica arrays are stacked along axis 0 into
    `(n_total, K, …)`.
-6. **Consolidated finalize**: `_resolve_multi_run` reshapes to
+6. **Consolidated finalize**: `_resolve_multi_replica` reshapes to
    `(G, P, K, …)`, wraps the base backend in *one*
    `EnsembleBackend(pressure=0.0)`, and calls
    `_finalise_initial_energies_and_counts` with
@@ -369,36 +488,44 @@ Step by step:
    through `ensemble_params={"pressure": P_r}` on the vmap axis, and
    `ladder` / `offset` from the backend config. One compile across
    all 4 GPUs at the bucket the NS step will use.
-7. **Runtime handoff**: `ResolvedMultiRunConfig` is returned to
-   `_cmd_run`, which calls
-   `cli/run.py::run_multi_gpu_from_config`. From here on, no
-   schema, no resolver — just JAX arrays and dataclasses flowing
-   through `run_ns_multi_gpu` with its `pmap(vmap(ns_step))`
-   dispatch.
+7. **Runtime handoff**: `ResolvedConfig` is returned to `_cmd_run`,
+   which inspects `resolved.batcher` and calls
+   `cli/run.py::run_multi_gpu_from_config` (the `PmapVmapRuns`
+   branch). From here on, no schema, no resolver — just JAX arrays
+   and dataclasses flowing through `run_ns_multi_gpu` with its
+   `pmap(vmap(ns_step))` dispatch.
+
+For a scalar-pressure version of the same config, steps 4–7 collapse
+to: `n_total = 1`, batcher is `SingleRun()`, resolver calls
+`_resolve_single_replica`, CLI calls `run_from_config`. The
+`ResolvedConfig` type is identical; only the array shapes and the
+batcher differ.
 
 ## Why this structure
 
 Three properties the three-layer split buys you:
 
 1. **Early, single-point validation.** Everything you can check
-   without running JAX is checked in `jaxrens validate`. You don't
-   lose 10 minutes of GPU time to a typo like `n_liv: 500`.
+   without running JAX is checked in `jaxrens validate --parse-only`.
+   You don't lose 10 minutes of GPU time to a typo like `n_liv: 500` —
+   the schema's `extra="forbid"` rejects it instantly, and the CLI
+   formats the error with a "did you mean" suggestion.
 2. **Independent evolution of the YAML surface and the core.** Add
    a new YAML shortcut in the schema without touching the core;
    rename a `NSConfig` field in the core without breaking YAML
    compatibility (the resolver adapts).
 3. **Programmatic entry point.** Nothing forces you through the
-   YAML layer. Build a `ResolvedMultiRunConfig` by hand in Python
-   and call `run_multi_gpu_from_config` directly — exactly what
-   `tests/test_cli_multi_run.py` does.
+   YAML layer. Build a `RootSpec` by hand in Python, call `resolve`,
+   then `run_from_config` / `run_multi_gpu_from_config` directly —
+   exactly what `tests/test_cli_multi_run.py` does.
 
 ## Where this lives in the code
 
 | Layer | File(s) |
 |---|---|
 | Schema | `src/jaxrens/cli/schema/` (10 spec modules) + `cli/schema/__init__.py` re-export |
-| Resolver | `src/jaxrens/cli/resolve.py` (~1000 LoC, one concern per function) |
-| Single-run entry point | `src/jaxrens/cli/run.py::run_from_config` |
-| Multi-run entry point | `src/jaxrens/cli/run.py::run_multi_gpu_from_config` |
+| Resolver | `src/jaxrens/cli/resolve.py` (~1500 LoC, one concern per function) |
+| Single-replica runtime entry | `src/jaxrens/cli/run.py::run_from_config` |
+| Multi-replica runtime entry | `src/jaxrens/cli/run.py::run_multi_gpu_from_config` |
 | CLI dispatch | `src/jaxrens/cli/cli.py::_cmd_run` |
 | Library core | `src/jaxrens/{sampling,state,backends,init,io,postprocess}/` |

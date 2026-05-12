@@ -530,8 +530,8 @@ class TestInitSpecResolverModeD:
             for r in caplog.records
         )
 
-    def test_cohort_gt_1_with_restart_file_raises(self, tmp_path):
-        from jaxrens.cli.resolve import expand_cohort
+    def test_multi_replica_with_restart_file_raises(self, tmp_path):
+        from jaxrens.cli.resolve import resolve
         from jaxrens.cli.schema import RootSpec
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
         d = {
@@ -545,10 +545,10 @@ class TestInitSpecResolverModeD:
         root = RootSpec.model_validate(d)
         import pytest as _pytest
         with _pytest.raises(ValueError, match="restart_file"):
-            expand_cohort(root)
+            resolve(root)
 
-    def test_cohort_gt_1_restart_error_message_contains_cohort_size(self, tmp_path):
-        from jaxrens.cli.resolve import expand_cohort
+    def test_multi_replica_restart_error_message_contains_n_total(self, tmp_path):
+        from jaxrens.cli.resolve import resolve
         from jaxrens.cli.schema import RootSpec
         p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
         d = {
@@ -562,7 +562,7 @@ class TestInitSpecResolverModeD:
         root = RootSpec.model_validate(d)
         import pytest as _pytest
         with _pytest.raises(ValueError, match="3"):
-            expand_cohort(root)
+            resolve(root)
 
     def test_mode_d_end_to_end_jit(self, tmp_path):
         """Mode D: load checkpoint, init_ns with restart_state, run ns_step under JIT."""

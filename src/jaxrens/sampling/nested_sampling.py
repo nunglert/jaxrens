@@ -866,7 +866,7 @@ def run_ns_parallel(
             swap_kernel=swap_kernel,
             batcher=batcher,
             backend=backend,
-            every=cfg.every,
+            re_interval=cfg.re_interval,
             n_swap_cycles=cfg.n_swap_cycles,
         )
 
@@ -1304,7 +1304,7 @@ def run_ns_multi_gpu(
             swap_kernel=swap_kernel_mg,
             batcher=batcher,
             backend=backend,
-            every=cfg.every,
+            re_interval=cfg.re_interval,
             n_swap_cycles=cfg.n_swap_cycles,
         )
 

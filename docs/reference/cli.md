@@ -48,7 +48,7 @@ jaxrens run -c config.yaml --set run.max_iterations=5000 \
 ```
 
 All fields accept `--set key.path=value` overrides; nested paths use
-dots (`run.n_live`, `ensemble.pressure`, `inter_re.every`). Lists
+dots (`run.n_live`, `ensemble.pressure`, `inter_re.re_interval`). Lists
 and nested structures are YAML-parsed, so `--set
 'ensemble.pressure=[0.5, 1.0, 2.0]'` works.
 

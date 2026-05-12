@@ -374,7 +374,7 @@ class TestStartupCutoffWarning:
         }
 
     def test_warns_on_tight_cell_prior(self, caplog):
-        from jaxrens.cli.resolve import _resolve_one
+        from jaxrens.cli.resolve import resolve
         from jaxrens.cli.schema.root import RootSpec
 
         cfg = self._minimal_config()
@@ -388,12 +388,12 @@ class TestStartupCutoffWarning:
         }
         root = RootSpec.model_validate(cfg)
         with caplog.at_level("WARNING", logger="jaxrens.cli.resolve"):
-            _resolve_one(root)
+            resolve(root)
         msgs = [r.getMessage() for r in caplog.records]
         assert any("LJ cutoff vs cell-prior bounds" in m for m in msgs), msgs
 
     def test_no_warning_on_spacious_cell_prior(self, caplog):
-        from jaxrens.cli.resolve import _resolve_one
+        from jaxrens.cli.resolve import resolve
         from jaxrens.cli.schema.root import RootSpec
 
         cfg = self._minimal_config()
@@ -407,12 +407,12 @@ class TestStartupCutoffWarning:
         }
         root = RootSpec.model_validate(cfg)
         with caplog.at_level("WARNING", logger="jaxrens.cli.resolve"):
-            _resolve_one(root)
+            resolve(root)
         msgs = [r.getMessage() for r in caplog.records]
         assert not any("LJ cutoff vs cell-prior bounds" in m for m in msgs), msgs
 
     def test_no_warning_without_cutoff(self, caplog):
-        from jaxrens.cli.resolve import _resolve_one
+        from jaxrens.cli.resolve import resolve
         from jaxrens.cli.schema.root import RootSpec
 
         cfg = self._minimal_config()
@@ -425,6 +425,6 @@ class TestStartupCutoffWarning:
         }
         root = RootSpec.model_validate(cfg)
         with caplog.at_level("WARNING", logger="jaxrens.cli.resolve"):
-            _resolve_one(root)
+            resolve(root)
         msgs = [r.getMessage() for r in caplog.records]
         assert not any("LJ cutoff vs cell-prior bounds" in m for m in msgs), msgs

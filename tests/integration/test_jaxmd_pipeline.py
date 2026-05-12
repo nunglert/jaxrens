@@ -112,9 +112,9 @@ def test_jaxmd_full_pipeline(tmp_path: Path) -> None:
     pytest.importorskip("jax_md")
 
     from jaxrens.cli.resolve import (
-        ResolvedMultiRunConfig,
-        expand_multi_run_or_cohort,
+        resolve,
     )
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
     from jaxrens.cli.run import run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
 
@@ -122,8 +122,8 @@ def test_jaxmd_full_pipeline(tmp_path: Path) -> None:
     raw["output"]["working_dir"] = str(tmp_path / "out")
 
     root = RootSpec.model_validate(raw)
-    resolved = expand_multi_run_or_cohort(root)
-    assert isinstance(resolved, ResolvedMultiRunConfig), (
+    resolved = resolve(root)
+    assert isinstance(resolved.batcher, PmapVmapRuns), (
         "Two-pressure config should route through the multi-GPU dispatcher."
     )
 
@@ -182,9 +182,9 @@ def test_jaxmd_multi_gpu_pipeline(tmp_path: Path) -> None:
     pytest.importorskip("jax_md")
 
     from jaxrens.cli.resolve import (
-        ResolvedMultiRunConfig,
-        expand_multi_run_or_cohort,
+        resolve,
     )
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
     from jaxrens.cli.run import run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
 
@@ -200,13 +200,13 @@ def test_jaxmd_multi_gpu_pipeline(tmp_path: Path) -> None:
     raw["output"]["out_file_prefix"] = "jaxmd_mgpu"
     raw["inter_re"] = {
         "flavor": "pressure",
-        "every": 2,
+        "re_interval": 2,
         "n_swap_cycles": 1,
     }
 
     root = RootSpec.model_validate(raw)
-    resolved = expand_multi_run_or_cohort(root)
-    assert isinstance(resolved, ResolvedMultiRunConfig)
+    resolved = resolve(root)
+    assert isinstance(resolved.batcher, PmapVmapRuns)
     assert resolved.ns.n_gpu == n_gpu
     assert resolved.ns.n_per_gpu == 2
 

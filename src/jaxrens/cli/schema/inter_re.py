@@ -30,14 +30,14 @@ class InterRESpec(BaseModel):
 
         inter_re:
           flavor: pressure
-          every: 1
+          re_interval: 1
           n_swap_cycles: 1
 
     Example YAML (XRENS with 2 runs, 8 atoms each, 2 species)::
 
         inter_re:
           flavor: xrens
-          every: 1
+          re_interval: 1
           n_swap_cycles: 1
           composition_targets:
             - [8, 0]   # run 0: 8 atoms of species 0, 0 of species 1
@@ -47,7 +47,7 @@ class InterRESpec(BaseModel):
 
         inter_re:
           flavor: semi_grand
-          every: 1
+          re_interval: 1
           n_swap_cycles: 1
           chemical_potentials:
             - [0.0, 0.0]   # run 0: μ for each species
@@ -59,7 +59,7 @@ class InterRESpec(BaseModel):
     flavor: str = "pressure"
     # Widened to int|float for RootSpec.interval_units='per_walker'; resolver
     # scales+casts to int before constructing InterREConfig.
-    every: int | float = 1
+    re_interval: int | float = 1
     n_swap_cycles: int = 1
     composition_targets: Optional[List[List[int]]] = None
     chemical_potentials: Optional[List[List[float]]] = None
@@ -172,7 +172,7 @@ class InterRESpec(BaseModel):
 
         return InterREConfig(
             flavor=self.flavor,
-            every=self.every,
+            re_interval=self.re_interval,
             n_swap_cycles=self.n_swap_cycles,
             composition_targets=comp_targets,
             chemical_potentials=chem_pots,

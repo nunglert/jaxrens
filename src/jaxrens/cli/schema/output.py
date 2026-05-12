@@ -50,6 +50,15 @@ class OutputSpec(BaseModel):
         ),
     )
 
+    # Per-fire inter-RE swap log.  When ``save_re_stats`` is True and
+    # ``inter_re`` is configured, the runtime registers an
+    # ``RECallback`` that writes ``<prefix>.re_stats.h5`` once per
+    # swap fire (cadence is dictated by ``inter_re.re_interval`` —
+    # there is intentionally no separate interval here, since the file
+    # would just sub-sample an already sub-sampled signal).  No-op
+    # when ``inter_re`` is not configured.
+    save_re_stats: bool = False
+
     # -- Deferred fields (see module docstring) --
     snapshot_time: float | None = None
     snapshot_clean: bool = False

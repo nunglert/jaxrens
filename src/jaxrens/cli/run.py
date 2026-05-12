@@ -77,11 +77,11 @@ def configure_file_logging(
     info_h._jaxrens_managed = True  # type: ignore[attr-defined]
     root.addHandler(info_h)
 
-    stream_h = logging.StreamHandler(sys.stderr)
-    stream_h.setLevel(logging.INFO)
-    stream_h.setFormatter(logging.Formatter(_LOG_FORMAT))
-    stream_h._jaxrens_managed = True  # type: ignore[attr-defined]
-    root.addHandler(stream_h)
+    # stream_h = logging.StreamHandler(sys.stderr)
+    # stream_h.setLevel(logging.INFO)
+    # stream_h.setFormatter(logging.Formatter(_LOG_FORMAT))
+    # stream_h._jaxrens_managed = True  # type: ignore[attr-defined]
+    # root.addHandler(stream_h)
 
     if level == "debug":
         debug_h = logging.FileHandler(working_dir / f"{prefix}.debug.log", mode="w")
@@ -522,7 +522,7 @@ def run_from_config(
 
 
 def run_multi_gpu_from_config(resolved) -> dict:
-    """Execute a multi-run NS dispatch from a ``ResolvedMultiRunConfig``.
+    """Execute a multi-replica NS dispatch from a multi-replica ``ResolvedConfig``.
 
     Mirrors :func:`run_from_config` but ends in ``run_ns_multi_gpu`` with
     per-replica ``ensemble_params_per_run``.  Wires all five callbacks with
@@ -760,6 +760,24 @@ def run_multi_gpu_from_config(resolved) -> dict:
             acc_logger,
             interval=int(getattr(resolved.output, "acc_rates_interval", 1)),
         ))
+
+    # Per-fire inter-RE swap counts (multi-run + inter_re only).
+    if (
+        resolved.inter_re_config is not None
+        and getattr(resolved.output, "save_re_stats", False)
+    ):
+        from jaxrens.io.re_stats_log import RELogger
+        from jaxrens.cli.monitor import RECallback
+
+        re_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.re_stats.h5"
+        )
+        re_logger = RELogger(
+            path=re_log_path,
+            n_pairs=max(n_total - 1, 0),
+            flavor=resolved.inter_re_config.flavor,
+        )
+        callbacks.append(RECallback(re_logger))
 
     first_mc = resolved.moves[0]
     full_auto_kwargs: dict[str, Any] = {}

@@ -458,7 +458,7 @@ class TestSemiGrandEndToEnd:
         # Two runs with different μ vectors (2 species, single-species system → μ[1] unused).
         inter_re_cfg = InterREConfig(
             flavor="semi_grand",
-            every=1,
+            re_interval=1,
             n_swap_cycles=1,
             chemical_potentials=((0.0, 0.0), (0.5, 0.5)),
         )
@@ -569,7 +569,7 @@ class TestSemiGrandPmapVmapSmoke:
 
         inter_re_cfg = InterREConfig(
             flavor="semi_grand",
-            every=1,
+            re_interval=1,
             n_swap_cycles=1,
             chemical_potentials=((0.0, 0.0), (0.5, 0.5)),
         )
@@ -609,7 +609,7 @@ class TestInterRESpecSemiGrand:
         from jaxrens.cli.schema.inter_re import InterRESpec
         spec = InterRESpec(
             flavor="semi_grand",
-            every=1,
+            re_interval=1,
             n_swap_cycles=1,
             chemical_potentials=[[0.0, 0.0], [0.5, 1.0]],
         )
@@ -642,7 +642,7 @@ class TestInterRESpecSemiGrand:
 
     def test_pressure_flavor_still_valid(self):
         from jaxrens.cli.schema.inter_re import InterRESpec
-        spec = InterRESpec(flavor="pressure", every=2, n_swap_cycles=1)
+        spec = InterRESpec(flavor="pressure", re_interval=2, n_swap_cycles=1)
         cfg = spec.to_inter_re_config()
         assert cfg.flavor == "pressure"
         assert cfg.chemical_potentials is None
@@ -651,11 +651,11 @@ class TestInterRESpecSemiGrand:
         from jaxrens.cli.schema.inter_re import InterRESpec
         spec = InterRESpec(
             flavor="semi_grand",
-            every=3,
+            re_interval=3,
             n_swap_cycles=2,
             chemical_potentials=[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
         )
         cfg = spec.to_inter_re_config()
-        assert cfg.every == 3
+        assert cfg.re_interval == 3
         assert cfg.n_swap_cycles == 2
         assert cfg.chemical_potentials == ((1.0, 2.0, 3.0), (4.0, 5.0, 6.0))

@@ -39,7 +39,7 @@ from jaxrens.cli.schema.moves import (
     AlchemicalMorphMoveSpec,
     AlchemicalShiftMoveSpec,
 )
-from jaxrens.cli.resolve import resolve, expand_cohort, ResolvedConfig
+from jaxrens.cli.resolve import resolve, ResolvedConfig
 from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
 
 _DATA = Path(__file__).parent / "data" / "cli"
@@ -682,50 +682,58 @@ class TestEnsembleResolver:
         d["run"]["pressure"] = 0.03
         root = RootSpec.model_validate(d)
         resolved = resolve(root)
-        assert resolved.ensemble_params == {"pressure": pytest.approx(0.03)}
+        assert resolved.ensemble_params_per_run[0]["pressure"] == pytest.approx(0.03)
         assert resolved.ns.pressure == pytest.approx(0.03)
 
 
 # ---------------------------------------------------------------------------
-# Cohort expansion resolver tests (yaml-fixture subset from TestCohortExpansion)
+# Multi-replica resolver tests (yaml-fixture subset from former TestCohortExpansion)
 # ---------------------------------------------------------------------------
 
-class TestCohortExpansionResolver:
+class TestMultiReplicaResolver:
     def test_npt_three_pressures_and_values(self):
-        """Merged from test_npt_three_pressures_three_configs and
-        test_npt_three_pressures_correct_values (Step D: collapsed)."""
+        """A 3-pressure list resolves to one 3-replica ResolvedConfig."""
+        from jaxrens.sampling.batch_descriptor import PmapVmapRuns
+
         d = _minimal_dict()
         d["run"]["seed"] = 10
         d["ensemble"] = {"type": "npt", "pressure": [0.01, 0.02, 0.03]}
         root = RootSpec.model_validate(d)
-        cohort = expand_cohort(root)
+        resolved = resolve(root)
 
-        # Shape assertion (was test_npt_three_pressures_three_configs)
-        assert len(cohort) == 3
-
-        # Value assertions (was test_npt_three_pressures_correct_values)
-        assert cohort[0].ensemble_params["pressure"] == pytest.approx(0.01)
-        assert cohort[1].ensemble_params["pressure"] == pytest.approx(0.02)
-        assert cohort[2].ensemble_params["pressure"] == pytest.approx(0.03)
+        assert isinstance(resolved.batcher, PmapVmapRuns)
+        n_total = resolved.batcher.n_gpu * resolved.batcher.n_per_gpu
+        assert n_total == 3
+        assert len(resolved.ensemble_params_per_run) == 3
+        assert resolved.ensemble_params_per_run[0]["pressure"] == pytest.approx(0.01)
+        assert resolved.ensemble_params_per_run[1]["pressure"] == pytest.approx(0.02)
+        assert resolved.ensemble_params_per_run[2]["pressure"] == pytest.approx(0.03)
 
     def test_npt_sweep_fixture_yaml_validates(self):
+        from jaxrens.sampling.batch_descriptor import PmapVmapRuns
+
         fixture = _DATA / "npt_sweep.yaml"
         with open(fixture) as fh:
             raw = yaml.safe_load(fh)
         root = RootSpec.model_validate(raw)
         from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
         assert isinstance(root.ensemble, NPTEnsembleSpec)
-        cohort = expand_cohort(root)
-        assert len(cohort) == 2
+        resolved = resolve(root)
+        assert isinstance(resolved.batcher, PmapVmapRuns)
+        n_total = resolved.batcher.n_gpu * resolved.batcher.n_per_gpu
+        assert n_total == 2
 
-    def test_npt_scalar_fixture_yaml_single_cohort(self):
+    def test_npt_scalar_fixture_yaml_single_run(self):
+        from jaxrens.sampling.batch_descriptor import SingleRun
+
         fixture = _DATA / "npt_scalar.yaml"
         with open(fixture) as fh:
             raw = yaml.safe_load(fh)
         root = RootSpec.model_validate(raw)
-        cohort = expand_cohort(root)
-        assert len(cohort) == 1
-        assert cohort[0].ensemble_params["pressure"] == pytest.approx(0.01)
+        resolved = resolve(root)
+        assert isinstance(resolved.batcher, SingleRun)
+        assert len(resolved.ensemble_params_per_run) == 1
+        assert resolved.ensemble_params_per_run[0]["pressure"] == pytest.approx(0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -1401,8 +1409,8 @@ class TestFinaliseInitialBucketChoice:
         assert backend.calls, "energy backend was never called"
         assert all(c == per_walker for c in backend.calls)
 
-    def test_resolve_one_populates_neighbor_counts_via_new_seam(self):
-        """End-to-end: ``_resolve_one`` runs the finalize seam after
+    def test_resolve_populates_neighbor_counts_via_new_seam(self):
+        """End-to-end: ``resolve`` runs the finalize seam after
         ``_resolve_init``, so ``initial_max_neighbor_counts`` is no
         longer ``None`` for ladder-aware backends.
 
@@ -1411,14 +1419,14 @@ class TestFinaliseInitialBucketChoice:
         ladder-aware backend via monkeypatch to prove the seam wires
         through to the bucket-choice path.
         """
-        from jaxrens.cli.resolve import _resolve_one
+        from jaxrens.cli.resolve import resolve
         from jaxrens.cli.schema import RootSpec
 
         # Sanity: with a backend that lacks max_neighbors_for, the seam
         # runs but counts stay None.  This exercises the new code path
         # without any monkeypatching.
         root = RootSpec.model_validate(_species_dict(n_atoms=2, n_live=4))
-        resolved = _resolve_one(root)
+        resolved = resolve(root)
         assert resolved.init.initial_energies is not None
         # Harmonic backend has no max_neighbors_for → counts stay None.
         assert resolved.init.initial_max_neighbor_counts is None

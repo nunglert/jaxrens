@@ -2,7 +2,7 @@
 
 Single comprehensive test that exercises:
 
-* **Resolver** — load YAML → ``ResolvedMultiRunConfig``, build LJ backend,
+* **Resolver** — load YAML → ``ResolvedConfig``, build LJ backend,
   per-replica EnsembleBackend wrapping, initial walker sampling, cell
   shape walk, initial-energy evaluation.
 * **Init** — ``init_ns_multi_gpu`` building a ``(G, P, ...)`` NSState.
@@ -54,7 +54,7 @@ ensemble:
 # Two replicas + RE every 10 iters → at least 2 swap attempts during the run.
 inter_re:
   flavor: pressure
-  every: 10
+  re_interval: 10
   n_swap_cycles: 1
 
 moves:
@@ -131,9 +131,9 @@ def test_lj_full_pipeline(tmp_path: Path) -> None:
       single-device CI runner.
     """
     from jaxrens.cli.resolve import (
-        ResolvedMultiRunConfig,
-        expand_multi_run_or_cohort,
+        resolve,
     )
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
     from jaxrens.cli.run import run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
 
@@ -141,8 +141,8 @@ def test_lj_full_pipeline(tmp_path: Path) -> None:
     raw["output"]["working_dir"] = str(tmp_path / "out")
 
     root = RootSpec.model_validate(raw)
-    resolved = expand_multi_run_or_cohort(root)
-    assert isinstance(resolved, ResolvedMultiRunConfig), (
+    resolved = resolve(root)
+    assert isinstance(resolved.batcher, PmapVmapRuns), (
         "Two-pressure config should route through the multi-GPU dispatcher."
     )
 
@@ -217,9 +217,9 @@ def test_lj_pipeline_smoke_variants(tmp_path: Path, missing: str) -> None:
     multi-GPU path; ``missing="pressures"`` collapses to single-run.
     """
     from jaxrens.cli.resolve import (
-        ResolvedMultiRunConfig,
-        expand_multi_run_or_cohort,
+        resolve,
     )
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
     from jaxrens.cli.run import run_from_config, run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
 
@@ -234,17 +234,17 @@ def test_lj_pipeline_smoke_variants(tmp_path: Path, missing: str) -> None:
         raw.pop("inter_re", None)  # multi-run path without RENS
 
     root = RootSpec.model_validate(raw)
-    resolved = expand_multi_run_or_cohort(root)
+    resolved = resolve(root)
 
-    if isinstance(resolved, ResolvedMultiRunConfig):
-        # Without inter_re, the resolver may still build a ResolvedMultiRunConfig
-        # if the pressure list is multi-element; exercise that path.
+    if isinstance(resolved.batcher, PmapVmapRuns):
+        # Without inter_re, the resolver may still build a multi-replica
+        # ResolvedConfig if the pressure list is multi-element; exercise
+        # that path.
         run_multi_gpu_from_config(resolved)
     else:
-        # Single-run (cohort of length 1 for scalar pressure).
-        assert len(resolved) >= 1
-        from jaxrens.cli.cli import _run_one
-        _run_one(resolved[0])
+        # SingleRun (n_total=1 for scalar pressure).
+        from jaxrens.cli.cli import _run_single
+        _run_single(resolved)
 
     # Per-config artefact paths use the parametrized prefix.
     out = tmp_path / "out"
@@ -280,7 +280,7 @@ ensemble:
 
 inter_re:
   flavor: pressure
-  every: 10
+  re_interval: 10
   n_swap_cycles: 1
 
 moves:
@@ -351,9 +351,9 @@ def test_lj_multi_gpu_pipeline(tmp_path: Path) -> None:
     either 2 or 4 local devices.
     """
     from jaxrens.cli.resolve import (
-        ResolvedMultiRunConfig,
-        expand_multi_run_or_cohort,
+        resolve,
     )
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
     from jaxrens.cli.run import run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
 
@@ -365,8 +365,8 @@ def test_lj_multi_gpu_pipeline(tmp_path: Path) -> None:
     raw["ensemble"]["pressure"] = raw["ensemble"]["pressure"][:n_total]
 
     root = RootSpec.model_validate(raw)
-    resolved = expand_multi_run_or_cohort(root)
-    assert isinstance(resolved, ResolvedMultiRunConfig)
+    resolved = resolve(root)
+    assert isinstance(resolved.batcher, PmapVmapRuns)
     assert resolved.ns.n_gpu == n_gpu, (
         f"expected n_gpu={n_gpu}, got {resolved.ns.n_gpu}"
     )

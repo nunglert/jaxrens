@@ -37,7 +37,8 @@ from jaxrens.cli.schema.moves import (
     AlchemicalMorphMoveSpec,
     AlchemicalShiftMoveSpec,
 )
-from jaxrens.cli.resolve import resolve, expand_cohort, ResolvedConfig
+from jaxrens.cli.resolve import resolve, ResolvedConfig
+from jaxrens.sampling.batch_descriptor import PmapVmapRuns, SingleRun
 from jaxrens.cli.cli import _apply_overrides, _parse_set_override
 
 _DATA = Path(__file__).parent / "data" / "cli"
@@ -675,203 +676,69 @@ class TestEnsembleSpec:
 
 
 # ---------------------------------------------------------------------------
-# 27. Cohort expansion — schema-level tests
-# (yaml-fixture resolver tests moved to test_resolve.py::TestCohortExpansionResolver)
+# 27. Topology resolution — schema-level tests
+# (cohort path removed; resolver now always produces one ResolvedConfig
+# whose ``batcher`` is SingleRun for n_total=1 and PmapVmapRuns otherwise.)
 # ---------------------------------------------------------------------------
 
-class TestCohortExpansion:
-    def test_nvt_scalar_seed_single_element(self):
+class TestTopologyResolution:
+    def test_nvt_scalar_resolves_to_single_run(self):
         root = RootSpec.model_validate(_minimal_dict())
-        cohort = expand_cohort(root)
-        assert len(cohort) == 1
+        resolved = resolve(root)
+        assert isinstance(resolved, ResolvedConfig)
+        assert isinstance(resolved.batcher, SingleRun)
+        assert len(resolved.ensemble_params_per_run) == 1
 
-    def test_nvt_cohort_index_zero(self):
-        root = RootSpec.model_validate(_minimal_dict())
-        cohort = expand_cohort(root)
-        assert cohort[0].cohort_index == 0
-
-    def test_npt_three_pressures_and_values(self):
-        """Merged from test_npt_three_pressures_three_configs and
-        test_npt_three_pressures_correct_values (Step D: collapsed)."""
-        d = _minimal_dict()
-        d["run"]["seed"] = 10
-        d["ensemble"] = {"type": "npt", "pressure": [0.01, 0.02, 0.03]}
-        root = RootSpec.model_validate(d)
-        cohort = expand_cohort(root)
-
-        # Shape assertion (was test_npt_three_pressures_three_configs)
-        assert len(cohort) == 3
-
-        # Value assertions (was test_npt_three_pressures_correct_values)
-        assert cohort[0].ensemble_params["pressure"] == pytest.approx(0.01)
-        assert cohort[1].ensemble_params["pressure"] == pytest.approx(0.02)
-        assert cohort[2].ensemble_params["pressure"] == pytest.approx(0.03)
-
-    def test_npt_scalar_seed_auto_incremented(self):
-        d = _minimal_dict()
-        d["run"]["seed"] = 10
-        d["ensemble"] = {"type": "npt", "pressure": [0.01, 0.02, 0.03]}
-        root = RootSpec.model_validate(d)
-        cohort = expand_cohort(root)
-        assert cohort[0].ns.seed == 10
-        assert cohort[1].ns.seed == 11
-        assert cohort[2].ns.seed == 12
-
-    def test_npt_cohort_indices_correct(self):
-        d = _minimal_dict()
-        d["ensemble"] = {"type": "npt", "pressure": [0.01, 0.02]}
-        root = RootSpec.model_validate(d)
-        cohort = expand_cohort(root)
-        assert cohort[0].cohort_index == 0
-        assert cohort[1].cohort_index == 1
-
-    def test_single_element_cohort_from_scalar_npt(self):
-        d = _minimal_dict()
-        d["ensemble"] = {"type": "npt", "pressure": 0.01}
-        root = RootSpec.model_validate(d)
-        cohort = expand_cohort(root)
-        assert len(cohort) == 1
-        assert cohort[0].ensemble_params["pressure"] == pytest.approx(0.01)
-
-    def test_resolve_wraps_single_element_cohort(self):
+    def test_npt_scalar_resolves_to_single_run(self):
         d = _minimal_dict()
         d["ensemble"] = {"type": "npt", "pressure": 0.01}
         root = RootSpec.model_validate(d)
         resolved = resolve(root)
-        assert isinstance(resolved, ResolvedConfig)
-        assert resolved.ensemble_params["pressure"] == pytest.approx(0.01)
+        assert isinstance(resolved.batcher, SingleRun)
+        assert len(resolved.ensemble_params_per_run) == 1
+        assert resolved.ensemble_params_per_run[0]["pressure"] == pytest.approx(0.01)
 
-    def test_resolve_asserts_on_multi_element_cohort(self):
+    def test_npt_three_pressures_resolves_to_multi_replica(self):
+        """A list-valued pressure routes to PmapVmapRuns with per-replica params."""
         d = _minimal_dict()
-        d["ensemble"] = {"type": "npt", "pressure": [0.01, 0.02]}
+        d["run"]["seed"] = 10
+        d["ensemble"] = {"type": "npt", "pressure": [0.01, 0.02, 0.03]}
         root = RootSpec.model_validate(d)
-        with pytest.raises(AssertionError, match="expand_cohort"):
-            resolve(root)
+        resolved = resolve(root)
+
+        assert isinstance(resolved.batcher, PmapVmapRuns)
+        n_total = resolved.batcher.n_gpu * resolved.batcher.n_per_gpu
+        assert n_total == 3
+        assert len(resolved.ensemble_params_per_run) == 3
+
+        # Per-replica pressures in the expected order.
+        assert resolved.ensemble_params_per_run[0]["pressure"] == pytest.approx(0.01)
+        assert resolved.ensemble_params_per_run[1]["pressure"] == pytest.approx(0.02)
+        assert resolved.ensemble_params_per_run[2]["pressure"] == pytest.approx(0.03)
 
 
 # ---------------------------------------------------------------------------
-# 28. Cohort expansion: CLI validate reports cohort size
+# 28. Topology resolution: CLI validate prints the correct topology line
 # ---------------------------------------------------------------------------
 
-class TestValidateCohortSize:
-    def test_validate_reports_cohort_size_1(self, capsys):
+class TestValidateTopologyLine:
+    def test_validate_reports_single_run_topology(self, capsys):
         from jaxrens.cli.cli import main
         with pytest.raises(SystemExit) as exc_info:
             main(["validate", "-c", str(_DATA / "minimal.yaml")])
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
-        assert "cohort size: 1" in captured.out
+        assert "SingleRun" in captured.out
 
-    def test_validate_reports_cohort_size_2(self, capsys):
+    def test_validate_reports_multi_replica_topology(self, capsys):
         from jaxrens.cli.cli import main
         with pytest.raises(SystemExit) as exc_info:
             main(["validate", "-c", str(_DATA / "npt_sweep.yaml")])
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
-        # A 2-pressure list now routes to the multi-run dispatch
-        # (single replica axis → n_total=2 replicas, split across
-        # detected devices).  The legacy sequential "cohort" wording
-        # only appears when n_total == 1.
-        assert "multi-run dispatch" in captured.out
+        # A 2-pressure list routes to the multi-replica dispatch.
+        assert "n_gpu=" in captured.out
         assert "2 replica" in captured.out
-
-
-# ---------------------------------------------------------------------------
-# 29. End-to-end cohort run via CLI (sequential, small run)
-# ---------------------------------------------------------------------------
-
-class TestCohortRunEndToEnd:
-    def test_npt_sweep_two_cohorts_run_sequentially(self):
-        """NPT + pressure list of length 2: both cohort elements produce valid NS runs."""
-        import jax
-        import jax.numpy as jnp
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import run_ns
-
-        d = {
-            "run": {
-                "n_live": 8,
-                "max_iterations": 5,
-                "n_mcmc_steps": 3,
-                "seed": 42,
-            },
-            "moves": [{"type": "random_walk", "step_size": 0.3}],
-            "backend": {"type": "harmonic"},
-            "output": {
-                "format": "none",
-                "working_dir": ".",
-                "info_interval": 999,
-            },
-            "ensemble": {"type": "npt", "pressure": [0.01, 0.02]},
-        }
-        root = RootSpec.model_validate(d)
-        cohort = expand_cohort(root)
-        assert len(cohort) == 2
-
-        results = []
-        for resolved in cohort:
-            backend = create_harmonic()
-            init_fn, step_fn, _ = build_mwg(backend, list(resolved.move_descriptors))
-            key = jax.random.key(resolved.ns.seed)
-            key, key_pos = jax.random.split(key)
-            positions = jax.random.uniform(key_pos, (8, 1, 3), minval=-3.0, maxval=3.0)
-            types = jnp.zeros((1,), dtype=jnp.int32)
-            energies = jax.vmap(
-                lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
-            )(positions)
-            result = run_ns(
-                positions=positions,
-                types=types,
-                energies=energies,
-                cells=None,
-                init_fn=init_fn,
-                step_fn=step_fn,
-                rng_key=key,
-                max_iterations=5,
-                n_mcmc_steps=3,
-            )
-            results.append(result)
-            assert result["iteration"] > 0
-            assert jnp.isfinite(result["log_evidence"])
-
-        assert results[0]["iteration"] > 0
-        assert results[1]["iteration"] > 0
-        assert cohort[0].ns.seed != cohort[1].ns.seed
-
-    def test_npt_sweep_jit_path_survives_tracing(self):
-        """Cohort with NPT + pressure list: each element's ns_step traces under JIT."""
-        import jax
-        import jax.numpy as jnp
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import init_ns, ns_step
-
-        d = {
-            "run": {"n_live": 6, "max_iterations": 3, "n_mcmc_steps": 2, "seed": 5},
-            "moves": [{"type": "random_walk", "step_size": 0.2}],
-            "backend": {"type": "harmonic"},
-            "output": {"format": "none", "working_dir": ".", "info_interval": 999},
-            "ensemble": {"type": "npt", "pressure": [0.01, 0.02]},
-        }
-        root = RootSpec.model_validate(d)
-        cohort = expand_cohort(root)
-
-        jit_ns_step = jax.jit(ns_step, static_argnames=("step_fn", "n_mcmc_steps"))
-
-        for resolved in cohort:
-            backend = create_harmonic()
-            init_fn, step_fn, _ = build_mwg(backend, list(resolved.move_descriptors))
-            key = jax.random.key(resolved.ns.seed)
-            key, key_pos = jax.random.split(key)
-            positions = jax.random.uniform(key_pos, (6, 1, 3), minval=-2.0, maxval=2.0)
-            types = jnp.zeros((1,), dtype=jnp.int32)
-            energies = jax.vmap(
-                lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
-            )(positions)
-            ns_state = init_ns(init_fn, positions, types, energies, cells=None, rng_key=key)
-            new_state, _ = jit_ns_step(ns_state, step_fn, n_mcmc_steps=2)
-            assert jnp.isfinite(new_state.log_evidence) or new_state.n_dead == 0
 
 
 # ---------------------------------------------------------------------------

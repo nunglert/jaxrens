@@ -605,6 +605,50 @@ class AccRatesCallback:
         self._logger.close()
 
 
+class RECallback:
+    """Writes per-fire inter-RE swap counts to HDF5.
+
+    Reads ``info["inter_re_stats"]`` (populated by ``run_loop`` when
+    the manager fires) and forwards the per-pair counts to an
+    :class:`~jaxrens.io.re_stats_log.RELogger`.  Skips iterations on
+    which the manager did not fire (info key absent or
+    ``n_attempted_per_pair`` is empty / sums to zero) — the resulting
+    file's iteration index is therefore the authoritative record of
+    when the manager actually did work.
+
+    Args:
+        logger_obj: A ready-to-use ``RELogger`` instance.
+    """
+
+    def __init__(self, logger_obj: Any) -> None:
+        self._logger = logger_obj
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        re_stats = info.get("inter_re_stats")
+        if re_stats is None:
+            return
+        n_att = re_stats.get("n_attempted_per_pair")
+        if n_att is None:
+            return
+        n_att_arr = np.asarray(n_att, dtype=np.int32)
+        if n_att_arr.size == 0 or int(n_att_arr.sum()) == 0:
+            # Manager didn't fire this iteration (or fired with no
+            # valid pairs).  Skip — keeps the file iteration-indexed
+            # by actual fires only.
+            return
+        n_acc_arr = np.asarray(
+            re_stats["n_accepted_per_pair"], dtype=np.int32
+        )
+        self._logger.write_entry(
+            iteration=iteration,
+            n_accepted_per_pair=n_acc_arr,
+            n_attempted_per_pair=n_att_arr,
+        )
+
+    def on_finish(self, ns_state: Any) -> None:
+        self._logger.close()
+
+
 class EnergyCheckCallback:
     """Warns if energy is not decreasing as expected.
 

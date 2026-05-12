@@ -116,7 +116,7 @@ output:
 def test_nequix_full_pipeline(tmp_path: Path) -> None:
     """Two-pressure nequix NS run.  Exercises:
 
-    * Resolver — config → ``ResolvedMultiRunConfig`` (two-pressure path).
+    * Resolver — config → ``ResolvedConfig`` (two-pressure path).
     * Backend build — ``create_nequix`` loading the bundled ``.nqx`` model.
     * Initial walker sampling + ``_finalise_initial_energies_and_counts``
       (no-``max_neighbors_for`` path for nequix).
@@ -133,9 +133,9 @@ def test_nequix_full_pipeline(tmp_path: Path) -> None:
     pytest.importorskip("nequix")
 
     from jaxrens.cli.resolve import (
-        ResolvedMultiRunConfig,
-        expand_multi_run_or_cohort,
+        resolve,
     )
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
     from jaxrens.cli.run import run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
 
@@ -144,8 +144,8 @@ def test_nequix_full_pipeline(tmp_path: Path) -> None:
     raw["output"]["working_dir"] = str(tmp_path / "out")
 
     root = RootSpec.model_validate(raw)
-    resolved = expand_multi_run_or_cohort(root)
-    assert isinstance(resolved, ResolvedMultiRunConfig), (
+    resolved = resolve(root)
+    assert isinstance(resolved.batcher, PmapVmapRuns), (
         "Two-pressure config should route through the multi-GPU dispatcher."
     )
 
@@ -222,7 +222,7 @@ ensemble:
 # cross-device gather + accept/reject path.
 inter_re:
   flavor: pressure
-  every: 2
+  re_interval: 2
   n_swap_cycles: 1
 
 moves:
@@ -293,9 +293,9 @@ def test_nequix_multi_gpu_pipeline(tmp_path: Path) -> None:
     pytest.importorskip("nequix")
 
     from jaxrens.cli.resolve import (
-        ResolvedMultiRunConfig,
-        expand_multi_run_or_cohort,
+        resolve,
     )
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
     from jaxrens.cli.run import run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
 
@@ -308,8 +308,8 @@ def test_nequix_multi_gpu_pipeline(tmp_path: Path) -> None:
     raw["ensemble"]["pressure"] = raw["ensemble"]["pressure"][:n_total]
 
     root = RootSpec.model_validate(raw)
-    resolved = expand_multi_run_or_cohort(root)
-    assert isinstance(resolved, ResolvedMultiRunConfig)
+    resolved = resolve(root)
+    assert isinstance(resolved.batcher, PmapVmapRuns)
     assert resolved.ns.n_gpu == n_gpu
     assert resolved.ns.n_per_gpu == 2
 

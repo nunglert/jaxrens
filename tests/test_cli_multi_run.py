@@ -1,8 +1,10 @@
-"""Multi-run (multi-GPU) CLI dispatch tests.
+"""Multi-replica CLI dispatch tests.
 
-These tests exercise ``_resolve_multi_run`` / ``expand_multi_run_or_cohort``
-and a tiny end-to-end ``run_multi_gpu_from_config`` invocation that stays on
-CPU (``n_gpu=1``, ``n_per_gpu>1``) so they run in CI without GPU.
+These tests exercise the multi-replica branch of ``resolve()`` (which used
+to be ``_resolve_multi_run`` / ``expand_multi_run_or_cohort`` before the
+cohort unification) and a tiny end-to-end ``run_multi_gpu_from_config``
+invocation that stays on CPU (``n_gpu=1``, ``n_per_gpu>1``) so they run in
+CI without GPU.
 """
 
 from __future__ import annotations
@@ -12,12 +14,12 @@ import jax.numpy as jnp
 import pytest
 
 from jaxrens.cli.resolve import (
-    ResolvedMultiRunConfig,
+    ResolvedConfig,
     _derive_replica_axes,
-    _resolve_multi_run,
-    expand_multi_run_or_cohort,
+    resolve,
 )
 from jaxrens.cli.schema import RootSpec
+from jaxrens.sampling.batch_descriptor import PmapVmapRuns, SingleRun
 
 
 def _lj_multi_run_config(
@@ -112,7 +114,7 @@ class TestDeriveReplicaAxes:
     def test_pressure_inter_re_requires_list(self):
         cfg = _lj_multi_run_config(
             [0.01],
-            inter_re={"flavor": "pressure", "every": 1, "n_swap_cycles": 1},
+            inter_re={"flavor": "pressure", "re_interval": 1, "n_swap_cycles": 1},
         )
         root = RootSpec.model_validate(cfg)
         with pytest.raises(ValueError, match="requires a list-valued"):
@@ -152,34 +154,36 @@ class TestDeriveReplicaAxes:
 
 
 # ---------------------------------------------------------------------------
-# _resolve_multi_run / expand_multi_run_or_cohort
+# resolve() — multi-replica branch (was _resolve_multi_run)
 # ---------------------------------------------------------------------------
 
 
-class TestResolveMultiRun:
+class TestResolveMultiReplica:
     @pytest.fixture(autouse=True)
     def _single_device(self, monkeypatch):
         from jaxrens.cli import resolve as _r
         monkeypatch.setattr(_r, "_local_device_count", lambda: 1)
 
-    def test_expand_dispatcher_returns_multi_run_for_pressure_list(self):
+    def test_pressure_list_resolves_to_pmap_vmap_runs(self):
         cfg = _lj_multi_run_config([0.01, 0.1])
         root = RootSpec.model_validate(cfg)
-        out = expand_multi_run_or_cohort(root)
-        assert isinstance(out, ResolvedMultiRunConfig)
+        out = resolve(root)
+        assert isinstance(out, ResolvedConfig)
+        assert isinstance(out.batcher, PmapVmapRuns)
         assert out.ns.n_gpu * out.ns.n_per_gpu == 2
 
-    def test_expand_dispatcher_returns_cohort_for_scalar(self):
+    def test_scalar_pressure_resolves_to_single_run(self):
         cfg = _lj_multi_run_config([0.01])
         root = RootSpec.model_validate(cfg)
-        out = expand_multi_run_or_cohort(root)
-        assert not isinstance(out, ResolvedMultiRunConfig)
-        assert isinstance(out, list) and len(out) == 1
+        out = resolve(root)
+        assert isinstance(out, ResolvedConfig)
+        assert isinstance(out.batcher, SingleRun)
+        assert len(out.ensemble_params_per_run) == 1
 
     def test_resolved_init_stacked_shapes(self):
         cfg = _lj_multi_run_config([0.01, 0.1, 1.0])
         root = RootSpec.model_validate(cfg)
-        out = _resolve_multi_run(root)
+        out = resolve(root)
         n_total = out.ns.n_gpu * out.ns.n_per_gpu
         n_live = out.ns.n_live
         pos = out.init.initial_positions
@@ -195,7 +199,7 @@ class TestResolveMultiRun:
         # when cells are shared (up to random init noise).
         cfg = _lj_multi_run_config([0.01, 10.0])
         root = RootSpec.model_validate(cfg)
-        out = _resolve_multi_run(root)
+        out = resolve(root)
         e_lo = out.init.initial_energies[0]
         e_hi = out.init.initial_energies[1]
         # Mean over walkers: high-pressure replica has larger energy.
@@ -204,21 +208,19 @@ class TestResolveMultiRun:
     def test_inter_re_config_propagated(self):
         cfg = _lj_multi_run_config(
             [0.01, 0.1],
-            inter_re={"flavor": "pressure", "every": 2, "n_swap_cycles": 3},
+            inter_re={"flavor": "pressure", "re_interval": 2, "n_swap_cycles": 3},
         )
         root = RootSpec.model_validate(cfg)
-        out = _resolve_multi_run(root)
+        out = resolve(root)
         assert out.inter_re_config is not None
         assert out.inter_re_config.flavor == "pressure"
-        assert out.inter_re_config.every == 2
+        assert out.inter_re_config.re_interval == 2
         assert out.inter_re_config.n_swap_cycles == 3
 
     def test_batcher_field_populated(self):
-        from jaxrens.sampling.batch_descriptor import PmapVmapRuns
-
         cfg = _lj_multi_run_config([0.01, 0.1])
         root = RootSpec.model_validate(cfg)
-        out = _resolve_multi_run(root)
+        out = resolve(root)
         assert out.batcher is not None
         assert isinstance(out.batcher, PmapVmapRuns)
         assert out.batcher.n_gpu == out.ns.n_gpu
@@ -246,7 +248,7 @@ class TestRunMultiGpuFromConfig:
             working_dir=tmp_path,
         )
         root = RootSpec.model_validate(cfg)
-        resolved = _resolve_multi_run(root)
+        resolved = resolve(root)
 
         from jaxrens.cli.run import run_multi_gpu_from_config
 
@@ -269,10 +271,10 @@ class TestRunMultiGpuFromConfig:
             max_iterations=3,
             n_mcmc_steps=2,
             working_dir=tmp_path,
-            inter_re={"flavor": "pressure", "every": 1, "n_swap_cycles": 1},
+            inter_re={"flavor": "pressure", "re_interval": 1, "n_swap_cycles": 1},
         )
         root = RootSpec.model_validate(cfg)
-        resolved = _resolve_multi_run(root)
+        resolved = resolve(root)
         assert resolved.inter_re_config is not None
 
         from jaxrens.cli.run import run_multi_gpu_from_config

@@ -22,6 +22,7 @@ from typing import Any, TypedDict
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jaxtyping import Array, Key
 
 from jaxrens.sampling.batch_descriptor import (
@@ -43,13 +44,23 @@ from jaxrens.state.ns import NSState
 
 
 class SwapStats(TypedDict):
-    """Public return type of ``InterREManager.apply``'s stats dict."""
+    """Public return type of ``InterREManager.apply``'s stats dict.
+
+    The aggregate fields (``n_swap_pairs_attempted``,
+    ``n_swap_pairs_accepted``, ``acceptance_rate``) are sums over all
+    pairs and all swap cycles in the fire.  The per-pair arrays carry
+    the same totals broken down by pair_id (``min(left, right)`` of
+    the (k, k+1) pair).  Always shape ``(n_runs - 1,)`` int32; when
+    ``n_runs < 2`` the arrays are length-zero.
+    """
 
     n_swap_pairs_attempted: int
     n_swap_pairs_accepted: int
     acceptance_rate: float
     n_energy_evals: int
     n_grad_evals: int
+    n_accepted_per_pair: np.ndarray
+    n_attempted_per_pair: np.ndarray
 
 
 _EMPTY_STATS: SwapStats = {
@@ -58,6 +69,8 @@ _EMPTY_STATS: SwapStats = {
     "acceptance_rate": 0.0,
     "n_energy_evals": 0,
     "n_grad_evals": 0,
+    "n_accepted_per_pair": np.zeros(0, dtype=np.int32),
+    "n_attempted_per_pair": np.zeros(0, dtype=np.int32),
 }
 
 
@@ -73,7 +86,7 @@ class InterREManager:
         batcher: ``BatchDescriptor`` controlling the execution mode.
         backend: Energy backend (unused for ``PressureRENSSwap`` but part of
             the general API for future kernels such as ``XRENSSwap``).
-        every: Fire a swap pass every this many NS iterations.  0 → never fire.
+        re_interval: Fire a swap pass every this many NS iterations.  0 → never fire.
         n_swap_cycles: Number of even+odd swap phases per fire.
     """
 
@@ -82,13 +95,13 @@ class InterREManager:
         swap_kernel: SwapKernel,
         batcher: BatchDescriptor,
         backend: Any,
-        every: int = 1,
+        re_interval: int = 1,
         n_swap_cycles: int = 1,
     ) -> None:
         self._swap_kernel = swap_kernel
         self._batcher = batcher
         self._backend = backend
-        self._every = every
+        self._re_interval = re_interval
         self._n_swap_cycles = n_swap_cycles
 
         # Kernel flavor flags (mutually exclusive).
@@ -110,7 +123,7 @@ class InterREManager:
     def fires(self, iteration: int) -> bool:
         """Return True iff a swap pass should fire on this iteration.
 
-        Rules: every > 0 AND iteration > 0 AND iteration % every == 0.
+        Rules: re_interval > 0 AND iteration > 0 AND iteration % re_interval == 0.
         Iteration 0 is skipped to match ``AdaptationManager.fires`` convention.
 
         Args:
@@ -119,16 +132,16 @@ class InterREManager:
         Returns:
             True when a swap should be attempted.
         """
-        return self._every > 0 and iteration > 0 and iteration % self._every == 0
+        return self._re_interval > 0 and iteration > 0 and iteration % self._re_interval == 0
 
     @property
     def is_active(self) -> bool:
         """True iff this manager will actually do work.
 
         ``SingleRun`` descriptors return False (no batched population to swap).
-        ``VmapRuns`` / ``PmapVmapRuns`` return True when ``every > 0``.
+        ``VmapRuns`` / ``PmapVmapRuns`` return True when ``re_interval > 0``.
         """
-        return self._batcher.is_batched and self._every > 0
+        return self._batcher.is_batched and self._re_interval > 0
 
     def apply(
         self, ns_state: NSState, rng_key: Key[Array, ""]
@@ -606,10 +619,15 @@ class InterREManager:
 
         # All devices ran the same swap (same RNG + same data after all_gather),
         # so device 0's swap_info is representative.
-        stats = self._build_stats({
+        device0_info: dict[str, Any] = {
             "n_accepted": swap_info_sharded["n_accepted"][0],
             "n_attempted": swap_info_sharded["n_attempted"][0],
-        })
+            "n_accepted_per_pair": swap_info_sharded["n_accepted_per_pair"][0],
+            "n_attempted_per_pair": swap_info_sharded["n_attempted_per_pair"][0],
+        }
+        if "n_energy_evals" in swap_info_sharded:
+            device0_info["n_energy_evals"] = swap_info_sharded["n_energy_evals"][0]
+        stats = self._build_stats(device0_info)
         return new_ns_state, stats
 
     @staticmethod
@@ -629,10 +647,25 @@ class InterREManager:
         n_acc = int(jnp.asarray(swap_info["n_accepted"]))
         rate = n_acc / max(n_att, 1)
         n_evals = int(jnp.asarray(swap_info["n_energy_evals"])) if "n_energy_evals" in swap_info else 0
+        # Per-pair arrays — host-side numpy copies for downstream
+        # logging.  Always present in swap_info post-2026-05 kernel
+        # extension; defensively zero-filled for legacy callers.
+        n_acc_pp = swap_info.get("n_accepted_per_pair")
+        n_att_pp = swap_info.get("n_attempted_per_pair")
+        n_acc_pp = (
+            np.asarray(n_acc_pp, dtype=np.int32)
+            if n_acc_pp is not None else np.zeros(0, dtype=np.int32)
+        )
+        n_att_pp = (
+            np.asarray(n_att_pp, dtype=np.int32)
+            if n_att_pp is not None else np.zeros(0, dtype=np.int32)
+        )
         return {
             "n_swap_pairs_attempted": n_att,
             "n_swap_pairs_accepted": n_acc,
             "acceptance_rate": rate,
             "n_energy_evals": n_evals,
             "n_grad_evals": 0,
+            "n_accepted_per_pair": n_acc_pp,
+            "n_attempted_per_pair": n_att_pp,
         }

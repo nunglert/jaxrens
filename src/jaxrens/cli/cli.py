@@ -19,7 +19,7 @@ from typing import Any
 
 import yaml
 
-from jaxrens.cli.resolve import expand_cohort, resolve
+from jaxrens.cli.resolve import _apply_interval_units, resolve
 from jaxrens.cli.run import configure_file_logging, run_from_config
 from jaxrens.cli.schema import RootSpec
 
@@ -102,8 +102,8 @@ def _load_and_validate(config_path: str, overrides: list[str]) -> RootSpec:
     return RootSpec.model_validate(raw)
 
 
-def _run_one(resolved, *, cohort_label: str = "") -> None:
-    """Execute a single NS run from a ``ResolvedConfig``."""
+def _run_single(resolved) -> None:
+    """Execute a SingleRun NS dispatch from a SingleRun ``ResolvedConfig``."""
     run_from_config(
         resolved.ns,
         list(resolved.moves),
@@ -166,6 +166,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     root = _load_and_validate(args.config, args.set)
 
+    # Scale per-walker intervals to absolute iters before logging, so the
+    # config dump and subsequent log lines show the values the runtime
+    # actually uses.  The resolver still calls ``_apply_interval_units``
+    # itself for direct (non-CLI) callers; here we flip
+    # ``interval_units`` to ``"absolute"`` so that second pass becomes
+    # an idempotent no-op (factor=1, identical re-rounding).
+    root = _apply_interval_units(root)
+    root = root.model_copy(update={"interval_units": "absolute"})
+
     # Hoist file logging before the resolver: heavy backends (NeuralIL,
     # MACE, nequix) spend many minutes in the resolver placing walkers
     # and JIT-compiling, and the resolver already emits ``logger.info``
@@ -187,78 +196,85 @@ def _cmd_run(args: argparse.Namespace) -> int:
         level=root.output.log_level,
     )
 
-    from jaxrens.cli.resolve import (
-        ResolvedMultiRunConfig,
-        expand_multi_run_or_cohort,
+    # Dump the validated config (with all pydantic defaults filled in)
+    # to the log so that, after the fact, you can tell which parameters
+    # came from the YAML file vs which were left to defaults.  ``mode=
+    # "json"`` coerces Path / enum values into strings; YAML rendering
+    # is more skim-friendly than JSON in a log file.
+    logger.info(
+        "Parsed configuration (validated, defaults filled):\n%s",
+        yaml.safe_dump(
+            root.model_dump(mode="json"),
+            sort_keys=False,
+            default_flow_style=False,
+        ).rstrip(),
     )
+
+    from jaxrens.sampling.batch_descriptor import SingleRun
     from jaxrens.cli.run import run_multi_gpu_from_config
 
-    resolved_any = expand_multi_run_or_cohort(root)
+    resolved = resolve(root)
 
-    if isinstance(resolved_any, ResolvedMultiRunConfig):
+    if isinstance(resolved.batcher, SingleRun):
+        pressure = resolved.ensemble_params_per_run[0].get("pressure")
         logger.info(
-            "[multi-run] n_gpu=%d n_per_gpu=%d n_total=%d pressures=%s",
-            resolved_any.ns.n_gpu,
-            resolved_any.ns.n_per_gpu,
-            resolved_any.ns.n_gpu * resolved_any.ns.n_per_gpu,
+            "[single-run] seed=%d%s",
+            resolved.ns.seed,
+            f" pressure={pressure:.4g}" if pressure is not None else "",
+        )
+        _run_single(resolved)
+    else:
+        logger.info(
+            "[multi-replica] n_gpu=%d n_per_gpu=%d n_total=%d pressures=%s",
+            resolved.ns.n_gpu,
+            resolved.ns.n_per_gpu,
+            resolved.ns.n_gpu * resolved.ns.n_per_gpu,
             ", ".join(
                 f"{p.get('pressure'):.4g}"
-                if p.get('pressure') is not None else "—"
-                for p in resolved_any.ensemble_params_per_run
+                if p.get("pressure") is not None else "—"
+                for p in resolved.ensemble_params_per_run
             ),
         )
-        run_multi_gpu_from_config(resolved_any)
-        return 0
-
-    cohort = resolved_any
-    n = len(cohort)
-    if n == 1:
-        _run_one(cohort[0])
-    else:
-        for i, resolved in enumerate(cohort):
-            logger.info(
-                "[cohort %d/%d] pressure=%s seed=%d",
-                i + 1, n,
-                resolved.ensemble_params.get('pressure'),
-                resolved.ns.seed,
-            )
-            _run_one(resolved, cohort_label=f"{i + 1}/{n}")
+        run_multi_gpu_from_config(resolved)
     return 0
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
     root = _load_and_validate(args.config, args.set)
-    from jaxrens.cli.resolve import (
-        ResolvedMultiRunConfig,
-        expand_multi_run_or_cohort,
-    )
-    resolved_any = expand_multi_run_or_cohort(root)
-    if isinstance(resolved_any, ResolvedMultiRunConfig):
-        n_moves = len(resolved_any.moves)
-        move_types = ", ".join(m.move_type for m in resolved_any.moves)
-        n_atoms = int(resolved_any.init.initial_positions.shape[-2])
+
+    if args.parse_only:
+        n_moves = len(root.moves)
+        move_types = ", ".join(m.move_type for m in root.moves)
         print(
-            f"OK — multi-run dispatch\n"
-            f"  topology: n_gpu={resolved_any.ns.n_gpu} × "
-            f"n_per_gpu={resolved_any.ns.n_per_gpu} = "
-            f"{resolved_any.ns.n_gpu * resolved_any.ns.n_per_gpu} replica(s)\n"
-            f"  run:     n_live={resolved_any.ns.n_live}, "
-            f"max_iterations={resolved_any.ns.max_iterations}\n"
+            f"OK — schema validation passed (parse-only)\n"
+            f"  run:     n_live={root.run.n_live}, "
+            f"max_iterations={root.run.max_iterations}\n"
             f"  moves:   {n_moves} move(s) [{move_types}]\n"
-            f"  backend: {resolved_any.backend.backend_type}, n_atoms={n_atoms}\n"
-            f"  output:  format={resolved_any.output.format}, "
-            f"prefix={resolved_any.output.out_file_prefix}"
+            f"  backend: {root.backend.backend_type}\n"
+            f"  output:  format={root.output.format}, "
+            f"prefix={root.output.out_file_prefix}"
         )
         return 0
 
-    cohort = resolved_any
-    n = len(cohort)
-    resolved = cohort[0]
+    from jaxrens.sampling.batch_descriptor import SingleRun
+
+    resolved = resolve(root)
     n_moves = len(resolved.moves)
     move_types = ", ".join(m.move_type for m in resolved.moves)
     n_atoms = int(resolved.init.initial_positions.shape[-2])
+
+    if isinstance(resolved.batcher, SingleRun):
+        topology_line = "  topology: SingleRun (1 replica, 1 GPU)\n"
+    else:
+        topology_line = (
+            f"  topology: n_gpu={resolved.ns.n_gpu} × "
+            f"n_per_gpu={resolved.ns.n_per_gpu} = "
+            f"{resolved.ns.n_gpu * resolved.ns.n_per_gpu} replica(s)\n"
+        )
+
     print(
-        f"OK — cohort size: {n}\n"
+        f"OK\n"
+        f"{topology_line}"
         f"  run:     n_live={resolved.ns.n_live}, "
         f"max_iterations={resolved.ns.max_iterations}\n"
         f"  moves:   {n_moves} move(s) [{move_types}]\n"
@@ -376,6 +392,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_val = sub.add_parser("validate", help="Validate a YAML config without running.")
     p_val.add_argument("-c", "--config", required=True, metavar="FILE")
     p_val.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    p_val.add_argument(
+        "--parse-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Stop after pydantic schema validation; skip the resolver "
+            "(no structure file read, no backend build, no walker placement). "
+            "Fast — for catching typos / wrong field names without paying "
+            "for heavy-backend initialization."
+        ),
+    )
 
     # -- dump-schema --
     p_dump = sub.add_parser("dump-schema", help="Print the JSON schema for RootSpec.")
@@ -411,8 +438,116 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _iter_basemodel_types(annotation: Any) -> Any:
+    """Yield every ``BaseModel`` subclass referenced in a pydantic
+    annotation, peeling ``Optional[...]`` / ``List[...]`` / ``Union[...]``
+    / ``Annotated[...]`` wrappers.
+    """
+    import typing
+    from pydantic import BaseModel
+
+    origin = typing.get_origin(annotation)
+    if origin is None:
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            yield annotation
+        return
+    for arg in typing.get_args(annotation):
+        if arg is type(None):
+            continue
+        yield from _iter_basemodel_types(arg)
+
+
+def _collect_field_paths(
+    model_cls: Any, prefix: str = "", _seen: set | None = None,
+) -> list[str]:
+    """Recursively collect dotted field paths from a pydantic model.
+
+    For unions / discriminated unions every variant is descended into,
+    so the resulting list contains paths reachable via any of them.
+    """
+    if _seen is None:
+        _seen = set()
+    if model_cls in _seen:
+        return []
+    _seen = _seen | {model_cls}
+
+    paths: list[str] = []
+    for name, finfo in model_cls.model_fields.items():
+        path = f"{prefix}.{name}" if prefix else name
+        paths.append(path)
+        for sub_cls in _iter_basemodel_types(finfo.annotation):
+            paths.extend(_collect_field_paths(sub_cls, path, _seen))
+    return paths
+
+
+def _suggest_for_extra_field(bad_key: str, parent_path: str) -> str:
+    """Render a "Did you mean: ..." suffix for an extra-forbidden field.
+
+    Two sources of candidates:
+      * Exact-leaf matches — a field with the same name exists somewhere
+        else in the schema (most common: user put a top-level field
+        under a section).
+      * Fuzzy matches against the *parent's own* fields via difflib.
+    """
+    import difflib
+
+    all_paths = _collect_field_paths(RootSpec)
+
+    exact = [p for p in all_paths if p.rsplit(".", 1)[-1] == bad_key]
+    parent_fields = [
+        p.rsplit(".", 1)[-1] if "." in p else p
+        for p in all_paths
+        if p.rsplit(".", 1)[0] == parent_path or (parent_path == "" and "." not in p)
+    ]
+    fuzzy = difflib.get_close_matches(bad_key, parent_fields, n=3, cutoff=0.6)
+    fuzzy_paths = [
+        (f"{parent_path}.{f}" if parent_path else f) for f in fuzzy if f != bad_key
+    ]
+
+    suggestions: list[str] = []
+    for p in exact + fuzzy_paths:
+        if p not in suggestions:
+            suggestions.append(p)
+    if not suggestions:
+        return ""
+    return f"  → did you mean: {', '.join(suggestions)}?"
+
+
+def _format_validation_error(exc: Any, config_path: str) -> str:
+    """Render a pydantic ``ValidationError`` as one line per problem.
+
+    The default traceback exposes pydantic internals that confuse users
+    who only want to know which YAML key is wrong.  We strip the noise,
+    print ``<dotted.path>: <message> (got <value>)`` per error, and for
+    "extra_forbidden" errors append a ``→ did you mean: ...?`` line with
+    valid paths that share the leaf name plus fuzzy matches against the
+    parent's own fields.
+    """
+    lines = [f"jaxrens: invalid configuration in {config_path!r}:"]
+    for err in exc.errors():
+        loc_parts = [str(p) for p in err["loc"]]
+        loc = ".".join(loc_parts) or "<root>"
+        msg = err.get("msg", "invalid value")
+        got = err.get("input", None)
+        if got is not None and not isinstance(got, (dict, list, tuple)):
+            suffix = f" (got {got!r})"
+        else:
+            suffix = ""
+        lines.append(f"  {loc}: {msg}{suffix}")
+
+        if err.get("type") == "extra_forbidden" and loc_parts:
+            bad_key = loc_parts[-1]
+            parent_path = ".".join(loc_parts[:-1])
+            hint = _suggest_for_extra_field(bad_key, parent_path)
+            if hint:
+                lines.append(hint)
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point registered via ``[project.scripts]``."""
+    from pydantic import ValidationError
+
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -423,7 +558,18 @@ def main(argv: list[str] | None = None) -> None:
         "migrate-ns-inp": _cmd_migrate_ns_inp,
     }
     handler = dispatch[args.command]
-    sys.exit(handler(args))
+    try:
+        sys.exit(handler(args))
+    except ValidationError as exc:
+        cfg = getattr(args, "config", "<unknown>")
+        print(_format_validation_error(exc, cfg), file=sys.stderr)
+        sys.exit(2)
+    except FileNotFoundError as exc:
+        print(f"jaxrens: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except yaml.YAMLError as exc:
+        print(f"jaxrens: YAML parse error: {exc}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

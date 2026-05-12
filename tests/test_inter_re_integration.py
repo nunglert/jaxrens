@@ -3,7 +3,7 @@
 Coverage:
 - Pressure-RENS end-to-end with VmapRuns: swaps happen, stats present every iter
 - SingleRun with inter_re_config: silently passed as None (no-op)
-- PmapVmapRuns smoke: n_gpu=1, n_per_gpu=2, inter_re.every=1
+- PmapVmapRuns smoke: n_gpu=1, n_per_gpu=2, inter_re.re_interval=1
 - Zero-overhead: run with inter_re=None matches baseline timing
 """
 
@@ -90,7 +90,7 @@ def _make_parallel_problem(
 
 
 class TestPressureRENSEndToEnd:
-    """Short 5-iteration run, n_runs=2, inter_re.every=1."""
+    """Short 5-iteration run, n_runs=2, inter_re.re_interval=1."""
 
     # Class-level state to run once and inspect at multiple test methods.
     _result = None
@@ -109,7 +109,7 @@ class TestPressureRENSEndToEnd:
             seed=123,
         )
 
-        inter_re_cfg = InterREConfig(flavor="pressure", every=1, n_swap_cycles=1)
+        inter_re_cfg = InterREConfig(flavor="pressure", re_interval=1, n_swap_cycles=1)
         re_stats_log = []
 
         class _Collector:
@@ -147,7 +147,7 @@ class TestPressureRENSEndToEnd:
         assert self._result is not None
 
     def test_re_stats_present_every_iter(self):
-        """inter_re_stats should appear on every iteration >= 1 (every=1)."""
+        """inter_re_stats should appear on every iteration >= 1 (re_interval=1)."""
         self._run()
         # _Collector was not used (run_ns_parallel doesn't accept callbacks in
         # the current API); check the result dict instead.
@@ -156,7 +156,7 @@ class TestPressureRENSEndToEnd:
         prob = _make_parallel_problem(
             n_runs=2, n_walkers=10, pressures=[0.01, 0.1], seed=123
         )
-        inter_re_cfg = InterREConfig(flavor="pressure", every=1)
+        inter_re_cfg = InterREConfig(flavor="pressure", re_interval=1)
         stats_log = []
 
         class _Cb:
@@ -223,7 +223,7 @@ class TestSingleRunInterRE:
         )(positions)
         rng_keys = jax.random.split(rng_key, 1)
 
-        inter_re_cfg = InterREConfig(flavor="pressure", every=1)
+        inter_re_cfg = InterREConfig(flavor="pressure", re_interval=1)
 
         result = run_ns_parallel(
             positions=positions,
@@ -252,7 +252,7 @@ class TestSingleRunInterRE:
 
 
 class TestPmapVmapRunsInterRE:
-    """run_ns_multi_gpu with inter_re.every=1, n_gpu=1, n_per_gpu=2."""
+    """run_ns_multi_gpu with inter_re.re_interval=1, n_gpu=1, n_per_gpu=2."""
 
     def test_smoke_no_error(self):
         from jaxrens.sampling.nested_sampling import run_ns_multi_gpu
@@ -275,7 +275,7 @@ class TestPmapVmapRunsInterRE:
             lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
         )(positions)
 
-        inter_re_cfg = InterREConfig(flavor="pressure", every=1)
+        inter_re_cfg = InterREConfig(flavor="pressure", re_interval=1)
 
         result = run_ns_multi_gpu(
             positions=positions,
@@ -324,7 +324,7 @@ class TestPmapVmapRunsInterRE:
         )
 
         descriptor = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
-        mgr = InterREManager(PressureRENSSwap(), descriptor, backend, every=1)
+        mgr = InterREManager(PressureRENSSwap(), descriptor, backend, re_interval=1)
 
         swap_key = jax.random.key(7)
         new_state, stats, _ = mgr.apply(ns_state, swap_key)
@@ -409,3 +409,155 @@ class TestFlavourValidation:
                 termination_criteria=[IterationTermination(3)],
                 inter_re_config=bad_cfg,
             )
+
+
+# ---------------------------------------------------------------------------
+# RECallback + RELogger end-to-end
+# ---------------------------------------------------------------------------
+
+
+class TestRECallbackEndToEnd:
+    """RECallback writes per-fire per-pair counts to <prefix>.re_stats.h5
+    when wired into the run_ns_multi_gpu callback list.
+
+    Covers:
+      * file is created, has the right shape, and counts are bounded
+      * iterations field reflects actual fire cadence (re_interval > 1)
+      * no file is written when the manager never fires
+    """
+
+    def test_writes_file_with_per_pair_counts(self, tmp_path):
+        from jaxrens.cli.monitor import RECallback
+        from jaxrens.io.re_stats_log import RELogger
+
+        backend = create_harmonic(k=1.0)
+        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        init_fn, step_fn, _ = build_mwg(backend, descriptors)
+
+        n_gpu, n_per_gpu, n_walkers = 1, 3, 8
+        n_total = n_gpu * n_per_gpu
+        key = jax.random.key(11)
+        rng_keys = jax.random.split(key, n_total)
+        pos_key, _ = jax.random.split(key)
+        positions = jax.random.uniform(
+            pos_key, (n_total, n_walkers, 1, 3), minval=-1.5, maxval=1.5,
+        )
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        energies = jax.vmap(
+            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+        )(positions)
+
+        inter_re_cfg = InterREConfig(flavor="pressure", re_interval=1)
+
+        path = tmp_path / "test.re_stats.h5"
+        re_logger = RELogger(path=path, n_pairs=n_total - 1, flavor="pressure")
+        callbacks = [RECallback(re_logger)]
+
+        run_ns_multi_gpu(
+            positions=positions, types=types, energies=energies, cells=None,
+            init_fn=init_fn, step_fn=step_fn, rng_keys=rng_keys,
+            n_gpu=n_gpu, n_per_gpu=n_per_gpu,
+            n_walkers=n_walkers,
+            max_iterations=5, n_mcmc_steps=3,
+            termination_criteria=[IterationTermination(5)],
+            inter_re_config=inter_re_cfg,
+            callbacks=callbacks,
+        )
+
+        # File must be created with iterations >= 1 fires (re_interval=1).
+        assert path.exists()
+        log = RELogger.read(path)
+        assert log.n_pairs == n_total - 1
+        assert log.flavor == "pressure"
+        assert log.iterations.shape[0] >= 1
+        # Each row's accepted count is bounded by attempted count.
+        assert np.all(log.n_accepted_per_pair <= log.n_attempted_per_pair)
+        # Attempted is non-negative.
+        assert np.all(log.n_attempted_per_pair >= 0)
+
+    def test_no_file_when_re_interval_skips_all_iterations(self, tmp_path):
+        """re_interval larger than max_iterations → manager never fires → no file."""
+        from jaxrens.cli.monitor import RECallback
+        from jaxrens.io.re_stats_log import RELogger
+
+        backend = create_harmonic(k=1.0)
+        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        init_fn, step_fn, _ = build_mwg(backend, descriptors)
+
+        n_gpu, n_per_gpu, n_walkers = 1, 2, 8
+        n_total = n_gpu * n_per_gpu
+        key = jax.random.key(11)
+        rng_keys = jax.random.split(key, n_total)
+        pos_key, _ = jax.random.split(key)
+        positions = jax.random.uniform(
+            pos_key, (n_total, n_walkers, 1, 3),
+        )
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        energies = jax.vmap(
+            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+        )(positions)
+
+        # re_interval=999 with max_iterations=3 → no fires.
+        inter_re_cfg = InterREConfig(flavor="pressure", re_interval=999)
+
+        path = tmp_path / "test.re_stats.h5"
+        re_logger = RELogger(path=path, n_pairs=n_total - 1, flavor="pressure")
+        callbacks = [RECallback(re_logger)]
+
+        run_ns_multi_gpu(
+            positions=positions, types=types, energies=energies, cells=None,
+            init_fn=init_fn, step_fn=step_fn, rng_keys=rng_keys,
+            n_gpu=n_gpu, n_per_gpu=n_per_gpu,
+            n_walkers=n_walkers,
+            max_iterations=3, n_mcmc_steps=2,
+            termination_criteria=[IterationTermination(3)],
+            inter_re_config=inter_re_cfg,
+            callbacks=callbacks,
+        )
+
+        assert not path.exists(), "RECallback wrote a file despite no fires"
+
+    def test_re_interval_2_writes_subsampled_iterations(self, tmp_path):
+        """With re_interval=2 and max_iterations=5, file should have entries
+        at iterations {2, 4} (manager fires when iter > 0 and iter % 2 == 0)."""
+        from jaxrens.cli.monitor import RECallback
+        from jaxrens.io.re_stats_log import RELogger
+
+        backend = create_harmonic(k=1.0)
+        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        init_fn, step_fn, _ = build_mwg(backend, descriptors)
+
+        n_gpu, n_per_gpu, n_walkers = 1, 2, 8
+        n_total = n_gpu * n_per_gpu
+        key = jax.random.key(11)
+        rng_keys = jax.random.split(key, n_total)
+        pos_key, _ = jax.random.split(key)
+        positions = jax.random.uniform(
+            pos_key, (n_total, n_walkers, 1, 3),
+        )
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        energies = jax.vmap(
+            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+        )(positions)
+
+        inter_re_cfg = InterREConfig(flavor="pressure", re_interval=2)
+
+        path = tmp_path / "test.re_stats.h5"
+        re_logger = RELogger(path=path, n_pairs=n_total - 1, flavor="pressure")
+        callbacks = [RECallback(re_logger)]
+
+        run_ns_multi_gpu(
+            positions=positions, types=types, energies=energies, cells=None,
+            init_fn=init_fn, step_fn=step_fn, rng_keys=rng_keys,
+            n_gpu=n_gpu, n_per_gpu=n_per_gpu,
+            n_walkers=n_walkers,
+            max_iterations=5, n_mcmc_steps=2,
+            termination_criteria=[IterationTermination(5)],
+            inter_re_config=inter_re_cfg,
+            callbacks=callbacks,
+        )
+
+        log = RELogger.read(path)
+        # All recorded iterations must be even and >= 2.
+        assert np.all(log.iterations >= 2)
+        assert np.all(log.iterations % 2 == 0)
