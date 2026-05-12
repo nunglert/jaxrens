@@ -1,0 +1,117 @@
+name: Bench
+
+# Performance-tracking bench for `ns_step`.  Runs only on PRs to main
+# (and manual dispatch).  Each run builds the CI docker image, runs
+# `bench/run.py` on PR head and on the PR's base SHA in turn on the same
+# ephemeral g5.xlarge instance, then posts/updates a single PR comment
+# with the delta table from `bench/compare.py`.
+#
+# Informational only — no pass/fail.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench:
+    name: ns_step bench (PR vs base)
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - family=g5.xlarge
+      - image=ubuntu24-gpu-x64
+      - spot=price-capacity-optimized
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # fetch-depth=0 so we can `git checkout` the base SHA later
+          # without a second `actions/checkout` invocation.
+          fetch-depth: 0
+
+      - name: Build CI image
+        run: docker build -f Dockerfile.ci -t jaxrens-ci:${{ github.sha }} .
+
+      - name: Bench PR head
+        run: |
+          set -euo pipefail
+          rm -f bench/results.jsonl
+          docker run --rm --gpus all \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            jaxrens-ci:${{ github.sha }} \
+            python bench/run.py
+          cp bench/results.jsonl /tmp/pr.jsonl
+          rm bench/results.jsonl
+
+      - name: Checkout base SHA
+        run: |
+          git -c advice.detachedHead=false checkout \
+            "${{ github.event.pull_request.base.sha }}"
+
+      - name: Bench base SHA
+        id: base_bench
+        continue-on-error: true
+        # Soft-fail: the most common case is the PR that *adds* bench.yml
+        # itself — base has no `bench/` dir and `python bench/run.py`
+        # exits nonzero.  Same pattern protects against transient
+        # cuSolver / OOM on the base run.  We surface the failure as a
+        # warning in the rendered comment instead of failing the job.
+        run: |
+          docker run --rm --gpus all \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            jaxrens-ci:${{ github.sha }} \
+            python bench/run.py
+          cp bench/results.jsonl /tmp/base.jsonl
+
+      - name: Ensure base file exists
+        if: always()
+        run: |
+          if [ ! -f /tmp/base.jsonl ]; then : > /tmp/base.jsonl; fi
+
+      - name: Render comparison markdown
+        run: |
+          if [ "${{ steps.base_bench.outcome }}" = "success" ]; then
+            python bench/compare.py /tmp/base.jsonl /tmp/pr.jsonl > /tmp/comment.md
+          else
+            python bench/compare.py /tmp/base.jsonl /tmp/pr.jsonl \
+              --base-failed > /tmp/comment.md
+          fi
+
+      - name: Find existing bench comment
+        # `pull_request` from a fork has read-only GITHUB_TOKEN; skip
+        # the comment dance entirely so the job still passes (informational).
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: peter-evans/find-comment@v4
+        id: fc
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- jaxrens-bench -->'
+
+      - name: Create bench comment
+        if: |
+          github.event.pull_request.head.repo.full_name == github.repository
+          && steps.fc.outputs.comment-id == ''
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: /tmp/comment.md
+
+      - name: Update bench comment
+        if: |
+          github.event.pull_request.head.repo.full_name == github.repository
+          && steps.fc.outputs.comment-id != ''
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          edit-mode: replace
+          body-path: /tmp/comment.md

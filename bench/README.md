@@ -1,12 +1,22 @@
 # `ns_step` performance benchmark
 
 Append-only wall-time log for the inner NS step, one row per backend per
-invocation.  Manual-trigger only — never wired into CI (per CLAUDE.md
-"one GPU process at a time").
+invocation.
 
 This is **not** a regression test: there are no thresholds and no
 assertions.  It exists so that after a major refactor you can re-run the
 suite and skim `view.py` to see whether the headline timings shifted.
+
+Three entry-points:
+- **Local** — `python bench/run.py`, results land in `bench/results.jsonl`
+  (gitignored), use `view.py` for the trend.  "One GPU process at a time"
+  on the local cluster — never run two of these in parallel.
+- **SLURM** — `sbatch bench/submit.slurm` requests a single GPU and runs
+  the same orchestrator from the repo root.
+- **CI on PRs** — `.github/workflows/bench.yml` runs the bench on PR head
+  and on the PR's base SHA on a single ephemeral g5.xlarge runner and
+  posts a delta table as a PR comment via `bench/compare.py`.  No
+  pass/fail; informational only.
 
 ## Run
 
@@ -46,6 +56,8 @@ means there were uncommitted changes when the row was recorded.
 | `_one.py` | Single-backend runner: load → resolve → init → cold call → warm loop → append row.  Exits 77 if the backend's optional dep / fixture is missing. |
 | `run.py`  | Orchestrator: spawns one `_one.py` subprocess per backend, sequentially.  Subprocess isolation keeps each backend's cold-compile time uncontaminated by previous backends' JAX startup amortisation. |
 | `view.py` | Reads `results.jsonl`, prints table or plots trend. |
+| `compare.py` | Diffs two `results.jsonl` files (typically PR head vs base SHA) and prints a markdown table for the GHA PR-comment workflow.  Stdlib-only. |
+| `submit.slurm` | SLURM batch wrapper for the local cluster.  Self-locates to the repo root and forwards CLI args to `run.py`. |
 | `configs/` | One YAML per backend at bench scale (n_live=200 for cheap, n_live=32 for heavy NN backends).  These are *not* the production `experiments/*/config.yaml` files — bench scales and bench-only output settings (no I/O). |
 | `results.jsonl` | Gitignored; one JSON object per line. |
 | `results.jsonl.example` | Committed; one hand-crafted row that documents the schema. |
