@@ -77,6 +77,18 @@ jobs:
         run: |
           if [ ! -f /tmp/base.jsonl ]; then : > /tmp/base.jsonl; fi
 
+      - name: Restore PR head
+        if: always()
+        # ``Checkout base SHA`` above switched the worktree to the base
+        # commit so the base run uses that commit's ``bench/run.py``.
+        # We need the PR head back before invoking ``bench/compare.py``
+        # — the base may not even have a ``bench/`` directory (the
+        # exact "PR adds bench.yml itself" case the base soft-fail
+        # protects against).
+        run: |
+          git -c advice.detachedHead=false checkout \
+            "${{ github.event.pull_request.head.sha }}"
+
       - name: Render comparison markdown
         run: |
           if [ "${{ steps.base_bench.outcome }}" = "success" ]; then
