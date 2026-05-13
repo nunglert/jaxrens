@@ -89,8 +89,9 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
     dataclasses always see ints).  When ``"per_walker"`` every affected field
     is multiplied by ``root.run.n_live`` first.
 
-    The eight scaled fields:
+    The scaled fields:
         output.{info,traj,snapshot,checkpoint}_interval
+        output.{temperature_lag,temperature_interval}
         run.max_iterations  (None preserved)
         termination[iteration].max_iterations
         inter_re.re_interval
@@ -105,6 +106,8 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
             "traj_interval",
             "snapshot_interval",
             "checkpoint_interval",
+            "temperature_lag",
+            "temperature_interval",
         )
     }
     run_upd = {
@@ -1005,6 +1008,10 @@ def _resolve_single_replica(
         log_level=root.output.log_level,
         save_acc_rates=root.output.save_acc_rates,
         acc_rates_interval=int(root.output.acc_rates_interval),
+        save_re_stats=root.output.save_re_stats,
+        temperature_lag=root.output.temperature_lag,
+        temperature_interval=int(root.output.temperature_interval),
+        temperature_kB=float(root.output.temperature_kB),
     )
 
     _warn_unused_output_fields(root.output)
@@ -1416,6 +1423,10 @@ def _resolve_multi_replica(
         log_level=root.output.log_level,
         save_acc_rates=root.output.save_acc_rates,
         acc_rates_interval=int(root.output.acc_rates_interval),
+        save_re_stats=root.output.save_re_stats,
+        temperature_lag=root.output.temperature_lag,
+        temperature_interval=int(root.output.temperature_interval),
+        temperature_kB=float(root.output.temperature_kB),
     )
     _warn_unused_output_fields(root.output)
 

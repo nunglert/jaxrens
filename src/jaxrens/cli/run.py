@@ -453,6 +453,8 @@ def run_from_config(
             adaptation_policies=burn_adaptation_policies,
             adjust_n_samples=getattr(adaptation_config, "adjust_n_samples", 50) if adaptation_config is not None else 50,
             adjust_max_rounds=getattr(adaptation_config, "adjust_max_rounds", 15) if adaptation_config is not None else 15,
+            max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
+            max_neighbors_offset=resolved.backend.max_neighbors_offset,
         )
 
         # Extract burned-in walker arrays to re-seed run_ns.
@@ -659,6 +661,8 @@ def run_multi_gpu_from_config(resolved) -> dict:
             adaptation_policies=adaptation_policies,
             adjust_n_samples=getattr(resolved.adaptation_cfg, "adjust_n_samples", 50),
             adjust_max_rounds=getattr(resolved.adaptation_cfg, "adjust_max_rounds", 15),
+            max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
+            max_neighbors_offset=resolved.backend.max_neighbors_offset,
         )
         pop = ns_state_burn.population
         # Burn-in operated on (G, P, K, ...) state via the PmapVmapRuns batcher.
@@ -971,6 +975,8 @@ def run_sharded_from_config(resolved) -> dict:
             adjust_max_rounds=getattr(
                 resolved.adaptation_cfg, "adjust_max_rounds", 15,
             ),
+            max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
+            max_neighbors_offset=resolved.backend.max_neighbors_offset,
         )
 
         # Flatten sharded (G, K/G, ...) population back to (K, ...) so the

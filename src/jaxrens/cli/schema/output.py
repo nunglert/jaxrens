@@ -59,6 +59,17 @@ class OutputSpec(BaseModel):
     # when ``inter_re`` is not configured.
     save_re_stats: bool = False
 
+    # Finite-difference temperature estimator (Baldock et al. 2017).
+    # ``temperature_lag`` is the length of the Emax FIFO used for the
+    # finite difference; ``None`` disables the callback entirely.
+    # Both ``temperature_lag`` and ``temperature_interval`` honour
+    # ``interval_units`` (``per_walker`` scales by ``n_live``).
+    # ``temperature_kB`` defaults to eV/K (ASE convention) — set ``1.0``
+    # for reduced-unit backends (LJ, harmonic).
+    temperature_lag: int | float | None = 100
+    temperature_interval: int | float = 100
+    temperature_kB: float = 8.6173324e-5
+
     # -- Deferred fields (see module docstring) --
     snapshot_time: float | None = None
     snapshot_clean: bool = False

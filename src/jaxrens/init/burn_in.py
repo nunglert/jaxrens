@@ -20,6 +20,7 @@ Parallelism axes:
 
 from __future__ import annotations
 
+import logging
 import warnings
 from typing import Any, Callable
 
@@ -32,8 +33,11 @@ from jaxrens.sampling.batch_descriptor import (
     SingleRun,
     VmapRuns,
 )
+from jaxrens.sampling.run_loop import _pick_next_bucket
 from jaxrens.state.ns import NSState
 from jaxrens.utils.padding import pad_to_multiple
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +140,8 @@ def initial_walk(
     adaptation_policies: tuple | None = None,
     adjust_n_samples: int = 50,
     adjust_max_rounds: int = 15,
+    max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
+    max_neighbors_offset: int = 5,
 ) -> NSState:
     """Run fixed-Emax MCMC to decorrelate walkers from their initialization.
 
@@ -180,6 +186,12 @@ def initial_walk(
             Required when per_move_fns is not None.
         adjust_n_samples: Number of trial walkers per adaptation round.
         adjust_max_rounds: Max bisection rounds per adaptation call.
+        max_neighbors_list: Bucket ladder for neighbor-overflow retries.
+            On overflow after a walk the next entry in this ladder is
+            selected via ``_pick_next_bucket`` and the walk is retried.
+            Mirrors the NS-loop parameter of the same name.
+        max_neighbors_offset: Headroom added to the observed peak when
+            picking the next bucket.  Mirrors the NS-loop parameter.
 
     Returns:
         New NSState with live walkers advanced. Same pytree shape as input.
@@ -313,8 +325,9 @@ def initial_walk(
     else:
         jit_one_walk = batcher.wrap_for_batch(_per_replica)
 
-    # --- Outer walk loop ---
-    for walk_i in range(n_walks):
+    # --- Outer walk loop (while-loop so overflow retries don't advance walk_i) ---
+    walk_i = 0
+    while walk_i < n_walks:
         if use_adaptation and walk_i > 0 and walk_i % adjust_interval == 0:
             key, key_adapt = jax.random.split(key)
             ns_state, _diag, _new_key = adapt_mgr.apply_to_state(
@@ -325,12 +338,40 @@ def initial_walk(
 
         if use_chunked_run_vmap:
             # Chunked path: scalar key, internal per-replica split.
-            ns_state, _ = jit_one_walk(sub, ns_state, emax)
+            new_ns_state, _ = jit_one_walk(sub, ns_state, emax)
         else:
             # ``distinct_keys`` returns shape_prefix-shaped INDEPENDENT
             # keys (scalar for SingleRun) on the right mesh per
             # batcher.  Each replica/shard walks its own walkers.
             walk_keys = batcher.distinct_keys(sub)
-            ns_state, _ = jit_one_walk(walk_keys, ns_state, emax)
+            new_ns_state, _ = jit_one_walk(walk_keys, ns_state, emax)
+
+        # Neighbor-bucket overflow retry — mirrors run_loop.py:441-456.
+        # On overflow, roll back to the pre-walk ``ns_state`` (we have
+        # not committed ``new_ns_state`` yet), bump the bucket via
+        # ``_pick_next_bucket``, and retry the same walk.  ``walk_i`` is
+        # NOT advanced.  JAX re-traces ``jit_one_walk`` automatically on
+        # the next call because ``max_neighbors`` is a static field on
+        # the MCState pytree (state/mc_state.py).
+        if jnp.any(new_ns_state.population.overflow):
+            true_max = int(new_ns_state.population.max_neighbor_count.max())
+            current = int(ns_state.population.max_neighbors)
+            new_max = _pick_next_bucket(
+                true_max, current,
+                tuple(max_neighbors_list), max_neighbors_offset,
+            )
+            logger.warning(
+                "Overflow in burn-in walk %d: observed max_neighbors=%d, "
+                "resizing bucket %d -> %d (ladder=%s, offset=%d)",
+                walk_i, true_max, current, new_max,
+                list(max_neighbors_list), max_neighbors_offset,
+            )
+            ns_state = ns_state.set(
+                population=ns_state.population.set(max_neighbors=new_max),
+            )
+            continue  # retry same walk_i with the new bucket
+
+        ns_state = new_ns_state
+        walk_i += 1
 
     return ns_state

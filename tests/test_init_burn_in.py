@@ -531,3 +531,123 @@ class TestBatchedRuns:
         )
 
 
+# ---------------------------------------------------------------------------
+# 9. Neighbor-bucket overflow retry inside initial_walk
+# ---------------------------------------------------------------------------
+
+
+def _wrap_step_fn_with_overflow(real_step_fn, *, threshold: int, count_above: int):
+    """Wrap a real step_fn so it sets ``overflow=True`` whenever the current
+    bucket ``state.max_neighbors`` is below ``threshold``.
+
+    When overflow fires, ``max_neighbor_count`` is also set to
+    ``count_above`` so the burn-in's call to ``_pick_next_bucket`` sees a
+    concrete observed peak.  When ``state.max_neighbors >= threshold`` the
+    real step_fn's output is passed through unchanged.
+
+    The condition reads ``state.max_neighbors`` (a static int on the
+    MCState pytree), so each JIT re-trace following a bucket bump observes
+    the new static value and produces the appropriate overflow flag.
+    """
+
+    def wrapped(key, state, emax):
+        new_state, info = real_step_fn(key, state, emax)
+        if state.max_neighbors < threshold:
+            new_state = new_state.set(
+                overflow=jnp.asarray(True),
+                max_neighbor_count=jnp.asarray(
+                    count_above, dtype=new_state.max_neighbor_count.dtype,
+                ),
+            )
+        return new_state, info
+
+    return wrapped
+
+
+class TestBurnInOverflowRetry:
+    """Burn-in must detect the population.overflow flag set by moves and
+    bump the neighbor-count bucket, retrying the same walk."""
+
+    def test_overflow_triggers_bucket_bump_and_retry(self):
+        """First walk overflows at bucket=10, retry succeeds at bucket=20."""
+        ns_state, step_fn, _, _ = _build_ns_state(n_walkers=4, n_atoms=2)
+        # Force the initial bucket below the overflow threshold.
+        ns_state = ns_state.set(
+            population=ns_state.population.set(max_neighbors=10),
+        )
+
+        overflow_step = _wrap_step_fn_with_overflow(
+            step_fn, threshold=15, count_above=17,
+        )
+
+        result = initial_walk(
+            jax.random.key(7),
+            ns_state,
+            overflow_step,
+            n_walks=2,
+            walklength=3,
+            adjust_interval=100,  # no adaptation; keep the test focused
+            emax_offset_per_atom=1.0,
+            n_atoms=2,
+            max_neighbors_list=(10, 20, 30),
+            max_neighbors_offset=0,
+        )
+
+        # Bucket was bumped 10 -> 20 via _pick_next_bucket(17, 10, ladder, 0).
+        assert int(result.population.max_neighbors) == 20
+        # The retry succeeded — the final state's overflow flag must be False
+        # (the threshold=15 condition is now satisfied at bucket=20).
+        assert bool(jnp.any(result.population.overflow)) is False
+
+    def test_overflow_aborts_when_ladder_exhausted(self):
+        """No headroom in ladder → _pick_next_bucket raises RuntimeError."""
+        ns_state, step_fn, _, _ = _build_ns_state(n_walkers=4, n_atoms=2)
+        ns_state = ns_state.set(
+            population=ns_state.population.set(max_neighbors=10),
+        )
+
+        # threshold=15, count_above=17, ladder only contains 10 → no entry
+        # satisfies "> 10 AND >= 17" → RuntimeError.
+        overflow_step = _wrap_step_fn_with_overflow(
+            step_fn, threshold=15, count_above=17,
+        )
+
+        with pytest.raises(RuntimeError):
+            initial_walk(
+                jax.random.key(8),
+                ns_state,
+                overflow_step,
+                n_walks=1,
+                walklength=3,
+                adjust_interval=100,
+                emax_offset_per_atom=1.0,
+                n_atoms=2,
+                max_neighbors_list=(10,),
+                max_neighbors_offset=0,
+            )
+
+    def test_no_overflow_path_is_semantics_preserving(self):
+        """When no overflow ever fires, the new while-loop must behave
+        identically to the old for-loop: ``n_walks`` walks consumed, bucket
+        unchanged."""
+        ns_state, step_fn, _, _ = _build_ns_state(n_walkers=4, n_atoms=2)
+        ns_state = ns_state.set(
+            population=ns_state.population.set(max_neighbors=30),
+        )
+
+        result = initial_walk(
+            jax.random.key(9),
+            ns_state,
+            step_fn,
+            n_walks=3,
+            walklength=4,
+            adjust_interval=100,
+            emax_offset_per_atom=1.0,
+            n_atoms=2,
+            max_neighbors_list=(10, 20, 30),
+            max_neighbors_offset=0,
+        )
+
+        assert int(result.population.max_neighbors) == 30
+        assert bool(jnp.any(result.population.overflow)) is False
+

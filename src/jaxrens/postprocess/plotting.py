@@ -415,17 +415,33 @@ def plot_acceptance_rates(
     return ax
 
 
+def _resolve_re_trace(monitor_or_trace):
+    """Accept either a Monitor (legacy) or an RELog (new); return the RELog."""
+    from jaxrens.io.re_stats_log import RELog
+
+    if isinstance(monitor_or_trace, RELog):
+        return monitor_or_trace
+    trace = getattr(monitor_or_trace, "re_trace", None)
+    if trace is None:
+        raise ValueError(
+            "No re_trace available.  Pass an RELog directly, or load a "
+            "Monitor from a directory that contains a .re_stats.h5 file."
+        )
+    return trace
+
+
 def plot_re_acceptance(
-    monitor: "Monitor",
+    monitor_or_trace,
     *,
     ax: "Axes | None" = None,
     per_pair: bool = True,
     window: int | None = None,
+    label_prefix: str = "",
     **kwargs,
 ) -> "Axes":
     """Plot inter-replica swap acceptance rate vs iteration.
 
-    Per-fire per-pair acceptance comes from ``monitor.re_trace`` (loaded from
+    Per-fire per-pair acceptance comes from the RE trace (loaded from
     ``<prefix>.re_stats.h5``).  When ``per_pair=True`` (default), draws one
     line per adjacent replica pair.  When ``per_pair=False``, plots the mean
     across pairs with a shaded ``fill_between`` for ±1 std.
@@ -435,28 +451,25 @@ def plot_re_acceptance(
     pair's trace before plotting.
 
     Args:
-        monitor: Populated Monitor with a non-None ``re_trace``.
+        monitor_or_trace: A populated Monitor with a non-None ``re_trace``
+            *or* an ``RELog`` instance directly.
         ax: Existing axes to plot into.  Created if None.
         per_pair: If True, draw one line per adjacent replica pair.  Otherwise
             plot mean ± std across pairs.
         window: Optional boxcar smoothing window length (in fire entries).
+        label_prefix: Prefix prepended to the legend label when
+            ``per_pair=False`` (used by the CLI plot dispatcher).
         **kwargs: Forwarded to ``ax.plot``.
 
     Returns:
         The Axes object.
 
     Raises:
-        ValueError: If ``monitor.re_trace`` is None or has zero pairs.
+        ValueError: If no RE trace can be resolved or it has zero pairs.
     """
     import matplotlib.pyplot as plt
 
-    if monitor.re_trace is None:
-        raise ValueError(
-            "Monitor has no re_trace.  Load from a directory that contains "
-            "a .re_stats.h5 file."
-        )
-
-    re_log = monitor.re_trace
+    re_log = _resolve_re_trace(monitor_or_trace)
     if re_log.n_pairs == 0:
         raise ValueError(
             "re_trace has zero pairs — nothing to plot (single-replica run)."
@@ -487,7 +500,11 @@ def plot_re_acceptance(
     else:
         mean = acc.mean(axis=1)
         std = acc.std(axis=1)
-        ax.plot(iters, mean, label=monitor.label or "mean swap acc", **kwargs)
+        # Label: monitor's label takes precedence when available; otherwise
+        # fall back to label_prefix + "mean swap acc".
+        mon_label = getattr(monitor_or_trace, "label", None)
+        lbl = mon_label or f"{label_prefix}mean swap acc".strip()
+        ax.plot(iters, mean, label=lbl, **kwargs)
         ax.fill_between(iters, mean - std, mean + std, alpha=0.2)
 
     ax.set_xlabel("iteration")

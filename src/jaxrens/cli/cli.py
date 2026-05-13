@@ -318,6 +318,30 @@ def _cmd_dump_schema(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_plot(args: argparse.Namespace) -> int:
+    """Quick-look plotter for individual run artefacts.
+
+    Dispatches by filename suffix (``.adaptation.h5`` / ``.re_stats.h5``
+    / ``.energies``) and writes a sibling PNG by default.
+    """
+    from pathlib import Path
+
+    from jaxrens.cli.plot import plot_file
+
+    in_path = Path(args.file)
+    out_path = Path(args.output) if args.output is not None else None
+    try:
+        written = plot_file(in_path, out_path)
+    except ValueError as exc:
+        print(f"jaxrens plot: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as exc:
+        print(f"jaxrens plot: file not found: {exc}", file=sys.stderr)
+        return 2
+    print(f"Wrote {written}")
+    return 0
+
+
 def _cmd_migrate_ns_inp(args: argparse.Namespace) -> int:
     """Migrate an old ns.inp file to jaxrens YAML format.
 
@@ -460,6 +484,30 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # -- plot --
+    p_plot = sub.add_parser(
+        "plot",
+        help=(
+            "Render a quick-look PNG from a single run artefact "
+            "(.adaptation.h5, .re_stats.h5, .energies).  Auto-detects by "
+            "filename suffix."
+        ),
+    )
+    p_plot.add_argument(
+        "file",
+        metavar="FILE",
+        help=(
+            "Artefact to plot.  Recognised suffixes: .adaptation.h5, "
+            ".re_stats.h5, .energies."
+        ),
+    )
+    p_plot.add_argument(
+        "-o", "--output",
+        default=None,
+        metavar="OUTPUT.png",
+        help="Output PNG path.  Default: sibling <stem>.<kind>.png.",
+    )
+
     return parser
 
 
@@ -581,6 +629,7 @@ def main(argv: list[str] | None = None) -> None:
         "validate": _cmd_validate,
         "dump-schema": _cmd_dump_schema,
         "migrate-ns-inp": _cmd_migrate_ns_inp,
+        "plot": _cmd_plot,
     }
     handler = dispatch[args.command]
     try:

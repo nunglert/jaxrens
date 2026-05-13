@@ -67,9 +67,12 @@ class OutputConfig:
     # Finite-difference temperature estimator (Baldock et al. 2017).
     # ``temperature_lag`` is the length of the Emax FIFO used for the
     # finite difference; ``None`` disables the callback entirely.
+    # Both ``temperature_lag`` and ``temperature_interval`` are scaled by
+    # ``RootSpec.interval_units`` (``per_walker`` → multiply by ``n_live``)
+    # in the resolver before reaching this runtime dataclass.
     # ``temperature_kB`` defaults to eV/K (ASE convention) — set ``1.0``
     # for reduced-unit backends (LJ, harmonic).
-    temperature_lag: int | None = None
+    temperature_lag: int | None = 100
     temperature_interval: int = 100
     temperature_kB: float = 8.6173324e-5
 
