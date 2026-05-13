@@ -1,5 +1,7 @@
 """jaxrens.init: walker initialization utilities."""
 
+import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
+
 from jaxrens.init.burn_in import initial_walk
 from jaxrens.init.cells import cell_shape_walk, sample_initial_volume
 from jaxrens.init.positions import grid_positions_in_cell, uniform_positions_in_cell

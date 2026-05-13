@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
 import jax
 import jax.numpy as jnp
 
@@ -453,8 +454,8 @@ def run_from_config(
             adaptation_policies=burn_adaptation_policies,
             adjust_n_samples=getattr(adaptation_config, "adjust_n_samples", 50) if adaptation_config is not None else 50,
             adjust_max_rounds=getattr(adaptation_config, "adjust_max_rounds", 15) if adaptation_config is not None else 15,
-            max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
-            max_neighbors_offset=resolved.backend.max_neighbors_offset,
+            max_neighbors_list=tuple(backend_config.max_neighbors_list),
+            max_neighbors_offset=backend_config.max_neighbors_offset,
         )
 
         # Extract burned-in walker arrays to re-seed run_ns.

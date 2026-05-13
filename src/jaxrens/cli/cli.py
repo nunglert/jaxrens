@@ -9,6 +9,8 @@ dump-schema  Print JSON schema for RootSpec.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING    
+
 import argparse
 import json
 import logging
@@ -19,9 +21,14 @@ from typing import Any
 
 import yaml
 
-from jaxrens.cli.resolve import _apply_interval_units, resolve
-from jaxrens.cli.run import configure_file_logging, run_from_config
-from jaxrens.cli.schema import RootSpec
+if TYPE_CHECKING:
+    from jaxrens.cli.schema.root import RootSpec
+
+# JAX-using imports (``jaxrens.cli.{resolve,run,schema}``) are deliberately
+# resolved inside the handler functions that need them.  This keeps the
+# ``jaxrens plot`` and ``jaxrens dump-schema`` subcommands JAX-free so they
+# run on a GPU-less or memory-pressured machine without paying for the JAX
+# backend probe.
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +102,8 @@ def _apply_overrides(raw: dict[str, Any], overrides: list[str]) -> dict[str, Any
 # ---------------------------------------------------------------------------
 
 def _load_and_validate(config_path: str, overrides: list[str]) -> RootSpec:
+    from jaxrens.cli.schema import RootSpec
+
     with open(config_path) as fh:
         raw: dict[str, Any] = yaml.safe_load(fh)
     if overrides:
@@ -104,6 +113,8 @@ def _load_and_validate(config_path: str, overrides: list[str]) -> RootSpec:
 
 def _run_single(resolved) -> None:
     """Execute a SingleRun NS dispatch from a SingleRun ``ResolvedConfig``."""
+    from jaxrens.cli.run import run_from_config
+
     run_from_config(
         resolved.ns,
         list(resolved.moves),
@@ -160,6 +171,9 @@ def _assert_n_gpus(expected: int | None) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    from jaxrens.cli.resolve import _apply_interval_units, resolve
+    from jaxrens.cli.run import configure_file_logging
+
     rc = _assert_n_gpus(args.n_gpus)
     if rc != 0:
         return rc
@@ -273,6 +287,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         )
         return 0
 
+    from jaxrens.cli.resolve import resolve
     from jaxrens.sampling.batch_descriptor import (
         ShardedSingleRun,
         SingleRun,
@@ -311,6 +326,8 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 
 def _cmd_dump_schema(args: argparse.Namespace) -> int:
+    from jaxrens.cli.schema import RootSpec
+
     schema = RootSpec.model_json_schema()
     fmt = getattr(args, "format", "json")
     if fmt == "json":
@@ -400,6 +417,7 @@ def _cmd_migrate_ns_inp(args: argparse.Namespace) -> int:
 
     # Optional validation round-trip --------------------------------------
     if args.validate:
+        from jaxrens.cli.schema import RootSpec
         try:
             RootSpec.model_validate(yaml.safe_load(yaml_text))
         except Exception as exc:
@@ -563,6 +581,8 @@ def _suggest_for_extra_field(bad_key: str, parent_path: str) -> str:
       * Fuzzy matches against the *parent's own* fields via difflib.
     """
     import difflib
+
+    from jaxrens.cli.schema import RootSpec
 
     all_paths = _collect_field_paths(RootSpec)
 

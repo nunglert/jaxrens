@@ -6,6 +6,7 @@ implements one of these protocols.
 
 from typing import Any, NamedTuple, Protocol
 
+import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
 import jax
 import jax.numpy as jnp
 
