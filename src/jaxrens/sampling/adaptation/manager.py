@@ -82,6 +82,26 @@ class AdaptationManager:
             Static under JIT.
         adjust_interval: Trigger ``apply`` every this many iterations.
             ``0`` means adaptation is disabled.
+        trial_batch_size: Optional chunk size for the bisection's inner
+            trial-walker vmap.  When set, the per-move closure passes
+            ``trial_batch_size`` through to ``adjust_step_size`` /
+            ``adjust_step_size_sharded``, converting the inner
+            ``vmap(move_fn)`` over ``adjust_n_samples`` trial walkers
+            into ``jax.lax.map(batch_size=trial_batch_size)``.  Bounds
+            peak memory at ``trial_batch_size * per-walker-state``.
+            Useful when the move kernel is expensive (e.g. MACE,
+            NeuralIL) and ``adjust_n_samples`` is large.  ``None``
+            (default) keeps the full trial vmap — zero overhead.
+        run_batch_size: Optional chunk size for the run-axis vmap.
+            Only consumed when ``batcher`` is :class:`VmapRuns`;
+            ignored for the other batchers (``SingleRun`` has no run
+            axis, ``PmapVmapRuns`` is already split by GPU,
+            ``ShardedSingleRun`` is one logical run).  When set,
+            ``_build_jit_fns`` builds a chunked wrapper that calls
+            ``jax.lax.map(per_replica_fn, ..., batch_size=run_batch_size)``
+            instead of ``jax.vmap``, bounding peak memory at the
+            chunk-replica granularity.  ``None`` (default) keeps the
+            full run-axis vmap.
     """
 
     def __init__(
@@ -93,6 +113,8 @@ class AdaptationManager:
         adjust_factor: float,
         adjust_max_rounds: int,
         adjust_interval: int,
+        trial_batch_size: int | None = None,
+        run_batch_size: int | None = None,
     ) -> None:
         self._move_descriptors = list(move_descriptors) if move_descriptors else []
         self._per_move_fns = list(per_move_fns) if per_move_fns else []
@@ -101,11 +123,9 @@ class AdaptationManager:
         self._adjust_factor = adjust_factor
         self._adjust_max_rounds = adjust_max_rounds
         self._adjust_interval = adjust_interval
+        self._trial_batch_size = trial_batch_size
+        self._run_batch_size = run_batch_size
 
-        # Build per-move JIT'd callables (once, at construction time).
-        # The callable signature depends on the batch descriptor type:
-        #   SingleRun: fn(pop, ss_scalar, emax_scalar, key) -> 10-tuple
-        #   VmapRuns:  fn(pop_batch, ss_vec, emax_vec, keys_vec) -> 10-tuple of batched arrays
         self._jit_fns: list[Callable] = []
         if self.is_active:
             self._jit_fns = self._build_jit_fns()
@@ -225,9 +245,99 @@ class AdaptationManager:
         # Return the advanced rng_key so the caller can carry it forward.
         return current_step_sizes, per_move_outputs, rng_key
 
+    def apply_to_state(
+        self,
+        ns_state,
+        emax,
+        rng_key,
+    ):
+        """One-shot adapt + write-back for callers holding an NSState.
+
+        Convenience over :meth:`apply` that does what every caller does
+        post-adapt:
+
+        1. Extracts ``current_step_sizes`` from ``ns_state.population``
+           via the batcher's ``extract_step_sizes``.
+        2. Promotes ``rng_key`` from scalar to ``shape_prefix``-shaped
+           per batcher (broadcast onto the ``'shard'`` mesh for
+           ShardedSingleRun, ``jax.random.split`` for VmapRuns /
+           PmapVmapRuns, identity for SingleRun).  Burn-in's outer
+           loop hands us a scalar; the NS loop's pre-shaped key can
+           also flow through (the broadcast / split is shape-aware).
+        3. Calls :meth:`apply`.
+        4. Broadcasts the new per-move step sizes back across the
+           walker axis via ``batcher.broadcast_step_sizes`` and writes
+           the result into ``ns_state.population.step_sizes``.
+
+        Returns:
+            ``(new_ns_state, per_move_outputs, new_rng_key)``.  The
+            advanced key matches the input ``rng_key`` shape; callers
+            that gave us a scalar get a scalar back, callers that gave
+            us a shape_prefix-shaped key get the same shape.
+        """
+        pop = ns_state.population
+        current_step_sizes = self._batcher.extract_step_sizes(pop)
+
+        # Promote scalar rng_key to shape_prefix-shaped on the right mesh.
+        # Broadcast (not split) for ShardedSingleRun so every shard sees
+        # the same key — load-bearing for coherent-bisection invariants
+        # inside ``adjust_step_size_sharded`` (`lax.psum` aggregates
+        # per-shard accept counts; identical RNG ⇒ same trial picks ⇒
+        # identical bisection path on every shard).
+        adapt_key = self._promote_adapt_key(rng_key)
+
+        new_step_sizes, diag, new_key = self.apply(
+            pop=pop,
+            emax=emax,
+            rng_key=adapt_key,
+            current_step_sizes=current_step_sizes,
+        )
+
+        n_walkers = pop.step_sizes.shape[self._batcher.walker_axis]
+        new_ss_pop = self._batcher.broadcast_step_sizes(
+            new_step_sizes, n_walkers,
+        )
+        new_pop = pop.set(step_sizes=new_ss_pop)
+        new_ns_state = ns_state.set(population=new_pop)
+        return new_ns_state, diag, new_key
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _promote_adapt_key(self, rng_key: jax.Array) -> jax.Array:
+        """Promote a scalar key to ``shape_prefix``-shaped for ``apply``.
+
+        For batched batchers, the per-replica adapt path expects
+        ``shape_prefix``-shaped keys.  Burn-in hands in a scalar from
+        its outer-loop split chain; the NS loop already has a properly
+        shaped key from ``init_ns_*``.  This helper is no-op for
+        shape-correct inputs and promotes scalars per batcher:
+
+        * **SingleRun**: identity.
+        * **VmapRuns(R)**: ``jax.random.split(key, R)`` → ``(R,)``.
+        * **PmapVmapRuns(G, P)**: ``split + reshape`` → ``(G, P)``.
+        * **ShardedSingleRun(G)**: BROADCAST (not split) onto the
+          ``'shard'``-named mesh → identical key on every shard, on
+          the right mesh for the pmap'd per-move adjuster.
+        """
+        key_ndim = jnp.asarray(rng_key).ndim
+        prefix_ndim = len(self._batcher.shape_prefix)
+        if key_ndim != 0 or prefix_ndim == 0:
+            return rng_key
+        if isinstance(self._batcher, ShardedSingleRun):
+            from jax.sharding import Mesh, NamedSharding, PartitionSpec
+            shard_mesh = NamedSharding(
+                Mesh(jax.local_devices()[:self._batcher.n_gpu], ("shard",)),
+                PartitionSpec("shard"),
+            )
+            return jax.device_put(
+                jnp.broadcast_to(rng_key[None], (self._batcher.n_gpu,)),
+                shard_mesh,
+            )
+        return jax.random.split(rng_key, self._batcher.n_runs).reshape(
+            self._batcher.shape_prefix,
+        )
 
     def _build_jit_fns(self) -> list[Callable]:
         """Build one JIT'd callable per move type.
@@ -259,6 +369,7 @@ class AdaptationManager:
             afac = self._adjust_factor
             max_ss = desc.step_size_max
             max_rounds = self._adjust_max_rounds
+            trial_chunk = self._trial_batch_size
 
             def _per_replica(
                 pop, ss, emax, key,
@@ -270,12 +381,48 @@ class AdaptationManager:
                 _max_ss=max_ss,
                 _max_rounds=max_rounds,
                 _adjust_fn=adjust_fn,
+                _trial_chunk=trial_chunk,
             ):
+                if _trial_chunk is None:
+                    return _adjust_fn(
+                        pop, _move_fn, ss, emax, key,
+                        _n_samp, _min_r, _max_r, _afac, _max_ss, _max_rounds,
+                    )
                 return _adjust_fn(
                     pop, _move_fn, ss, emax, key,
                     _n_samp, _min_r, _max_r, _afac, _max_ss, _max_rounds,
+                    trial_batch_size=_trial_chunk,
                 )
 
-            fns.append(self._batcher.wrap_for_batch(_per_replica))
+            fns.append(self._wrap_per_replica(_per_replica))
 
         return fns
+
+    def _wrap_per_replica(self, per_replica_fn: Callable) -> Callable:
+        """Wrap ``per_replica_fn`` for the active batcher + chunking config.
+
+        Equivalent to ``self._batcher.wrap_for_batch(per_replica_fn)`` for
+        the default un-chunked path.  When ``self._run_batch_size`` is set
+        AND the batcher is :class:`VmapRuns`, replaces the run-axis
+        ``jax.vmap`` with ``jax.lax.map(batch_size=...)`` so peak memory
+        tracks the chunk-replica granularity instead of the full vmap.
+        """
+        from jaxrens.sampling.batch_descriptor import VmapRuns
+
+        chunked = (
+            self._run_batch_size is not None
+            and isinstance(self._batcher, VmapRuns)
+        )
+        if not chunked:
+            return self._batcher.wrap_for_batch(per_replica_fn)
+
+        run_chunk = self._run_batch_size
+
+        def _chunked(pop, ss, emax, run_keys):
+            return jax.lax.map(
+                lambda x: per_replica_fn(x[0], x[1], x[2], x[3]),
+                (pop, ss, emax, run_keys),
+                batch_size=run_chunk,
+            )
+
+        return jax.jit(_chunked)

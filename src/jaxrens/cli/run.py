@@ -848,12 +848,20 @@ def run_sharded_from_config(resolved) -> dict:
     the flat ``(K, ...)`` layout — ``init_ns_sharded`` (inside
     ``run_ns_sharded``) does the reshape and per-device placement.
 
-    Burn-in is intentionally skipped in v1: the existing
-    :func:`initial_walk` codepath assumes the SingleRun / VmapRuns /
-    PmapVmapRuns shape contracts and is not yet sharded-aware.
-    A clear warning is logged when ``initial_walk`` is configured.
+    Burn-in (`initial_walk`) runs through ``ShardedSingleRun`` natively
+    — adaptation goes through :class:`AdaptationManager` (which
+    dispatches to ``adjust_step_size_sharded``) and the walking step
+    pmaps with per-shard distinct keys.  After burn-in the sharded
+    NSState's ``(G, K/G, ...)`` population is flattened back to
+    ``(K, ...)`` for the post-burn-in neighbor-count refresh and for
+    re-init by ``run_ns_sharded`` (which re-shards via
+    ``init_ns_sharded``).
     """
     from jaxrens.io.adaptation_log import AdaptationLogger
+    from jaxrens.sampling.nested_sampling import (
+        _choose_starting_bucket,
+        init_ns_sharded,
+    )
 
     ns = resolved.ns
     batcher = resolved.batcher  # ShardedSingleRun
@@ -880,17 +888,97 @@ def run_sharded_from_config(resolved) -> dict:
             f"{positions.shape[0]} but n_live={n_live}."
         )
 
+    key = jax.random.key(ns.seed)
+
+    # --- Burn-in (sharded) -------------------------------------------------
     burn_in_cfg = resolved.initial_walk_config
-    if burn_in_cfg is not None and burn_in_cfg.n_walks > 0:
-        logger.warning(
-            "Burn-in (initial_walk) is configured (n_walks=%d) but is not "
-            "yet supported on the sharded single-run path.  Skipping burn-in "
-            "for this run.  Followup: extend initial_walk to handle "
-            "ShardedSingleRun.",
-            burn_in_cfg.n_walks,
+    do_burn_in = burn_in_cfg is not None and burn_in_cfg.n_walks > 0
+    initial_max_neighbor_counts = resolved.init.initial_max_neighbor_counts
+    if do_burn_in:
+        from jaxrens.init.burn_in import initial_walk
+
+        _ladder = tuple(int(x) for x in resolved.backend.max_neighbors_list)
+        _offset = int(resolved.backend.max_neighbors_offset)
+        starting_bucket = _choose_starting_bucket(
+            initial_max_neighbor_counts, _ladder, _offset,
         )
 
-    key = jax.random.key(ns.seed)
+        key, key_init, key_burn = jax.random.split(key, 3)
+        step_sizes = jnp.full(
+            len(resolved.move_descriptors), resolved.moves[0].step_size,
+        )
+        ns_state_burn = init_ns_sharded(
+            init_fn,
+            positions, types, energies, cells, key_init,
+            n_gpu=n_gpu,
+            step_sizes=step_sizes,
+            ensemble_params=(
+                resolved.ensemble_params_per_run[0]
+                if resolved.ensemble_params_per_run else None
+            ),
+            max_neighbors=starting_bucket,
+            max_neighbor_counts=initial_max_neighbor_counts,
+        )
+
+        n_atoms_burn = positions.shape[-2]
+        adaptation_policies = resolved.adaptation_policies
+        burn_per_move_fns = per_move_fns
+
+        logger.info(
+            "Starting sharded burn-in: n_walks=%d, walklength=%d, "
+            "adjust_interval=%d, walker_batch_size=%s, n_gpu=%d, n_atoms=%d",
+            burn_in_cfg.n_walks, burn_in_cfg.walklength,
+            burn_in_cfg.adjust_interval,
+            getattr(burn_in_cfg, "walker_batch_size", None),
+            n_gpu, n_atoms_burn,
+        )
+
+        ns_state_burn = initial_walk(
+            key=key_burn,
+            ns_state=ns_state_burn,
+            step_fn=step_fn,
+            n_walks=burn_in_cfg.n_walks,
+            walklength=burn_in_cfg.walklength,
+            adjust_interval=burn_in_cfg.adjust_interval,
+            emax_offset_per_atom=burn_in_cfg.emax_offset_per_atom,
+            n_atoms=n_atoms_burn,
+            batcher=batcher,
+            walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
+            per_move_fns=burn_per_move_fns,
+            adaptation_policies=adaptation_policies,
+            adjust_n_samples=getattr(
+                resolved.adaptation_cfg, "adjust_n_samples", 50,
+            ),
+            adjust_max_rounds=getattr(
+                resolved.adaptation_cfg, "adjust_max_rounds", 15,
+            ),
+        )
+
+        # Flatten sharded (G, K/G, ...) population back to (K, ...) so the
+        # neighbor-count refresh and ``run_ns_sharded``'s ``init_ns_sharded``
+        # see the canonical flat input layout.
+        pop_burn = ns_state_burn.population
+
+        def _flatten_shard(arr):
+            if arr is None:
+                return None
+            return arr.reshape((-1,) + arr.shape[2:])
+
+        positions = _flatten_shard(pop_burn.positions)
+        energies = _flatten_shard(pop_burn.energy)
+        cells = _flatten_shard(pop_burn.cell)
+        logger.info("Sharded burn-in complete")
+
+        # Post-burn-in neighbor-count refresh — burn-in drifts
+        # positions/cells; the resolver's pre-burn-in counts are stale.
+        if hasattr(base_backend, "max_neighbors_for"):
+            logger.info(
+                "Recomputing post-burn-in max neighbor counts (n_walkers=%d)",
+                positions.shape[0],
+            )
+            initial_max_neighbor_counts = _recompute_max_neighbor_counts(
+                base_backend, positions, cells,
+            )
 
     ensemble_params = (
         resolved.ensemble_params_per_run[0]
@@ -1015,7 +1103,7 @@ def run_sharded_from_config(resolved) -> dict:
         move_descriptors=list(resolved.move_descriptors),
         max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
         max_neighbors_offset=resolved.backend.max_neighbors_offset,
-        initial_max_neighbor_counts=resolved.init.initial_max_neighbor_counts,
+        initial_max_neighbor_counts=initial_max_neighbor_counts,
         batcher=batcher,
         **full_auto_kwargs,
     )

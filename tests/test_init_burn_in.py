@@ -351,6 +351,9 @@ class TestJIT:
 # ---------------------------------------------------------------------------
 
 class TestAdaptationCallCount:
+    """Burn-in delegates adaptation to ``AdaptationManager``; mock its
+    ``.apply`` to count fires."""
+
     def test_adjust_called_correct_number_of_times(self):
         """With n_walks=5 and adjust_interval=2, adaptation fires at walks 2 and 4."""
         from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
@@ -366,35 +369,29 @@ class TestAdaptationCallCount:
 
         adapt_call_count = [0]
 
-        def stub_adjust_fn(population, move_fn, step_size, emax, rng_key,
-                           n_samples, min_rate, max_rate, adjust_factor,
-                           max_step_size, max_rounds):
+        def stub_apply(self, pop, emax, rng_key, current_step_sizes):
             adapt_call_count[0] += 1
-            return step_size, jnp.array(0.5), jnp.zeros(4, dtype=jnp.int32)
+            return current_step_sizes, {}, rng_key
 
         import unittest.mock as mock
         with mock.patch(
-            "jaxrens.init.burn_in.jax.jit",
-            side_effect=lambda fn, **kw: fn,
+            "jaxrens.sampling.adaptation.manager.AdaptationManager.apply",
+            new=stub_apply,
         ):
-            with mock.patch(
-                "jaxrens.init.burn_in.adjust_step_size",
-                new=stub_adjust_fn,
-            ):
-                initial_walk(
-                    jax.random.key(0),
-                    ns_state,
-                    step_fn,
-                    n_walks=5,
-                    walklength=3,
-                    adjust_interval=2,
-                    emax_offset_per_atom=1.0,
-                    n_atoms=2,
-                    per_move_fns=per_move_fns,
-                    adaptation_policies=(policy,),
-                    adjust_n_samples=10,
-                    adjust_max_rounds=5,
-                )
+            initial_walk(
+                jax.random.key(0),
+                ns_state,
+                step_fn,
+                n_walks=5,
+                walklength=3,
+                adjust_interval=2,
+                emax_offset_per_atom=1.0,
+                n_atoms=2,
+                per_move_fns=per_move_fns,
+                adaptation_policies=(policy,),
+                adjust_n_samples=10,
+                adjust_max_rounds=5,
+            )
 
         assert adapt_call_count[0] == 2, (
             f"Expected 2 adaptation calls, got {adapt_call_count[0]}"
@@ -411,35 +408,29 @@ class TestAdaptationCallCount:
 
         adapt_call_count = [0]
 
-        def stub_adjust_fn(population, move_fn, step_size, emax, rng_key,
-                           n_samples, min_rate, max_rate, adjust_factor,
-                           max_step_size, max_rounds):
+        def stub_apply(self, pop, emax, rng_key, current_step_sizes):
             adapt_call_count[0] += 1
-            return step_size, jnp.array(0.5), jnp.zeros(4, dtype=jnp.int32)
+            return current_step_sizes, {}, rng_key
 
         import unittest.mock as mock
         with mock.patch(
-            "jaxrens.init.burn_in.jax.jit",
-            side_effect=lambda fn, **kw: fn,
+            "jaxrens.sampling.adaptation.manager.AdaptationManager.apply",
+            new=stub_apply,
         ):
-            with mock.patch(
-                "jaxrens.init.burn_in.adjust_step_size",
-                new=stub_adjust_fn,
-            ):
-                initial_walk(
-                    jax.random.key(0),
-                    ns_state,
-                    step_fn,
-                    n_walks=1,
-                    walklength=3,
-                    adjust_interval=1,
-                    emax_offset_per_atom=1.0,
-                    n_atoms=2,
-                    per_move_fns=per_move_fns,
-                    adaptation_policies=(policy,),
-                    adjust_n_samples=10,
-                    adjust_max_rounds=3,
-                )
+            initial_walk(
+                jax.random.key(0),
+                ns_state,
+                step_fn,
+                n_walks=1,
+                walklength=3,
+                adjust_interval=1,
+                emax_offset_per_atom=1.0,
+                n_atoms=2,
+                per_move_fns=per_move_fns,
+                adaptation_policies=(policy,),
+                adjust_n_samples=10,
+                adjust_max_rounds=3,
+            )
 
         assert adapt_call_count[0] == 0, (
             f"Adaptation fired on walk_i=0, expected 0 calls, got {adapt_call_count[0]}"

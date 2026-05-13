@@ -157,6 +157,84 @@ def _pack_adjustment_info(
     )
 
 
+_PRESERVE_INFO_KEYS = frozenset({"move_names"})
+_DROP_INFO_KEYS_AFTER_SCALARIZE = frozenset({"_batcher"})
+
+
+def _gather_sharded_ns_state(ns_state: NSState) -> NSState:
+    """Return an NSState with population leaves gathered to ``(K, ...)``.
+
+    For ShardedSingleRun, ``ns_state.population`` carries leaves shaped
+    ``(G, K // G, ...)`` distributed across G devices.  Callbacks that
+    were written for SingleRun expect ``(K, ...)``-shaped leaves.  This
+    helper gathers + reshapes; non-population scalar leaves carry a
+    redundant (G,) axis (post-`lax.psum`) — collapse via ``[0]``.
+    """
+    pop = ns_state.population
+
+    def _gather_leaf(leaf):
+        arr = jnp.asarray(leaf)
+        if arr.ndim == 0:
+            return arr
+        # Population leaves: (G, K_per_gpu, ...) → (K, ...).
+        # Per-shard scalars stored on pop (e.g. step_size, n_atoms): (G,) →
+        # take [0] (every shard identical).
+        if arr.ndim >= 2:
+            return arr.reshape((arr.shape[0] * arr.shape[1],) + arr.shape[2:])
+        return arr[0]
+
+    new_pop = jax.tree.map(_gather_leaf, pop)
+
+    # Top-level NSState scalar leaves (log_evidence, iteration, rng_key)
+    # also carry a (G,) redundant axis — collapse via [0].
+    def _collapse(leaf):
+        arr = jnp.asarray(leaf)
+        return arr[0] if arr.ndim > 0 else arr
+
+    new_ns_state = ns_state.set(
+        population=new_pop,
+        log_evidence=_collapse(ns_state.log_evidence),
+        iteration=_collapse(ns_state.iteration),
+        rng_key=_collapse(ns_state.rng_key),
+    )
+    return new_ns_state
+
+
+def _scalarize_sharded_info(info: dict[str, Any]) -> dict[str, Any]:
+    """Collapse the redundant leading-G axis from every leaf in ``info``.
+
+    ShardedSingleRun's ``ns_step_sharded`` and ``adjust_step_size_sharded``
+    write per-shard scalars / per-shard arrays where every shard's entry
+    is identical (post-`lax.psum` invariant).  Take ``[0]`` along that
+    axis so SingleRun-shaped callbacks (ProgressCallback,
+    TrajectoryCallback, etc.) see scalar / unsharded shapes without
+    needing to know about the underlying batcher.
+
+    Preserves a small allowlist of keys that are intentionally
+    already-collapsed (``move_names`` is a Python list,
+    ``_batcher`` is the descriptor itself).
+    """
+    out: dict[str, Any] = {}
+    for k, v in info.items():
+        if k in _DROP_INFO_KEYS_AFTER_SCALARIZE:
+            # Hide the sharded batcher reference: the scalarized dict
+            # now looks like SingleRun, so callbacks that branch on
+            # ``info["_batcher"]`` (e.g. AdaptationCallback's
+            # ``batcher.flatten``) should fall back to their
+            # SingleRun-shaped ndim heuristics.
+            continue
+        if k in _PRESERVE_INFO_KEYS or v is None:
+            out[k] = v
+            continue
+        try:
+            arr = jnp.asarray(v)
+        except (TypeError, ValueError):
+            out[k] = v
+            continue
+        out[k] = arr[0] if arr.ndim > 0 else arr
+    return out
+
+
 def _dispatch_callbacks(
     callbacks: list,
     iteration: int,
@@ -336,19 +414,18 @@ def _run_loop(
         # ---- Adaptation ----
         adjust_info = None
         if adapt_mgr.fires(i):
-            pop = ns_state.population
-            emax = batcher.reduce_emax(pop.energy)
-            # adapt_mgr.apply does its own key splitting internally;
-            # pass rng_key directly and get back the advanced carry.
-            current_step_sizes, per_move_outputs, rng_key = adapt_mgr.apply(
-                pop, emax, rng_key, current_step_sizes,
+            emax = batcher.reduce_emax(ns_state.population.energy)
+            # ``apply_to_state`` extracts current_step_sizes, runs the
+            # adapt, and writes the new step sizes back into the
+            # population — single integration point for both burn-in
+            # and the NS loop.
+            ns_state, per_move_outputs, rng_key = adapt_mgr.apply_to_state(
+                ns_state, emax, rng_key,
             )
-            # Re-broadcast updated step sizes across the walker axis.
-            n_walkers = pop.step_sizes.shape[batcher.walker_axis]
-            new_ss_pop = batcher.broadcast_step_sizes(
-                current_step_sizes, n_walkers,
+            # Re-extract for the downstream callbacks / info dict.
+            current_step_sizes = batcher.extract_step_sizes(
+                ns_state.population,
             )
-            ns_state = ns_state.set(population=pop.set(step_sizes=new_ss_pop))
             adjust_info = per_move_outputs
 
         # ---- NS step ----
@@ -429,7 +506,21 @@ def _run_loop(
         info["_batcher"] = batcher
 
         # ---- Callback dispatch ----
-        _dispatch_callbacks(callbacks, i, ns_state, info)
+        # ShardedSingleRun: ``info`` carries a redundant leading (G,)
+        # axis on every leaf (each shard reports the same global value
+        # post-`lax.psum`); the population leaves carry a non-redundant
+        # leading G axis (each shard owns ``K // G`` walkers).
+        # Collapse info via ``[0]`` and gather+reshape population leaves
+        # to ``(K, ...)`` so SingleRun-shaped callbacks see uniform
+        # shapes.
+        from jaxrens.sampling.batch_descriptor import ShardedSingleRun
+        if isinstance(batcher, ShardedSingleRun):
+            info = _scalarize_sharded_info(info)
+            ns_state_for_cb = _gather_sharded_ns_state(ns_state)
+        else:
+            ns_state_for_cb = ns_state
+
+        _dispatch_callbacks(callbacks, i, ns_state_for_cb, info)
 
         # ---- Termination ----
         log_z_scalar, hmax_scalar = batcher.reduce_for_termination(

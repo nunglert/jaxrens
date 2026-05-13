@@ -281,3 +281,202 @@ def test_resolver_rejects_indivisible_n_live(tmp_path):
     root = _minimal_root(tmp_path, shard_n_gpu=3, n_live=8)
     with pytest.raises(ValueError, match="divisible"):
         resolve(root)
+
+
+# ---------------------------------------------------------------------------
+# Burn-in (initial_walk) under ShardedSingleRun
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n_gpu", [1, pytest.param(2, marks=pytest.mark.skipif(
+    N_LOCAL < 2, reason="requires 2 local devices",
+))])
+def test_burn_in_sharded_completes_under_emax(n_gpu):
+    """Sharded burn-in finishes; final energies stay below the fixed Emax.
+
+    For G=1 this is the trivial-pmap case; for G=2 it exercises the
+    per-shard distinct-key walking dispatch (each shard walks its own
+    walkers independently) plus the broadcast-key adaptation path.
+    """
+    from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
+    from jaxrens.init.burn_in import initial_walk
+
+    if 8 % n_gpu != 0:
+        pytest.skip("n_walkers must divide n_gpu")
+
+    setup = _make_harmonic_problem(seed=42, n_walkers=8)
+
+    ns_state = init_ns_sharded(
+        setup["init_fn"],
+        setup["positions"], setup["types"], setup["energies"],
+        None, jax.random.key(7),
+        n_gpu=n_gpu,
+    )
+
+    n_atoms = setup["positions"].shape[1]
+    emax_offset_per_atom = 1.0
+    batcher = ShardedSingleRun(n_gpu=n_gpu)
+    # ``reduce_emax`` now returns shape ``(G,)`` (every entry identical
+    # by construction) — take ``[0]`` for the Python-scalar Emax used
+    # in the assertion.
+    fixed_emax = float(
+        batcher.reduce_emax(ns_state.population.energy)[0]
+        + emax_offset_per_atom * n_atoms
+    )
+
+    policy = ResolvedAdaptationPolicy(
+        min_rate=0.25, max_rate=0.75,
+        adjust_factor=1.5, step_size_max=10.0,
+    )
+
+    ns_state_after = initial_walk(
+        key=jax.random.key(13),
+        ns_state=ns_state,
+        step_fn=setup["step_fn"],
+        n_walks=2,
+        walklength=4,
+        adjust_interval=1,
+        emax_offset_per_atom=emax_offset_per_atom,
+        n_atoms=n_atoms,
+        batcher=batcher,
+        per_move_fns=setup["per_move_fns"],
+        adaptation_policies=(policy,),
+        adjust_n_samples=8,
+        adjust_max_rounds=3,
+    )
+
+    final_energies = np.asarray(ns_state_after.population.energy)
+    assert np.all(np.isfinite(final_energies))
+    assert np.all(final_energies <= fixed_emax + 1e-6), (
+        f"Some walkers exceed Emax={fixed_emax:.4g}: max={final_energies.max():.4g}"
+    )
+
+
+@pytest.mark.skipif(N_LOCAL < 2, reason="requires 2 local devices")
+def test_burn_in_sharded_g2_shards_walk_independently():
+    """At G=2 each shard must walk its own walkers — populations must differ."""
+    from jaxrens.init.burn_in import initial_walk
+
+    setup = _make_harmonic_problem(seed=2, n_walkers=8)
+    ns_state = init_ns_sharded(
+        setup["init_fn"],
+        setup["positions"], setup["types"], setup["energies"],
+        None, jax.random.key(0),
+        n_gpu=2,
+    )
+
+    ns_state_after = initial_walk(
+        key=jax.random.key(11),
+        ns_state=ns_state,
+        step_fn=setup["step_fn"],
+        n_walks=1,
+        walklength=8,
+        adjust_interval=999,
+        emax_offset_per_atom=10.0,
+        n_atoms=setup["positions"].shape[1],
+        batcher=ShardedSingleRun(n_gpu=2),
+    )
+
+    pos = np.asarray(ns_state_after.population.positions)  # (G=2, K/G=4, A, 3)
+    shard0 = pos[0].reshape(-1)
+    shard1 = pos[1].reshape(-1)
+    assert not np.allclose(shard0, shard1, atol=1e-6), (
+        "Per-shard populations are identical — shards are running the same "
+        "chain, defeating burn-in's per-shard independence."
+    )
+
+
+@pytest.mark.skipif(N_LOCAL < 2, reason="requires 2 local devices")
+def test_burn_in_sharded_g2_step_sizes_equal_across_shards():
+    """Adaptation under sharding must produce identical step sizes per shard.
+
+    Bisection runs ``lax.psum`` over the per-shard accept/eval counters,
+    so every shard sees the same global rate and converges to the same
+    step size.  Final ``step_sizes`` must therefore be bit-equal across
+    the leading G axis.
+    """
+    from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
+    from jaxrens.init.burn_in import initial_walk
+
+    setup = _make_harmonic_problem(seed=3, n_walkers=8)
+    ns_state = init_ns_sharded(
+        setup["init_fn"],
+        setup["positions"], setup["types"], setup["energies"],
+        None, jax.random.key(0),
+        n_gpu=2,
+    )
+
+    policy = ResolvedAdaptationPolicy(
+        min_rate=0.25, max_rate=0.75,
+        adjust_factor=1.5, step_size_max=10.0,
+    )
+
+    ns_state_after = initial_walk(
+        key=jax.random.key(99),
+        ns_state=ns_state,
+        step_fn=setup["step_fn"],
+        n_walks=3,
+        walklength=4,
+        adjust_interval=1,
+        emax_offset_per_atom=1.0,
+        n_atoms=setup["positions"].shape[1],
+        batcher=ShardedSingleRun(n_gpu=2),
+        per_move_fns=setup["per_move_fns"],
+        adaptation_policies=(policy,),
+        adjust_n_samples=8,
+        adjust_max_rounds=3,
+    )
+
+    # population.step_sizes shape: (G=2, K/G=4, n_moves=1).  Per-shard
+    # values must agree along the leading G axis (post-`lax.psum`
+    # bisection invariant).
+    ss = np.asarray(ns_state_after.population.step_sizes)
+    np.testing.assert_allclose(ss[0], ss[1], rtol=0, atol=0,
+        err_msg="Per-shard step sizes differ — adaptation broke "
+        "the cross-shard `lax.psum` invariant.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# AdaptationManager.trial_batch_size + run_batch_size parity
+# ---------------------------------------------------------------------------
+
+
+def test_adaptation_manager_trial_batch_size_matches_full_vmap():
+    """``AdaptationManager(trial_batch_size=N)`` results match ``trial_batch_size=None``.
+
+    Pins the chunked-trial-vmap path's correctness on the cheapest
+    batcher (``SingleRun``) at a divisor chunk size.  Ensures the
+    closure that propagates ``trial_batch_size`` to ``adjust_step_size``
+    doesn't perturb the result.
+    """
+    from jaxrens.sampling.adaptation.manager import AdaptationManager
+
+    setup = _make_harmonic_problem(seed=4, n_walkers=8)
+    pop = init_ns(
+        setup["init_fn"],
+        setup["positions"], setup["types"], setup["energies"],
+        None, jax.random.key(0),
+    ).population
+
+    common = dict(
+        move_descriptors=setup["descriptors"],
+        per_move_fns=setup["per_move_fns"],
+        batcher=SingleRun(),
+        adjust_n_samples=8,
+        adjust_factor=1.5,
+        adjust_max_rounds=3,
+        adjust_interval=1,
+    )
+
+    mgr_full = AdaptationManager(**common)
+    mgr_chunked = AdaptationManager(trial_batch_size=4, **common)
+
+    emax = jnp.max(pop.energy) + 1.0
+    key = jax.random.key(0)
+    init_ss = jnp.array([0.2])
+
+    ss_full, _, _ = mgr_full.apply(pop, emax, key, init_ss)
+    ss_chunked, _, _ = mgr_chunked.apply(pop, emax, key, init_ss)
+
+    np.testing.assert_allclose(ss_full, ss_chunked, rtol=1e-5)
