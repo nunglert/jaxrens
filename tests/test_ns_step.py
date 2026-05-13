@@ -16,7 +16,12 @@ from jaxrens.backends.toy import create_harmonic
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
-from jaxrens.sampling.nested_sampling import init_ns, init_ns_parallel, ns_step
+from jaxrens.sampling.nested_sampling import (
+    _get_extra_indices,
+    init_ns,
+    init_ns_parallel,
+    ns_step,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +221,53 @@ class TestNSStep:
             emaxes.append(float(info["emax"]))
 
         assert emaxes[-1] < emaxes[0], "Emax should decrease during NS with n_extra"
+
+
+# ---------------------------------------------------------------------------
+# _get_extra_indices (clone-source exclusion regression test)
+# ---------------------------------------------------------------------------
+
+
+class TestGetExtraIndices:
+    """Both the worst walker AND the clone source must be excluded from the
+    extras pool.  If the clone source leaks in, the clone's data sits at two
+    population slots (worst_idx and clone_idx) and both get walked
+    independently from the same parent state — losing one independent walker
+    and producing two correlated descendants every iteration where the
+    collision happens.  Repeated across long runs this seeds visible
+    population degeneracies.
+    """
+
+    def test_excludes_worst_and_clone(self):
+        worst_idx = jnp.int32(7)
+        clone_idx = jnp.int32(3)
+        # Try many keys; the picked indices must never collide with either.
+        for seed in range(50):
+            picks = _get_extra_indices(
+                worst_idx, clone_idx,
+                n_walkers=10, n_extra=5,
+                rng_key=jax.random.key(seed),
+            )
+            assert picks.shape == (5,)
+            assert not bool(jnp.any(picks == worst_idx)), \
+                f"seed {seed}: extras picked worst_idx ({int(worst_idx)})"
+            assert not bool(jnp.any(picks == clone_idx)), \
+                f"seed {seed}: extras picked clone_idx ({int(clone_idx)})"
+            # All picks must be unique (argsort-based selection guarantees this).
+            assert len(set(int(p) for p in picks)) == 5
+
+    def test_extras_can_use_all_other_slots(self):
+        """With n_extra = n_walkers - 2, the picked set is exactly the
+        complement of {worst_idx, clone_idx}."""
+        worst_idx = jnp.int32(0)
+        clone_idx = jnp.int32(5)
+        picks = _get_extra_indices(
+            worst_idx, clone_idx,
+            n_walkers=10, n_extra=8,
+            rng_key=jax.random.key(0),
+        )
+        expected = {1, 2, 3, 4, 6, 7, 8, 9}
+        assert set(int(p) for p in picks) == expected
 
 
 # ---------------------------------------------------------------------------

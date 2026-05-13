@@ -30,6 +30,26 @@ Multi-species support
 The ``species`` argument is therefore ignored in ``__call__``;
 ``atomic_numbers`` is set at construction from the element the model
 was parameterised for.
+
+MIC limitation
+--------------
+jax-md's ``energy.tersoff`` / ``energy.eam`` use the minimum image
+convention internally and have no way to enumerate periodic images
+or exclude self-image triplets.  As a consequence:
+
+* They are silently incorrect when any cell side falls below
+  ``2 * r_cutoff`` (neighbours wrap to the wrong image and are
+  undercounted).
+* The all-pairs Tersoff path does **not** respect extensivity for
+  periodic supercells (a 2x2x2 hand-built supercell of the same
+  crystal does not return ``8 * e_unit_cell``), which prevents the
+  position-replication trick that the other periodic backends
+  (LJ / MACE / Nequix / NeuralIL) use to work around small cells.
+
+This backend therefore intentionally exposes no ``supercell_trafo``
+knob — use it only when the unit cell is large enough that
+``cell_perp_distance > 2 * r_cutoff`` for every walker (under NPT,
+size the ``cell.min_volume_per_atom`` prior accordingly).
 """
 
 from __future__ import annotations

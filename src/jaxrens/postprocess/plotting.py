@@ -174,6 +174,77 @@ def plot_partition_function(
     return ax
 
 
+def plot_heatmap(
+    T: np.ndarray,
+    P: np.ndarray,
+    Z: np.ndarray,
+    *,
+    ax: "Axes | None" = None,
+    cmap: str = "viridis",
+    fmt: str = "PT",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    do_colorbar: bool = True,
+    cbar_label: str | None = None,
+    T_label: str = "T",
+    P_label: str = "P",
+    **pcolormesh_kwargs,
+) -> "Axes":
+    """Draw a 2D pressure-temperature heatmap of an observable.
+
+    Args:
+        T: Temperature grid, shape ``(n_T,)``.
+        P: Pressure grid, shape ``(n_P,)``.  Must be sorted by the caller —
+            ``pcolormesh`` does not reorder cells.
+        Z: Observable values, shape ``(n_P, n_T)`` (rows index pressure).
+        ax: Existing axes to plot into.  Created if None.
+        cmap: Matplotlib colormap name.
+        fmt: ``"PT"`` puts pressure on the x-axis, temperature on y.
+            ``"TP"`` swaps them.
+        vmin, vmax: Colour-scale clipping bounds; ``None`` uses the data range.
+        do_colorbar: Attach a colorbar to the figure when ``True``.
+        cbar_label: Label drawn next to the colorbar.
+        T_label, P_label: Axis labels for the temperature / pressure axes.
+        **pcolormesh_kwargs: Forwarded to ``ax.pcolormesh``.
+
+    Returns:
+        The Axes object.
+    """
+    import matplotlib.pyplot as plt
+
+    ax = _get_ax(ax)
+    Z = np.asarray(Z)
+    T = np.asarray(T)
+    P = np.asarray(P)
+    if Z.shape != (P.shape[0], T.shape[0]):
+        raise ValueError(
+            f"Z.shape={Z.shape} must be (n_P, n_T)="
+            f"({P.shape[0]}, {T.shape[0]})"
+        )
+
+    if fmt == "PT":
+        X, Y = np.meshgrid(P, T)
+        Z_plot = Z.T
+        xlabel, ylabel = P_label, T_label
+    elif fmt == "TP":
+        X, Y = np.meshgrid(T, P)
+        Z_plot = Z
+        xlabel, ylabel = T_label, P_label
+    else:
+        raise ValueError(f"fmt must be 'PT' or 'TP', got {fmt!r}")
+
+    pcolormesh_kwargs.setdefault("shading", "auto")
+    pcolormesh_kwargs.setdefault("rasterized", True)
+    im = ax.pcolormesh(
+        X, Y, Z_plot, vmin=vmin, vmax=vmax, cmap=cmap, **pcolormesh_kwargs,
+    )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if do_colorbar:
+        plt.colorbar(im, ax=ax, label=cbar_label)
+    return ax
+
+
 def plot_free_energy(
     monitor: "Monitor",
     T: np.ndarray,
@@ -205,8 +276,26 @@ def plot_free_energy(
     return ax
 
 
+def _resolve_adaptation_trace(monitor_or_trace):
+    """Accept either a Monitor (legacy) or an AdaptationLog (new) and
+    return the underlying ``AdaptationLog``.  Raises if neither has one.
+    """
+    from jaxrens.io.adaptation_log import AdaptationLog
+
+    if isinstance(monitor_or_trace, AdaptationLog):
+        return monitor_or_trace
+    trace = getattr(monitor_or_trace, "adaptation_trace", None)
+    if trace is None:
+        raise ValueError(
+            "No adaptation_trace available.  Pass an AdaptationLog "
+            "directly, or load a Monitor / MonitorCollection from a "
+            "directory that contains a .adaptation.h5 file."
+        )
+    return trace
+
+
 def plot_step_sizes(
-    monitor: "Monitor",
+    monitor_or_trace,
     *,
     ax: "Axes | None" = None,
     per_run: bool = False,
@@ -219,7 +308,11 @@ def plot_step_sizes(
     the mean across runs with a shaded ``fill_between`` for ±1 std.
 
     Args:
-        monitor:  Populated Monitor with a non-None ``adaptation_trace``.
+        monitor_or_trace: A populated Monitor with a non-None
+            ``adaptation_trace`` *or* an ``AdaptationLog`` directly (the
+            latter is what ``MonitorCollection.plot_step_sizes`` passes
+            when the cohort-wide log is loaded by
+            ``from_multi_run_directory``).
         ax:       Existing axes.  Created if None.
         per_run:  If True, draw individual run lines instead of mean±std.
         **kwargs: Forwarded to ``ax.plot`` (not to ``fill_between``).
@@ -228,23 +321,16 @@ def plot_step_sizes(
         The Axes object.
 
     Raises:
-        ValueError: If ``monitor.adaptation_trace`` is None.
+        ValueError: If no adaptation trace can be resolved.
     """
     import matplotlib.pyplot as plt
 
-    if monitor.adaptation_trace is None:
-        raise ValueError(
-            "Monitor has no adaptation_trace.  Load from a directory that "
-            "contains a .adaptation.h5 file."
-        )
-
+    trace = _resolve_adaptation_trace(monitor_or_trace)
     ax = _get_ax(ax)
-    trace = monitor.adaptation_trace
 
     iters = trace.iterations                     # (n_entries,)
     ss = trace.step_sizes                        # (n_entries, n_runs, n_moves)
     move_names = trace.move_names
-    n_moves = trace.n_moves
     n_runs = trace.n_runs
 
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
@@ -271,7 +357,7 @@ def plot_step_sizes(
 
 
 def plot_acceptance_rates(
-    monitor: "Monitor",
+    monitor_or_trace,
     *,
     ax: "Axes | None" = None,
     per_run: bool = False,
@@ -284,7 +370,8 @@ def plot_acceptance_rates(
     the mean across runs with a shaded ``fill_between`` for ±1 std.
 
     Args:
-        monitor:  Populated Monitor with a non-None ``adaptation_trace``.
+        monitor_or_trace: A populated Monitor with a non-None
+            ``adaptation_trace`` *or* an ``AdaptationLog`` directly.
         ax:       Existing axes.  Created if None.
         per_run:  If True, draw individual run lines instead of mean±std.
         **kwargs: Forwarded to ``ax.plot`` (not to ``fill_between``).
@@ -293,23 +380,16 @@ def plot_acceptance_rates(
         The Axes object.
 
     Raises:
-        ValueError: If ``monitor.adaptation_trace`` is None.
+        ValueError: If no adaptation trace can be resolved.
     """
     import matplotlib.pyplot as plt
 
-    if monitor.adaptation_trace is None:
-        raise ValueError(
-            "Monitor has no adaptation_trace.  Load from a directory that "
-            "contains a .adaptation.h5 file."
-        )
-
+    trace = _resolve_adaptation_trace(monitor_or_trace)
     ax = _get_ax(ax)
-    trace = monitor.adaptation_trace
 
     iters = trace.iterations                      # (n_entries,)
     acc = trace.acceptance_rates                  # (n_entries, n_runs, n_moves)
     move_names = trace.move_names
-    n_moves = trace.n_moves
     n_runs = trace.n_runs
 
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
@@ -331,5 +411,87 @@ def plot_acceptance_rates(
 
     ax.set_xlabel("iteration")
     ax.set_ylabel("acceptance rate")
+    ax.legend()
+    return ax
+
+
+def plot_re_acceptance(
+    monitor: "Monitor",
+    *,
+    ax: "Axes | None" = None,
+    per_pair: bool = True,
+    window: int | None = None,
+    **kwargs,
+) -> "Axes":
+    """Plot inter-replica swap acceptance rate vs iteration.
+
+    Per-fire per-pair acceptance comes from ``monitor.re_trace`` (loaded from
+    ``<prefix>.re_stats.h5``).  When ``per_pair=True`` (default), draws one
+    line per adjacent replica pair.  When ``per_pair=False``, plots the mean
+    across pairs with a shaded ``fill_between`` for ±1 std.
+
+    Per-fire values are 0/1 noisy for ``n_swap_cycles=1`` runs.  Pass
+    ``window=W`` to apply a centred boxcar average of width ``W`` to each
+    pair's trace before plotting.
+
+    Args:
+        monitor: Populated Monitor with a non-None ``re_trace``.
+        ax: Existing axes to plot into.  Created if None.
+        per_pair: If True, draw one line per adjacent replica pair.  Otherwise
+            plot mean ± std across pairs.
+        window: Optional boxcar smoothing window length (in fire entries).
+        **kwargs: Forwarded to ``ax.plot``.
+
+    Returns:
+        The Axes object.
+
+    Raises:
+        ValueError: If ``monitor.re_trace`` is None or has zero pairs.
+    """
+    import matplotlib.pyplot as plt
+
+    if monitor.re_trace is None:
+        raise ValueError(
+            "Monitor has no re_trace.  Load from a directory that contains "
+            "a .re_stats.h5 file."
+        )
+
+    re_log = monitor.re_trace
+    if re_log.n_pairs == 0:
+        raise ValueError(
+            "re_trace has zero pairs — nothing to plot (single-replica run)."
+        )
+
+    ax = _get_ax(ax)
+    iters = re_log.iterations                              # (n_entries,)
+    acc = np.asarray(re_log.acceptance_rates, dtype=np.float64)
+
+    if window is not None and window > 1:
+        kernel = np.ones(int(window), dtype=np.float64) / float(window)
+        acc = np.stack(
+            [
+                np.convolve(acc[:, p], kernel, mode="same")
+                for p in range(acc.shape[1])
+            ],
+            axis=1,
+        )
+
+    if per_pair:
+        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        for p in range(re_log.n_pairs):
+            color = colors[p % len(colors)]
+            ax.plot(
+                iters, acc[:, p],
+                label=f"pair {p}-{p + 1}", color=color, **kwargs,
+            )
+    else:
+        mean = acc.mean(axis=1)
+        std = acc.std(axis=1)
+        ax.plot(iters, mean, label=monitor.label or "mean swap acc", **kwargs)
+        ax.fill_between(iters, mean - std, mean + std, alpha=0.2)
+
+    ax.set_xlabel("iteration")
+    ax.set_ylabel(f"swap acceptance rate ({re_log.flavor})")
+    ax.set_ylim(-0.05, 1.05)
     ax.legend()
     return ax

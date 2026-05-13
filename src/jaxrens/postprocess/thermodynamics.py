@@ -1,220 +1,53 @@
 """Thermodynamic post-processing of nested sampling results.
 
-All functions are pure JAX and jit-compatible. Energy convention:
-E = -log(L), so higher energy = lower likelihood.
+NumPy-based for unconditional float64 precision.  Sampling is pinned to
+float32 by the root ``__init__`` (see the comment there); post-processing
+runs in a separate process, so the precision regimes don't interfere.
+
+Energy convention: ``E = -log(L)``, so higher energy = lower likelihood.
 
 Batch-shape support
 -------------------
 All public functions accept ``dead_energies`` with arbitrary leading batch
-dimensions ``(*batch, max_dead)``.  The ``max_dead`` axis is always last.
+dimensions ``(*batch, max_dead)``.  Output shape mirrors the input batch
+prefix (output of the trailing axis-reduction).  Examples:
 
-Examples:
+* ``(max_dead,)``          → scalar output
+* ``(n_runs, max_dead)``   → ``(n_runs,)``
+* ``(G, P, max_dead)``     → ``(G, P)``
 
-* ``(max_dead,)``          — single run (``SingleRun``)
-* ``(n_runs, max_dead)``   — parallel runs (``VmapRuns``)
-* ``(G, P, max_dead)``     — multi-GPU runs (``PmapVmapRuns``)
-
-The strategy is **reshape-then-compute**:
-
-1. Merge all leading dims into a single ``n_flat`` axis.
-2. Run the existing 1-D per-run kernel via ``jax.vmap``.
-3. Reshape outputs back to the original batch prefix.
-
-This avoids doubling the JIT surface and gives predictable output shapes:
-output batch dims mirror input batch dims (minus ``max_dead``).
-
-Existing callers passing 1-D ``dead_energies`` receive scalar outputs, as
-before.
+JAX-array inputs are auto-converted to NumPy via ``np.asarray``; outputs are
+always NumPy float64 (or 0-d / array thereof).  JIT-compilation of these
+functions is **not** supported; they run on the host in fp64.  Cv etc.
+on a (n_dead,) array of a few thousand entries is far below the cost of
+a typical sampling iteration, so JITability bought nothing in practice
+while masking precision loss.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
-import jax
-import jax.numpy as jnp
 import numpy as np
-from jax.scipy.special import logsumexp
+from scipy.special import logsumexp
 
 
 # ---------------------------------------------------------------------------
-# Internal 1-D per-run kernels (unchanged from the original implementation)
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _calc_log_weights_1d(
-    n_dead: int | jnp.ndarray,
-    n_live: int | jnp.ndarray,
-    n_cull: int = 1,
-) -> jnp.ndarray:
-    """Per-run log weights — operates on scalar n_dead / n_live."""
-    n_live = jnp.asarray(n_live, dtype=jnp.float64 if jax.config.x64_enabled else jnp.float32)
-    n_cull = jnp.asarray(n_cull, dtype=n_live.dtype)
-
-    log_t = jnp.log(n_live - n_cull) - jnp.log(n_live + 1.0 - n_cull)
-    log_shell = jnp.log1p(-jnp.exp(log_t))
-
-    indices = jnp.arange(n_dead, dtype=n_live.dtype)
-    log_X = indices * log_t
-    log_w = log_X + log_shell
-    return log_w
+def _as_f64(x) -> np.ndarray:
+    """Coerce array-like (including JAX arrays) to ``np.ndarray[float64]``."""
+    return np.asarray(x, dtype=np.float64)
 
 
-def _calc_log_weights_live_1d(
-    n_dead: int | jnp.ndarray,
-    n_live: int | jnp.ndarray,
-    n_cull: int = 1,
-) -> jnp.ndarray:
-    """Per-run live log weight — scalar output."""
-    n_live = jnp.asarray(n_live, dtype=jnp.float64 if jax.config.x64_enabled else jnp.float32)
-    n_cull = jnp.asarray(n_cull, dtype=n_live.dtype)
-    n_dead = jnp.asarray(n_dead, dtype=n_live.dtype)
+def _log_t(n_live, n_cull: int = 1) -> np.ndarray:
+    """Per-iteration log shrinkage factor, ``log((N+1-c-1)/(N+1-c))``.
 
-    log_t = jnp.log(n_live - n_cull) - jnp.log(n_live + 1.0 - n_cull)
-    log_X_final = n_dead * log_t
-    log_w_live = log_X_final - jnp.log(n_live)
-    return log_w_live
-
-
-def _log_evidence_1d(
-    dead_energies: jnp.ndarray,
-    live_energies: jnp.ndarray,
-    n_live: int | jnp.ndarray,
-    n_cull: int = 1,
-) -> jnp.ndarray:
-    """Log evidence for a single 1-D dead_energies array."""
-    n_dead = dead_energies.shape[0]
-    log_w_dead = _calc_log_weights_1d(n_dead, n_live, n_cull)
-    log_Z_dead = logsumexp(log_w_dead + (-dead_energies))
-
-    log_w_live = _calc_log_weights_live_1d(n_dead, n_live, n_cull)
-    log_Z_live = logsumexp(log_w_live + (-live_energies))
-
-    return jnp.logaddexp(log_Z_dead, log_Z_live)
-
-
-def _partition_function_1d(
-    beta: jnp.ndarray,
-    dead_energies: jnp.ndarray,
-    live_energies: jnp.ndarray,
-    n_live: int | jnp.ndarray,
-    n_cull: int = 1,
-    dead_volumes: jnp.ndarray | None = None,
-    live_volumes: jnp.ndarray | None = None,
-) -> jnp.ndarray:
-    """Partition function for a single 1-D dead_energies array."""
-    n_dead = dead_energies.shape[0]
-    log_w_dead = _calc_log_weights_1d(n_dead, n_live, n_cull)
-    dead_E = dead_energies if dead_volumes is None else dead_energies + dead_volumes
-    log_terms_dead = log_w_dead - beta * dead_E
-
-    log_w_live = _calc_log_weights_live_1d(n_dead, n_live, n_cull)
-    live_E = live_energies if live_volumes is None else live_energies + live_volumes
-    log_terms_live = log_w_live - beta * live_E
-
-    return logsumexp(jnp.concatenate([log_terms_dead, log_terms_live]))
-
-
-def _heat_capacity_1d(
-    beta: jnp.ndarray,
-    dead_energies: jnp.ndarray,
-    live_energies: jnp.ndarray,
-    n_live: int | jnp.ndarray,
-    n_cull: int = 1,
-) -> jnp.ndarray:
-    """Heat capacity for a single 1-D dead_energies array.
-
-    Computes ``β² · Var(E)`` where ``Var(E) = Σ w_i (E_i - <E>)²``.  The
-    deviation form is used in place of the algebraic ``<E²> - <E>²``
-    identity to avoid catastrophic cancellation at low T (where the
-    distribution collapses onto a single walker, so both moments are
-    close to ``E_min²`` and their difference is dominated by float noise
-    — visible as wild spikes / negative Cv in fp32).
+    Computed as ``log(N - c) - log(N + 1 - c)`` for numerical stability.
     """
-    n_dead = dead_energies.shape[0]
-    log_w_dead = _calc_log_weights_1d(n_dead, n_live, n_cull)
-    log_w_live = _calc_log_weights_live_1d(n_dead, n_live, n_cull)
-    log_w_live_arr = jnp.full(live_energies.shape[0], log_w_live)
-
-    all_log_w = jnp.concatenate([log_w_dead, log_w_live_arr])
-    all_E = jnp.concatenate([dead_energies, live_energies])
-
-    log_unnorm = all_log_w - beta * all_E
-    log_Z = logsumexp(log_unnorm)
-    w = jnp.exp(log_unnorm - log_Z)
-
-    mean_E = jnp.sum(w * all_E)
-    var_E = jnp.sum(w * (all_E - mean_E) ** 2)
-    return beta**2 * var_E
-
-
-def _expectation_1d(
-    observable_values: jnp.ndarray,
-    beta: jnp.ndarray,
-    dead_energies: jnp.ndarray,
-    live_energies: jnp.ndarray,
-    n_live: int | jnp.ndarray,
-    n_cull: int = 1,
-) -> jnp.ndarray:
-    """Thermal expectation for a single 1-D dead_energies array."""
-    n_dead = dead_energies.shape[0]
-    log_w_dead = _calc_log_weights_1d(n_dead, n_live, n_cull)
-    log_w_live = _calc_log_weights_live_1d(n_dead, n_live, n_cull)
-    log_w_live_arr = jnp.full(live_energies.shape[0], log_w_live)
-
-    all_log_w = jnp.concatenate([log_w_dead, log_w_live_arr])
-    all_E = jnp.concatenate([dead_energies, live_energies])
-
-    log_unnorm = all_log_w - beta * all_E
-    log_Z = logsumexp(log_unnorm)
-    w = jnp.exp(log_unnorm - log_Z)
-    return jnp.sum(w * observable_values)
-
-
-# ---------------------------------------------------------------------------
-# Batch-shape dispatch helpers
-# ---------------------------------------------------------------------------
-
-
-def _batch_apply(fn_1d, *replica_arrays: jnp.ndarray) -> jnp.ndarray:
-    """Apply a 1-D per-run function across any leading batch dims.
-
-    The first positional array's leading shape (minus its last axis) defines
-    the batch prefix.  Subsequent arrays either share that prefix or are
-    1-D (broadcast over the batch).
-
-    Args:
-        fn_1d: Function whose positional arguments correspond 1-to-1 with
-            ``replica_arrays`` after flattening to single-replica shape.
-            Returns a scalar (or any pytree of scalars) per replica.
-        *replica_arrays: One or more per-replica arrays.  Each has either
-            a ``(*batch, last)`` shape (gets flattened to ``(n_flat, last)``)
-            or a ``(last,)`` shape (gets broadcast to ``(n_flat, last)``).
-
-    Returns:
-        Output with shape ``batch``.  Scalar (0-D) for 1-D input.
-    """
-    if len(replica_arrays) == 0:
-        raise ValueError("_batch_apply requires at least one replica array")
-
-    primary = jnp.asarray(replica_arrays[0])
-    batch_shape = primary.shape[:-1]
-
-    if len(batch_shape) == 0:
-        # 1-D primary: skip vmap, call directly (callers expect a scalar).
-        return fn_1d(*(jnp.asarray(a) for a in replica_arrays))
-
-    n_flat = int(np.prod(batch_shape))
-    flat = []
-    for a in replica_arrays:
-        a = jnp.asarray(a)
-        if a.ndim == 1:
-            flat.append(jnp.broadcast_to(a[None], (n_flat, a.shape[0])))
-        else:
-            flat.append(a.reshape((n_flat,) + a.shape[len(batch_shape):]))
-
-    out_flat = jax.vmap(fn_1d)(*flat)
-    return out_flat.reshape(batch_shape)
+    nl = _as_f64(n_live)
+    nc = _as_f64(n_cull)
+    return np.log(nl - nc) - np.log(nl + 1.0 - nc)
 
 
 # ---------------------------------------------------------------------------
@@ -223,42 +56,43 @@ def _batch_apply(fn_1d, *replica_arrays: jnp.ndarray) -> jnp.ndarray:
 
 
 def calc_log_weights(
-    n_dead: int | jnp.ndarray,
-    n_live: int | jnp.ndarray,
+    n_dead,
+    n_live,
     n_cull: int = 1,
-) -> jnp.ndarray:
+) -> np.ndarray:
     """Compute log prior-mass weights for dead points.
 
-    For dead point i (0-indexed):
-        log_t = log((N - n_cull) / (N + 1 - n_cull))
+    For dead point ``i`` (0-indexed)::
+
+        log_t   = log((N - n_cull) / (N + 1 - n_cull))
         log_X_i = i * log_t
         log_w_i = log_X_i + log(1 - exp(log_t))
 
-    This function operates on **scalar** ``n_dead`` / ``n_live`` and returns
-    a 1-D weight vector of length ``n_dead``.  It is not batch-aware by
-    itself; batch handling lives in the per-run callers.
-
     Args:
         n_dead: Number of dead points collected (scalar).
         n_live: Number of live walkers (scalar).
-        n_cull: Number of walkers culled per iteration (default 1).
+        n_cull: Number culled per iteration (default 1).
 
     Returns:
-        Array of log weights, shape ``(n_dead,)``.
+        ``np.ndarray[float64]`` of shape ``(n_dead,)``.
     """
-    return _calc_log_weights_1d(n_dead, n_live, n_cull)
+    n_dead = int(np.asarray(n_dead))
+    log_t = _log_t(n_live, n_cull)
+    log_shell = np.log1p(-np.exp(log_t))
+    indices = np.arange(n_dead, dtype=np.float64)
+    return indices * log_t + log_shell
 
 
 def calc_log_weights_live(
-    n_dead: int | jnp.ndarray,
-    n_live: int | jnp.ndarray,
+    n_dead,
+    n_live,
     n_cull: int = 1,
-) -> jnp.ndarray:
+) -> np.ndarray:
     """Compute log weight for each remaining live walker.
 
-    After n_dead iterations the remaining prior mass is
-    X_final = exp(n_dead * log_t). Each live walker gets
-    log_w_live = log(X_final / n_live).
+    After ``n_dead`` iterations the remaining prior mass is
+    ``X_final = exp(n_dead * log_t)``; each live walker carries
+    ``log_w_live = log(X_final / n_live)``.
 
     Args:
         n_dead: Number of dead points collected (scalar).
@@ -266,115 +100,116 @@ def calc_log_weights_live(
         n_cull: Number culled per iteration.
 
     Returns:
-        Scalar log weight for each live walker.
+        0-d ``np.ndarray[float64]`` (the scalar log weight per live walker).
     """
-    return _calc_log_weights_live_1d(n_dead, n_live, n_cull)
+    n_dead_f = _as_f64(n_dead)
+    n_live_f = _as_f64(n_live)
+    log_t = _log_t(n_live, n_cull)
+    return n_dead_f * log_t - np.log(n_live_f)
 
 
 def log_evidence(
-    dead_energies: jnp.ndarray,
-    live_energies: jnp.ndarray,
-    n_live: int | jnp.ndarray,
+    dead_energies,
+    live_energies,
+    n_live,
     n_cull: int = 1,
-) -> jnp.ndarray:
-    """Compute total log evidence Z from dead and live points.
+) -> np.ndarray:
+    """Total log evidence ``log Z`` from dead and live points.
 
     Supports arbitrary leading batch dimensions on ``dead_energies`` and
-    ``live_energies``.  The batch shape of the output mirrors the input
-    (minus the trailing ``max_dead`` / ``n_live`` axes).
+    ``live_energies``.  Output batch shape mirrors the input (minus the
+    trailing ``max_dead`` / ``n_live`` axes).
 
     Args:
-        dead_energies: Energies of dead points, shape ``(*batch, n_dead)``.
-        live_energies: Energies of remaining live walkers,
-            shape ``(*batch, n_live)`` or ``(n_live,)`` (broadcast).
+        dead_energies: Dead point energies, shape ``(*batch, n_dead)``.
+        live_energies: Live walker energies, shape ``(*batch, n_live)`` or
+            ``(n_live,)`` (broadcast over batch).
         n_live: Number of live walkers (scalar).
         n_cull: Number culled per iteration.
 
     Returns:
-        Log Z with shape ``batch`` — scalar for 1-D input.
+        ``log Z`` with shape ``batch`` — scalar for 1-D input.
     """
-    return _batch_apply(
-        lambda de, le: _log_evidence_1d(de, le, n_live, n_cull),
-        dead_energies, live_energies,
-    )
+    dead_E = _as_f64(dead_energies)
+    live_E = _as_f64(live_energies)
+    n_dead = dead_E.shape[-1]
+
+    log_w_dead = calc_log_weights(n_dead, n_live, n_cull)      # (n_dead,)
+    log_w_live = calc_log_weights_live(n_dead, n_live, n_cull)  # scalar
+
+    # Broadcasting handles arbitrary batch prefix; axis=-1 reduces the trailing
+    # dead/live walker dimension.
+    log_Z_dead = logsumexp(log_w_dead + (-dead_E), axis=-1)
+    log_Z_live = logsumexp(log_w_live + (-live_E), axis=-1)
+    return np.logaddexp(log_Z_dead, log_Z_live)
 
 
 def partition_function(
-    beta: float | jnp.ndarray,
-    dead_energies: jnp.ndarray,
-    live_energies: jnp.ndarray,
-    n_live: int | jnp.ndarray,
+    beta,
+    dead_energies,
+    live_energies,
+    n_live,
     n_cull: int = 1,
-    dead_volumes: jnp.ndarray | None = None,
-    live_volumes: jnp.ndarray | None = None,
-) -> jnp.ndarray:
-    """Compute log Z(beta) at inverse temperature beta.
+    dead_volumes=None,
+    live_volumes=None,
+) -> np.ndarray:
+    """Log partition function ``log Z(beta)`` at inverse temperature ``beta``.
 
-    Z(beta) = sum_i w_i * exp(-beta * E_i)
-
-    Supports arbitrary leading batch dimensions on ``dead_energies`` /
-    ``live_energies``.  Output shape mirrors the batch prefix.
+    ``Z(beta) = Σ_i w_i exp(-beta · E_i)`` over the merged dead+live ensemble.
 
     Args:
-        beta: Inverse temperature 1/(k_B T).
+        beta: Inverse temperature ``1/(k_B T)``.
         dead_energies: Dead point energies, shape ``(*batch, n_dead)``.
         live_energies: Live walker energies, shape ``(*batch, n_live)`` or
             ``(n_live,)``.
         n_live: Number of live walkers.
         n_cull: Number culled per iteration.
-        dead_volumes: Optional PV contributions for dead points;
-            shape must match ``dead_energies``.
-        live_volumes: Optional PV contributions for live points;
-            shape must match ``live_energies``.
+        dead_volumes: Optional PV contributions for dead points, shape must
+            broadcast with ``dead_energies``.
+        live_volumes: Optional PV contributions for live points, shape must
+            broadcast with ``live_energies``.
 
     Returns:
-        Log Z(beta) with shape ``batch`` — scalar for 1-D input.
+        ``log Z(beta)`` with shape ``batch`` — scalar for 1-D input.
     """
-    beta = jnp.asarray(beta)
-    # The four-way None dispatch keeps optional volumes out of the vmap
-    # signature; ``_batch_apply`` then handles flatten/vmap/reshape uniformly.
-    if dead_volumes is not None and live_volumes is not None:
-        return _batch_apply(
-            lambda de, le, dv, lv: _partition_function_1d(
-                beta, de, le, n_live, n_cull, dv, lv,
-            ),
-            dead_energies, live_energies, dead_volumes, live_volumes,
-        )
+    beta = _as_f64(beta)
+    dead_E = _as_f64(dead_energies)
+    live_E = _as_f64(live_energies)
     if dead_volumes is not None:
-        return _batch_apply(
-            lambda de, le, dv: _partition_function_1d(
-                beta, de, le, n_live, n_cull, dv, None,
-            ),
-            dead_energies, live_energies, dead_volumes,
-        )
+        dead_E = dead_E + _as_f64(dead_volumes)
     if live_volumes is not None:
-        return _batch_apply(
-            lambda de, le, lv: _partition_function_1d(
-                beta, de, le, n_live, n_cull, None, lv,
-            ),
-            dead_energies, live_energies, live_volumes,
-        )
-    return _batch_apply(
-        lambda de, le: _partition_function_1d(
-            beta, de, le, n_live, n_cull, None, None,
-        ),
-        dead_energies, live_energies,
+        live_E = live_E + _as_f64(live_volumes)
+
+    n_dead = dead_E.shape[-1]
+    log_w_dead = calc_log_weights(n_dead, n_live, n_cull)
+    log_w_live = calc_log_weights_live(n_dead, n_live, n_cull)
+
+    log_terms_dead = log_w_dead - beta * dead_E   # (*batch, n_dead)
+    log_terms_live = log_w_live - beta * live_E   # (*batch, n_live)
+
+    # Concatenate along the trailing axis (works for any batch prefix).
+    log_terms_live_b = np.broadcast_to(
+        log_terms_live, log_terms_dead.shape[:-1] + (log_terms_live.shape[-1],),
     )
+    all_log_terms = np.concatenate([log_terms_dead, log_terms_live_b], axis=-1)
+    return logsumexp(all_log_terms, axis=-1)
 
 
 def heat_capacity(
-    beta: float | jnp.ndarray,
-    dead_energies: jnp.ndarray,
-    live_energies: jnp.ndarray,
-    n_live: int | jnp.ndarray,
+    beta,
+    dead_energies,
+    live_energies,
+    n_live,
     n_cull: int = 1,
-) -> jnp.ndarray:
-    """Compute heat capacity C_v at inverse temperature beta.
+) -> np.ndarray:
+    """Heat capacity ``C_v(beta) = beta² · Var(E)`` at inverse temperature beta.
 
-    C_v = beta^2 * (<E^2> - <E>^2)
-
-    Supports arbitrary leading batch dimensions on ``dead_energies`` /
-    ``live_energies``.  Output shape mirrors the batch prefix.
+    Uses the **deviation form** ``Σ w_i (E_i - <E>)²`` instead of the algebraic
+    identity ``<E²> - <E>²``: the latter exhibits catastrophic cancellation at
+    low T (distribution collapses onto a single walker, ``<E²>`` and ``<E>²``
+    both approach ``E_min²``, and their difference is dominated by float noise).
+    Even in fp64 the deviation form is the safer default; in fp32 the algebraic
+    form gives visible negative-Cv spikes.
 
     Args:
         beta: Inverse temperature.
@@ -385,32 +220,48 @@ def heat_capacity(
         n_cull: Number culled per iteration.
 
     Returns:
-        C_v with shape ``batch`` — scalar for 1-D input.
+        ``C_v`` with shape ``batch`` — scalar for 1-D input.
     """
-    beta = jnp.asarray(beta)
-    return _batch_apply(
-        lambda de, le: _heat_capacity_1d(beta, de, le, n_live, n_cull),
-        dead_energies, live_energies,
+    beta = _as_f64(beta)
+    dead_E = _as_f64(dead_energies)
+    live_E = _as_f64(live_energies)
+    n_dead = dead_E.shape[-1]
+
+    log_w_dead = calc_log_weights(n_dead, n_live, n_cull)
+    log_w_live_scalar = calc_log_weights_live(n_dead, n_live, n_cull)
+    log_w_live = np.full(live_E.shape[-1], log_w_live_scalar, dtype=np.float64)
+
+    # Broadcast to a common batch prefix so concatenation along the trailing
+    # axis works for arbitrary input ndims.
+    live_E_b = np.broadcast_to(
+        live_E, dead_E.shape[:-1] + (live_E.shape[-1],),
     )
+    all_E = np.concatenate([dead_E, live_E_b], axis=-1)
+    all_log_w = np.concatenate([log_w_dead, log_w_live])  # (n_dead + n_live,)
+
+    log_unnorm = all_log_w - beta * all_E                # (*batch, n_total)
+    log_Z = logsumexp(log_unnorm, axis=-1, keepdims=True)
+    w = np.exp(log_unnorm - log_Z)                       # normalised weights
+
+    mean_E = np.sum(w * all_E, axis=-1, keepdims=True)
+    var_E = np.sum(w * (all_E - mean_E) ** 2, axis=-1)
+    return beta**2 * var_E
 
 
 def expectation(
-    observable_values: jnp.ndarray,
-    beta: float | jnp.ndarray,
-    dead_energies: jnp.ndarray,
-    live_energies: jnp.ndarray,
-    n_live: int | jnp.ndarray,
+    observable_values,
+    beta,
+    dead_energies,
+    live_energies,
+    n_live,
     n_cull: int = 1,
-) -> jnp.ndarray:
-    """Compute thermal expectation <O>(beta) for an observable.
-
-    Supports arbitrary leading batch dimensions.  ``observable_values``
-    must have shape ``(*batch, n_dead + n_live)`` or ``(n_dead + n_live,)``
-    (broadcast over batch).
+) -> np.ndarray:
+    """Thermal expectation ``<O>(beta)`` for an observable on the dead+live set.
 
     Args:
         observable_values: Observable values, shape
-            ``(*batch, n_dead + n_live)`` or ``(n_dead + n_live,)``.
+            ``(*batch, n_dead + n_live)`` or ``(n_dead + n_live,)``
+            (broadcast over batch).
         beta: Inverse temperature.
         dead_energies: Dead point energies, shape ``(*batch, n_dead)``.
         live_energies: Live walker energies, shape ``(*batch, n_live)`` or
@@ -419,32 +270,43 @@ def expectation(
         n_cull: Number culled per iteration.
 
     Returns:
-        <O> with shape ``batch`` — scalar for 1-D input.
+        ``<O>`` with shape ``batch`` — scalar for 1-D input.
     """
-    beta = jnp.asarray(beta)
-    # ``_batch_apply`` keys the batch shape off its first replica array;
-    # passing ``dead_energies`` first matches the public batch convention
-    # (output shape mirrors ``dead_energies.shape[:-1]``).
-    return _batch_apply(
-        lambda de, le, obs: _expectation_1d(obs, beta, de, le, n_live, n_cull),
-        dead_energies, live_energies, observable_values,
+    beta = _as_f64(beta)
+    dead_E = _as_f64(dead_energies)
+    live_E = _as_f64(live_energies)
+    obs = _as_f64(observable_values)
+    n_dead = dead_E.shape[-1]
+
+    log_w_dead = calc_log_weights(n_dead, n_live, n_cull)
+    log_w_live_scalar = calc_log_weights_live(n_dead, n_live, n_cull)
+    log_w_live = np.full(live_E.shape[-1], log_w_live_scalar, dtype=np.float64)
+
+    live_E_b = np.broadcast_to(
+        live_E, dead_E.shape[:-1] + (live_E.shape[-1],),
     )
+    all_E = np.concatenate([dead_E, live_E_b], axis=-1)
+    all_log_w = np.concatenate([log_w_dead, log_w_live])
+
+    # Broadcast obs to the batch prefix when given as 1-D.
+    obs_b = np.broadcast_to(obs, all_E.shape)
+
+    log_unnorm = all_log_w - beta * all_E
+    log_Z = logsumexp(log_unnorm, axis=-1, keepdims=True)
+    w = np.exp(log_unnorm - log_Z)
+    return np.sum(w * obs_b, axis=-1)
 
 
-def free_energy(
-    beta: float | jnp.ndarray,
-    log_Z_beta: jnp.ndarray,
-) -> jnp.ndarray:
-    """Compute Helmholtz free energy F = -log Z(beta) / beta.
-
-    Accepts any shape for ``log_Z_beta``; the batch shape is preserved.
+def free_energy(beta, log_Z_beta) -> np.ndarray:
+    """Helmholtz free energy ``F = -log Z(beta) / beta``.
 
     Args:
         beta: Inverse temperature (scalar or broadcastable).
-        log_Z_beta: Log partition function at beta, shape ``batch``.
+        log_Z_beta: Log partition function at ``beta``, any shape.
 
     Returns:
-        F with the same shape as ``log_Z_beta``.
+        ``F`` with the same shape as ``log_Z_beta``.
     """
-    beta = jnp.asarray(beta)
+    beta = _as_f64(beta)
+    log_Z_beta = _as_f64(log_Z_beta)
     return -log_Z_beta / beta

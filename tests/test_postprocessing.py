@@ -435,16 +435,6 @@ class TestBatchShapeLogEvidence:
         out = log_evidence(dead_1d, live_1d, n_live=20)
         assert out.ndim == 0, f"Expected scalar, got ndim={out.ndim}"
 
-    def test_jit_compatible(self):
-        G, P = 1, 2
-        dead, live = _make_gp_data(G, P)
-        n_live = 50
-        jitted = jax.jit(lambda d, l: log_evidence(d, l, n_live=n_live))
-        out = jitted(dead, live)
-        assert out.shape == (G, P)
-        assert jnp.all(jnp.isfinite(out))
-
-
 class TestBatchShapePartitionFunction:
     """partition_function with (G, P, max_dead) input."""
 
@@ -470,16 +460,6 @@ class TestBatchShapePartitionFunction:
         out = partition_function(1.0, dead_1d, live_1d, n_live=20)
         assert out.ndim == 0
 
-    def test_jit_compatible(self):
-        G, P = 1, 2
-        dead, live = _make_gp_data(G, P)
-        n_live = 50
-        jitted = jax.jit(lambda d, l: partition_function(1.0, d, l, n_live=n_live))
-        out = jitted(dead, live)
-        assert out.shape == (G, P)
-        assert jnp.all(jnp.isfinite(out))
-
-
 class TestBatchShapeHeatCapacity:
     """heat_capacity with (G, P, max_dead) input."""
 
@@ -504,17 +484,6 @@ class TestBatchShapeHeatCapacity:
         dead_1d, live_1d = _generate_harmonic_ns_data(n_dead=200, n_live=20)
         out = heat_capacity(1.0, dead_1d, live_1d, n_live=20)
         assert out.ndim == 0
-
-    def test_jit_compatible(self):
-        G, P = 1, 2
-        dead, live = _make_gp_data(G, P)
-        n_live = 50
-        jitted = jax.jit(lambda d, l: heat_capacity(1.0, d, l, n_live=n_live))
-        out = jitted(dead, live)
-        assert out.shape == (G, P)
-        assert jnp.all(jnp.isfinite(out))
-        assert jnp.all(out >= 0.0)
-
 
 class TestBatchShapeExpectation:
     """expectation with (G, P, max_dead) input."""
@@ -545,16 +514,6 @@ class TestBatchShapeExpectation:
         out = expectation(obs, 1.0, dead_1d, live_1d, n_live=20)
         assert out.ndim == 0
 
-    def test_jit_compatible(self):
-        G, P, n_dead, n_live = 1, 2, 200, 20
-        dead, live = _make_gp_data(G, P, n_dead=n_dead, n_live=n_live)
-        obs = jnp.concatenate([dead, live], axis=-1)
-        n_live_static = n_live
-        jitted = jax.jit(lambda obs_, d, l: expectation(obs_, 1.0, d, l, n_live=n_live_static))
-        out = jitted(obs, dead, live)
-        assert out.shape == (G, P)
-
-
 class TestBatchShapeFreeEnergy:
     """free_energy handles batched log_Z_beta."""
 
@@ -584,13 +543,3 @@ class TestBatchShapeFreeEnergy:
         F = free_energy(1.0, log_Z)
         assert F.ndim == 0
 
-    def test_jit_compatible(self):
-        G, P = 1, 2
-        dead, live = _make_gp_data(G, P)
-        n_live = 50
-        jitted = jax.jit(lambda d, l: free_energy(
-            1.0, partition_function(1.0, d, l, n_live=n_live)
-        ))
-        out = jitted(dead, live)
-        assert out.shape == (G, P)
-        assert jnp.all(jnp.isfinite(out))

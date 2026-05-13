@@ -64,6 +64,15 @@ class OutputConfig:
     # ``inter_re.re_interval``.  No-op when ``inter_re`` is not configured.
     save_re_stats: bool = False
 
+    # Finite-difference temperature estimator (Baldock et al. 2017).
+    # ``temperature_lag`` is the length of the Emax FIFO used for the
+    # finite difference; ``None`` disables the callback entirely.
+    # ``temperature_kB`` defaults to eV/K (ASE convention) — set ``1.0``
+    # for reduced-unit backends (LJ, harmonic).
+    temperature_lag: int | None = None
+    temperature_interval: int = 100
+    temperature_kB: float = 8.6173324e-5
+
 
 @dataclass(frozen=True)
 class InterREConfig:

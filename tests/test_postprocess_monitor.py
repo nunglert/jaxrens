@@ -835,6 +835,377 @@ class TestMonitorCollection:
             )
 
 
+class TestFromMultiRunDirectoryConfigInference:
+    """Auto-detection of prefix + pressure labels from ``config.yaml``."""
+
+    @staticmethod
+    def _write_multi_run_artefacts(
+        out_dir: Path,
+        prefix: str,
+        n_runs: int,
+        n_live: int = 4,
+        n_dead_per_run: int = 6,
+    ) -> None:
+        """Build a minimal ``(n_runs,)``-shaped checkpoint plus per-replica
+        ``.energies`` logs so ``from_multi_run_directory`` can iterate the
+        replicas.  No physics — just shapes the loader expects.
+        """
+        import h5py
+
+        from jaxrens.io.energy_log import EnergyLogger
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rng = np.random.default_rng(0)
+        live_e = rng.uniform(-1.0, 1.0, (n_runs, n_live)).astype(np.float32)
+        log_Z = rng.uniform(-1.0, 1.0, (n_runs,)).astype(np.float32)
+        iteration = np.full((n_runs,), n_dead_per_run, dtype=np.int32)
+        n_dead = np.full((n_runs,), n_dead_per_run, dtype=np.int32)
+
+        n_atoms = 2
+        positions = rng.uniform(0.0, 1.0, (n_runs, n_live, n_atoms, 3)).astype(np.float32)
+        types = np.zeros((n_runs, n_live, n_atoms), dtype=np.int32)
+        ckpt_path = out_dir / f"{prefix}.final.checkpoint.h5"
+        with h5py.File(ckpt_path, "w") as f:
+            f.create_dataset("positions", data=positions)
+            f.create_dataset("types", data=types)
+            f.create_dataset("energies", data=live_e)
+            f.create_dataset("log_evidence", data=log_Z)
+            f.create_dataset("iteration", data=iteration)
+            f.create_dataset("n_dead", data=n_dead)
+            f.attrs["n_walkers"] = n_live
+
+        for i in range(n_runs):
+            elog = EnergyLogger(
+                out_dir / f"{prefix}.run{i:02d}.energies",
+                n_walkers=n_live, n_cull=1,
+            )
+            elog.write_header()
+            for k in range(n_dead_per_run):
+                elog.write_entry(k, energy=float(-k), volume=10.0 + k)
+            elog.close()
+
+    def test_prefix_inferred_from_config(self, tmp_path):
+        """``output.out_file_prefix`` is picked up when ``prefix`` is omitted."""
+        out_dir = tmp_path / "output"
+        prefix = "neuralil_si16"
+        self._write_multi_run_artefacts(out_dir, prefix=prefix, n_runs=3)
+        (tmp_path / "config.yaml").write_text(
+            f"output:\n  out_file_prefix: {prefix}\n"
+        )
+
+        coll = MonitorCollection.from_multi_run_directory(out_dir)
+        assert len(coll) == 3
+        # Default labels (runNN) when ensemble section is absent.
+        assert [m.label for m in coll] == ["run00", "run01", "run02"]
+
+    def test_pressure_labels_and_metadata_from_config(self, tmp_path):
+        """An NPT pressure list matching n_total drives labels and metadata."""
+        out_dir = tmp_path / "output"
+        prefix = "sweep"
+        self._write_multi_run_artefacts(out_dir, prefix=prefix, n_runs=3)
+        (tmp_path / "config.yaml").write_text(
+            "output:\n"
+            f"  out_file_prefix: {prefix}\n"
+            "ensemble:\n"
+            "  type: npt\n"
+            "  pressure: [2.0, 4.0, 6.0]\n"
+            "  pressure_units: gpa\n"
+        )
+
+        coll = MonitorCollection.from_multi_run_directory(out_dir)
+        assert [m.label for m in coll] == [
+            "P= 2.00 GPa", "P= 4.00 GPa", "P= 6.00 GPa",
+        ]
+        assert [m.pressure_gpa for m in coll] == [2.0, 4.0, 6.0]
+
+    def test_explicit_args_override_config(self, tmp_path):
+        """Explicit ``prefix=`` and ``labels=`` win over config inference."""
+        out_dir = tmp_path / "output"
+        prefix = "mysweep"
+        self._write_multi_run_artefacts(out_dir, prefix=prefix, n_runs=2)
+        (tmp_path / "config.yaml").write_text(
+            f"output:\n  out_file_prefix: {prefix}\n"
+            "ensemble:\n  type: npt\n  pressure: [1.0, 2.0]\n  pressure_units: gpa\n"
+        )
+
+        coll = MonitorCollection.from_multi_run_directory(
+            out_dir, prefix=prefix, labels=["foo", "bar"],
+        )
+        assert [m.label for m in coll] == ["foo", "bar"]
+        # Pressure metadata still attaches when config matches n_total.
+        assert [m.pressure_gpa for m in coll] == [1.0, 2.0]
+
+    def test_falls_back_to_runNN_without_config(self, tmp_path):
+        """No config.yaml present → default ``prefix='ns'`` and ``runNN`` labels."""
+        out_dir = tmp_path / "output"
+        self._write_multi_run_artefacts(out_dir, prefix="ns", n_runs=2)
+
+        coll = MonitorCollection.from_multi_run_directory(out_dir)
+        assert [m.label for m in coll] == ["run00", "run01"]
+        # No pressure metadata attached when there's no config to read.
+        assert not hasattr(coll[0], "pressure_gpa")
+
+    def test_explicit_config_path_overrides_discovery(self, tmp_path):
+        """An explicit ``config=`` argument bypasses auto-discovery."""
+        out_dir = tmp_path / "output"
+        prefix = "explicit"
+        self._write_multi_run_artefacts(out_dir, prefix=prefix, n_runs=2)
+        config_path = tmp_path / "elsewhere.yaml"
+        config_path.write_text(
+            f"output:\n  out_file_prefix: {prefix}\n"
+            "ensemble:\n  type: npt\n  pressure: [3.0, 5.0]\n  pressure_units: gpa\n"
+        )
+
+        coll = MonitorCollection.from_multi_run_directory(
+            out_dir, config=config_path,
+        )
+        assert [m.pressure_gpa for m in coll] == [3.0, 5.0]
+
+    def test_plot_heatmap_smoke(self, tmp_path):
+        """End-to-end: from_multi_run_directory + plot_heatmap yields one
+        pcolormesh patch with the right cell count and axis labels.
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.collections import QuadMesh
+
+        out_dir = tmp_path / "output"
+        prefix = "heatmap_smoke"
+        self._write_multi_run_artefacts(out_dir, prefix=prefix, n_runs=3)
+        (tmp_path / "config.yaml").write_text(
+            f"output:\n  out_file_prefix: {prefix}\n"
+            "ensemble:\n  type: npt\n  pressure: [1.0, 4.0, 2.0]\n"
+            "  pressure_units: gpa\n"
+        )
+
+        coll = MonitorCollection.from_multi_run_directory(out_dir)
+        T = np.linspace(0.5, 2.0, 5)
+        ax = coll.plot_heatmap(T, "heat_capacity")
+
+        # Exactly one QuadMesh laid down by pcolormesh.
+        meshes = [c for c in ax.collections if isinstance(c, QuadMesh)]
+        assert len(meshes) == 1
+        # Default fmt='PT' → x=P, y=T.
+        assert ax.get_xlabel() == "P [GPa]"
+        assert ax.get_ylabel() == "T"
+        plt.close("all")
+
+    def test_plot_heatmap_fmt_tp_swaps_axes(self, tmp_path):
+        import matplotlib.pyplot as plt
+
+        out_dir = tmp_path / "output"
+        prefix = "fmt_tp"
+        self._write_multi_run_artefacts(out_dir, prefix=prefix, n_runs=2)
+        (tmp_path / "config.yaml").write_text(
+            f"output:\n  out_file_prefix: {prefix}\n"
+            "ensemble:\n  type: npt\n  pressure: [1.0, 2.0]\n"
+            "  pressure_units: gpa\n"
+        )
+
+        coll = MonitorCollection.from_multi_run_directory(out_dir)
+        ax = coll.plot_heatmap(np.linspace(0.5, 2.0, 4), "heat_capacity", fmt="TP")
+        assert ax.get_xlabel() == "T"
+        assert ax.get_ylabel() == "P [GPa]"
+        plt.close("all")
+
+    def test_plot_heatmap_falls_back_to_indices(self, tmp_path):
+        """Without per-monitor pressure metadata the y-axis is replica index."""
+        import matplotlib.pyplot as plt
+
+        out_dir = tmp_path / "output"
+        self._write_multi_run_artefacts(out_dir, prefix="ns", n_runs=2)
+        # No config.yaml → no pressure_gpa metadata.
+        coll = MonitorCollection.from_multi_run_directory(out_dir)
+        ax = coll.plot_heatmap(np.linspace(0.5, 2.0, 4), "heat_capacity")
+        assert ax.get_xlabel() == "replica index"
+        plt.close("all")
+
+    def test_plot_heatmap_callable_observable(self, tmp_path):
+        """A custom callable observable feeds the heatmap grid."""
+        import matplotlib.pyplot as plt
+
+        out_dir = tmp_path / "output"
+        prefix = "callable_obs"
+        self._write_multi_run_artefacts(out_dir, prefix=prefix, n_runs=2)
+        (tmp_path / "config.yaml").write_text(
+            f"output:\n  out_file_prefix: {prefix}\n"
+            "ensemble:\n  type: npt\n  pressure: [1.0, 2.0]\n"
+            "  pressure_units: gpa\n"
+        )
+        coll = MonitorCollection.from_multi_run_directory(out_dir)
+
+        def constant_obs(monitor, T):
+            return np.full(T.shape, float(monitor.pressure_gpa))
+
+        ax = coll.plot_heatmap(
+            np.linspace(0.5, 2.0, 4), constant_obs, cbar_label="P",
+        )
+        # The pcolormesh should have data spanning the pressure range.
+        mesh = ax.collections[0]
+        arr = mesh.get_array()
+        assert float(arr.min()) == pytest.approx(1.0)
+        assert float(arr.max()) == pytest.approx(2.0)
+        plt.close("all")
+
+    def test_plot_heatmap_unknown_observable_raises(self, tmp_path):
+        out_dir = tmp_path / "output"
+        self._write_multi_run_artefacts(out_dir, prefix="ns", n_runs=2)
+        coll = MonitorCollection.from_multi_run_directory(out_dir)
+        with pytest.raises(ValueError, match="Unknown observable"):
+            coll.plot_heatmap(np.linspace(0.5, 2.0, 4), "not_a_real_observable")
+
+    def test_adaptation_trace_loaded_into_collection(self, tmp_path):
+        """``from_multi_run_directory`` should pick up ``<prefix>.adaptation.h5``
+        and attach it to the collection (not to individual monitors)."""
+        import h5py, json
+
+        out_dir = tmp_path / "output"
+        prefix = "adap"
+        self._write_multi_run_artefacts(out_dir, prefix=prefix, n_runs=2)
+
+        # Hand-craft a minimal adaptation.h5 matching the v3 schema.
+        ad_path = out_dir / f"{prefix}.adaptation.h5"
+        n_entries, n_runs, n_moves = 5, 2, 2
+        with h5py.File(ad_path, "w") as f:
+            f.attrs["adaptation_log_schema_version"] = 3
+            f.attrs["n_moves"] = n_moves
+            f.attrs["n_runs"] = n_runs
+            f.attrs["move_names"] = json.dumps(["galilean", "volume"])
+            f.create_dataset("iterations", data=np.arange(n_entries, dtype=np.int64))
+            f.create_dataset(
+                "step_sizes",
+                data=np.linspace(0.01, 0.1, n_entries * n_runs * n_moves,
+                                 dtype=np.float32).reshape(n_entries, n_runs, n_moves),
+            )
+            f.create_dataset(
+                "acceptance_rates",
+                data=np.full((n_entries, n_runs, n_moves), 0.4, dtype=np.float32),
+            )
+            f.create_dataset(
+                "n_evaluations",
+                data=np.full((n_entries, n_runs, n_moves), 100, dtype=np.int64),
+            )
+            f.create_dataset(
+                "n_grad_evaluations",
+                data=np.full((n_entries, n_runs, n_moves), 50, dtype=np.int64),
+            )
+            stats = f.create_group("adjustment_stats")
+            stats.create_dataset(
+                "n_rounds",
+                data=np.ones((n_entries, n_runs, n_moves), dtype=np.int32),
+            )
+            stats.create_dataset(
+                "converged",
+                data=np.ones((n_entries, n_runs, n_moves), dtype=bool),
+            )
+            stats.create_dataset(
+                "cap_hits",
+                data=np.zeros((n_entries, n_runs, n_moves), dtype=np.int32),
+            )
+            stats.create_dataset(
+                "floor_hits",
+                data=np.zeros((n_entries, n_runs, n_moves), dtype=np.int32),
+            )
+            stats.create_dataset(
+                "bracket_detected",
+                data=np.zeros((n_entries, n_runs, n_moves), dtype=bool),
+            )
+            stats.create_dataset(
+                "reject_reason_counts",
+                data=np.zeros((n_entries, n_runs, n_moves, 4), dtype=np.int32),
+            )
+        (tmp_path / "config.yaml").write_text(
+            f"output:\n  out_file_prefix: {prefix}\n"
+        )
+
+        coll = MonitorCollection.from_multi_run_directory(out_dir)
+        assert coll.adaptation_trace is not None
+        assert coll.adaptation_trace.n_runs == 2
+        assert coll.adaptation_trace.n_moves == 2
+        assert coll.adaptation_trace.step_sizes.shape == (n_entries, 2, 2)
+
+    def test_plot_step_sizes_uses_collection_trace(self, tmp_path):
+        """``MonitorCollection.plot_step_sizes`` should plot from the
+        cohort-level adaptation trace, not from per-monitor traces."""
+        import h5py, json
+        import matplotlib.pyplot as plt
+
+        out_dir = tmp_path / "output"
+        prefix = "ploth5"
+        self._write_multi_run_artefacts(out_dir, prefix=prefix, n_runs=2)
+        ad_path = out_dir / f"{prefix}.adaptation.h5"
+        with h5py.File(ad_path, "w") as f:
+            f.attrs["adaptation_log_schema_version"] = 3
+            f.attrs["n_moves"] = 2
+            f.attrs["n_runs"] = 2
+            f.attrs["move_names"] = json.dumps(["a", "b"])
+            f.create_dataset("iterations", data=np.arange(4, dtype=np.int64))
+            f.create_dataset(
+                "step_sizes",
+                data=np.full((4, 2, 2), 0.05, dtype=np.float32),
+            )
+            f.create_dataset(
+                "acceptance_rates",
+                data=np.full((4, 2, 2), 0.4, dtype=np.float32),
+            )
+            f.create_dataset(
+                "n_evaluations",
+                data=np.full((4, 2, 2), 100, dtype=np.int64),
+            )
+            f.create_dataset(
+                "n_grad_evaluations",
+                data=np.full((4, 2, 2), 50, dtype=np.int64),
+            )
+            stats = f.create_group("adjustment_stats")
+            stats.create_dataset("n_rounds", data=np.ones((4, 2, 2), dtype=np.int32))
+            stats.create_dataset("converged", data=np.ones((4, 2, 2), dtype=bool))
+            stats.create_dataset("cap_hits", data=np.zeros((4, 2, 2), dtype=np.int32))
+            stats.create_dataset("floor_hits", data=np.zeros((4, 2, 2), dtype=np.int32))
+            stats.create_dataset("bracket_detected", data=np.zeros((4, 2, 2), dtype=bool))
+            stats.create_dataset("reject_reason_counts", data=np.zeros((4, 2, 2, 4), dtype=np.int32))
+        (tmp_path / "config.yaml").write_text(
+            f"output:\n  out_file_prefix: {prefix}\n"
+        )
+
+        coll = MonitorCollection.from_multi_run_directory(out_dir)
+        # per_run=False → one line per move (mean across replicas)
+        ax = coll.plot_step_sizes(per_run=False)
+        assert len(ax.get_lines()) == 2  # one per move
+        plt.close("all")
+        # per_run=True → one line per (move, replica)
+        ax = coll.plot_step_sizes(per_run=True)
+        assert len(ax.get_lines()) == 4
+        plt.close("all")
+
+    def test_plot_heatmap_low_level_shape_validation(self):
+        """plot_heatmap rejects mismatched (n_P, n_T) shapes loudly."""
+        import matplotlib.pyplot as plt
+        from jaxrens.postprocess.plotting import plot_heatmap
+
+        T = np.linspace(0.0, 1.0, 5)
+        P = np.linspace(0.0, 1.0, 3)
+        Z_bad = np.zeros((4, 5))  # n_P axis disagrees with len(P)=3
+        with pytest.raises(ValueError, match=r"Z.shape"):
+            plot_heatmap(T, P, Z_bad)
+        plt.close("all")
+
+    def test_pressure_list_length_mismatch_falls_back(self, tmp_path):
+        """A pressure list whose length disagrees with n_total is ignored."""
+        out_dir = tmp_path / "output"
+        prefix = "mismatch"
+        self._write_multi_run_artefacts(out_dir, prefix=prefix, n_runs=3)
+        (tmp_path / "config.yaml").write_text(
+            f"output:\n  out_file_prefix: {prefix}\n"
+            # 16-entry pressure list, but only 3 replicas — must not crash.
+            "ensemble:\n  type: npt\n  pressure: "
+            + "[" + ",".join(str(float(p)) for p in range(1, 17)) + "]\n"
+            "  pressure_units: gpa\n"
+        )
+
+        coll = MonitorCollection.from_multi_run_directory(out_dir)
+        assert [m.label for m in coll] == ["run00", "run01", "run02"]
+        assert not hasattr(coll[0], "pressure_gpa")
+
+
 # ---------------------------------------------------------------------------
 # Smoke test: load existing lj8_npt example output (ships in repo)
 # ---------------------------------------------------------------------------

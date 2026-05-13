@@ -25,6 +25,7 @@ from jaxrens.cli.monitor import (
     EnergyCheckCallback,
     MemProfileCallback,
     ProgressCallback,
+    TemperatureCallback,
     TrajectoryCallback,
 )
 from jaxrens.io.energy_log import EnergyLogger
@@ -309,6 +310,15 @@ def run_from_config(
         ProgressCallback(info_interval=output_config.info_interval),
         EnergyCheckCallback(),
     ]
+
+    if output_config.temperature_lag is not None:
+        callbacks.append(TemperatureCallback(
+            n_live=ns_config.n_live,
+            n_cull=ns_config.n_cull,
+            lag=output_config.temperature_lag,
+            interval=output_config.temperature_interval,
+            kB=output_config.temperature_kB,
+        ))
 
     callbacks.append(
         CheckpointCallback(
@@ -689,6 +699,15 @@ def run_multi_gpu_from_config(resolved) -> dict:
         EnergyCheckCallback(),
     ]
 
+    if resolved.output.temperature_lag is not None:
+        callbacks.append(TemperatureCallback(
+            n_live=ns.n_live,
+            n_cull=ns.n_cull,
+            lag=resolved.output.temperature_lag,
+            interval=resolved.output.temperature_interval,
+            kB=resolved.output.temperature_kB,
+        ))
+
     symbol_map = resolved.init.symbol_map
     callbacks.append(
         CheckpointCallback(
@@ -990,6 +1009,15 @@ def run_sharded_from_config(resolved) -> dict:
         ProgressCallback(info_interval=resolved.output.info_interval),
         EnergyCheckCallback(),
     ]
+
+    if resolved.output.temperature_lag is not None:
+        callbacks.append(TemperatureCallback(
+            n_live=ns.n_live,
+            n_cull=ns.n_cull,
+            lag=resolved.output.temperature_lag,
+            interval=resolved.output.temperature_interval,
+            kB=resolved.output.temperature_kB,
+        ))
 
     symbol_map = resolved.init.symbol_map
     callbacks.append(

@@ -127,13 +127,25 @@ def _find_worst_walkers(
 
 def _get_extra_indices(
     worst_idx: jnp.ndarray,
+    clone_idx: jnp.ndarray,
     n_walkers: int,
     n_extra: int,
     rng_key: jax.Array,
 ) -> jnp.ndarray:
-    """Pick n_extra random walker indices, excluding the worst walker."""
+    """Pick n_extra random walker indices, excluding worst and clone sources.
+
+    Why: the clone walker's data is written to ``worst_idx`` before
+    walking, so by then ``worst_idx`` and ``clone_idx`` hold identical
+    states.  If ``clone_idx`` were eligible for the extras pool, both
+    positions would walk independently starting from the same parent
+    and the original walker at ``clone_idx`` would be overwritten — net
+    effect: lose one independent walker, gain two correlated descendants
+    of the same ancestor.  Repeated across iterations this builds up
+    population degeneracies, so we exclude both.
+    """
     noise = jax.random.uniform(rng_key, shape=(n_walkers,))
     noise = noise.at[worst_idx].set(-jnp.inf)
+    noise = noise.at[clone_idx].set(-jnp.inf)
     return jnp.argsort(-noise)[:n_extra]
 
 
@@ -308,9 +320,14 @@ def ns_step(
         pop, clone,
     )
 
-    # 5. Gather walkers to walk: worst_idx (the clone) + n_extra survivors
+    # 5. Gather walkers to walk: worst_idx (the clone) + n_extra survivors.
+    # Both worst_idx and clone_idx are excluded from the extras pool —
+    # see ``_get_extra_indices`` for why (avoids parent-correlated extras
+    # silently overwriting the clone source).
     if n_extra > 0:
-        extra_indices = _get_extra_indices(worst_idx, n_walkers, n_extra, key_extra)
+        extra_indices = _get_extra_indices(
+            worst_idx, clone_idx, n_walkers, n_extra, key_extra,
+        )
         walk_indices = jnp.concatenate([worst_idx[None], extra_indices])
     else:
         walk_indices = worst_idx[None]
@@ -530,9 +547,11 @@ def ns_step_sharded(
     )
 
     # 5. Gather walkers to walk: worst (clone) + n_extra survivors.
+    # See ``_get_extra_indices`` — both worst_idx and clone_idx are
+    # excluded so the extras pool can't include the clone source.
     if n_extra > 0:
         extra_indices = _get_extra_indices(
-            worst_idx, n_walkers_global, n_extra, key_extra,
+            worst_idx, clone_idx, n_walkers_global, n_extra, key_extra,
         )
         walk_indices = jnp.concatenate([worst_idx[None], extra_indices])
     else:

@@ -6,6 +6,7 @@ Callbacks receive NSState objects (not dicts).
 
 from __future__ import annotations
 
+import collections
 import logging
 import time
 from pathlib import Path
@@ -19,6 +20,23 @@ from jaxrens.state.ns import NSState
 from jaxrens.utils.cell import get_volume
 
 logger = logging.getLogger(__name__)
+
+
+def _format_elapsed(seconds: float) -> str:
+    """Render a duration as ``Dd HHh MMm SSs``, dropping leading zero units."""
+    s = int(round(seconds))
+    days, s = divmod(s, 86400)
+    hours, s = divmod(s, 3600)
+    minutes, s = divmod(s, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or parts:
+        parts.append(f"{hours}h")
+    if minutes or parts:
+        parts.append(f"{minutes}m")
+    parts.append(f"{s}s")
+    return " ".join(parts)
 
 
 def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
@@ -361,20 +379,21 @@ class ProgressCallback:
         # Iterations stay in lock-step across replicas (outer Python loop
         # advances all runs by 1 per tick), so a single int suffices.
         iter_n = int(jnp.max(iteration_arr))
+        elapsed_str = _format_elapsed(elapsed)
         if log_z_arr.ndim > 0:
             logger.info(
-                "NS finished: %d iterations, log_Z=[%.4f..%.4f], elapsed=%.1fs",
+                "NS finished: %d iterations, log_Z=[%.4f..%.4f], elapsed=%s",
                 iter_n,
                 float(jnp.min(log_z_arr)),
                 float(jnp.max(log_z_arr)),
-                elapsed,
+                elapsed_str,
             )
         else:
             logger.info(
-                "NS finished: %d iterations, log_Z=%.4f, elapsed=%.1fs",
+                "NS finished: %d iterations, log_Z=%.4f, elapsed=%s",
                 iter_n,
                 float(log_z_arr),
-                elapsed,
+                elapsed_str,
             )
 
 
@@ -668,6 +687,119 @@ class EnergyCheckCallback:
                 "iter=%d: Emax increased (%.6f > %.6f)", iteration, emax, self._prev_emax
             )
         self._prev_emax = emax
+
+    def on_finish(self, ns_state: Any) -> None:
+        pass
+
+
+class TemperatureCallback:
+    """Finite-difference temperature estimator (Baldock et al., PRE 96, 043311, 2017).
+
+    Maintains a per-replica FIFO of the last ``lag`` ``info["emax"]`` values and
+    reports ``T = 1 / (k_B * beta)`` with
+    ``beta = (L - 1) * log_alpha / (E_last - E_first)`` and
+    ``log_alpha = log((n_live + 1 - n_cull) / (n_live + 1))``.
+
+    Diagnostic only — never feeds back into the run. Works for SingleRun,
+    VmapRuns, and PmapVmapRuns shape conventions via ``info["_batcher"]``.
+
+    Returns NaN when the deque is shorter than 2 samples or when
+    ``E_last == E_first`` (avoids ``ZeroDivisionError``); downstream
+    aggregation uses ``np.nan{min,max,median}``.
+
+    Args:
+        n_live: Number of live walkers (from ``NSConfig.n_live``).
+        n_cull: Number of culled walkers per iteration (from ``NSConfig.n_cull``).
+        lag: Length of the Emax FIFO (window size for the finite difference).
+        interval: Emit a log line every ``interval`` iterations.
+        kB: Boltzmann constant in the backend's energy units.  Default
+            ``8.6173324e-5`` eV/K (ASE convention).  Set ``1.0`` for
+            reduced-unit backends (LJ, harmonic).
+    """
+
+    def __init__(
+        self,
+        n_live: int,
+        n_cull: int = 1,
+        lag: int = 100,
+        interval: int = 100,
+        kB: float = 8.6173324e-5,
+    ) -> None:
+        self._lag = int(lag)
+        self._interval = max(1, int(interval))
+        self._kB = float(kB)
+        self._log_alpha = float(
+            np.log((n_live + 1 - n_cull) / (n_live + 1))
+        )
+        self._histories: list[collections.deque] | None = None
+
+    def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
+        batcher = (start_info or {}).get("_batcher") if start_info else None
+        n_runs = batcher.n_runs if batcher is not None else 1
+        self._histories = [
+            collections.deque(maxlen=self._lag) for _ in range(n_runs)
+        ]
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        if self._histories is None:
+            # on_start was not called (legacy/test caller) — lazy-init from info.
+            batcher = info.get("_batcher")
+            n_runs = batcher.n_runs if batcher is not None else 1
+            self._histories = [
+                collections.deque(maxlen=self._lag) for _ in range(n_runs)
+            ]
+
+        emax_arr = jnp.asarray(info.get("emax", 0.0))
+        batcher = info.get("_batcher")
+        if batcher is not None:
+            flat = batcher.flatten(emax_arr)
+        elif emax_arr.ndim == 0:
+            flat = emax_arr[None]
+        else:
+            flat = emax_arr
+        flat_np = np.asarray(flat).reshape(-1)
+
+        if flat_np.shape[0] != len(self._histories):
+            # Resize the per-replica list if the run topology changed since
+            # on_start (e.g. tests that swap batchers mid-run).
+            self._histories = [
+                collections.deque(maxlen=self._lag)
+                for _ in range(flat_np.shape[0])
+            ]
+
+        for k, e in enumerate(flat_np):
+            self._histories[k].append(float(e))
+
+        if iteration % self._interval != 0:
+            return
+
+        T = np.array(
+            [self._compute_T(h) for h in self._histories], dtype=np.float64
+        )
+        # All replicas still warming up — emit a pending line instead of
+        # letting nanmin/nanmax fire All-NaN RuntimeWarnings.
+        if np.all(np.isnan(T)):
+            logger.info("iter=%d  T_est=pending (deque < 2)", iteration)
+            return
+        if T.size == 1:
+            logger.info("iter=%d  T_est=%.3f K", iteration, float(T[0]))
+        else:
+            logger.info(
+                "iter=%d  T_est=[%.3f..%.3f] K  median=%.3f",
+                iteration,
+                float(np.nanmin(T)),
+                float(np.nanmax(T)),
+                float(np.nanmedian(T)),
+            )
+
+    def _compute_T(self, history: collections.deque) -> float:
+        if len(history) < 2:
+            return float("nan")
+        dE = history[-1] - history[0]
+        if dE == 0.0:
+            return float("nan")
+        beta = (len(history) - 1) * self._log_alpha / dE
+        return 1.0 / (self._kB * beta)
 
     def on_finish(self, ns_state: Any) -> None:
         pass
