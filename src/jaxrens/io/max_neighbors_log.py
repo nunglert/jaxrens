@@ -31,8 +31,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_FLUSH_INTERVAL = 256  # buffered entries before flushing; close() flushes the remainder.
-
 
 @dataclass
 class MaxNeighborsLog:
@@ -68,14 +66,21 @@ class MaxNeighborsLog:
 class MaxNeighborsLogger:
     """Append-only HDF5 writer for per-iteration neighbor-bucket diagnostics.
 
-    Buffers writes in memory and flushes every ``_FLUSH_INTERVAL`` entries
-    (and on ``close()``).  The file is only created on the first flush, so
-    runs without the callback never produce an empty artefact.
+    Buffers writes in memory and flushes once the NS iteration index has
+    advanced by ``flush_interval`` since the last flush (and on ``close()``).
+    The threshold is in absolute NS iterations; per-walker YAML units are
+    handled upstream by ``_apply_interval_units``.  The file is only created
+    on the first flush, so runs without the callback never produce an empty
+    artefact.
 
     Args:
-        path: Destination file path (``.max_neighbors.h5``).
-        n_runs: Number of parallel NS runs (use 1 for SingleRun).
-        n_walkers: Number of walkers per run.
+        path:           Destination file path (``.max_neighbors.h5``).
+        n_runs:         Number of parallel NS runs (use 1 for SingleRun).
+        n_walkers:      Number of walkers per run; sets the per-walker
+                        dataset shape only.
+        flush_interval: Flush after the NS iteration index has advanced by
+                        this many absolute iterations since the previous
+                        flush.  Default 1000.
     """
 
     def __init__(
@@ -83,15 +88,18 @@ class MaxNeighborsLogger:
         path: Path | str,
         n_runs: int,
         n_walkers: int,
+        flush_interval: int = 1000,
     ) -> None:
         self.path = Path(path)
         self.n_runs = int(n_runs)
         self.n_walkers = int(n_walkers)
+        self.flush_interval = max(1, int(flush_interval))
 
         self._buf_iters: list[int] = []
         self._buf_counts: list[np.ndarray] = []
         self._buf_buckets: list[np.ndarray] = []
         self._buf_overflow: list[np.ndarray] = []
+        self._last_flush_iter: int | None = None
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -105,7 +113,8 @@ class MaxNeighborsLogger:
         bucket_size: np.ndarray,
         overflow: np.ndarray,
     ) -> None:
-        """Buffer one entry.  Auto-flushes every ``_FLUSH_INTERVAL`` entries.
+        """Buffer one entry.  Auto-flushes once the iteration index has
+        advanced by ``flush_interval * n_walkers`` since the last flush.
 
         Args:
             iteration: NS iteration index (Python int).
@@ -121,13 +130,17 @@ class MaxNeighborsLogger:
         buckets = self._coerce_per_run(bucket_size, dtype=np.int32)
         of = self._coerce_per_run(overflow, dtype=np.bool_)
 
-        self._buf_iters.append(int(iteration))
+        iter_int = int(iteration)
+        self._buf_iters.append(iter_int)
         self._buf_counts.append(counts)
         self._buf_buckets.append(buckets)
         self._buf_overflow.append(of)
 
-        if len(self._buf_iters) >= _FLUSH_INTERVAL:
+        if self._last_flush_iter is None:
+            self._last_flush_iter = iter_int
+        elif iter_int - self._last_flush_iter >= self.flush_interval:
             self._flush()
+            self._last_flush_iter = iter_int
 
     def close(self) -> None:
         """Flush remaining buffer and close the logger.

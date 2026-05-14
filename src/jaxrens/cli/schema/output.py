@@ -37,6 +37,23 @@ class OutputSpec(BaseModel):
     working_dir: Path = Path(".")
     log_level: Literal["info", "debug"] = "info"
 
+    # Shared write-buffer flush cadence for trace loggers (acc_rates,
+    # max_neighbors, re_stats).  A flush fires once the NS iteration
+    # index has advanced by ``flush_interval`` since the previous
+    # flush.  Honours ``RootSpec.interval_units`` like every other
+    # ``*_interval`` field — set ``per_walker`` to specify in
+    # walker-sweeps.  Adaptation events are NOT affected — that log
+    # flushes per-event for crash durability.
+    flush_interval: int | float = Field(
+        default=1000,
+        gt=0,
+        description=(
+            "Flush trace-logger write buffers every ``flush_interval``"
+            " NS iterations.  Default 1000.  In ``per_walker`` mode this"
+            " is in walker-sweeps (recommended: 2-10)."
+        ),
+    )
+
     # Per-iter chain-phase acceptance log.  When ``save_acc_rates`` is
     # True the runtime registers an ``AccRatesCallback`` that writes
     # ``<prefix>.acc_rates.h5`` every ``acc_rates_interval`` iterations.

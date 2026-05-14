@@ -94,6 +94,7 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
         output.{info,traj,snapshot,checkpoint}_interval
         output.{temperature_lag,temperature_interval}
         output.{acc_rates_interval,max_neighbors_interval}
+        output.flush_interval
         run.max_iterations  (None preserved)
         termination[iteration].max_iterations
         inter_re.re_interval
@@ -112,6 +113,7 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
             "temperature_interval",
             "acc_rates_interval",
             "max_neighbors_interval",
+            "flush_interval",
         )
     }
     run_upd = {
@@ -917,7 +919,7 @@ class ResolvedConfig:
     inter_re_config: Any = None  # InterREConfig | None
     # Batcher describing the (G, P) topology.  ``SingleRun`` when
     # n_total == 1, ``PmapVmapRuns(n_gpu, n_per_gpu)`` otherwise.
-    # Consumed uniformly by ``_run_loop``, ``AdaptationManager``,
+    # Consumed uniformly by ``_run_loop``, ``build_adapt_step``,
     # ``InterREManager`` and the dispatcher in ``cli/run.py``.
     batcher: BatchDescriptor | None = None
 
@@ -1010,6 +1012,7 @@ def _resolve_single_replica(
         out_file_prefix=root.output.out_file_prefix,
         working_dir=Path(root.output.working_dir),
         log_level=root.output.log_level,
+        flush_interval=int(root.output.flush_interval),
         save_acc_rates=root.output.save_acc_rates,
         acc_rates_interval=int(root.output.acc_rates_interval),
         save_max_neighbors=root.output.save_max_neighbors,
@@ -1427,6 +1430,7 @@ def _resolve_multi_replica(
         out_file_prefix=root.output.out_file_prefix,
         working_dir=Path(root.output.working_dir),
         log_level=root.output.log_level,
+        flush_interval=int(root.output.flush_interval),
         save_acc_rates=root.output.save_acc_rates,
         acc_rates_interval=int(root.output.acc_rates_interval),
         save_max_neighbors=root.output.save_max_neighbors,

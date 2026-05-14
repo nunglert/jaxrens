@@ -613,7 +613,7 @@ class ShardedSingleRun(BatchDescriptor):
       logically, but the leading ``G`` axis is the sharding axis,
       not a replica axis.  Consumers iterating ``shape_prefix`` (the
       cumulative counters in ``_run_loop``, the per-move
-      ``stack_axis`` in ``AdaptationManager``) end up with a length-G
+      ``stack_axis`` in ``build_adapt_step``) end up with a length-G
       axis where each row is identical post-``lax.psum``.  Correct;
       G× redundant memory on small counters.  Acceptable cost.
 
@@ -625,7 +625,7 @@ class ShardedSingleRun(BatchDescriptor):
     (ss / emax / key); the wrapper broadcasts to (G,) before
     ``pmap`` and takes ``[0]`` of the result on the way out.  This
     keeps the per-replica callable signature identical to
-    SingleRun so :class:`AdaptationManager` doesn't need a different
+    SingleRun so :func:`build_adapt_step` doesn't need a different
     closure shape — only the underlying ``adjust_step_size_sharded``
     call needs to know it's running under pmap.
 
@@ -690,7 +690,7 @@ class ShardedSingleRun(BatchDescriptor):
         ``adjust_step_size_sharded`` is that every shard makes the
         *same* RNG decisions, so the broadcast-then-split pattern is
         equivalent to "every shard splits the same key" — used by
-        :class:`AdaptationManager.apply` (which sees a ``(G,)``-shaped
+        the ``adapt_step`` closure (which sees a ``(G,)``-shaped
         key from its ``rng_key`` parameter).
 
         Returns shape ``(G, n_sub_keys)`` with typed-key dtype.
@@ -742,7 +742,7 @@ class ShardedSingleRun(BatchDescriptor):
         :meth:`VmapRuns.reduce_emax` returning ``(R,)`` and
         :meth:`PmapVmapRuns.reduce_emax` returning ``(G, P)``.
         Following the shape_prefix convention everywhere lets
-        consumers (`AdaptationManager.apply`, `_run_loop`'s
+        consumers (the ``adapt_step`` closure, `_run_loop`'s
         adaptation block) handle every batcher uniformly without
         per-batcher emax broadcast/reshape.
 

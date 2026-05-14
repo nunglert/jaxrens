@@ -497,7 +497,7 @@ class AdaptationCallback:
 
         # Collect per-adjust-call diagnostic stats when present (v2 schema).
         # All values arrive shaped ``(*shape_prefix, n_moves[, 4])`` straight
-        # from ``AdaptationManager.apply`` — for PmapVmapRuns(G, P) that's
+        # from ``adapt_step`` — for PmapVmapRuns(G, P) that's
         # ``(G, P, n_moves[, 4])``.  Coerce to the flat ``(n_runs, ...)``
         # layout the HDF5 schema expects using the same ``batcher.flatten``
         # the ss/acc path uses above.  Without this the dataset is created

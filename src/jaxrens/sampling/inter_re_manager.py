@@ -11,9 +11,8 @@ The manager is descriptor-aware:
   same swap decisions), then re-shards by slicing the device's own offset.
   For ``n_gpu=1`` the all_gather is a no-op (zero extra cost).
 
-Design mirrors ``AdaptationManager``: built once at construction time, JIT'd
-swap step cached; ``_run_loop`` calls ``fires(i)`` / ``apply(state, key)`` at
-each iteration.
+Design: built once at construction time, JIT'd swap step cached; ``_run_loop``
+calls ``fires(i)`` / ``apply(state, key)`` at each iteration.
 """
 
 from __future__ import annotations
@@ -127,7 +126,7 @@ class InterREManager:
         """Return True iff a swap pass should fire on this iteration.
 
         Rules: re_interval > 0 AND iteration > 0 AND iteration % re_interval == 0.
-        Iteration 0 is skipped to match ``AdaptationManager.fires`` convention.
+        Iteration 0 is skipped to match the adapt-step firing convention.
 
         Args:
             iteration: Current NS iteration index (Python int).

@@ -1,13 +1,11 @@
-"""Tests for the batching/chunking knobs on ``initial_walk``.
+"""Tests for ``initial_walk``'s ``walker_batch_size`` chunking knob.
 
 Split out from ``test_init_burn_in.py``: the semantic tests (no-op, shape
 invariance, decorrelation, Emax constraint, JIT, adaptation invocation)
-live there. This file covers only the chunking axes:
+live there. This file covers the walker-axis chunking only:
 
-- walker_batch_size (chunked vmap inside one_walk)
-- run_batch_size (chunked vmap over n_runs in batched=True)
-- combined walker- and run-chunking
-- trial-vmap chunking inside adjust_step_size
+- walker_batch_size in ``_one_walk`` (chunked walker vmap)
+- walker_batch_size carried into the adapt step as ``trial_batch_size``
 """
 
 from __future__ import annotations
@@ -203,91 +201,11 @@ class TestWalkerChunking:
 
 
 # ---------------------------------------------------------------------------
-# run_batch_size: chunked vmap over n_runs
-# ---------------------------------------------------------------------------
-
-class TestRunChunking:
-    def test_run_batch_size_divides_evenly_same_result(self):
-        n_runs, n_walkers, n_atoms = 3, 4, 2
-        ns_states, step_fn, _, _ = _build_batched_ns_state(
-            n_runs=n_runs, n_walkers=n_walkers, n_atoms=n_atoms
-        )
-        key = jax.random.key(42)
-
-        result_full = initial_walk(
-            key, ns_states, step_fn,
-            n_walks=2, walklength=4, adjust_interval=100,
-            emax_offset_per_atom=0.0, n_atoms=n_atoms,
-            batched=True, run_batch_size=None,
-        )
-        result_chunked = initial_walk(
-            key, ns_states, step_fn,
-            n_walks=2, walklength=4, adjust_interval=100,
-            emax_offset_per_atom=0.0, n_atoms=n_atoms,
-            batched=True, run_batch_size=1,
-        )
-
-        np.testing.assert_allclose(
-            np.array(result_full.population.positions),
-            np.array(result_chunked.population.positions),
-            atol=1e-5,
-        )
-
-    def test_run_batch_size_not_dividing_raises(self):
-        n_runs, n_walkers, n_atoms = 3, 4, 2
-        ns_states, step_fn, _, _ = _build_batched_ns_state(
-            n_runs=n_runs, n_walkers=n_walkers, n_atoms=n_atoms
-        )
-        with pytest.raises(ValueError, match="run_batch_size"):
-            initial_walk(
-                jax.random.key(0), ns_states, step_fn,
-                n_walks=1, walklength=2, adjust_interval=100,
-                emax_offset_per_atom=0.0, n_atoms=n_atoms,
-                batched=True, run_batch_size=2,
-            )
-
-
-# ---------------------------------------------------------------------------
-# walker + run chunking combined
-# ---------------------------------------------------------------------------
-
-class TestCombinedChunking:
-    def test_combined_walker_and_run_batch_size(self):
-        n_runs, n_walkers, n_atoms = 3, 4, 2
-        ns_states, step_fn, _, _ = _build_batched_ns_state(
-            n_runs=n_runs, n_walkers=n_walkers, n_atoms=n_atoms
-        )
-
-        result = initial_walk(
-            jax.random.key(0),
-            ns_states,
-            step_fn,
-            n_walks=2,
-            walklength=3,
-            adjust_interval=100,
-            emax_offset_per_atom=0.0,
-            n_atoms=n_atoms,
-            batched=True,
-            walker_batch_size=2,
-            run_batch_size=1,
-        )
-
-        assert result.population.positions.shape == (n_runs, n_walkers, n_atoms, 3)
-        assert result.population.energy.shape == (n_runs, n_walkers)
-        assert jnp.all(jnp.isfinite(result.population.positions))
-
-
-# ---------------------------------------------------------------------------
-# Trial-vmap chunking inside adjust_step_size
+# Trial-vmap chunking inside the adapt step (walker_batch_size carries through)
 # ---------------------------------------------------------------------------
 
 class TestAdaptationChunking:
-    def _run_with(
-        self,
-        *,
-        walker_batch_size: int | None,
-        run_batch_size: int | None,
-    ):
+    def _run_with(self, *, walker_batch_size: int | None):
         from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
 
         n_runs, n_walkers, n_atoms = 4, 4, 2
@@ -308,7 +226,6 @@ class TestAdaptationChunking:
             n_atoms=n_atoms,
             batched=True,
             walker_batch_size=walker_batch_size,
-            run_batch_size=run_batch_size,
             per_move_fns=per_move_fns,
             adaptation_policies=(policy,),
             adjust_n_samples=8,
@@ -317,32 +234,16 @@ class TestAdaptationChunking:
         return result
 
     def test_walker_batch_size_matches_full_vmap(self):
-        baseline = self._run_with(walker_batch_size=None, run_batch_size=None)
-        chunked = self._run_with(walker_batch_size=2, run_batch_size=None)
-        np.testing.assert_array_equal(
-            np.array(baseline.population.step_sizes),
-            np.array(chunked.population.step_sizes),
-        )
-
-    def test_run_batch_size_matches_full_vmap(self):
-        baseline = self._run_with(walker_batch_size=None, run_batch_size=None)
-        chunked = self._run_with(walker_batch_size=None, run_batch_size=2)
-        np.testing.assert_array_equal(
-            np.array(baseline.population.step_sizes),
-            np.array(chunked.population.step_sizes),
-        )
-
-    def test_combined_chunking_matches_full_vmap(self):
-        baseline = self._run_with(walker_batch_size=None, run_batch_size=None)
-        chunked = self._run_with(walker_batch_size=2, run_batch_size=2)
+        baseline = self._run_with(walker_batch_size=None)
+        chunked = self._run_with(walker_batch_size=2)
         np.testing.assert_array_equal(
             np.array(baseline.population.step_sizes),
             np.array(chunked.population.step_sizes),
         )
 
     def test_walker_batch_size_non_divisor_in_trial_vmap(self):
-        baseline = self._run_with(walker_batch_size=None, run_batch_size=None)
-        chunked = self._run_with(walker_batch_size=3, run_batch_size=None)
+        baseline = self._run_with(walker_batch_size=None)
+        chunked = self._run_with(walker_batch_size=3)
         np.testing.assert_array_equal(
             np.array(baseline.population.step_sizes),
             np.array(chunked.population.step_sizes),

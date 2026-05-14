@@ -296,7 +296,7 @@ class TestOverflowRetry:
         the rest successful).
         """
         from jaxrens.sampling.run_loop import _run_loop
-        from jaxrens.sampling.adaptation.manager import AdaptationManager
+        from jaxrens.sampling.adaptation.manager import build_adapt_step
         from jaxrens.sampling.batch_descriptor import SingleRun
         from jaxrens.sampling.termination import IterationTermination
 
@@ -333,7 +333,7 @@ class TestOverflowRetry:
                 return lambda state, sfn, nm, ne: patched_step_fn(state, sfn, nm, ne)
 
         batcher = _PatchedSingleRun()
-        adapt_mgr = AdaptationManager(
+        adapt_step = build_adapt_step(
             move_descriptors=[],
             per_move_fns=None,
             batcher=batcher,
@@ -350,7 +350,8 @@ class TestOverflowRetry:
 
         final_state, _, _ = _run_loop(
             batcher=batcher,
-            adapt_mgr=adapt_mgr,
+            adapt_step=adapt_step,
+            adjust_interval=0,
             ns_state=ns_state,
             step_fn=s["step_fn"],
             n_mcmc_steps=3,
@@ -381,7 +382,7 @@ class TestOverflowRetry:
     def test_overflow_retry_increases_max_neighbors(self):
         """After overflow retry, population.max_neighbors must increase."""
         from jaxrens.sampling.run_loop import _run_loop
-        from jaxrens.sampling.adaptation.manager import AdaptationManager
+        from jaxrens.sampling.adaptation.manager import build_adapt_step
         from jaxrens.sampling.batch_descriptor import SingleRun
         from jaxrens.sampling.termination import IterationTermination, PriorMassTermination
 
@@ -421,7 +422,7 @@ class TestOverflowRetry:
                 return lambda state, sfn, nm, ne: patched_step_fn(state, sfn, nm, ne)
 
         batcher = _PatchedSingleRun()
-        adapt_mgr = AdaptationManager(
+        adapt_step = build_adapt_step(
             move_descriptors=[],
             per_move_fns=None,
             batcher=batcher,
@@ -437,7 +438,8 @@ class TestOverflowRetry:
 
         _run_loop(
             batcher=batcher,
-            adapt_mgr=adapt_mgr,
+            adapt_step=adapt_step,
+            adjust_interval=0,
             ns_state=ns_state,
             step_fn=s["step_fn"],
             n_mcmc_steps=3,

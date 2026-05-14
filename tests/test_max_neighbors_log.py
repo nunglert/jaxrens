@@ -32,7 +32,7 @@ from jaxrens.cli.monitor import MaxNeighborsCallback
 from jaxrens.io.max_neighbors_log import MaxNeighborsLog, MaxNeighborsLogger
 from jaxrens.postprocess.monitor import Monitor
 from jaxrens.postprocess.plotting import plot_max_neighbors
-from jaxrens.sampling.adaptation.manager import AdaptationManager
+from jaxrens.sampling.adaptation.manager import build_adapt_step
 from jaxrens.sampling.batch_descriptor import SingleRun
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.mwg import build_mwg
@@ -166,7 +166,7 @@ class TestMaxNeighborsCallback:
         cb = MaxNeighborsCallback(mn_logger, interval=1)
 
         batcher = SingleRun()
-        adapt_mgr = AdaptationManager(
+        adapt_step = build_adapt_step(
             move_descriptors=[],
             per_move_fns=None,
             batcher=batcher,
@@ -177,7 +177,8 @@ class TestMaxNeighborsCallback:
         )
         _run_loop(
             batcher=batcher,
-            adapt_mgr=adapt_mgr,
+            adapt_step=adapt_step,
+            adjust_interval=0,
             ns_state=ns_state,
             step_fn=step_fn,
             n_mcmc_steps=1,

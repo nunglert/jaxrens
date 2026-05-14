@@ -25,8 +25,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_FLUSH_INTERVAL = 256  # buffer entries before flushing
-
 
 @dataclass
 class RELog:
@@ -57,18 +55,23 @@ class RELog:
 class RELogger:
     """Append-only HDF5 writer for per-fire inter-RE swap counts.
 
-    Buffers writes in memory and flushes every ``_FLUSH_INTERVAL``
-    entries (and on ``close()``).  The file is only created on the
-    first flush, so runs without any swap fires never produce an empty
-    artefact.
+    Buffers writes in memory and flushes once the NS iteration index
+    has advanced by ``flush_interval`` since the last flush (and on
+    ``close()``).  The threshold is in absolute NS iterations; per-walker
+    YAML units are handled upstream by ``_apply_interval_units``.  The
+    file is only created on the first flush, so runs without any swap
+    fires never produce an empty artefact.
 
     Args:
-        path:    Destination file path (.re_stats.h5).
-        n_pairs: Number of adjacent replica pairs (= n_runs - 1).  May
-                 be 0 (for n_runs < 2) — the writer accepts but a
-                 callback should not push such entries.
-        flavor:  RE flavor label, one of 'pressure', 'xrens',
-                 'semi_grand'.  Stored as an HDF5 attr.
+        path:           Destination file path (.re_stats.h5).
+        n_pairs:        Number of adjacent replica pairs (= n_runs - 1).
+                        May be 0 (for n_runs < 2) — the writer accepts
+                        but a callback should not push such entries.
+        flavor:         RE flavor label, one of 'pressure', 'xrens',
+                        'semi_grand'.  Stored as an HDF5 attr.
+        flush_interval: Flush after the NS iteration index has advanced
+                        by this many absolute iterations since the
+                        previous flush.  Default 1000.
     """
 
     def __init__(
@@ -76,14 +79,17 @@ class RELogger:
         path: Path | str,
         n_pairs: int,
         flavor: str,
+        flush_interval: int = 1000,
     ) -> None:
         self.path = Path(path)
         self.n_pairs = int(n_pairs)
         self.flavor = str(flavor)
+        self.flush_interval = max(1, int(flush_interval))
 
         self._buf_iters: list[int] = []
         self._buf_n_acc: list[np.ndarray] = []
         self._buf_n_att: list[np.ndarray] = []
+        self._last_flush_iter: int | None = None
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -96,7 +102,8 @@ class RELogger:
         n_accepted_per_pair: np.ndarray,
         n_attempted_per_pair: np.ndarray,
     ) -> None:
-        """Buffer one entry.  Auto-flushes every ``_FLUSH_INTERVAL`` entries.
+        """Buffer one entry.  Auto-flushes once the iteration index has
+        advanced by ``flush_interval`` absolute iters since the last flush.
 
         Args:
             iteration:            NS iteration index (Python int).
@@ -109,12 +116,16 @@ class RELogger:
         n_acc = self._coerce(n_accepted_per_pair)
         n_att = self._coerce(n_attempted_per_pair)
 
-        self._buf_iters.append(int(iteration))
+        iter_int = int(iteration)
+        self._buf_iters.append(iter_int)
         self._buf_n_acc.append(n_acc)
         self._buf_n_att.append(n_att)
 
-        if len(self._buf_iters) >= _FLUSH_INTERVAL:
+        if self._last_flush_iter is None:
+            self._last_flush_iter = iter_int
+        elif iter_int - self._last_flush_iter >= self.flush_interval:
             self._flush()
+            self._last_flush_iter = iter_int
 
     def close(self) -> None:
         """Flush remaining buffer and close the logger.

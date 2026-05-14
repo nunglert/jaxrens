@@ -522,6 +522,7 @@ class TestMonitorFromDirectory:
     def test_from_directory_prefers_final(self, tmp_path):
         """Prefers .final.checkpoint.h5 over .checkpoint.h5."""
         from jaxrens.io.checkpoint import save_checkpoint
+        from jaxrens.io.energy_log import EnergyLogger
         import jax.numpy as jnp
 
         rng = np.random.default_rng(0)
@@ -554,6 +555,14 @@ class TestMonitorFromDirectory:
 
         _write(tmp_path / "ns.checkpoint.h5", log_evidence_val=10.0)
         _write(tmp_path / "ns.final.checkpoint.h5", log_evidence_val=99.0)
+
+        energy_logger = EnergyLogger(
+            tmp_path / "ns.energies", n_walkers=n_live, n_cull=1,
+        )
+        energy_logger.write_header()
+        for i, e in enumerate(np.sort(rng.uniform(0, 5, n_dead))):
+            energy_logger.write_entry(i, float(e))
+        energy_logger.close()
 
         m = Monitor.from_directory(tmp_path, prefix="ns", prefer_final=True)
         assert m.log_evidence == pytest.approx(99.0, rel=1e-4)
@@ -787,6 +796,7 @@ class TestMonitorCollection:
     def test_from_directories_round_trip(self, tmp_path):
         """from_directories loads each dir into a Monitor."""
         from jaxrens.io.checkpoint import save_checkpoint
+        from jaxrens.io.energy_log import EnergyLogger
         import jax.numpy as jnp
 
         dirs = []
@@ -819,6 +829,15 @@ class TestMonitorCollection:
                 "n_walkers": n_live,
             }
             save_checkpoint(d / "ns.final.checkpoint.h5", ns_state)
+
+            energy_logger = EnergyLogger(
+                d / "ns.energies", n_walkers=n_live, n_cull=1,
+            )
+            energy_logger.write_header()
+            for j, e in enumerate(dead_e):
+                energy_logger.write_entry(j, float(e))
+            energy_logger.close()
+
             dirs.append(d)
 
         coll = MonitorCollection.from_directories(dirs, labels=["a", "b"], prefix="ns")
@@ -1229,7 +1248,7 @@ class TestSmokeRealRun:
         assert np.isfinite(m.log_evidence)
         assert m.is_npt  # lj8_npt is NPT
 
-    def test_heat_capacity_on_real_run(self):
+    def test_heat_capacity_on_real_run(self, tmp_path):
         import matplotlib.pyplot as plt
 
         m = Monitor.from_directory(_LJ8_NPT_OUTPUT, prefix="lj8_npt", label="lj8_smoke")
@@ -1240,9 +1259,10 @@ class TestSmokeRealRun:
 
         ax = plot_heat_capacity(m, T)
         fig = ax.get_figure()
-        fig.savefig("/tmp/lj8_smoke.png", dpi=72)
+        out_path = tmp_path / "lj8_smoke.png"
+        fig.savefig(out_path, dpi=72)
         plt.close("all")
-        assert Path("/tmp/lj8_smoke.png").exists()
+        assert out_path.exists()
 
     def test_energy_trace_loaded(self):
         m = Monitor.from_directory(_LJ8_NPT_OUTPUT, prefix="lj8_npt", label="lj8_smoke")

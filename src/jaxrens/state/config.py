@@ -64,6 +64,18 @@ class OutputConfig:
     out_file_prefix: str = "ns"
     working_dir: Path = field(default_factory=lambda: Path("."))
     log_level: str = "info"  # "info" | "debug"
+
+    # Common write-buffer flush cadence for the per-iter trace loggers
+    # (``acc_rates``, ``max_neighbors``, ``re_stats``).  A flush fires once
+    # the NS iteration index has advanced by ``flush_interval`` since the
+    # previous flush.  Scaled by ``RootSpec.interval_units`` in the resolver
+    # exactly like every other ``*_interval`` field — set ``per_walker`` in
+    # the YAML to specify the value in walker-sweeps instead of raw iters.
+    # Decoupled from per-callback firing intervals so tight logging cadences
+    # don't force per-iter I/O.  Does NOT affect the adaptation log, which
+    # flushes on every event for crash durability.
+    flush_interval: int = 1000
+
     # Per-iter chain acceptance logging.  ``True`` registers an
     # ``AccRatesCallback`` writing ``<prefix>.acc_rates.h5`` every
     # ``acc_rates_interval`` iterations.  Decoupled from full_auto.

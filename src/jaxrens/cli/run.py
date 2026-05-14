@@ -378,6 +378,7 @@ def run_from_config(
             path=acc_log_path,
             move_names=[d.name for d in move_descriptors],
             n_runs=1,
+            flush_interval=int(getattr(output_config, "flush_interval", 1000)),
         )
         callbacks.append(AccRatesCallback(
             acc_logger,
@@ -395,6 +396,7 @@ def run_from_config(
             path=mn_log_path,
             n_runs=1,
             n_walkers=ns_config.n_live,
+            flush_interval=int(getattr(output_config, "flush_interval", 1000)),
         )
         callbacks.append(MaxNeighborsCallback(
             mn_logger,
@@ -466,7 +468,6 @@ def run_from_config(
             emax_offset_per_atom=burn_in_cfg.emax_offset_per_atom,
             n_atoms=n_atoms,
             walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
-            run_batch_size=getattr(burn_in_cfg, "run_batch_size", None),
             per_move_fns=burn_per_move_fns,
             adaptation_policies=burn_adaptation_policies,
             adjust_n_samples=getattr(adaptation_config, "adjust_n_samples", 50) if adaptation_config is not None else 50,
@@ -520,6 +521,7 @@ def run_from_config(
             adjust_n_samples=adaptation_config.adjust_n_samples,
             adjust_max_rounds=adaptation_config.adjust_max_rounds,
             adjust_factor=adjust_factor,
+            trial_batch_size=adaptation_config.trial_batch_size,
         )
 
     result = run_ns(
@@ -658,12 +660,10 @@ def run_multi_gpu_from_config(resolved) -> dict:
 
         logger.info(
             "Starting initial burn-in: n_walks=%d, walklength=%d, "
-            "adjust_interval=%d, walker_batch_size=%s, run_batch_size=%s, "
-            "n_atoms=%d",
+            "adjust_interval=%d, walker_batch_size=%s, n_atoms=%d",
             burn_in_cfg.n_walks, burn_in_cfg.walklength,
             burn_in_cfg.adjust_interval,
             getattr(burn_in_cfg, "walker_batch_size", None),
-            getattr(burn_in_cfg, "run_batch_size", None),
             n_atoms,
         )
 
@@ -678,7 +678,6 @@ def run_multi_gpu_from_config(resolved) -> dict:
             n_atoms=n_atoms,
             batcher=resolved.batcher,
             walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
-            run_batch_size=getattr(burn_in_cfg, "run_batch_size", None),
             per_move_fns=burn_per_move_fns,
             adaptation_policies=adaptation_policies,
             adjust_n_samples=getattr(resolved.adaptation_cfg, "adjust_n_samples", 50),
@@ -803,6 +802,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
             path=acc_log_path,
             move_names=[d.name for d in resolved.move_descriptors],
             n_runs=n_total,
+            flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
         )
         callbacks.append(AccRatesCallback(
             acc_logger,
@@ -820,6 +820,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
             path=mn_log_path,
             n_runs=n_total,
             n_walkers=n_live,
+            flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
         )
         callbacks.append(MaxNeighborsCallback(
             mn_logger,
@@ -841,6 +842,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
             path=re_log_path,
             n_pairs=max(n_total - 1, 0),
             flavor=resolved.inter_re_config.flavor,
+            flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
         )
         callbacks.append(RECallback(re_logger))
 
@@ -858,6 +860,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
             adjust_n_samples=resolved.adaptation_cfg.adjust_n_samples,
             adjust_max_rounds=resolved.adaptation_cfg.adjust_max_rounds,
             adjust_factor=adjust_factor,
+            trial_batch_size=resolved.adaptation_cfg.trial_batch_size,
         )
 
     logger.info(
@@ -915,7 +918,7 @@ def run_sharded_from_config(resolved) -> dict:
     ``run_ns_sharded``) does the reshape and per-device placement.
 
     Burn-in (`initial_walk`) runs through ``ShardedSingleRun`` natively
-    — adaptation goes through :class:`AdaptationManager` (which
+    — adaptation goes through :func:`build_adapt_step` (which
     dispatches to ``adjust_step_size_sharded``) and the walking step
     pmaps with per-shard distinct keys.  After burn-in the sharded
     NSState's ``(G, K/G, ...)`` population is flattened back to
@@ -1129,6 +1132,7 @@ def run_sharded_from_config(resolved) -> dict:
             path=mn_log_path,
             n_runs=1,
             n_walkers=n_live,
+            flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
         )
         callbacks.append(MaxNeighborsCallback(
             mn_logger,
@@ -1148,6 +1152,7 @@ def run_sharded_from_config(resolved) -> dict:
             path=acc_log_path,
             move_names=[d.name for d in resolved.move_descriptors],
             n_runs=1,
+            flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
         )
         callbacks.append(AccRatesCallback(
             acc_logger,
@@ -1168,6 +1173,7 @@ def run_sharded_from_config(resolved) -> dict:
             adjust_n_samples=resolved.adaptation_cfg.adjust_n_samples,
             adjust_max_rounds=resolved.adaptation_cfg.adjust_max_rounds,
             adjust_factor=adjust_factor,
+            trial_batch_size=resolved.adaptation_cfg.trial_batch_size,
         )
 
     logger.info(

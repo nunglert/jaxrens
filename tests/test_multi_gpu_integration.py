@@ -1,4 +1,4 @@
-"""Integration tests for the multi-GPU NS branch: AdaptationManager pmap
+"""Integration tests for the multi-GPU NS branch: build_adapt_step pmap
 path, init_ns_multi_gpu, and run_ns_multi_gpu.
 
 All tests use n_gpu=1 (single-device constraint); the implementation itself
@@ -6,7 +6,7 @@ does not hard-code this. PmapVmapRuns descriptor unit tests live in
 test_batch_descriptor.py.
 
 Coverage:
-- AdaptationManager with PmapVmapRuns: apply() shapes
+- build_adapt_step with PmapVmapRuns: closure shapes
 - init_ns_multi_gpu: state shapes
 - run_ns_multi_gpu: smoke test, finite log_evidence, shapes (1, P)
 - Parity: PmapVmapRuns(n_gpu=1, n_per_gpu=P) vs VmapRuns(n_runs=P)
@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 
 from jaxrens.backends.toy import create_harmonic
-from jaxrens.sampling.adaptation.manager import AdaptationManager
+from jaxrens.sampling.adaptation.manager import build_adapt_step
 from jaxrens.sampling.batch_descriptor import PmapVmapRuns, VmapRuns
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
@@ -91,7 +91,7 @@ def _make_harmonic_problem(
 
 
 # ---------------------------------------------------------------------------
-# AdaptationManager with PmapVmapRuns
+# build_adapt_step with PmapVmapRuns
 # ---------------------------------------------------------------------------
 
 
@@ -141,15 +141,15 @@ def pmap_harmonic_setup():
     }
 
 
-class TestAdaptationManagerPmapVmap:
-    """AdaptationManager.apply() with PmapVmapRuns."""
+class TestBuildAdaptStepPmapVmap:
+    """``build_adapt_step`` closure with PmapVmapRuns."""
 
-    def _build_mgr(self, setup):
-        return AdaptationManager(
+    def _build(self, setup):
+        return build_adapt_step(
             move_descriptors=setup["descriptors"],
             per_move_fns=setup["per_move_fns"],
             batcher=PmapVmapRuns(
-                n_gpu=setup["n_gpu"], n_per_gpu=setup["n_per_gpu"]
+                n_gpu=setup["n_gpu"], n_per_gpu=setup["n_per_gpu"],
             ),
             adjust_n_samples=10,
             adjust_factor=1.5,
@@ -157,69 +157,65 @@ class TestAdaptationManagerPmapVmap:
             adjust_interval=50,
         )
 
-    def test_apply_no_error(self, pmap_harmonic_setup):
-        """apply() runs without error for PmapVmapRuns."""
+    def test_closure_no_error(self, pmap_harmonic_setup):
+        """closure runs without error for PmapVmapRuns."""
         _require_gpu()
         setup = pmap_harmonic_setup
-        mgr = self._build_mgr(setup)
-        pop = setup["pop"]
+        adapt = self._build(setup)
+        assert adapt is not None
+        ns_states = setup["batched_states"]
         n_gpu, n_per_gpu = setup["n_gpu"], setup["n_per_gpu"]
-        n_moves = 1
 
-        # emax: (G, P) — max over walker axis 2
-        emax = jnp.max(pop.energy, axis=2)
-        # ss: (G, P, n_moves)
-        ss = pop.step_sizes[:, :, 0, :]
-        # keys: (G, P)
-        run_keys = jax.random.split(jax.random.key(10), n_gpu * n_per_gpu).reshape(
-            n_gpu, n_per_gpu
-        )
+        emax = jnp.max(ns_states.population.energy, axis=2)  # (G, P)
+        run_keys = jax.random.split(
+            jax.random.key(10), n_gpu * n_per_gpu,
+        ).reshape(n_gpu, n_per_gpu)
 
-        new_ss, diags, new_key = mgr.apply(pop, emax, run_keys, ss)
+        new_state, diag, new_key = adapt(ns_states, emax, run_keys)
 
-        assert new_ss.shape == (n_gpu, n_per_gpu, n_moves)
         assert new_key.shape == (n_gpu, n_per_gpu)
+        # step_sizes pulled out via the same axis as the input.
+        assert new_state.population.step_sizes.shape \
+            == ns_states.population.step_sizes.shape
 
-    def test_apply_output_shapes(self, pmap_harmonic_setup):
+    def test_diag_output_shapes(self, pmap_harmonic_setup):
         """Diagnostics have shape (G, P, n_moves) for PmapVmapRuns."""
         _require_gpu()
         setup = pmap_harmonic_setup
-        mgr = self._build_mgr(setup)
-        pop = setup["pop"]
+        adapt = self._build(setup)
+        ns_states = setup["batched_states"]
         n_gpu, n_per_gpu = setup["n_gpu"], setup["n_per_gpu"]
         n_moves = 1
 
-        emax = jnp.max(pop.energy, axis=2)  # (G, P)
-        ss = pop.step_sizes[:, :, 0, :]      # (G, P, n_moves)
-        run_keys = jax.random.split(jax.random.key(11), n_gpu * n_per_gpu).reshape(
-            n_gpu, n_per_gpu
-        )
+        emax = jnp.max(ns_states.population.energy, axis=2)
+        run_keys = jax.random.split(
+            jax.random.key(11), n_gpu * n_per_gpu,
+        ).reshape(n_gpu, n_per_gpu)
 
-        new_ss, diags, _ = mgr.apply(pop, emax, run_keys, ss)
+        _, diag, _ = adapt(ns_states, emax, run_keys)
 
-        assert new_ss.shape == (n_gpu, n_per_gpu, n_moves)
-        assert diags["rate"].shape == (n_gpu, n_per_gpu, n_moves)
-        assert diags["counts"].shape == (n_gpu, n_per_gpu, n_moves, 4)
-        assert diags["n_rounds"].shape == (n_gpu, n_per_gpu, n_moves)
-        assert diags["converged"].shape == (n_gpu, n_per_gpu, n_moves)
+        assert diag["rate"].shape == (n_gpu, n_per_gpu, n_moves)
+        assert diag["counts"].shape == (n_gpu, n_per_gpu, n_moves, 4)
+        assert diag["n_rounds"].shape == (n_gpu, n_per_gpu, n_moves)
+        assert diag["converged"].shape == (n_gpu, n_per_gpu, n_moves)
 
-    def test_apply_step_sizes_positive_finite(self, pmap_harmonic_setup):
+    def test_step_sizes_positive_finite(self, pmap_harmonic_setup):
         """Returned step sizes must be positive and finite."""
         _require_gpu()
         setup = pmap_harmonic_setup
-        mgr = self._build_mgr(setup)
-        pop = setup["pop"]
+        adapt = self._build(setup)
+        ns_states = setup["batched_states"]
         n_gpu, n_per_gpu = setup["n_gpu"], setup["n_per_gpu"]
 
-        emax = jnp.max(pop.energy, axis=2)
-        ss = pop.step_sizes[:, :, 0, :]
-        run_keys = jax.random.split(jax.random.key(12), n_gpu * n_per_gpu).reshape(
-            n_gpu, n_per_gpu
-        )
+        emax = jnp.max(ns_states.population.energy, axis=2)
+        run_keys = jax.random.split(
+            jax.random.key(12), n_gpu * n_per_gpu,
+        ).reshape(n_gpu, n_per_gpu)
 
-        new_ss, _, _ = mgr.apply(pop, emax, run_keys, ss)
-        assert jnp.all(new_ss > 0.0)
-        assert jnp.all(jnp.isfinite(new_ss))
+        new_state, _, _ = adapt(ns_states, emax, run_keys)
+        ss = new_state.population.step_sizes
+        assert jnp.all(ss > 0.0)
+        assert jnp.all(jnp.isfinite(ss))
 
 # ---------------------------------------------------------------------------
 # init_ns_multi_gpu

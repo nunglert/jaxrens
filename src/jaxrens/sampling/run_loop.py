@@ -31,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float, Key
 
-from jaxrens.sampling.adaptation.manager import AdaptationManager
+from jaxrens.sampling.adaptation.manager import build_adapt_step  # noqa: F401
 from jaxrens.sampling.batch_descriptor import BatchDescriptor
 from jaxrens.sampling.inter_re_manager import InterREManager
 from jaxrens.sampling.move_kernel import MoveKernel
@@ -120,7 +120,7 @@ def _pack_adjustment_info(
     ``_bump_cumulative_counters`` consumes when ``include_trial=True``.
 
     All array values are passed through with shape ``(*shape_prefix,
-    n_moves, ...)`` exactly as ``AdaptationManager.apply`` returned
+    n_moves, ...)`` exactly as ``adapt_step`` returned
     them — no list-of-scalars round-trip — so this works uniformly for
     SingleRun (``(n_moves,)`` / ``(n_moves, 4)``), VmapRuns
     (``(n_runs, n_moves, ...)``), and PmapVmapRuns (``(G, P,
@@ -132,7 +132,7 @@ def _pack_adjustment_info(
         info: Info dict to update.
         current_step_sizes: Per-move step sizes after the adjust call,
             shape ``(*shape_prefix, n_moves)``.
-        adjust_info: Dict returned by ``AdaptationManager.apply`` —
+        adjust_info: Dict returned by ``adapt_step`` —
             keys ``rate``, ``counts``, ``n_rounds``, ``converged``,
             ``cap_hits``, ``floor_hits``, ``bracket_detected``,
             ``trial_n_evaluations``, ``trial_n_grad_evaluations``.
@@ -272,7 +272,8 @@ from jaxrens.sampling.bucket_manager import (  # noqa: E402
 def _run_loop(
     *,
     batcher: BatchDescriptor,
-    adapt_mgr: AdaptationManager,
+    adapt_step: Callable | None,
+    adjust_interval: int,
     ns_state: NSState,
     step_fn: Callable,
     n_mcmc_steps: int,
@@ -306,8 +307,11 @@ def _run_loop(
     Args:
         batcher: ``BatchDescriptor`` instance controlling JIT-compilation,
             key splitting, and termination reduction.
-        adapt_mgr: ``AdaptationManager`` instance. May be inactive
-            (``is_active=False``) when no step-size adaptation is configured.
+        adapt_step: Closure built by :func:`build_adapt_step`, or ``None``
+            when no step-size adaptation is configured.  Called as
+            ``(ns_state, emax, key) -> (new_ns_state, diag, new_key)``.
+        adjust_interval: Iterations between adapt fires.  ``<= 0`` (or
+            ``adapt_step is None``) disables adaptation.
         ns_state: Initial ``NSState`` (single or batched).
         step_fn: MCMC step function from ``build_mwg()``.
         n_mcmc_steps: Number of MCMC steps per walker (static under JIT).
@@ -418,13 +422,9 @@ def _run_loop(
     while True:
         # ---- Adaptation ----
         adjust_info = None
-        if adapt_mgr.fires(i):
+        if adapt_step is not None and i > 0 and i % adjust_interval == 0:
             emax = batcher.reduce_emax(ns_state.population.energy)
-            # ``apply_to_state`` extracts current_step_sizes, runs the
-            # adapt, and writes the new step sizes back into the
-            # population — single integration point for both burn-in
-            # and the NS loop.
-            ns_state, per_move_outputs, rng_key = adapt_mgr.apply_to_state(
+            ns_state, per_move_outputs, rng_key = adapt_step(
                 ns_state, emax, rng_key,
             )
             # Re-extract for the downstream callbacks / info dict.
@@ -480,7 +480,7 @@ def _run_loop(
         # ---- Pack adjustment info (only when fires this iter) ----
         # Works uniformly for SingleRun, VmapRuns, and PmapVmapRuns:
         # adjust_info values are already shaped ``(*shape_prefix, n_moves, ...)``
-        # straight from ``AdaptationManager.apply``; the packer is shape-agnostic
+        # straight from ``adapt_step``; the packer is shape-agnostic
         # and ``AdaptationCallback.on_iteration`` will call ``batcher.flatten``
         # to land them in ``(n_runs_total, n_moves, ...)`` before HDF5.
         if adjust_info is not None:

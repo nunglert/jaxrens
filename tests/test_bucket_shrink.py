@@ -17,7 +17,7 @@ import pytest
 
 import jaxrens.sampling.moves.random_walk as _rw_mod
 from jaxrens.backends.toy import create_harmonic
-from jaxrens.sampling.adaptation.manager import AdaptationManager
+from jaxrens.sampling.adaptation.manager import build_adapt_step
 from jaxrens.sampling.batch_descriptor import SingleRun
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.mwg import build_mwg
@@ -143,31 +143,6 @@ def _wrap_step_fn_force_observed(real_step_fn, observed_max: int):
     return wrapped
 
 
-def _wrap_step_fn_with_spike(real_step_fn, low: int, high: int, spike_at: int):
-    """Like ``_wrap_step_fn_force_observed`` but reports ``high`` once at the
-    ``spike_at``-th call (across the whole run) and ``low`` otherwise.
-
-    Tracks state in a Python list so the closure can mutate it across JIT
-    invocations.  Since the wrapper itself is not jitted (it's the input to
-    ``build_mwg`` which gets jitted inside ``ns_step``), this is safe as long
-    as the test exercises a single replica without vmap/pmap — i.e. SingleRun.
-    """
-    counter = [0]
-
-    def wrapped(key, state, emax):
-        new_state, info = real_step_fn(key, state, emax)
-        counter[0] += 1
-        val = high if counter[0] == spike_at else low
-        new_state = new_state.set(
-            max_neighbor_count=jnp.asarray(
-                val, dtype=new_state.max_neighbor_count.dtype,
-            ),
-            overflow=jnp.asarray(False),
-        )
-        return new_state, info
-    return wrapped
-
-
 def _run_loop_minimal(ns_state, step_fn, *, n_iters: int,
                       shrink_dwell: int = 0,
                       shrink_margin: int | None = None,
@@ -179,7 +154,7 @@ def _run_loop_minimal(ns_state, step_fn, *, n_iters: int,
     shrink-check block — no adaptation, no callbacks, no inter-RE.
     """
     batcher = SingleRun()
-    adapt_mgr = AdaptationManager(
+    adapt_step = build_adapt_step(
         move_descriptors=[],
         per_move_fns=None,
         batcher=batcher,
@@ -190,7 +165,8 @@ def _run_loop_minimal(ns_state, step_fn, *, n_iters: int,
     )
     ns_state_out, _rng, _cum = _run_loop(
         batcher=batcher,
-        adapt_mgr=adapt_mgr,
+        adapt_step=adapt_step,
+        adjust_interval=0,
         ns_state=ns_state,
         step_fn=step_fn,
         n_mcmc_steps=1,
@@ -259,25 +235,6 @@ class TestBucketShrinkInLoop:
             shrink_dwell=2, shrink_margin=0, ladder=self.LADDER, offset=0,
         )
         assert int(result.population.max_neighbors) == 30
-
-    def test_spike_resets_streak(self):
-        """A single iteration with a high observed peak resets ``low_count``."""
-        ns_state, step_fn, _backend = _build_ns_state(n_walkers=4, n_atoms=2)
-        ns_state = ns_state.set(
-            population=ns_state.population.set(max_neighbors=50),
-        )
-        # 1st step: low (5).  2nd step: spike (46) — would fail the gap
-        # for next-smaller=45 with margin=0 since 46 > 45.  3rd step: low.
-        # With dwell=3, the spike at step 2 resets the streak and only one
-        # low step remains by the end of 3 iterations → no shrink.
-        wrapped = _wrap_step_fn_with_spike(
-            step_fn, low=5, high=46, spike_at=2,
-        )
-        result = _run_loop_minimal(
-            ns_state, wrapped, n_iters=3,
-            shrink_dwell=3, shrink_margin=0, ladder=self.LADDER, offset=0,
-        )
-        assert int(result.population.max_neighbors) == 50
 
     def test_margin_can_block_shrink_at_boundary(self):
         """A margin gap prevents shrinking when the observed peak sits right
@@ -352,6 +309,34 @@ class TestBucketManagerDirect:
         assert int(retried.population.max_neighbors) == 45
         # Most important invariant: growing wiped the streak.
         assert mgr.low_count == 0
+
+    def test_spike_resets_streak(self):
+        """A single high observed peak resets ``low_count`` mid-streak.
+
+        Drives ``BucketManager.maybe_shrink`` directly with three observed
+        peaks (5, 46, 5) under ``dwell=3, margin=0`` on the (30,35,40,45,50)
+        ladder starting at bucket=50.  Iter 0 (obs=5) increments the streak
+        to 1; iter 1 (obs=46) fails the gap below the next-smaller bucket 45
+        and resets the streak to 0; iter 2 (obs=5) raises it to 1 again.  Net:
+        no shrink, bucket stays at 50.
+
+        Implemented as a direct ``BucketManager`` drive rather than as a
+        ``_run_loop`` integration to sidestep ``jax.jit`` tracing — Python
+        side-channel state in a wrapped ``step_fn`` does not survive
+        compilation.
+        """
+        mgr = BucketManager(self.LADDER, offset=0, shrink_dwell=3,
+                            shrink_margin=0)
+        st = self._stub_state(bucket=50, observed=5)
+        st = mgr.maybe_shrink(st, iteration=0)
+        assert mgr.low_count == 1
+        st = self._stub_state(bucket=int(st.population.max_neighbors), observed=46)
+        st = mgr.maybe_shrink(st, iteration=1)
+        assert mgr.low_count == 0
+        st = self._stub_state(bucket=int(st.population.max_neighbors), observed=5)
+        st = mgr.maybe_shrink(st, iteration=2)
+        assert mgr.low_count == 1
+        assert int(st.population.max_neighbors) == 50
 
     def test_shrink_fires_after_dwell(self):
         mgr = BucketManager(self.LADDER, offset=0, shrink_dwell=2,

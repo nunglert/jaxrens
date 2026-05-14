@@ -90,12 +90,19 @@ class TestAccRatesLoggerRoundTrip:
         np.testing.assert_array_equal(loaded.n_accepted[0, 0], [10, 20])
 
     def test_flush_boundary(self, tmp_path):
-        from jaxrens.io.acc_rates_log import _FLUSH_INTERVAL
-
-        n_entries = _FLUSH_INTERVAL + 5
+        # Force at least two mid-run flushes: with flush_interval=50 the
+        # auto-flush condition fires every 50 iterations, so iterating
+        # over 130 absolute iters yields 2 mid-run flushes + close().
+        flush_interval = 50
+        n_entries = 130
         n_moves = 2
         path = tmp_path / "flush.h5"
-        log = AccRatesLogger(path=path, move_names=["x", "y"], n_runs=1)
+        log = AccRatesLogger(
+            path=path,
+            move_names=["x", "y"],
+            n_runs=1,
+            flush_interval=flush_interval,
+        )
         for i in range(n_entries):
             log.write_entry(
                 i,

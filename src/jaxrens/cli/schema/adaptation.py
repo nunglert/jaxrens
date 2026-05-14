@@ -89,6 +89,7 @@ class AdaptationSpec(BaseModel):
     adjust_interval: int | float = 0
     adjust_n_samples: int = 50
     adjust_max_rounds: int = 15
+    trial_batch_size: int | None = None
     defaults: AdaptationPolicy = Field(default_factory=AdaptationPolicy)
     per_move: dict[str, AdaptationPolicy] = Field(default_factory=dict)
 

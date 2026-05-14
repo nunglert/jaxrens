@@ -14,8 +14,6 @@ The ``batcher`` argument routes the run-axis dispatch:
 
 Parallelism axes:
     walker_batch_size: chunk the walker vmap via lax.map(batch_size=N).
-    run_batch_size: chunk the run vmap via lax.map(batch_size=M).  Only
-        applies to ``VmapRuns``; ignored for SingleRun and PmapVmapRuns.
 """
 
 from __future__ import annotations
@@ -27,7 +25,7 @@ from typing import Any, Callable
 import jax
 import jax.numpy as jnp
 
-from jaxrens.sampling.adaptation.manager import AdaptationManager
+from jaxrens.sampling.adaptation.manager import build_adapt_step
 from jaxrens.sampling.batch_descriptor import (
     BatchDescriptor,
     SingleRun,
@@ -147,7 +145,6 @@ def initial_walk(
     batcher: BatchDescriptor | None = None,
     batched: bool | None = None,  # deprecated; pass ``batcher`` instead
     walker_batch_size: int | None = None,
-    run_batch_size: int | None = None,
     per_move_fns: list[Callable] | None = None,
     adaptation_policies: tuple | None = None,
     adjust_n_samples: int = 50,
@@ -166,9 +163,6 @@ def initial_walk(
         walker_batch_size=None: vmap over all walkers simultaneously (fastest).
         walker_batch_size=N: chunk via lax.map(batch_size=N). Any positive
             int; non-divisors are handled internally by padding.
-        run_batch_size=None: vmap over all runs simultaneously (VmapRuns only).
-        run_batch_size=M: chunk via lax.map(batch_size=M). Must divide n_runs.
-            Ignored for SingleRun and PmapVmapRuns.
 
     Args:
         key: JAX PRNG key.
@@ -192,8 +186,6 @@ def initial_walk(
             ``batcher`` instead.
         walker_batch_size: Chunk size for walker vmap. None = full vmap.
             Any positive int; non-divisors are handled internally by padding.
-        run_batch_size: Chunk size for run vmap (VmapRuns only). None =
-            full vmap over runs. Must divide n_runs evenly.
         per_move_fns: Per-move step functions (third return of build_mwg).
             Required for step-size adaptation; None disables it.
         adaptation_policies: Tuple of ResolvedAdaptationPolicy, one per move.
@@ -218,9 +210,6 @@ def initial_walk(
     Returns:
         New NSState with live walkers advanced. Same pytree shape as input.
         Dead-point arrays, log_evidence, iteration, n_dead are unchanged.
-
-    Raises:
-        ValueError: If run_batch_size does not evenly divide n_runs.
     """
     if batched is not None:
         warnings.warn(
@@ -244,18 +233,7 @@ def initial_walk(
     if n_walks == 0:
         return ns_state
 
-    # --- Validate chunking parameters ---
     n_walkers = int(ns_state.population.energy.shape[batcher.walker_axis])
-    if (
-        isinstance(batcher, VmapRuns)
-        and run_batch_size is not None
-        and batcher.n_runs % run_batch_size != 0
-    ):
-        raise ValueError(
-            f"run_batch_size={run_batch_size} does not evenly divide "
-            f"n_runs={batcher.n_runs}. "
-            f"Choose a divisor of {batcher.n_runs}."
-        )
 
     # --- Compute fixed Emax (per replica) ---
     population = ns_state.population
@@ -270,24 +248,24 @@ def initial_walk(
     )
 
     if use_adaptation:
-        # ``AdaptationManager`` only reads ``name``/``min_rate``/
+        # ``build_adapt_step`` only reads ``name``/``min_rate``/
         # ``max_rate``/``step_size_max`` from each move descriptor.
         # Burn-in receives ``ResolvedAdaptationPolicy`` (no ``name``);
         # construct a real :class:`MoveKernel` with a no-op
-        # ``build_kernel`` (the manager never calls it — only reads the
+        # ``build_kernel`` (the builder never calls it — only reads the
         # four rate/cap fields).  ``MoveKernel`` is a frozen dataclass
         # with strict beartype-checked typing on its sequence
         # consumers, so a real instance is required.  Per-move
-        # ``adjust_factor`` collapses to a single value (the manager's
+        # ``adjust_factor`` collapses to a single value (the builder's
         # contract) — burn-in adopts the first policy's factor,
-        # mirroring how the NS-loop manager is constructed in
+        # mirroring how the NS-loop adapt step is constructed in
         # ``cli/run.py``.
         from jaxrens.sampling.move_kernel import MoveKernel
 
         def _noop_build_kernel(*_args, **_kwargs):  # pragma: no cover
             raise RuntimeError(
                 "burn-in's MoveKernel shim build_kernel was invoked — "
-                "AdaptationManager should only read static fields."
+                "build_adapt_step should only read static fields."
             )
 
         descs = [
@@ -301,10 +279,10 @@ def initial_walk(
             for i, p in enumerate(adaptation_policies)
         ]
         adjust_factor = float(adaptation_policies[0].adjust_factor)
-        # Propagate ``walker_batch_size`` as ``trial_batch_size`` and
-        # ``run_batch_size`` (VmapRuns chunked-adapt).  Both are
-        # zero-overhead when ``None``.
-        adapt_mgr = AdaptationManager(
+        # Propagate burn-in's ``walker_batch_size`` to the adapt step as
+        # ``trial_batch_size`` — same memory motivation (chunk the per-
+        # round trial vmap).  Zero-overhead when ``None``.
+        adapt_step = build_adapt_step(
             move_descriptors=descs,
             per_move_fns=per_move_fns,
             batcher=batcher,
@@ -313,39 +291,20 @@ def initial_walk(
             adjust_max_rounds=adjust_max_rounds,
             adjust_interval=adjust_interval,
             trial_batch_size=walker_batch_size,
-            run_batch_size=run_batch_size,
         )
     else:
-        adapt_mgr = None
+        adapt_step = None
 
     # --- Build one-walk function via the descriptor ---
-    # Per-replica callable; ``wrap_for_batch`` adds the right jit/vmap/pmap
-    # composition for the chosen descriptor.  ``run_batch_size`` (chunked
-    # vmap along the run axis) is only meaningful for ``VmapRuns`` — for
-    # SingleRun there is no run axis, and for PmapVmapRuns the replicas are
-    # already split by GPU.  The chunked path is left explicit below.
+    # ``wrap_for_batch`` adds the right jit / vmap / pmap composition for
+    # the chosen descriptor (identity for SingleRun, vmap for VmapRuns,
+    # pmap-of-vmap for PmapVmapRuns).
     def _per_replica(k, run_state, run_emax):
         return _one_walk(
             k, run_state, step_fn, walklength, run_emax, walker_batch_size,
         )
 
-    use_chunked_run_vmap = (
-        run_batch_size is not None and isinstance(batcher, VmapRuns)
-    )
-    if use_chunked_run_vmap:
-        # VmapRuns + run_batch_size: chunked run-axis lax.map (the only
-        # path that wants a SCALAR key — the chunk wrapper splits
-        # internally and feeds per-replica keys to ``_per_replica``).
-        def _chunked_walk(key_in, batched_state, batched_emax):
-            run_keys = jax.random.split(key_in, batcher.n_runs)
-            return jax.lax.map(
-                lambda x: _per_replica(x[0], x[1], x[2]),
-                (run_keys, batched_state, batched_emax),
-                batch_size=run_batch_size,
-            )
-        jit_one_walk = jax.jit(_chunked_walk)
-    else:
-        jit_one_walk = batcher.wrap_for_batch(_per_replica)
+    jit_one_walk = batcher.wrap_for_batch(_per_replica)
 
     # Bucket-ladder manager shared with ``_run_loop``.  Growth always
     # active; shrink path opt-in via ``shrink_dwell > 0``.
@@ -359,23 +318,19 @@ def initial_walk(
     # --- Outer walk loop (while-loop so overflow retries don't advance walk_i) ---
     walk_i = 0
     while walk_i < n_walks:
-        if use_adaptation and walk_i > 0 and walk_i % adjust_interval == 0:
+        if adapt_step is not None and walk_i > 0 and walk_i % adjust_interval == 0:
             key, key_adapt = jax.random.split(key)
-            ns_state, _diag, _new_key = adapt_mgr.apply_to_state(
+            ns_state, _diag, _new_key = adapt_step(
                 ns_state, emax, key_adapt,
             )
 
         key, sub = jax.random.split(key)
 
-        if use_chunked_run_vmap:
-            # Chunked path: scalar key, internal per-replica split.
-            new_ns_state, _ = jit_one_walk(sub, ns_state, emax)
-        else:
-            # ``distinct_keys`` returns shape_prefix-shaped INDEPENDENT
-            # keys (scalar for SingleRun) on the right mesh per
-            # batcher.  Each replica/shard walks its own walkers.
-            walk_keys = batcher.distinct_keys(sub)
-            new_ns_state, _ = jit_one_walk(walk_keys, ns_state, emax)
+        # ``distinct_keys`` returns shape_prefix-shaped INDEPENDENT keys
+        # (scalar for SingleRun) on the right mesh per batcher.  Each
+        # replica/shard walks its own walkers.
+        walk_keys = batcher.distinct_keys(sub)
+        new_ns_state, _ = jit_one_walk(walk_keys, ns_state, emax)
 
         # Bucket overflow → grow and retry the same walk.  JAX re-traces
         # ``jit_one_walk`` automatically because ``max_neighbors`` is a

@@ -22,7 +22,7 @@ import numpy as np
 from jaxtyping import Array, Float, Int, Key
 
 from jaxrens.base import NSCallback
-from jaxrens.sampling.adaptation.manager import AdaptationManager
+from jaxrens.sampling.adaptation.manager import build_adapt_step
 from jaxrens.sampling.batch_descriptor import PmapVmapRuns, ShardedSingleRun, SingleRun, VmapRuns
 from jaxrens.sampling.inter_re_manager import InterREManager
 from jaxrens.sampling.moves.replica_exchange import PressureRENSSwap, SemiGrandSwap, XRENSSwap
@@ -529,13 +529,22 @@ def ns_step_sharded(
         :func:`ns_step`.
     """
     # Fires once per cache miss; same rationale as in ``ns_step`` above.
+    _leaves_flat, _tdef = jax.tree_util.tree_flatten(ns_state)
+    def _fmt(v):
+        return (
+            f"{getattr(v, 'shape', '?')}:{getattr(v, 'dtype', type(v).__name__)}"
+            f"{'(weak)' if getattr(v, 'weak_type', False) else ''}"
+        )
+    _leaf_str = "  ".join(_fmt(v) for v in _leaves_flat)
     logger.info(
         "ns_step_sharded tracing: pop_shape=%s  max_neighbors=%d  "
-        "n_mcmc=%d  n_extra=%d",
+        "n_mcmc=%d  n_extra=%d  n_leaves=%d  leaves=[%s]",
         ns_state.population.positions.shape,
         int(ns_state.population.max_neighbors),
         int(n_mcmc_steps),
         int(n_extra),
+        len(_leaves_flat),
+        _leaf_str,
     )
     pop_local = ns_state.population
     key = ns_state.rng_key
@@ -762,6 +771,7 @@ def run_ns(
     adjust_n_samples: int = 50,
     adjust_max_rounds: int = 15,
     adjust_factor: float = 1.5,
+    trial_batch_size: int | None = None,
     restart_state=None,
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
@@ -772,7 +782,7 @@ def run_ns(
     """Run a full nested sampling calculation.
 
     Thin wrapper: validates args, initialises NSState, constructs
-    descriptor + AdaptationManager, delegates to ``_run_loop``, and
+    descriptor + adapt_step, delegates to ``_run_loop``, and
     packages the result dict (live state + scalars only — dead-point
     history is persisted to disk by the per-iteration callbacks, not
     returned).
@@ -825,7 +835,7 @@ def run_ns(
     )
 
     batcher = SingleRun()
-    adapt_mgr = AdaptationManager(
+    adapt_step = build_adapt_step(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,
         batcher=batcher,
@@ -833,11 +843,13 @@ def run_ns(
         adjust_factor=adjust_factor,
         adjust_max_rounds=adjust_max_rounds,
         adjust_interval=adjust_interval,
+        trial_batch_size=trial_batch_size,
     )
 
     ns_state, rng_key, _cumulative = _run_loop(
         batcher=batcher,
-        adapt_mgr=adapt_mgr,
+        adapt_step=adapt_step,
+        adjust_interval=adjust_interval,
         ns_state=ns_state,
         step_fn=step_fn,
         n_mcmc_steps=n_mcmc_steps,
@@ -967,6 +979,7 @@ def run_ns_parallel(
     adjust_n_samples: int = 50,
     adjust_max_rounds: int = 15,
     adjust_factor: float = 1.5,
+    trial_batch_size: int | None = None,
     restart_states: list | None = None,
     inter_re_config=None,
     backend=None,
@@ -980,7 +993,7 @@ def run_ns_parallel(
     """Run multiple NS calculations in parallel via vmap(ns_step).
 
     Thin wrapper: validates args, initialises batched NSState, constructs
-    VmapRuns descriptor + AdaptationManager, delegates to ``_run_loop``,
+    VmapRuns descriptor + adapt_step, delegates to ``_run_loop``,
     and packages the result dict.
 
     Args:
@@ -1053,7 +1066,7 @@ def run_ns_parallel(
     )
 
     batcher = VmapRuns(n_runs=n_runs)
-    adapt_mgr = AdaptationManager(
+    adapt_step = build_adapt_step(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,
         batcher=batcher,
@@ -1061,6 +1074,7 @@ def run_ns_parallel(
         adjust_factor=adjust_factor,
         adjust_max_rounds=adjust_max_rounds,
         adjust_interval=adjust_interval,
+        trial_batch_size=trial_batch_size,
     )
 
     # Construct InterREManager when inter_re_config is provided.
@@ -1147,12 +1161,13 @@ def run_ns_parallel(
         )
 
     # Per-run PRNG keys used during adaptation (independent of ns_states.rng_key).
-    # _run_loop will consume and advance these via adapt_mgr.
+    # _run_loop will consume and advance these via adapt_step.
     adapt_keys = jax.vmap(lambda k: jax.random.split(k)[0])(rng_keys)  # (n_runs,)
 
     ns_states, adapt_keys, _cumulative = _run_loop(
         batcher=batcher,
-        adapt_mgr=adapt_mgr,
+        adapt_step=adapt_step,
+        adjust_interval=adjust_interval,
         ns_state=ns_states,
         step_fn=step_fn,
         n_mcmc_steps=n_mcmc_steps,
@@ -1460,6 +1475,7 @@ def run_ns_multi_gpu(
     adjust_n_samples: int = 50,
     adjust_max_rounds: int = 15,
     adjust_factor: float = 1.5,
+    trial_batch_size: int | None = None,
     restart_states: list[list] | None = None,
     inter_re_config=None,
     backend=None,
@@ -1616,7 +1632,7 @@ def run_ns_multi_gpu(
             f"n_per_gpu={n_per_gpu}. Pass either form, not both with "
             f"conflicting values."
         )
-    adapt_mgr = AdaptationManager(
+    adapt_step = build_adapt_step(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,
         batcher=batcher,
@@ -1624,6 +1640,7 @@ def run_ns_multi_gpu(
         adjust_factor=adjust_factor,
         adjust_max_rounds=adjust_max_rounds,
         adjust_interval=adjust_interval,
+        trial_batch_size=trial_batch_size,
     )
 
     # Construct InterREManager when inter_re_config is provided.
@@ -1714,7 +1731,8 @@ def run_ns_multi_gpu(
 
     ns_states, adapt_keys, _cumulative = _run_loop(
         batcher=batcher,
-        adapt_mgr=adapt_mgr,
+        adapt_step=adapt_step,
+        adjust_interval=adjust_interval,
         ns_state=ns_states,
         step_fn=step_fn,
         n_mcmc_steps=n_mcmc_steps,
@@ -1804,6 +1822,7 @@ def run_ns_sharded(
     adjust_n_samples: int = 50,
     adjust_max_rounds: int = 15,
     adjust_factor: float = 1.5,
+    trial_batch_size: int | None = None,
     restart_state=None,
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
@@ -1919,7 +1938,7 @@ def run_ns_sharded(
             f"with explicit n_gpu={n_gpu}."
         )
 
-    adapt_mgr = AdaptationManager(
+    adapt_step = build_adapt_step(
         move_descriptors=move_descriptors or [],
         per_move_fns=per_move_fns,
         batcher=batcher,
@@ -1927,9 +1946,10 @@ def run_ns_sharded(
         adjust_factor=adjust_factor,
         adjust_max_rounds=adjust_max_rounds,
         adjust_interval=adjust_interval,
+        trial_batch_size=trial_batch_size,
     )
 
-    # AdaptationManager.apply expects rng_key shape == shape_prefix.  For
+    # ``adapt_step`` expects rng_key shape == shape_prefix.  For
     # ShardedSingleRun shape_prefix == (n_gpu,) so we need a (G,) key.
     # All shards must see identical decisions → broadcast the same key.
     adapt_key = jax.random.split(rng_key)[0]
@@ -1939,7 +1959,8 @@ def run_ns_sharded(
     # of the default ``ns_step``) when calling ``batcher.wrap_step``.
     ns_state, _adapt_keys_out, _cumulative = _run_loop(
         batcher=batcher,
-        adapt_mgr=adapt_mgr,
+        adapt_step=adapt_step,
+        adjust_interval=adjust_interval,
         ns_state=ns_state,
         step_fn=step_fn,
         n_mcmc_steps=n_mcmc_steps,

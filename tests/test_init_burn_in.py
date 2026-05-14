@@ -10,8 +10,8 @@ Covers:
 - Adaptation disabled (per_move_fns=None) runs without error
 - Batched (multi-run): output shape + run independence
 
-Walker/run chunking tests (walker_batch_size, run_batch_size, combined,
-trial-vmap chunking inside adjust_step_size) live in
+Walker-axis chunking tests (``walker_batch_size`` in ``_one_walk`` and
+its carry-through to the adapt step's ``trial_batch_size``) live in
 ``test_init_burn_in_chunking.py``.
 """
 
@@ -351,8 +351,24 @@ class TestJIT:
 # ---------------------------------------------------------------------------
 
 class TestAdaptationCallCount:
-    """Burn-in delegates adaptation to ``AdaptationManager``; mock its
-    ``.apply`` to count fires."""
+    """Burn-in delegates adaptation to ``build_adapt_step``; we patch the
+    builder to return a counting stub closure."""
+
+    @staticmethod
+    def _stub_builder(call_count):
+        """Return a ``build_adapt_step`` patch that yields a counting closure.
+
+        The closure is a no-op on the population state — it just increments
+        ``call_count[0]`` and returns its inputs.  Drop-in for the real
+        builder's contract: ``(ns_state, emax, key) -> (ns_state, {}, key)``.
+        """
+        def patched_builder(*_args, **_kwargs):
+            def stub_adapt_step(ns_state, emax, rng_key):
+                call_count[0] += 1
+                return ns_state, {}, rng_key
+            return stub_adapt_step
+
+        return patched_builder
 
     def test_adjust_called_correct_number_of_times(self):
         """With n_walks=5 and adjust_interval=2, adaptation fires at walks 2 and 4."""
@@ -369,14 +385,10 @@ class TestAdaptationCallCount:
 
         adapt_call_count = [0]
 
-        def stub_apply(self, pop, emax, rng_key, current_step_sizes):
-            adapt_call_count[0] += 1
-            return current_step_sizes, {}, rng_key
-
         import unittest.mock as mock
         with mock.patch(
-            "jaxrens.sampling.adaptation.manager.AdaptationManager.apply",
-            new=stub_apply,
+            "jaxrens.init.burn_in.build_adapt_step",
+            new=self._stub_builder(adapt_call_count),
         ):
             initial_walk(
                 jax.random.key(0),
@@ -408,14 +420,10 @@ class TestAdaptationCallCount:
 
         adapt_call_count = [0]
 
-        def stub_apply(self, pop, emax, rng_key, current_step_sizes):
-            adapt_call_count[0] += 1
-            return current_step_sizes, {}, rng_key
-
         import unittest.mock as mock
         with mock.patch(
-            "jaxrens.sampling.adaptation.manager.AdaptationManager.apply",
-            new=stub_apply,
+            "jaxrens.init.burn_in.build_adapt_step",
+            new=self._stub_builder(adapt_call_count),
         ):
             initial_walk(
                 jax.random.key(0),

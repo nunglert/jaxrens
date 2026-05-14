@@ -146,6 +146,7 @@ def test_run_ns_sharded_matches_single_run(n_gpu):
     )
 
 
+@pytest.mark.skipif(N_LOCAL < 2, reason="requires 2 local devices")
 def test_init_ns_sharded_divisibility_error():
     """``init_ns_sharded`` rejects K not divisible by n_gpu."""
     setup = _make_harmonic_problem(seed=0, n_walkers=7)
@@ -161,6 +162,7 @@ def test_init_ns_sharded_divisibility_error():
         )
 
 
+@pytest.mark.skipif(N_LOCAL < 2, reason="requires 2 local devices")
 def test_run_ns_sharded_divisibility_error():
     """``run_ns_sharded`` rejects K not divisible by n_gpu."""
     setup = _make_harmonic_problem(seed=0, n_walkers=7)
@@ -438,26 +440,26 @@ def test_burn_in_sharded_g2_step_sizes_equal_across_shards():
 
 
 # ---------------------------------------------------------------------------
-# AdaptationManager.trial_batch_size + run_batch_size parity
+# build_adapt_step.trial_batch_size parity
 # ---------------------------------------------------------------------------
 
 
-def test_adaptation_manager_trial_batch_size_matches_full_vmap():
-    """``AdaptationManager(trial_batch_size=N)`` results match ``trial_batch_size=None``.
+def test_adapt_step_trial_batch_size_matches_full_vmap():
+    """``build_adapt_step(trial_batch_size=N)`` results match ``trial_batch_size=None``.
 
     Pins the chunked-trial-vmap path's correctness on the cheapest
     batcher (``SingleRun``) at a divisor chunk size.  Ensures the
-    closure that propagates ``trial_batch_size`` to ``adjust_step_size``
+    closure that propagates ``trial_batch_size`` to ``_one_bisection_round``
     doesn't perturb the result.
     """
-    from jaxrens.sampling.adaptation.manager import AdaptationManager
+    from jaxrens.sampling.adaptation.manager import build_adapt_step
 
     setup = _make_harmonic_problem(seed=4, n_walkers=8)
-    pop = init_ns(
+    ns_state = init_ns(
         setup["init_fn"],
         setup["positions"], setup["types"], setup["energies"],
         None, jax.random.key(0),
-    ).population
+    )
 
     common = dict(
         move_descriptors=setup["descriptors"],
@@ -469,14 +471,24 @@ def test_adaptation_manager_trial_batch_size_matches_full_vmap():
         adjust_interval=1,
     )
 
-    mgr_full = AdaptationManager(**common)
-    mgr_chunked = AdaptationManager(trial_batch_size=4, **common)
+    adapt_full = build_adapt_step(**common)
+    adapt_chunked = build_adapt_step(trial_batch_size=4, **common)
 
-    emax = jnp.max(pop.energy) + 1.0
+    emax = jnp.max(ns_state.population.energy) + 1.0
     key = jax.random.key(0)
     init_ss = jnp.array([0.2])
+    ns_state = ns_state.set(
+        population=ns_state.population.set(
+            step_sizes=jnp.broadcast_to(
+                init_ss[None, :],
+                ns_state.population.step_sizes.shape,
+            ),
+        ),
+    )
 
-    ss_full, _, _ = mgr_full.apply(pop, emax, key, init_ss)
-    ss_chunked, _, _ = mgr_chunked.apply(pop, emax, key, init_ss)
+    state_full, _, _ = adapt_full(ns_state, emax, key)
+    state_chunked, _, _ = adapt_chunked(ns_state, emax, key)
 
+    ss_full = state_full.population.step_sizes[0]
+    ss_chunked = state_chunked.population.step_sizes[0]
     np.testing.assert_allclose(ss_full, ss_chunked, rtol=1e-5)

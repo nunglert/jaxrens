@@ -47,12 +47,18 @@ class TestRELoggerRoundTrip:
         np.testing.assert_array_equal(loaded.n_attempted_per_pair, n_att)
 
     def test_buffer_flush_threshold(self, tmp_path):
-        # Force at least one buffer flush mid-run (>_FLUSH_INTERVAL=256).
+        # Force at least one mid-run flush: with flush_interval=50, a
+        # flush fires once iter advances by 50 absolute iters.
         n_entries, n_pairs = 300, 2
         iters, n_acc, n_att = _make_counts(n_entries, n_pairs, seed=1)
         path = tmp_path / "re.h5"
 
-        log = RELogger(path=path, n_pairs=n_pairs, flavor="xrens")
+        log = RELogger(
+            path=path,
+            n_pairs=n_pairs,
+            flavor="xrens",
+            flush_interval=50,
+        )
         for i in range(n_entries):
             log.write_entry(int(iters[i]), n_acc[i], n_att[i])
         # Mid-run, the file should already exist after the first auto-flush.

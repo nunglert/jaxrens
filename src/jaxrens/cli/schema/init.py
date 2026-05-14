@@ -30,14 +30,11 @@ class InitialWalkSpec(BaseModel):
     ``init_ns`` and ``run_ns`` to decorrelate the live-walker population from
     initialization artifacts.  Burn-in is skipped for Mode D (restart) runs.
 
-    Memory-control knobs:
+    Memory-control knob:
         ``walker_batch_size``: chunk the per-walker vmap via ``lax.map``.
             ``None`` = full vmap over all walkers (default; fastest).
             Any positive int; non-divisors of ``n_walkers`` are handled
             internally by padding.
-        ``run_batch_size``: chunk the per-run vmap when ``batched=True``.
-            ``None`` = full vmap over all runs (default).
-            Must divide ``n_runs`` evenly. Ignored for single-run configs.
 
     Deferred fields:
         ``write_initial_walkers``: accepted but not yet consumed by the runtime.
@@ -59,14 +56,6 @@ class InitialWalkSpec(BaseModel):
             "None = full vmap over all walkers (max speed). "
             "Any positive int; non-divisors of n_walkers are padded "
             "internally."
-        ),
-    )
-    run_batch_size: int | None = Field(
-        default=None,
-        description=(
-            "Chunk runs during batched burn-in. "
-            "None = full vmap over all runs. "
-            "Must divide n_runs evenly."
         ),
     )
 
