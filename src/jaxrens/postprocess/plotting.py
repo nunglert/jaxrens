@@ -512,3 +512,114 @@ def plot_re_acceptance(
     ax.set_ylim(-0.05, 1.05)
     ax.legend()
     return ax
+
+
+def _resolve_max_neighbors_trace(monitor_or_trace):
+    """Accept either a Monitor or a MaxNeighborsLog; return the log."""
+    from jaxrens.io.max_neighbors_log import MaxNeighborsLog
+
+    if isinstance(monitor_or_trace, MaxNeighborsLog):
+        return monitor_or_trace
+    trace = getattr(monitor_or_trace, "max_neighbors_trace", None)
+    if trace is None:
+        raise ValueError(
+            "No max_neighbors_trace available.  Pass a MaxNeighborsLog "
+            "directly, or load a Monitor from a directory that contains a "
+            ".max_neighbors.h5 file (enable via output.save_max_neighbors=True)."
+        )
+    return trace
+
+
+def plot_max_neighbors(
+    monitor_or_trace,
+    *,
+    ax: "Axes | None" = None,
+    kind: str = "percentiles",
+    run: int = 0,
+    percentiles: tuple[float, ...] = (50.0, 90.0, 100.0),
+    show_bucket: bool = True,
+    **kwargs,
+) -> "Axes":
+    """Plot per-iteration neighbor-bucket diagnostics.
+
+    Two display modes:
+
+    * ``kind="percentiles"`` (default): line plot showing the requested
+      ``percentiles`` of the per-walker max_neighbor_count distribution
+      vs iteration.  Useful for "is the bucket too generous / too tight"
+      at a glance.
+    * ``kind="heatmap"``: 2-D histogram of (iteration, max_neighbor_count)
+      densities — closest to "the distribution per iteration" requested
+      by the user.  Cell color = log-count of walkers at that
+      (iteration, count) bin.
+
+    When ``show_bucket=True`` overlays the current bucket size as a
+    step line — handy for spotting the gap between observed peak and
+    the configured bucket.
+
+    Args:
+        monitor_or_trace: A Monitor with a non-None ``max_neighbors_trace``
+            *or* a ``MaxNeighborsLog`` instance.
+        ax: Existing axes to plot into.  Created if None.
+        kind: ``"percentiles"`` or ``"heatmap"``.
+        run: Run index for multi-run logs.  Default 0 (the only entry
+            for SingleRun).
+        percentiles: Percentiles to plot when ``kind="percentiles"``.
+            Defaults to (50, 90, 100) — median, p90, max.
+        show_bucket: Overlay the bucket-size step line.
+        **kwargs: Forwarded to ``ax.plot`` (percentiles) or
+            ``ax.pcolormesh`` (heatmap).
+
+    Returns:
+        The Axes object.
+    """
+    log = _resolve_max_neighbors_trace(monitor_or_trace)
+    if not (0 <= run < log.n_runs):
+        raise ValueError(
+            f"run={run} out of range for max_neighbors_trace with "
+            f"n_runs={log.n_runs}."
+        )
+
+    ax = _get_ax(ax)
+    iters = log.iterations  # (n_entries,)
+    counts = log.max_neighbor_count[:, run, :]  # (n_entries, n_walkers)
+    buckets = log.bucket_size[:, run]            # (n_entries,)
+
+    if kind == "percentiles":
+        for pct in percentiles:
+            vals = np.percentile(counts, pct, axis=-1)
+            ax.plot(iters, vals, label=f"p{int(pct)}", **kwargs)
+        ylabel = "max_neighbor_count (per-walker percentiles)"
+    elif kind == "heatmap":
+        # Build a 2-D histogram: x = iteration index in the log, y = count.
+        # Each (iter, walker) pair contributes one entry at (iter, count).
+        cmax = int(counts.max()) + 1
+        cmin = int(counts.min())
+        n_iter, n_walk = counts.shape
+        H = np.zeros((cmax - cmin + 1, n_iter), dtype=np.int64)
+        for i in range(n_iter):
+            vals, freq = np.unique(counts[i], return_counts=True)
+            H[vals - cmin, i] = freq
+        # log scale to make sparse bins visible.
+        with np.errstate(divide="ignore"):
+            H_log = np.log10(H, where=H > 0, out=np.full_like(H, np.nan, dtype=np.float64))
+        y_edges = np.arange(cmin, cmax + 2) - 0.5
+        x_edges = np.concatenate([iters, [iters[-1] + 1]]).astype(np.float64) - 0.5
+        ax.pcolormesh(x_edges, y_edges, H_log, **kwargs)
+        ylabel = "max_neighbor_count"
+    else:
+        raise ValueError(
+            f"kind must be 'percentiles' or 'heatmap', got {kind!r}."
+        )
+
+    if show_bucket:
+        ax.step(
+            iters, buckets, where="post",
+            label="bucket", color="k", linestyle="--", linewidth=1.0,
+        )
+
+    ax.set_xlabel("iteration")
+    ax.set_ylabel(ylabel)
+    if kind == "percentiles" or show_bucket:
+        ax.legend()
+    return ax

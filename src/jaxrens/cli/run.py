@@ -384,6 +384,23 @@ def run_from_config(
             interval=int(getattr(output_config, "acc_rates_interval", 1)),
         ))
 
+    if getattr(output_config, "save_max_neighbors", False):
+        from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
+        from jaxrens.cli.monitor import MaxNeighborsCallback
+
+        mn_log_path = (
+            working_dir / f"{output_config.out_file_prefix}.max_neighbors.h5"
+        )
+        mn_logger = MaxNeighborsLogger(
+            path=mn_log_path,
+            n_runs=1,
+            n_walkers=ns_config.n_live,
+        )
+        callbacks.append(MaxNeighborsCallback(
+            mn_logger,
+            interval=int(getattr(output_config, "max_neighbors_interval", 1)),
+        ))
+
     first_mc = move_config[0] if isinstance(move_config, list) else move_config
 
     key = jax.random.key(ns_config.seed)
@@ -456,6 +473,8 @@ def run_from_config(
             adjust_max_rounds=getattr(adaptation_config, "adjust_max_rounds", 15) if adaptation_config is not None else 15,
             max_neighbors_list=tuple(backend_config.max_neighbors_list),
             max_neighbors_offset=backend_config.max_neighbors_offset,
+            max_neighbors_shrink_dwell=backend_config.max_neighbors_shrink_dwell,
+            max_neighbors_shrink_margin=backend_config.max_neighbors_shrink_margin,
         )
 
         # Extract burned-in walker arrays to re-seed run_ns.
@@ -523,6 +542,8 @@ def run_from_config(
         restart_state=restart_state,
         max_neighbors_list=tuple(backend_config.max_neighbors_list),
         max_neighbors_offset=backend_config.max_neighbors_offset,
+        max_neighbors_shrink_dwell=backend_config.max_neighbors_shrink_dwell,
+        max_neighbors_shrink_margin=backend_config.max_neighbors_shrink_margin,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
         **full_auto_kwargs,
     )
@@ -664,6 +685,8 @@ def run_multi_gpu_from_config(resolved) -> dict:
             adjust_max_rounds=getattr(resolved.adaptation_cfg, "adjust_max_rounds", 15),
             max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
             max_neighbors_offset=resolved.backend.max_neighbors_offset,
+            max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
+            max_neighbors_shrink_margin=resolved.backend.max_neighbors_shrink_margin,
         )
         pop = ns_state_burn.population
         # Burn-in operated on (G, P, K, ...) state via the PmapVmapRuns batcher.
@@ -786,6 +809,23 @@ def run_multi_gpu_from_config(resolved) -> dict:
             interval=int(getattr(resolved.output, "acc_rates_interval", 1)),
         ))
 
+    if getattr(resolved.output, "save_max_neighbors", False):
+        from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
+        from jaxrens.cli.monitor import MaxNeighborsCallback
+
+        mn_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.max_neighbors.h5"
+        )
+        mn_logger = MaxNeighborsLogger(
+            path=mn_log_path,
+            n_runs=n_total,
+            n_walkers=n_live,
+        )
+        callbacks.append(MaxNeighborsCallback(
+            mn_logger,
+            interval=int(getattr(resolved.output, "max_neighbors_interval", 1)),
+        ))
+
     # Per-fire inter-RE swap counts (multi-run + inter_re only).
     if (
         resolved.inter_re_config is not None
@@ -852,6 +892,8 @@ def run_multi_gpu_from_config(resolved) -> dict:
         backend=base_backend,
         max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
         max_neighbors_offset=resolved.backend.max_neighbors_offset,
+        max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
+        max_neighbors_shrink_margin=resolved.backend.max_neighbors_shrink_margin,
         initial_max_neighbor_counts=post_burn_in_counts,
         batcher=resolved.batcher,
         **full_auto_kwargs,
@@ -978,6 +1020,8 @@ def run_sharded_from_config(resolved) -> dict:
             ),
             max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
             max_neighbors_offset=resolved.backend.max_neighbors_offset,
+            max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
+            max_neighbors_shrink_margin=resolved.backend.max_neighbors_shrink_margin,
         )
 
         # Flatten sharded (G, K/G, ...) population back to (K, ...) so the
@@ -1074,6 +1118,23 @@ def run_sharded_from_config(resolved) -> dict:
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
 
+    if getattr(resolved.output, "save_max_neighbors", False):
+        from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
+        from jaxrens.cli.monitor import MaxNeighborsCallback
+
+        mn_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.max_neighbors.h5"
+        )
+        mn_logger = MaxNeighborsLogger(
+            path=mn_log_path,
+            n_runs=1,
+            n_walkers=n_live,
+        )
+        callbacks.append(MaxNeighborsCallback(
+            mn_logger,
+            interval=int(getattr(resolved.output, "max_neighbors_interval", 1)),
+        ))
+
     if resolved.move_descriptors and getattr(
         resolved.output, "save_acc_rates", False,
     ):
@@ -1138,6 +1199,8 @@ def run_sharded_from_config(resolved) -> dict:
         move_descriptors=list(resolved.move_descriptors),
         max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
         max_neighbors_offset=resolved.backend.max_neighbors_offset,
+        max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
+        max_neighbors_shrink_margin=resolved.backend.max_neighbors_shrink_margin,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
         batcher=batcher,
         **full_auto_kwargs,

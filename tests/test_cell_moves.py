@@ -606,3 +606,102 @@ class TestTF32PrecisionFix:
             f"Energy changed by {energy_diff:.3e} at ss=1e-20.  "
             "Expected bit-stable result — TF32 may be leaking through the matmul."
         )
+
+
+# ---------------------------------------------------------------------------
+# Regression: bucket-sizing signals are gated on ``cell_valid``
+# ---------------------------------------------------------------------------
+
+
+class _OverflowingBackend:
+    """Stub backend that always reports overflow + a large neighbor count.
+
+    Used to verify that cell moves do not let bucket-sizing signals leak
+    out of proposals that violated the cell-shape constraint.
+    """
+
+    r_cutoff = 0.0
+
+    def __init__(self, count: int = 999):
+        self._count = count
+
+    def __call__(self, positions, species, cell, max_neighbors=0,
+                 ensemble_params=None):
+        energy = jnp.sum(positions**2)
+        return energy, jnp.int32(self._count), jnp.bool_(True)
+
+
+_OVERFLOWING_BACKEND = _OverflowingBackend(count=999)
+
+
+_MOVE_BUILDERS = {
+    "volume": vol_build_kernel,
+    "shear": shear_build_kernel,
+    "stretch": stretch_build_kernel,
+}
+
+
+class TestCellInvalidOverflowGated:
+    """``state.overflow`` and ``state.max_neighbor_count`` must NOT be
+    poisoned by proposals that the chain cannot live at (cell-shape
+    rejections from max/min volume per atom or min aspect).
+
+    Without the ``cell_valid`` gate, hard-rejected proposals would force
+    the outer Python loop to permanently escalate the neighbor bucket
+    despite the chain never sampling near those configurations.
+    """
+
+    @pytest.mark.parametrize("move", ["volume", "shear", "stretch"])
+    def test_cell_invalid_does_not_set_overflow_or_count(
+        self, move, positions, types, cell,
+    ):
+        # Big step + extremely tight cell bounds → every proposal is
+        # cell-invalid, the backend reports overflow=True and count=999,
+        # but state must stay clean.
+        state = _make_cell_state(positions, types, energy=0.5,
+                                 cell=cell, step_size=10.0)
+        step = jax.jit(_MOVE_BUILDERS[move](
+            _OVERFLOWING_BACKEND, N_ATOMS,
+            max_vol_per_atom=63.0,
+            min_vol_per_atom=62.0,
+            min_aspect=0.999,
+        ))
+
+        for i in range(20):
+            key = jax.random.key(i)
+            state, info = step(key, state, likelihood_constraint=1e10)
+            # Cell rejection (reason 2 for shear/stretch, 2 for volume:
+            # priority is energy=1 > cell=2 > prior=3, and we set Emax
+            # to 1e10 so energy never trips).
+            assert not bool(info.accepted)
+
+        assert bool(state.overflow) is False, (
+            f"{move}: overflow leaked from a cell-invalid proposal"
+        )
+        assert int(state.max_neighbor_count) == 0, (
+            f"{move}: max_neighbor_count leaked from a cell-invalid proposal"
+        )
+
+    @pytest.mark.parametrize("move", ["volume", "shear", "stretch"])
+    def test_cell_valid_still_propagates_overflow(
+        self, move, positions, types, cell,
+    ):
+        # Loose bounds + tiny step → proposal cell is valid; the gate
+        # must NOT swallow the genuine overflow signal.
+        state = _make_cell_state(positions, types, energy=0.5,
+                                 cell=cell, step_size=1e-4)
+        step = jax.jit(_MOVE_BUILDERS[move](
+            _OVERFLOWING_BACKEND, N_ATOMS,
+            max_vol_per_atom=1000.0,
+            min_vol_per_atom=1.0,
+            min_aspect=0.5,
+        ))
+        key = jax.random.key(0)
+        new_state, info = step(key, state, likelihood_constraint=1e10)
+
+        assert bool(new_state.overflow) is True, (
+            f"{move}: overflow gate swallowed a legitimate cell-valid signal"
+        )
+        assert int(new_state.max_neighbor_count) == 999, (
+            f"{move}: max_neighbor_count gate dropped a cell-valid count"
+        )

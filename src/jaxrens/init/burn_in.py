@@ -33,7 +33,7 @@ from jaxrens.sampling.batch_descriptor import (
     SingleRun,
     VmapRuns,
 )
-from jaxrens.sampling.run_loop import _pick_next_bucket
+from jaxrens.sampling.bucket_manager import BucketManager
 from jaxrens.state.ns import NSState
 from jaxrens.utils.padding import pad_to_multiple
 
@@ -69,6 +69,18 @@ def _one_walk(
     Returns:
         (new_ns_state, last_accepted) where last_accepted is (n_walkers, walklength).
     """
+    # Fires once per cache miss; subsequent walks with identical shapes /
+    # static fields reuse the compiled binary and stay silent.  A second
+    # entry after iter-N indicates the burn-in bucket changed (overflow
+    # retry).
+    logger.info(
+        "burnin _one_walk tracing: pop_shape=%s  max_neighbors=%d  "
+        "walklength=%d  walker_batch_size=%s",
+        ns_state.population.positions.shape,
+        int(ns_state.population.max_neighbors),
+        int(walklength),
+        walker_batch_size,
+    )
     population = ns_state.population
     # Use the leading dim of the local population, not ``ns_state.n_walkers``.
     # ``n_walkers`` is a static field that holds the GLOBAL count (matters for
@@ -142,6 +154,8 @@ def initial_walk(
     adjust_max_rounds: int = 15,
     max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
+    max_neighbors_shrink_dwell: int = 0,
+    max_neighbors_shrink_margin: int | None = None,
 ) -> NSState:
     """Run fixed-Emax MCMC to decorrelate walkers from their initialization.
 
@@ -192,6 +206,14 @@ def initial_walk(
             Mirrors the NS-loop parameter of the same name.
         max_neighbors_offset: Headroom added to the observed peak when
             picking the next bucket.  Mirrors the NS-loop parameter.
+        max_neighbors_shrink_dwell: Hysteresis dwell window for downsizing
+            the bucket — see :class:`~jaxrens.sampling.bucket_manager.BucketManager`.
+            ``0`` (default) disables shrinking, preserving the existing
+            growth-only behaviour.  Mirrors the NS-loop parameter.
+        max_neighbors_shrink_margin: Hysteresis gap below the next-smaller
+            ladder entry that must hold for ``shrink_dwell`` iterations
+            before the bucket is shrunk.  ``None`` reuses
+            ``max_neighbors_offset``.  Mirrors the NS-loop parameter.
 
     Returns:
         New NSState with live walkers advanced. Same pytree shape as input.
@@ -325,6 +347,15 @@ def initial_walk(
     else:
         jit_one_walk = batcher.wrap_for_batch(_per_replica)
 
+    # Bucket-ladder manager shared with ``_run_loop``.  Growth always
+    # active; shrink path opt-in via ``shrink_dwell > 0``.
+    bucket_mgr = BucketManager(
+        ladder=max_neighbors_list,
+        offset=max_neighbors_offset,
+        shrink_dwell=max_neighbors_shrink_dwell,
+        shrink_margin=max_neighbors_shrink_margin,
+    )
+
     # --- Outer walk loop (while-loop so overflow retries don't advance walk_i) ---
     walk_i = 0
     while walk_i < n_walks:
@@ -346,32 +377,19 @@ def initial_walk(
             walk_keys = batcher.distinct_keys(sub)
             new_ns_state, _ = jit_one_walk(walk_keys, ns_state, emax)
 
-        # Neighbor-bucket overflow retry — mirrors run_loop.py:441-456.
-        # On overflow, roll back to the pre-walk ``ns_state`` (we have
-        # not committed ``new_ns_state`` yet), bump the bucket via
-        # ``_pick_next_bucket``, and retry the same walk.  ``walk_i`` is
-        # NOT advanced.  JAX re-traces ``jit_one_walk`` automatically on
-        # the next call because ``max_neighbors`` is a static field on
-        # the MCState pytree (state/mc_state.py).
-        if jnp.any(new_ns_state.population.overflow):
-            true_max = int(new_ns_state.population.max_neighbor_count.max())
-            current = int(ns_state.population.max_neighbors)
-            new_max = _pick_next_bucket(
-                true_max, current,
-                tuple(max_neighbors_list), max_neighbors_offset,
-            )
-            logger.warning(
-                "Overflow in burn-in walk %d: observed max_neighbors=%d, "
-                "resizing bucket %d -> %d (ladder=%s, offset=%d)",
-                walk_i, true_max, current, new_max,
-                list(max_neighbors_list), max_neighbors_offset,
-            )
-            ns_state = ns_state.set(
-                population=ns_state.population.set(max_neighbors=new_max),
-            )
-            continue  # retry same walk_i with the new bucket
+        # Bucket overflow → grow and retry the same walk.  JAX re-traces
+        # ``jit_one_walk`` automatically because ``max_neighbors`` is a
+        # static field on the MCState pytree.  Counter ``walk_i`` is not
+        # advanced.
+        ns_state, retry = bucket_mgr.grow_if_overflow(
+            ns_state, new_ns_state,
+            label="burn-in walk", iteration=walk_i,
+        )
+        if retry:
+            continue
 
-        ns_state = new_ns_state
+        # Optional shrink path — no-op when ``shrink_dwell == 0``.
+        ns_state = bucket_mgr.maybe_shrink(ns_state, iteration=walk_i)
         walk_i += 1
 
     return ns_state

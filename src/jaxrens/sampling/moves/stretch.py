@@ -75,12 +75,19 @@ def build_kernel(
             jnp.where(~energy_ok, jnp.int32(1), jnp.int32(2)),
         )
 
+        # See ``volume.py`` for the rationale: bucket-sizing signals are
+        # gated on ``cell_valid`` so hard cell-shape rejections (which the
+        # chain will never live at) don't permanently inflate the neighbor
+        # bucket.
         new_state = state.set(
             positions=jnp.where(accepted, new_positions, state.positions),
             energy=jnp.where(accepted, new_energy, state.energy),
             cell=jnp.where(accepted, new_cell, state.cell),
-            max_neighbor_count=jnp.maximum(state.max_neighbor_count, count),
-            overflow=state.overflow | overflow,
+            max_neighbor_count=jnp.maximum(
+                state.max_neighbor_count,
+                jnp.where(cell_valid, count, 0),
+            ),
+            overflow=state.overflow | (overflow & cell_valid),
         )
 
         info = MoveInfo(

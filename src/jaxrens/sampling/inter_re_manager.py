@@ -18,12 +18,15 @@ each iteration.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, TypedDict
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Key
+
+logger = logging.getLogger(__name__)
 
 from jaxrens.sampling.batch_descriptor import (
     BatchDescriptor,
@@ -222,6 +225,12 @@ class InterREManager:
             # XRENS path: requires composition_targets and backend.
             def _xrens_swap_fn(rng_key, positions, types, energies, cells,
                                emax, pressures, composition_targets):
+                # Cache-miss tracing log (fires only on first trace per signature).
+                logger.info(
+                    "inter_re tracing: flavor=xrens  pop_shape=%s  "
+                    "n_swap_cycles=%d",
+                    positions.shape, int(n_swap_cycles),
+                )
                 return xrens_replica_exchange_step(
                     rng_key=rng_key,
                     all_positions=positions,
@@ -240,6 +249,11 @@ class InterREManager:
             # Semi-grand path: requires chemical_potentials; zero backend calls.
             def _sg_swap_fn(rng_key, positions, types, energies, cells,
                             emax, pressures, chemical_potentials):
+                logger.info(
+                    "inter_re tracing: flavor=semi_grand  pop_shape=%s  "
+                    "n_swap_cycles=%d",
+                    positions.shape, int(n_swap_cycles),
+                )
                 return semi_grand_replica_exchange_step(
                     rng_key=rng_key,
                     all_positions=positions,
@@ -255,6 +269,11 @@ class InterREManager:
             jit_vmap = jax.jit(_sg_swap_fn)
         else:
             def _swap_fn(rng_key, positions, types, energies, cells, emax, pressures):
+                logger.info(
+                    "inter_re tracing: flavor=pressure  pop_shape=%s  "
+                    "n_swap_cycles=%d",
+                    positions.shape, int(n_swap_cycles),
+                )
                 return replica_exchange_step(
                     rng_key=rng_key,
                     all_positions=positions,

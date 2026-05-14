@@ -221,11 +221,16 @@ def init_ns(
     population = jax.tree.map(lambda *xs: jnp.stack(xs), *walkers)
 
     if restart_state is None:
-        log_evidence = jnp.array(-jnp.inf)
+        # ``dtype=jnp.float32`` removes the weak_type that ``jnp.array(<py float>)``
+        # would otherwise produce.  ``jnp.logaddexp(...)`` inside ``ns_step``
+        # returns a strongly-typed float, so without the explicit dtype here
+        # the cache key flips between the first call (weak) and the second
+        # (strong) and forces a redundant re-trace at iter 1.
+        log_evidence = jnp.array(-jnp.inf, dtype=jnp.float32)
         iteration = jnp.array(0, dtype=jnp.int32)
     else:
         rs = restart_state
-        log_evidence = jnp.array(rs.log_evidence)
+        log_evidence = jnp.array(rs.log_evidence, dtype=jnp.float32)
         iteration = jnp.array(rs.iteration, dtype=jnp.int32)
 
     state = NSState(
@@ -274,6 +279,34 @@ def ns_step(
     Returns:
         (updated_ns_state, info_dict).
     """
+    # Fires once per cache miss (i.e. once per distinct input signature).
+    # Subsequent calls with the same shapes / static fields reuse the JIT
+    # cache and never re-trace, so this stays quiet during normal stepping
+    # but surfaces every bucket bump, every batcher-shape change, etc.
+    #
+    # When two trace lines fire back-to-back with the same headline shape
+    # (a "double compile"), diff the ``leaves=`` summary below — the
+    # differing entry is the cache key that flipped.
+    # Dump every leaf's (shape, dtype, weak_type) — the JIT cache key
+    # depends on all three.  pytree structure changes show up as
+    # different total leaf counts.
+    _leaves_flat, _tdef = jax.tree_util.tree_flatten(ns_state)
+    def _fmt(v):
+        return (
+            f"{getattr(v, 'shape', '?')}:{getattr(v, 'dtype', type(v).__name__)}"
+            f"{'(weak)' if getattr(v, 'weak_type', False) else ''}"
+        )
+    _leaf_str = "  ".join(_fmt(v) for v in _leaves_flat)
+    logger.info(
+        "ns_step tracing: pop_shape=%s  max_neighbors=%d  n_mcmc=%d  "
+        "n_extra=%d  n_leaves=%d  leaves=[%s]",
+        ns_state.population.positions.shape,
+        int(ns_state.population.max_neighbors),
+        int(n_mcmc_steps),
+        int(n_extra),
+        len(_leaves_flat),
+        _leaf_str,
+    )
     pop = ns_state.population
     potentials = pop.energy  # (n_walkers,) — full ensemble potential
     key = ns_state.rng_key
@@ -495,6 +528,15 @@ def ns_step_sharded(
         ``(K_per_gpu, ...)`` layout; ``info`` keys match
         :func:`ns_step`.
     """
+    # Fires once per cache miss; same rationale as in ``ns_step`` above.
+    logger.info(
+        "ns_step_sharded tracing: pop_shape=%s  max_neighbors=%d  "
+        "n_mcmc=%d  n_extra=%d",
+        ns_state.population.positions.shape,
+        int(ns_state.population.max_neighbors),
+        int(n_mcmc_steps),
+        int(n_extra),
+    )
     pop_local = ns_state.population
     key = ns_state.rng_key
 
@@ -723,6 +765,8 @@ def run_ns(
     restart_state=None,
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
+    max_neighbors_shrink_dwell: int = 0,
+    max_neighbors_shrink_margin: int | None = None,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
 ) -> dict:
     """Run a full nested sampling calculation.
@@ -806,6 +850,8 @@ def run_ns(
         info_interval=max(1, (max_iterations or 1000) // 20),
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
+        max_neighbors_shrink_dwell=int(max_neighbors_shrink_dwell),
+        max_neighbors_shrink_margin=max_neighbors_shrink_margin,
     )
 
     # Final evidence: add contribution from remaining live walkers
@@ -927,6 +973,8 @@ def run_ns_parallel(
     callbacks: list | None = None,
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
+    max_neighbors_shrink_dwell: int = 0,
+    max_neighbors_shrink_margin: int | None = None,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
 ) -> dict:
     """Run multiple NS calculations in parallel via vmap(ns_step).
@@ -1118,6 +1166,8 @@ def run_ns_parallel(
         inter_re_mgr=inter_re_mgr,
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
+        max_neighbors_shrink_dwell=int(max_neighbors_shrink_dwell),
+        max_neighbors_shrink_margin=max_neighbors_shrink_margin,
     )
 
     # Final evidence: per-run contribution from remaining live walkers
@@ -1415,6 +1465,8 @@ def run_ns_multi_gpu(
     backend=None,
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
+    max_neighbors_shrink_dwell: int = 0,
+    max_neighbors_shrink_margin: int | None = None,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
     batcher: PmapVmapRuns | None = None,
 ) -> dict:
@@ -1676,6 +1728,8 @@ def run_ns_multi_gpu(
         inter_re_mgr=inter_re_mgr,
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
+        max_neighbors_shrink_dwell=int(max_neighbors_shrink_dwell),
+        max_neighbors_shrink_margin=max_neighbors_shrink_margin,
     )
 
     # Final evidence: per-run contribution from remaining live walkers.
@@ -1753,6 +1807,8 @@ def run_ns_sharded(
     restart_state=None,
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
+    max_neighbors_shrink_dwell: int = 0,
+    max_neighbors_shrink_margin: int | None = None,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
     batcher: ShardedSingleRun | None = None,
 ) -> dict:
@@ -1897,6 +1953,8 @@ def run_ns_sharded(
         inter_re_mgr=None,
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
+        max_neighbors_shrink_dwell=int(max_neighbors_shrink_dwell),
+        max_neighbors_shrink_margin=max_neighbors_shrink_margin,
         ns_step_fn=ns_step_sharded,
     )
 

@@ -9,15 +9,13 @@ dump-schema  Print JSON schema for RootSpec.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING    
-
 import argparse
 import json
 import logging
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import yaml
 

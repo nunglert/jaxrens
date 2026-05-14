@@ -93,6 +93,7 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
     The scaled fields:
         output.{info,traj,snapshot,checkpoint}_interval
         output.{temperature_lag,temperature_interval}
+        output.{acc_rates_interval,max_neighbors_interval}
         run.max_iterations  (None preserved)
         termination[iteration].max_iterations
         inter_re.re_interval
@@ -109,6 +110,8 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
             "checkpoint_interval",
             "temperature_lag",
             "temperature_interval",
+            "acc_rates_interval",
+            "max_neighbors_interval",
         )
     }
     run_upd = {
@@ -1009,6 +1012,8 @@ def _resolve_single_replica(
         log_level=root.output.log_level,
         save_acc_rates=root.output.save_acc_rates,
         acc_rates_interval=int(root.output.acc_rates_interval),
+        save_max_neighbors=root.output.save_max_neighbors,
+        max_neighbors_interval=int(root.output.max_neighbors_interval),
         save_re_stats=root.output.save_re_stats,
         temperature_lag=root.output.temperature_lag,
         temperature_interval=int(root.output.temperature_interval),
@@ -1424,6 +1429,8 @@ def _resolve_multi_replica(
         log_level=root.output.log_level,
         save_acc_rates=root.output.save_acc_rates,
         acc_rates_interval=int(root.output.acc_rates_interval),
+        save_max_neighbors=root.output.save_max_neighbors,
+        max_neighbors_interval=int(root.output.max_neighbors_interval),
         save_re_stats=root.output.save_re_stats,
         temperature_lag=root.output.temperature_lag,
         temperature_interval=int(root.output.temperature_interval),

@@ -50,6 +50,20 @@ class OutputSpec(BaseModel):
         ),
     )
 
+    # Per-iter neighbor-bucket diagnostic log.  When ``save_max_neighbors``
+    # is True the runtime registers a ``MaxNeighborsCallback`` that writes
+    # ``<prefix>.max_neighbors.h5`` every ``max_neighbors_interval``
+    # iterations.  No-op for backends that don't use neighbor lists
+    # (e.g. all-pairs LJ, toy backends).  Honours ``interval_units``.
+    save_max_neighbors: bool = False
+    max_neighbors_interval: int | float = Field(
+        default=1,
+        description=(
+            "Fire MaxNeighborsCallback every N iterations.  Default 1; "
+            "raise to reduce I/O on long runs."
+        ),
+    )
+
     # Per-fire inter-RE swap log.  When ``save_re_stats`` is True and
     # ``inter_re`` is configured, the runtime registers an
     # ``RECallback`` that writes ``<prefix>.re_stats.h5`` once per

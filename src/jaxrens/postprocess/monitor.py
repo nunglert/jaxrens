@@ -46,6 +46,10 @@ class Monitor:
         adaptation_trace: Per-move step sizes and acceptance rates, or None.
         re_trace: Per-fire inter-replica swap counts and acceptance rates, or
             None.
+        max_neighbors_trace: Per-iteration neighbor-bucket diagnostics
+            (per-walker max_neighbor_count + bucket size + overflow), or
+            None.  Loaded from ``<prefix>.max_neighbors.h5`` when the run
+            opted in via ``output.save_max_neighbors``.
         label: Human-readable label for plots.
         path: Source directory, or None.
     """
@@ -169,6 +173,13 @@ class Monitor:
             from jaxrens.io.re_stats_log import RELogger
             re_trace = RELogger.read(re_path)
 
+        # Optional max-neighbors diagnostic trace.
+        max_neighbors_trace = None
+        mn_path = path / f"{prefix}.max_neighbors.h5"
+        if mn_path.exists():
+            from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
+            max_neighbors_trace = MaxNeighborsLogger.read(mn_path)
+
         return cls(
             dead_energies=dead_energies,
             dead_volumes=dead_volumes,
@@ -183,6 +194,7 @@ class Monitor:
             iteration_trace=iteration_trace,
             adaptation_trace=adaptation_trace,
             re_trace=re_trace,
+            max_neighbors_trace=max_neighbors_trace,
             label=label,
             path=path,
         )
@@ -203,6 +215,7 @@ class Monitor:
         iteration_trace: np.ndarray | None = None,
         adaptation_trace=None,
         re_trace=None,
+        max_neighbors_trace=None,
         label: str = "",
         path: Path | None = None,
     ) -> None:
@@ -237,6 +250,8 @@ class Monitor:
         self.adaptation_trace = adaptation_trace
         # re_trace is an RELog dataclass or None
         self.re_trace = re_trace
+        # max_neighbors_trace is a MaxNeighborsLog dataclass or None
+        self.max_neighbors_trace = max_neighbors_trace
         self.label = label
         self.path = Path(path) if path is not None else None
 

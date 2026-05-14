@@ -259,33 +259,14 @@ def _dispatch_callbacks(
 # ---------------------------------------------------------------------------
 
 
-def _pick_next_bucket(
-    true_max: int,
-    current: int,
-    ladder: tuple[int, ...],
-    offset: int,
-) -> int:
-    """Return the smallest ladder entry that accommodates the observed need.
-
-    The target size is ``true_max + offset`` — adding headroom prevents the
-    very next MCMC step from tripping the same overflow after a trivial cell
-    fluctuation.  Restricting the choice to ``ladder`` bounds the number of
-    distinct JIT recompilations to ``len(ladder)`` over a whole run.
-
-    Raises ``RuntimeError`` when the ladder is exhausted or cannot make
-    progress; both conditions are user-actionable (extend the list).
-    """
-    target = int(true_max) + int(offset)
-    for b in ladder:
-        if b >= target and b > current:
-            return b
-    raise RuntimeError(
-        f"Overflow retry cannot make progress: observed max neighbor count "
-        f"{int(true_max)} (+ offset {offset}) requires bucket >= {target}, "
-        f"but no entry in max_neighbors_list={list(ladder)} satisfies both "
-        f"> current bucket {int(current)} and >= {target}. "
-        f"Extend backend.max_neighbors_list to cover this regime."
-    )
+# Backward-compatible re-exports.  The pickers (and the BucketManager) now
+# live in ``sampling.bucket_manager``; importing them from this module is
+# preserved so older tests and downstream code keep working.
+from jaxrens.sampling.bucket_manager import (  # noqa: E402
+    BucketManager,
+    _pick_next_bucket,
+    _pick_prev_bucket,
+)
 
 
 def _run_loop(
@@ -305,6 +286,8 @@ def _run_loop(
     inter_re_mgr: InterREManager | None = None,
     max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
+    max_neighbors_shrink_dwell: int = 0,
+    max_neighbors_shrink_margin: int | None = None,
     ns_step_fn: Callable | None = None,
 ) -> tuple[NSState, Key[Array, "*B"], dict[str, np.ndarray]]:
     """Unified NS outer loop shared by ``run_ns`` and ``run_ns_parallel``.
@@ -347,6 +330,18 @@ def _run_loop(
             provided and ``inter_re_mgr.is_active`` is True, a swap pass
             fires after each ``ns_step`` call on iterations where
             ``inter_re_mgr.fires(i)`` is True.  ``None`` → zero overhead.
+        max_neighbors_shrink_dwell: Number of consecutive iterations the
+            observed peak must sit ``shrink_margin`` below the next-smaller
+            ladder entry before the bucket is downsized one step.  ``0``
+            (default) disables shrinking entirely so existing runs are
+            byte-identical.  JAX's compilation cache reuses earlier compiles
+            when the bucket revisits a known size, so the only cost paid by
+            a wrong downsize is the next overflow re-grow.
+        max_neighbors_shrink_margin: Slack required below the next-smaller
+            ladder entry for a shrink to qualify (``observed + offset +
+            margin <= next_smaller``).  Together with ``shrink_dwell`` this
+            forms the hysteresis gap that prevents bucket thrashing at a
+            ladder boundary.  ``None`` (default) reuses ``max_neighbors_offset``.
 
     Returns:
         ``(ns_state, rng_key, cumulative)`` where:
@@ -409,6 +404,16 @@ def _run_loop(
         if hasattr(cb, "on_start"):
             cb.on_start(ns_state, start_info)
 
+    # Bucket-ladder hysteresis manager — owns _pick_next/_prev_bucket calls
+    # and the ``low_count`` shrink counter.  Shared with burn-in's
+    # ``initial_walk`` so both sites use the same growth + shrink logic.
+    bucket_mgr = BucketManager(
+        ladder=max_neighbors_list,
+        offset=max_neighbors_offset,
+        shrink_dwell=max_neighbors_shrink_dwell,
+        shrink_margin=max_neighbors_shrink_margin,
+    )
+
     i = 0
     while True:
         # ---- Adaptation ----
@@ -438,24 +443,17 @@ def _run_loop(
 
         # ---- Overflow retry ----
         # For PmapVmapRuns, any overflow across any (G, P) shard triggers a retry.
-        if jnp.any(new_ns_state.population.overflow):
-            true_max = int(new_ns_state.population.max_neighbor_count.max())
-            current = int(ns_state.population.max_neighbors)
-            new_max = _pick_next_bucket(
-                true_max, current, max_neighbors_list, max_neighbors_offset,
-            )
-            logger.warning(
-                "Overflow at iter %d: observed max_neighbors=%d, "
-                "resizing bucket %d -> %d (ladder=%s, offset=%d)",
-                i, true_max, current, new_max,
-                list(max_neighbors_list), max_neighbors_offset,
-            )
-            ns_state = ns_state.set(
-                population=ns_state.population.set(max_neighbors=new_max),
-            )
+        ns_state, retry = bucket_mgr.grow_if_overflow(
+            ns_state, new_ns_state, label="iter", iteration=i,
+        )
+        if retry:
             continue
 
-        ns_state = new_ns_state
+        # ---- Bucket shrink (hysteresis-gated) ----
+        # No-op when shrink_dwell == 0; otherwise steps the bucket down one
+        # ladder entry once the observed peak has stayed below the next-
+        # smaller bucket (with margin) for ``shrink_dwell`` iterations.
+        ns_state = bucket_mgr.maybe_shrink(ns_state, iteration=i)
 
         # ---- Inter-RE phase ----
         # Fires after ns_step, before cumulative counter bump and callbacks.

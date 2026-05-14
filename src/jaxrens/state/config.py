@@ -41,6 +41,16 @@ class BackendConfig:
     max_neighbors_list: list[int] = field(default_factory=lambda: [30, 35, 40, 45, 50])
     max_neighbors_offset: int = 5
 
+    # Hysteresis-gated bucket shrinking (opt-in).  When ``shrink_dwell == 0``
+    # (default), the outer NS loop never downsizes the bucket: behaviour is
+    # byte-identical to before this feature was added.  When > 0, the bucket
+    # is stepped one entry down after ``shrink_dwell`` consecutive iterations
+    # where ``observed_max + offset + shrink_margin <= next_smaller_entry``.
+    # ``shrink_margin = None`` reuses ``max_neighbors_offset`` so the gap is
+    # symmetric to the growth headroom.
+    max_neighbors_shrink_dwell: int = 0
+    max_neighbors_shrink_margin: int | None = None
+
 
 @dataclass(frozen=True)
 class OutputConfig:
@@ -59,6 +69,16 @@ class OutputConfig:
     # ``acc_rates_interval`` iterations.  Decoupled from full_auto.
     save_acc_rates: bool = False
     acc_rates_interval: int = 1
+
+    # Per-iter neighbor-bucket diagnostic log.  When ``True`` registers a
+    # ``MaxNeighborsCallback`` writing ``<prefix>.max_neighbors.h5`` every
+    # ``max_neighbors_interval`` iterations.  Captures the full per-walker
+    # ``max_neighbor_count`` distribution plus the current bucket and
+    # overflow flag — useful for diagnosing bucket oscillations and for
+    # tuning ``max_neighbors_list`` / ``shrink_dwell``.  Default-off; no I/O
+    # overhead unless enabled.
+    save_max_neighbors: bool = False
+    max_neighbors_interval: int = 1
 
     # Per-fire inter-RE swap log; cadence is upstream
     # ``inter_re.re_interval``.  No-op when ``inter_re`` is not configured.

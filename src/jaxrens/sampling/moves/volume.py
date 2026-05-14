@@ -88,12 +88,22 @@ def build_kernel(
                       jnp.where(~cell_valid, jnp.int32(2), jnp.int32(3))),
         )
 
+        # Gate the bucket-sizing signals on ``cell_valid``: hard cell-shape
+        # rejections (max/min volume per atom, min aspect ratio) describe
+        # configurations the chain will *never* live at.  Letting their
+        # overflow / max_neighbor_count leak into state would force the
+        # outer loop to escalate the neighbor bucket permanently to support
+        # proposals that get rejected on the spot — pure waste, and
+        # min-volume violations can blow the neighbor count up by ~10×.
         new_state = state.set(
             positions=jnp.where(accepted, new_positions, state.positions),
             energy=jnp.where(accepted, new_energy, state.energy),
             cell=jnp.where(accepted, new_cell, state.cell),
-            max_neighbor_count=jnp.maximum(state.max_neighbor_count, count),
-            overflow=state.overflow | overflow,
+            max_neighbor_count=jnp.maximum(
+                state.max_neighbor_count,
+                jnp.where(cell_valid, count, 0),
+            ),
+            overflow=state.overflow | (overflow & cell_valid),
         )
 
         info = MoveInfo(

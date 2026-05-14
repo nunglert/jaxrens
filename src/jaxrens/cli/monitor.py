@@ -625,6 +625,65 @@ class AccRatesCallback:
         self._logger.close()
 
 
+class MaxNeighborsCallback:
+    """Writes per-iteration neighbor-bucket diagnostics to HDF5.
+
+    Captures the full per-walker ``max_neighbor_count`` distribution at
+    each iteration, alongside the current bucket size and the overflow
+    flag — enough to plot the per-iteration distribution of neighbor
+    counts vs the current bucket boundary, and to diagnose bucket
+    growth/shrink dynamics.
+
+    Reads directly off the post-step ``ns_state``: no info-dict keys
+    are required.  For sharded runs, the redundant leading-G axis on
+    info is collapsed upstream by ``_run_loop``, but the population
+    leaves are already gathered to ``(K, ...)`` via
+    ``_gather_sharded_ns_state``.
+
+    Args:
+        logger_obj: A ready-to-use ``MaxNeighborsLogger`` instance.
+        interval: Fire every ``interval`` iterations.  Default ``1``.
+    """
+
+    def __init__(self, logger_obj: Any, interval: int = 1) -> None:
+        self._logger = logger_obj
+        self._interval = max(1, int(interval))
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        if iteration % self._interval != 0:
+            return
+        pop = ns_state.population
+        counts = jnp.asarray(pop.max_neighbor_count)
+        # ``max_neighbors`` is a static int shared across every replica/walker
+        # in this run.  Same value across the population, so pass the scalar
+        # and let the logger broadcast to ``(n_runs,)``.
+        bucket_scalar = int(pop.max_neighbors)
+        # ``overflow`` is per-walker (shape ``(*B, n_walkers)``).  The
+        # logger stores a per-run flag, so reduce across walkers via
+        # ``any`` after flattening the batch prefix.
+        of = jnp.asarray(pop.overflow)
+
+        batcher = info.get("_batcher")
+        if batcher is not None:
+            counts = batcher.flatten(counts)
+            of = batcher.flatten(of)
+        else:
+            if counts.ndim == 1:
+                counts = counts[None, :]
+
+        of_per_run = jnp.any(of, axis=-1) if of.ndim > 0 else of
+
+        self._logger.write_entry(
+            iteration=iteration,
+            max_neighbor_count=np.asarray(counts, dtype=np.int32),
+            bucket_size=np.int32(bucket_scalar),
+            overflow=np.asarray(of_per_run, dtype=np.bool_),
+        )
+
+    def on_finish(self, ns_state: Any) -> None:
+        self._logger.close()
+
+
 class RECallback:
     """Writes per-fire inter-RE swap counts to HDF5.
 

@@ -382,7 +382,21 @@ class AdaptationManager:
                 _max_rounds=max_rounds,
                 _adjust_fn=adjust_fn,
                 _trial_chunk=trial_chunk,
+                _desc_name=desc.name,
             ):
+                # Fires once per cache miss — i.e. once per distinct
+                # signature *per move type*.  After a bucket bump this fires
+                # again for every move whose adapt kernel hasn't yet been
+                # compiled against the new ``max_neighbors``.
+                logger.info(
+                    "adapt _per_replica tracing: move=%s  pop_shape=%s  "
+                    "max_neighbors=%d  n_samp=%d  max_rounds=%d",
+                    _desc_name,
+                    pop.positions.shape,
+                    int(pop.max_neighbors),
+                    int(_n_samp),
+                    int(_max_rounds),
+                )
                 if _trial_chunk is None:
                     return _adjust_fn(
                         pop, _move_fn, ss, emax, key,
