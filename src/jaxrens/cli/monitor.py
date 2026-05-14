@@ -289,7 +289,7 @@ class ProgressCallback:
                 acc_per_move = n_acc / jnp.maximum(n_prop, 1)
                 rc = jnp.asarray(rr_counts_per_move) if rr_counts_per_move is not None else None
             else:
-                # Backward compat: trial-phase rates from adjust_step_size.
+                # Backward compat: trial-phase rates from the adapt step.
                 trial_acc = info.get("acceptance_rates_per_move")
                 if trial_acc is None:
                     acc_per_move = None

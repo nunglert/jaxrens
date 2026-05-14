@@ -9,10 +9,9 @@ Covers:
 - Step-size adjustment called the correct number of times
 - Adaptation disabled (per_move_fns=None) runs without error
 - Batched (multi-run): output shape + run independence
-
-Walker-axis chunking tests (``walker_batch_size`` in ``_one_walk`` and
-its carry-through to the adapt step's ``trial_batch_size``) live in
-``test_init_burn_in_chunking.py``.
+- Walker-axis chunking (``walker_batch_size`` in ``_one_walk`` and its
+  carry-through to the adapt step's ``trial_batch_size``)
+- Neighbor-bucket overflow retry
 """
 
 from __future__ import annotations
@@ -540,7 +539,165 @@ class TestBatchedRuns:
 
 
 # ---------------------------------------------------------------------------
-# 9. Neighbor-bucket overflow retry inside initial_walk
+# 9. walker_batch_size: chunked vmap inside one_walk
+# ---------------------------------------------------------------------------
+
+class TestWalkerChunking:
+    def test_walker_batch_size_divides_evenly_same_result(self):
+        n_walkers, n_atoms = 4, 2
+        ns_state, step_fn, _, _ = _build_ns_state(n_walkers=n_walkers, n_atoms=n_atoms)
+        key = jax.random.key(7)
+
+        result_full = initial_walk(
+            key, ns_state, step_fn,
+            n_walks=2, walklength=5, adjust_interval=100,
+            emax_offset_per_atom=0.5, n_atoms=n_atoms,
+            walker_batch_size=None,
+        )
+        result_chunked = initial_walk(
+            key, ns_state, step_fn,
+            n_walks=2, walklength=5, adjust_interval=100,
+            emax_offset_per_atom=0.5, n_atoms=n_atoms,
+            walker_batch_size=2,
+        )
+
+        np.testing.assert_allclose(
+            np.array(result_full.population.positions),
+            np.array(result_chunked.population.positions),
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            np.array(result_full.population.energy),
+            np.array(result_chunked.population.energy),
+            atol=1e-5,
+        )
+
+    def test_walker_batch_size_not_dividing_pads_and_matches_full_vmap(self):
+        n_walkers, n_atoms = 4, 2
+        ns_state, step_fn, _, _ = _build_ns_state(n_walkers=n_walkers, n_atoms=n_atoms)
+        key = jax.random.key(11)
+
+        result_full = initial_walk(
+            key, ns_state, step_fn,
+            n_walks=2, walklength=5, adjust_interval=100,
+            emax_offset_per_atom=0.5, n_atoms=n_atoms,
+            walker_batch_size=None,
+        )
+        result_padded = initial_walk(
+            key, ns_state, step_fn,
+            n_walks=2, walklength=5, adjust_interval=100,
+            emax_offset_per_atom=0.5, n_atoms=n_atoms,
+            walker_batch_size=3,
+        )
+
+        assert result_padded.population.positions.shape == (
+            n_walkers, *result_full.population.positions.shape[1:]
+        )
+        np.testing.assert_allclose(
+            np.array(result_full.population.positions),
+            np.array(result_padded.population.positions),
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            np.array(result_full.population.energy),
+            np.array(result_padded.population.energy),
+            atol=1e-5,
+        )
+
+    def test_walker_batch_size_non_divisor_large(self):
+        """walker_batch_size=8 on n_walkers=10 (user-reported pattern)."""
+        n_walkers, n_atoms = 10, 2
+        ns_state, step_fn, _, _ = _build_ns_state(n_walkers=n_walkers, n_atoms=n_atoms)
+        result = initial_walk(
+            jax.random.key(0), ns_state, step_fn,
+            n_walks=1, walklength=2, adjust_interval=100,
+            emax_offset_per_atom=0.0, n_atoms=n_atoms,
+            walker_batch_size=8,
+        )
+        assert result.population.energy.shape[0] == n_walkers
+
+    def test_walker_batch_size_equals_n_walkers_same_as_full_vmap(self):
+        n_walkers, n_atoms = 4, 2
+        ns_state, step_fn, _, _ = _build_ns_state(n_walkers=n_walkers, n_atoms=n_atoms)
+        key = jax.random.key(13)
+
+        result_full = initial_walk(
+            key, ns_state, step_fn,
+            n_walks=2, walklength=4, adjust_interval=100,
+            emax_offset_per_atom=0.0, n_atoms=n_atoms,
+            walker_batch_size=None,
+        )
+        result_equal = initial_walk(
+            key, ns_state, step_fn,
+            n_walks=2, walklength=4, adjust_interval=100,
+            emax_offset_per_atom=0.0, n_atoms=n_atoms,
+            walker_batch_size=n_walkers,
+        )
+
+        np.testing.assert_allclose(
+            np.array(result_full.population.positions),
+            np.array(result_equal.population.positions),
+            atol=1e-5,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 10. Trial-vmap chunking inside the adapt step (walker_batch_size carries through)
+# ---------------------------------------------------------------------------
+
+class TestAdaptationChunking:
+    def _run_with(self, *, walker_batch_size: int | None):
+        from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
+
+        n_runs, n_walkers, n_atoms = 4, 4, 2
+        ns_states, step_fn, per_move_fns, _ = _build_batched_ns_state(
+            n_runs=n_runs, n_walkers=n_walkers, n_atoms=n_atoms,
+        )
+        policy = ResolvedAdaptationPolicy(
+            min_rate=0.25, max_rate=0.75, adjust_factor=1.5, step_size_max=10.0,
+        )
+        result = initial_walk(
+            jax.random.key(2026),
+            ns_states,
+            step_fn,
+            n_walks=3,
+            walklength=4,
+            adjust_interval=1,
+            emax_offset_per_atom=2.0,
+            n_atoms=n_atoms,
+            batched=True,
+            walker_batch_size=walker_batch_size,
+            per_move_fns=per_move_fns,
+            adaptation_policies=(policy,),
+            adjust_n_samples=8,
+            adjust_max_rounds=4,
+        )
+        return result
+
+    def test_walker_batch_size_matches_full_vmap(self):
+        baseline = self._run_with(walker_batch_size=None)
+        chunked = self._run_with(walker_batch_size=2)
+        np.testing.assert_array_equal(
+            np.array(baseline.population.step_sizes),
+            np.array(chunked.population.step_sizes),
+        )
+
+    def test_walker_batch_size_non_divisor_in_trial_vmap(self):
+        baseline = self._run_with(walker_batch_size=None)
+        chunked = self._run_with(walker_batch_size=3)
+        np.testing.assert_array_equal(
+            np.array(baseline.population.step_sizes),
+            np.array(chunked.population.step_sizes),
+        )
+        np.testing.assert_allclose(
+            np.array(baseline.population.positions),
+            np.array(chunked.population.positions),
+            atol=1e-5,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 11. Neighbor-bucket overflow retry inside initial_walk
 # ---------------------------------------------------------------------------
 
 

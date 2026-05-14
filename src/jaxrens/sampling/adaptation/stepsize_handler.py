@@ -1,18 +1,22 @@
-"""Step size adjustment via trial moves — pure JAX function.
+"""Step size adjustment via trial moves — pure JAX functions.
 
-Core function: ``adjust_step_size`` adjusts the step size for ONE move
-type on ONE run by running trial moves on sampled walkers and iterating
-until the acceptance rate falls within a target window.
+Two production entry points, one per batcher regime:
 
-Properties:
-- Pure function on arrays — no class, no mutable state
-- JIT-compilable (``lax.while_loop`` for the bisection)
-- Vmappable over runs for multi-run parallelism
-- Layout-agnostic: same function under vmap/pmap
+* :func:`_one_bisection_round` — one bisection round on a pre-gathered
+  trial sample.  The Python loop in
+  :func:`jaxrens.sampling.adaptation.manager.build_adapt_step` drives it
+  for SingleRun / VmapRuns / PmapVmapRuns.  Removes one outer ``while``
+  from the gradient body's XLA nesting (see WORKLOG 2026-05-14).
 
-The outer loop (which moves to adjust, when to trigger, how to write
-back) is handled by ``run_ns`` — this module only does the core
-adjustment for a single (move, run) pair.
+* :func:`adjust_step_size_sharded` — full in-XLA bisection
+  (``lax.while_loop``) with cross-shard ``lax.psum`` inside the body.
+  Used for ShardedSingleRun, where the psum has to live inside the
+  pmap'd region.
+
+Both share :func:`_process_rate_jax` (branchless rate-window decision)
+and :func:`_gather_trial_walkers` (single random.choice + indexed
+gather over the K-walker population).  The outer loop (when to trigger,
+how to write back) lives in ``build_adapt_step`` / ``_run_loop``.
 """
 
 from __future__ import annotations
@@ -128,8 +132,8 @@ def _one_bisection_round(
     *,
     trial_batch_size: int | None = None,
 ):
-    """One bisection round — JIT-friendly body extracted from
-    :func:`adjust_step_size`'s ``lax.while_loop``.
+    """One bisection round — JIT-friendly body driven by the Python loop in
+    :func:`jaxrens.sampling.adaptation.manager.build_adapt_step`.
 
     Trial-vmap, rate computation, and :func:`_process_rate_jax` only.  The
     ``sample`` argument is the **pre-gathered** ``n_samples``-walker
@@ -232,205 +236,6 @@ def _one_bisection_round(
     )
 
 
-def adjust_step_size(
-    population: Any,
-    move_fn: Callable,
-    step_size: Float[Array, ""],
-    emax: Float[Array, ""],
-    rng_key: Key[Array, ""],
-    n_samples: int,
-    min_rate: float,
-    max_rate: float,
-    adjust_factor: float,
-    max_step_size: float,
-    max_rounds: int,
-    *,
-    trial_batch_size: int | None = None,
-) -> tuple[
-    Float[Array, ""], Float[Array, ""], Int[Array, "4"],
-    Int[Array, ""], Bool[Array, ""], Int[Array, ""], Int[Array, ""], Bool[Array, ""],
-    Int[Array, ""], Int[Array, ""],
-]:
-    """Adjust step size for one move type until acceptance rate is in window.
-
-    Pure JAX function. JIT-compilable. Vmappable over runs.
-
-    Iterates a bisection-like loop: sample walkers → run trial moves →
-    measure acceptance rate → scale step size up/down. Stops when rate
-    falls within [min_rate, max_rate] or brackets are detected.
-
-    Args:
-        population: Batched MCState, shape (n_walkers, ...) on every field.
-        move_fn: Single-move step function (static under JIT).
-            Signature: move_fn(state, key, constraint) -> (state, MoveInfo)
-        step_size: Current step size (scalar).
-        emax: Likelihood constraint — max energy in population (scalar).
-        rng_key: PRNG key.
-        n_samples: Number of walkers to sample per trial round (static).
-        min_rate: Lower bound of target acceptance window (static).
-        max_rate: Upper bound of target acceptance window (static).
-        adjust_factor: Multiplicative factor for step size scaling (static).
-        max_step_size: Upper bound on step size (static).
-        max_rounds: Maximum number of adjustment rounds (static).
-        trial_batch_size: Optional chunk size for the trial vmap (kwarg-only,
-            static).  ``None`` (default) preserves the original behaviour:
-            ``jax.vmap(trial_one)`` over all ``n_samples`` walkers.  When
-            set to an int, the trial vmap is replaced by
-            ``jax.lax.map(..., batch_size=trial_batch_size)`` so peak memory
-            scales with the chunk rather than ``n_samples`` — needed when the
-            move's backward tape (e.g. galilean ``value_and_grad`` × n_reflect
-            on MACE) makes the full vmap exceed device memory.  Any positive
-            int is accepted; if ``n_samples`` is not a multiple of
-            ``trial_batch_size`` the trial population is padded with copies
-            of the last sample and the pad is sliced off before rate/count
-            aggregation.
-
-    Returns:
-        (new_step_size, final_rate, final_counts, n_rounds, converged,
-         cap_hits, floor_hits, bracket_detected,
-         trial_n_evaluations, trial_n_grad_evaluations)
-        - new_step_size: scalar float — adjusted step size
-        - final_rate: scalar float — acceptance rate at final round
-        - final_counts: (4,) int32 — rejection reason counts from final round
-        - n_rounds: scalar int32 — number of bisection rounds executed
-        - converged: scalar bool — True iff loop converged within max_rounds
-        - cap_hits: scalar int32 — rounds where proposed ss hit max_step_size
-        - floor_hits: scalar int32 — rounds where proposed ss hit 1e-20 floor
-        - bracket_detected: scalar bool — True iff both too-high and too-low
-          rates were observed during bisection (proper bracket formed)
-        - trial_n_evaluations: scalar int32 — total backend calls made during
-          all trial rounds (summed across walkers and rounds)
-        - trial_n_grad_evaluations: scalar int32 — value_and_grad subset of
-          trial_n_evaluations
-    """
-    n_walkers = population.energy.shape[0]
-
-    # Carry: (step_size, step_size_prev, rate_prev, rng_key, round_idx,
-    #         converged, reject_counts, cap_hits, floor_hits,
-    #         saw_too_high, saw_too_low,
-    #         cumulative_n_evals, cumulative_n_grad_evals)
-    def cond_fn(carry):
-        _, _, _, _, round_idx, converged, _, _, _, _, _, _, _ = carry
-        return ~converged & (round_idx < max_rounds)
-
-    def body_fn(carry):
-        (ss, ss_prev, rate_prev, key, round_idx, converged, _,
-         cap_hits, floor_hits, saw_too_high, saw_too_low,
-         cum_evals, cum_grad_evals) = carry
-
-        # 1. Sample walkers
-        key, key_sample, key_trials = jax.random.split(key, 3)
-        indices = jax.random.choice(
-            key_sample, n_walkers, shape=(n_samples,), replace=True
-        )
-        sample = jax.tree.map(lambda x: x[indices], population)
-
-        # 2. Inject test step size into both step_size (scalar) and step_sizes
-        # (per-move array).  The MWG wrapper reads state.step_sizes[move_idx]
-        # rather than state.step_size, so we must update the array as well.
-        # Broadcasting ss into all positions is safe because the trial
-        # function only calls one specific move kernel per adjust_step_size
-        # call, so only the target move_idx entry is read.
-        sample = sample.set(
-            step_size=jnp.full(n_samples, ss),
-            step_sizes=jnp.broadcast_to(
-                ss[None, None], (n_samples, sample.step_sizes.shape[-1])
-            ),
-        )
-
-        # 3. Run trial moves (vmapped over sampled walkers; optionally chunked)
-        trial_keys = jax.random.split(key_trials, n_samples)
-
-        def trial_one(state, trial_key):
-            _, info = move_fn(state, trial_key, emax)
-            return info.accepted, info.reject_reason, info.n_evaluations, info.n_grad_evaluations
-
-        if trial_batch_size is None:
-            accepted, reasons, n_evals_per_sample, n_grad_evals_per_sample = jax.vmap(trial_one)(sample, trial_keys)
-        else:
-            # Chunked-vmap: lax.map vmaps within a chunk and scans across
-            # chunks.  Bounds peak memory at trial_batch_size × per-trial
-            # backward tape, regardless of n_samples.  Equivalent output.
-            # When n_samples % trial_batch_size != 0, pad the inputs by
-            # repeating the last entry and slice the dummies off the output;
-            # n_pad is Python-static so JIT shapes stay concrete.
-            padded_sample, n_pad = pad_to_multiple(
-                sample, n_samples, trial_batch_size
-            )
-            padded_trial_keys, _ = pad_to_multiple(
-                trial_keys, n_samples, trial_batch_size
-            )
-            accepted, reasons, n_evals_per_sample, n_grad_evals_per_sample = jax.lax.map(
-                lambda x: trial_one(x[0], x[1]),
-                (padded_sample, padded_trial_keys),
-                batch_size=trial_batch_size,
-            )
-            if n_pad > 0:
-                accepted = accepted[:n_samples]
-                reasons = reasons[:n_samples]
-                n_evals_per_sample = n_evals_per_sample[:n_samples]
-                n_grad_evals_per_sample = n_grad_evals_per_sample[:n_samples]
-        rate = jnp.mean(accepted.astype(jnp.float32))
-
-        # Per-reason counts (code 0=accepted, 1=energy, 2=cell, 3=prior)
-        counts = jnp.array([
-            jnp.sum(reasons == 0),
-            jnp.sum(reasons == 1),
-            jnp.sum(reasons == 2),
-            jnp.sum(reasons == 3),
-        ], dtype=jnp.int32)
-
-        # Accumulate evaluation counts over all trial rounds
-        round_evals = jnp.sum(n_evals_per_sample.astype(jnp.int32))
-        round_grad_evals = jnp.sum(n_grad_evals_per_sample.astype(jnp.int32))
-        new_cum_evals = cum_evals + round_evals
-        new_cum_grad_evals = cum_grad_evals + round_grad_evals
-
-        # 4. Process rate → new step size + convergence flag + diagnostics
-        new_ss, new_converged, cap_hit, floor_hit, too_high, too_low = _process_rate_jax(
-            rate, ss, ss_prev, rate_prev,
-            min_rate, max_rate, adjust_factor, max_step_size,
-        )
-
-        new_cap_hits = cap_hits + cap_hit.astype(jnp.int32)
-        new_floor_hits = floor_hits + floor_hit.astype(jnp.int32)
-        new_saw_too_high = saw_too_high | too_high
-        new_saw_too_low = saw_too_low | too_low
-
-        return (new_ss, ss, rate, key, round_idx + 1,
-                converged | new_converged, counts,
-                new_cap_hits, new_floor_hits,
-                new_saw_too_high, new_saw_too_low,
-                new_cum_evals, new_cum_grad_evals)
-
-    init_carry = (
-        step_size,
-        step_size,
-        jnp.array(-1.0),  # sentinel: no previous rate
-        rng_key,
-        jnp.array(0, dtype=jnp.int32),
-        jnp.array(False),
-        jnp.zeros(4, dtype=jnp.int32),
-        jnp.array(0, dtype=jnp.int32),   # cap_hits
-        jnp.array(0, dtype=jnp.int32),   # floor_hits
-        jnp.array(False),                 # saw_too_high
-        jnp.array(False),                 # saw_too_low
-        jnp.array(0, dtype=jnp.int32),   # cumulative_n_evals
-        jnp.array(0, dtype=jnp.int32),   # cumulative_n_grad_evals
-    )
-
-    final = jax.lax.while_loop(cond_fn, body_fn, init_carry)
-    (final_ss, _, final_rate, _, n_rounds, converged, final_counts,
-     cap_hits, floor_hits, saw_too_high, saw_too_low,
-     trial_n_evals, trial_n_grad_evals) = final
-
-    bracket_detected = saw_too_high & saw_too_low
-
-    return (final_ss, final_rate, final_counts,
-            n_rounds, converged, cap_hits, floor_hits, bracket_detected,
-            trial_n_evals, trial_n_grad_evals)
-
-
 # ---------------------------------------------------------------------------
 # adjust_step_size_sharded — sibling for ShardedSingleRun population layout
 # ---------------------------------------------------------------------------
@@ -457,9 +262,11 @@ def adjust_step_size_sharded(
 ]:
     """Adjust step size with the population sharded across ``n_gpu`` GPUs.
 
-    Sibling of :func:`adjust_step_size`.  Must be called inside a
-    ``jax.pmap`` with ``axis_name="shard"`` (see
-    :meth:`ShardedSingleRun.wrap_for_batch`).
+    The cross-shard counterpart to :func:`_one_bisection_round`'s
+    Python-driven bisection: this one keeps the bisection inside an
+    in-XLA ``lax.while_loop`` so the per-shard ``lax.psum`` calls live
+    inside the pmap'd region.  Must be called inside a ``jax.pmap`` with
+    ``axis_name="shard"`` (see :meth:`ShardedSingleRun.wrap_for_batch`).
 
     Sampling strategy: each shard independently samples ``n_samples``
     walkers from its *local* ``(K_per_gpu, ...)`` slice.  Effective
@@ -475,8 +282,9 @@ def adjust_step_size_sharded(
     ``_process_rate_jax`` decisions → identical updated ``ss`` →
     bisection paths stay coherent across shards.
 
-    Returns the same 10-tuple as :func:`adjust_step_size`; values are
-    identical on every shard.
+    Returns ``(final_ss, final_rate, final_counts, n_rounds, converged,
+    cap_hits, floor_hits, bracket_detected, trial_n_evals,
+    trial_n_grad_evals)`` — values are identical on every shard.
     """
     n_walkers_local = population.energy.shape[0]
 
@@ -502,7 +310,7 @@ def adjust_step_size_sharded(
         )
         sample = jax.tree.map(lambda x: x[indices], population)
 
-        # 2. Inject test step size (same as adjust_step_size).
+        # 2. Inject test step size (same as _one_bisection_round).
         sample = sample.set(
             step_size=jnp.full(n_samples, ss),
             step_sizes=jnp.broadcast_to(

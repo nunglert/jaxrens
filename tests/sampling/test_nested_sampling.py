@@ -889,79 +889,8 @@ class TestParityNRunsOne:
         assert int(result["n_dead"][0]) > 0
 
 
-class TestParallelVmappedAdjustJIT:
-    """JIT test for vmapped adjust_step_size inside run_ns_parallel.
-
-    Verifies compilation, correct output shapes, and no retracing.
-    """
-
-    def test_vmapped_adjust_compiles_and_runs(self):
-        """Directly test the vmapped adjust_step_size layer used in run_ns_parallel."""
-        from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
-
-        backend = create_harmonic(k=1.0)
-        descriptors = [
-            MoveKernel(
-                "random_walk", random_walk.build_kernel,
-                step_size=0.1, step_size_max=5.0,
-                min_rate=0.2, max_rate=0.7,
-            ),
-        ]
-        init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
-
-        n_runs = 3
-        n_walkers = 15
-        n_atoms = 1
-        key = jax.random.key(5)
-        keys = jax.random.split(key, n_runs)
-        positions = jax.vmap(
-            lambda k: jax.random.uniform(k, (n_walkers, n_atoms, 3), minval=-1.0, maxval=1.0)
-        )(keys)
-        types = jnp.zeros((n_atoms,), dtype=jnp.int32)
-        energies = jax.vmap(
-            lambda pos: jax.vmap(
-                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
-            )(pos)
-        )(positions)
-
-        # Initialize n_runs NSStates and stack them
-        from jaxrens.sampling.nested_sampling import init_ns_parallel
-        ns_states = init_ns_parallel(
-            init_fn, positions, types, energies, None, keys,
-            step_sizes=jnp.full(1, 0.1),
-        )
-
-        pop = ns_states.population  # (n_runs, n_walkers, ...)
-        emax_per_run = jnp.max(pop.energy, axis=1)  # (n_runs,)
-        ss_init = jnp.full(n_runs, 0.3)  # (n_runs,)
-        trial_keys = jax.random.split(jax.random.key(7), n_runs)
-
-        move_fn = per_move_fns[0]
-        desc = descriptors[0]
-
-        # Build the same vmapped+JIT fn as run_ns_parallel does
-        def _per_run(p, ss, emax, k):
-            return adjust_step_size(
-                p, move_fn, ss, emax, k,
-                10, desc.min_rate, desc.max_rate,
-                1.5, desc.step_size_max, 10,
-            )
-
-        jit_vmap_adjust = jax.jit(jax.vmap(_per_run))
-
-        # First call — compiles
-        result = jit_vmap_adjust(pop, ss_init, emax_per_run, trial_keys)
-        new_ss_runs = result[0]
-
-        assert new_ss_runs.shape == (n_runs,), (
-            f"Expected (n_runs,)={(n_runs,)}, got {new_ss_runs.shape}"
-        )
-        assert result[3].dtype == jnp.int32   # n_rounds
-
-        # Second call with different data — must not retrace (same shapes)
-        trial_keys2 = jax.random.split(jax.random.key(99), n_runs)
-        result2 = jit_vmap_adjust(pop, ss_init, emax_per_run, trial_keys2)
-        assert result2[0].shape == (n_runs,)
+class TestParallelFullAuto:
+    """End-to-end shape checks for ``run_ns_parallel`` with full-auto adaptation."""
 
     def test_run_ns_parallel_full_auto_correct_shapes(self):
         """run_ns_parallel with full-auto adaptation: output shapes must be (n_runs, ...)."""
