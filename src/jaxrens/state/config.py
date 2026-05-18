@@ -45,11 +45,10 @@ class BackendConfig:
     # (default), the outer NS loop never downsizes the bucket: behaviour is
     # byte-identical to before this feature was added.  When > 0, the bucket
     # is stepped one entry down after ``shrink_dwell`` consecutive iterations
-    # where ``observed_max + offset + shrink_margin <= next_smaller_entry``.
-    # ``shrink_margin = None`` reuses ``max_neighbors_offset`` so the gap is
-    # symmetric to the growth headroom.
+    # where ``observed_max + offset <= next_smaller_entry``.  Temporal
+    # hysteresis comes from ``shrink_dwell``; the ``offset`` slack already
+    # plays the role of post-shrink safety margin.
     max_neighbors_shrink_dwell: int = 0
-    max_neighbors_shrink_margin: int | None = None
 
 
 @dataclass(frozen=True)

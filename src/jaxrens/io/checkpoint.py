@@ -41,10 +41,13 @@ from pathlib import Path
 from typing import Any
 
 import h5py
-import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
-import jax
-import jax.numpy as jnp
 import numpy as np
+
+# NOTE: jax / jnp are imported lazily inside ``save_checkpoint`` (which
+# constructs the rng_key default).  ``load_checkpoint`` deliberately does
+# not import jax — it uses numpy throughout so headless postprocess paths
+# (e.g. ``MonitorCollection.from_multi_run_directory``) stay jax-free.
+# See tests/test_lazy_jax_import.py.
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +172,19 @@ def save_checkpoint(
         # n_walkers is always a plain Python int in all three result dicts.
         f.attrs["n_walkers"] = int(ns_state["n_walkers"])
 
+        # Persist the run's PRNG state so restart resumes the same stream.
+        # Stored as raw uint32 (key_data) — the typed Key wrapper is recreated
+        # on load via ``jax.random.wrap_key_data``.  This keeps the HDF5 file
+        # numpy-compatible and load_checkpoint jax-free.  Legacy checkpoints
+        # without this dataset trigger the caller-supplied-key fallback in
+        # init_ns.
+        if ns_state.get("rng_key") is not None:
+            import jax.random as _jr  # lazy — save path is already jax-using
+
+            f.create_dataset(
+                "rng_key_data", data=np.asarray(_jr.key_data(ns_state["rng_key"]))
+            )
+
         if symbol_map is not None:
             f.attrs["symbol_map"] = json.dumps(
                 {str(k): v for k, v in symbol_map.items()}
@@ -193,10 +209,7 @@ def _read_field(f: h5py.File, key: str) -> np.ndarray | int | float:
         raise KeyError(f"Field '{key}' not found in checkpoint (neither dataset nor attr).")
 
 
-def load_checkpoint(
-    path: Path | str,
-    rng_key: jax.Array | None = None,
-) -> dict:
+def load_checkpoint(path: Path | str) -> dict:
     """Load NS state from HDF5 checkpoint.
 
     Handles checkpoints written by any of the three run variants:
@@ -210,22 +223,26 @@ def load_checkpoint(
     checkpoints where ``n_dead`` is a plain integer.  For batched
     checkpoints the full stored arrays are returned as-is.
 
-    Args:
-        path: Path to checkpoint file.
-        rng_key: New RNG key for resumed run. If None, uses key(0).
+    All array fields — including ``rng_key_data`` — are returned as
+    ``numpy.ndarray`` (not ``jax.Array``) so this function does not import
+    or touch jax.  Restart-path callers that need a typed PRNG ``Key``
+    re-wrap with ``jax.random.wrap_key_data(...)`` themselves (see
+    ``init/restart.py``); the wrapping must happen there, not here, to
+    keep headless postprocess paths jax-free.
 
     Returns:
         NS state dict compatible with ns_step / run_ns and variants.
+        ``state["rng_key_data"]`` is the raw uint32 buffer when the
+        checkpoint persisted one (current format), or ``None`` for legacy
+        checkpoints that pre-date the save.
     """
     path = Path(path)
-    if rng_key is None:
-        rng_key = jax.random.key(0)
 
     with h5py.File(path, "r") as f:
-        positions = jnp.array(f["positions"][()])
-        types = jnp.array(f["types"][()])
-        energies = jnp.array(f["energies"][()])
-        cells = jnp.array(f["cells"][()]) if "cells" in f else None
+        positions = np.asarray(f["positions"][()])
+        types = np.asarray(f["types"][()])
+        energies = np.asarray(f["energies"][()])
+        cells = np.asarray(f["cells"][()]) if "cells" in f else None
 
         # dead_* are optional in the new HDF5 format (the canonical record
         # lives in `.energies` / `.traj`).  Treat missing fields as empty
@@ -233,15 +250,15 @@ def load_checkpoint(
         # that rely on dead-point data should source it from the streamed
         # files (see ``postprocess.Monitor.from_directory``).
         dead_energies_raw = (
-            jnp.array(f["dead_energies"][()]) if "dead_energies" in f else None
+            np.asarray(f["dead_energies"][()]) if "dead_energies" in f else None
         )
         dead_positions_raw = (
-            jnp.array(f["dead_positions"][()]) if "dead_positions" in f else None
+            np.asarray(f["dead_positions"][()]) if "dead_positions" in f else None
         )
 
         # log_evidence: stored as dataset (batched) or attr (scalar).
         log_evidence_raw = _read_field(f, "log_evidence")
-        log_evidence = jnp.array(log_evidence_raw)
+        log_evidence = np.asarray(log_evidence_raw)
 
         # iteration / n_dead: may be dataset or attr.
         iteration_raw = _read_field(f, "iteration")
@@ -257,8 +274,15 @@ def load_checkpoint(
         n_dead_raw = _read_field(f, "n_dead")
         n_walkers = int(f.attrs["n_walkers"])
 
-        dead_volumes_raw = jnp.array(f["dead_volumes"][()]) if "dead_volumes" in f else None
-        live_volumes = jnp.array(f["live_volumes"][()]) if "live_volumes" in f else None
+        dead_volumes_raw = np.asarray(f["dead_volumes"][()]) if "dead_volumes" in f else None
+        live_volumes = np.asarray(f["live_volumes"][()]) if "live_volumes" in f else None
+
+        # Raw PRNG state (uint32 buffer).  ``jax.random.wrap_key_data`` is
+        # the inverse of the ``key_data`` call in save_checkpoint and is
+        # invoked by restart-path callers — not here, so load stays jax-free.
+        rng_key_data = (
+            np.asarray(f["rng_key_data"][()]) if "rng_key_data" in f else None
+        )
 
     # Determine whether this is a scalar (single-run) checkpoint.
     n_dead_np = np.asarray(n_dead_raw)
@@ -277,13 +301,15 @@ def load_checkpoint(
             # Legacy format: pad dead arrays to a comfortable size for callers
             # that previously relied on padded shapes.
             max_dead = max(n_dead * 2, 50000)
-            dead_energies = jnp.full(max_dead, jnp.inf)
-            dead_energies = dead_energies.at[:n_dead].set(dead_energies_raw)
-            dead_positions = jnp.zeros((max_dead, *positions.shape[1:]))
-            dead_positions = dead_positions.at[:n_dead].set(dead_positions_raw)
+            dead_energies = np.full(max_dead, np.inf, dtype=dead_energies_raw.dtype)
+            dead_energies[:n_dead] = dead_energies_raw
+            dead_positions = np.zeros(
+                (max_dead, *positions.shape[1:]), dtype=dead_positions_raw.dtype,
+            )
+            dead_positions[:n_dead] = dead_positions_raw
             if dead_volumes_raw is not None:
-                dead_volumes = jnp.zeros(max_dead)
-                dead_volumes = dead_volumes.at[:n_dead].set(dead_volumes_raw)
+                dead_volumes = np.zeros(max_dead, dtype=dead_volumes_raw.dtype)
+                dead_volumes[:n_dead] = dead_volumes_raw
             else:
                 dead_volumes = None
     else:
@@ -298,8 +324,8 @@ def load_checkpoint(
     logger.info("Checkpoint loaded from %s (iteration %s)", path, _iter_log)
 
     emax = (
-        jnp.array(emax_raw) if emax_raw is not None
-        else jnp.array(jnp.inf, dtype=jnp.float32)
+        np.asarray(emax_raw) if emax_raw is not None
+        else np.asarray(np.inf, dtype=np.float32)
     )
 
     return {
@@ -316,7 +342,7 @@ def load_checkpoint(
         "emax": emax,
         "n_dead": n_dead,
         "n_walkers": n_walkers,
-        "rng_key": rng_key,
+        "rng_key_data": rng_key_data,
     }
 
 

@@ -40,13 +40,11 @@ class BaseBackendSpec(BaseModel):
     # Hysteresis-gated bucket shrinking (opt-in).  ``shrink_dwell = 0``
     # (default) preserves the pre-existing escalate-only behaviour.  When
     # set > 0, after ``shrink_dwell`` consecutive iterations of
-    # ``observed + offset + shrink_margin <= next_smaller_entry`` the
-    # outer loop steps the bucket one ladder entry down.  Going back to
-    # a previously-visited bucket reuses the JAX compilation cache, so
-    # the compile budget stays bounded by ``len(max_neighbors_list)``.
-    # ``shrink_margin = None`` reuses ``max_neighbors_offset``.
+    # ``observed + offset <= next_smaller_entry`` the outer loop steps
+    # the bucket one ladder entry down.  Going back to a previously-
+    # visited bucket reuses the JAX compilation cache, so the compile
+    # budget stays bounded by ``len(max_neighbors_list)``.
     max_neighbors_shrink_dwell: int = Field(default=0, ge=0)
-    max_neighbors_shrink_margin: Optional[int] = Field(default=None, ge=0)
 
     @field_validator("max_neighbors_list")
     @classmethod
@@ -83,7 +81,6 @@ class BaseBackendSpec(BaseModel):
             max_neighbors_list=list(self.max_neighbors_list),
             max_neighbors_offset=self.max_neighbors_offset,
             max_neighbors_shrink_dwell=self.max_neighbors_shrink_dwell,
-            max_neighbors_shrink_margin=self.max_neighbors_shrink_margin,
             **self._backend_config_extras(),
         )
 

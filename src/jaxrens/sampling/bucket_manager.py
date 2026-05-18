@@ -11,11 +11,11 @@ Python loop has to:
    new bucket, or compiles it once on first hit).
 
 Optionally — when ``shrink_dwell > 0`` — the loop also tracks how long the
-observed neighbor peak has stayed comfortably below the next-smaller ladder
-entry and steps the bucket back down once the dwell is satisfied.  The gap
-between "grow when overflow" and "shrink only after a sustained low streak
-with margin" is the hysteresis that keeps the bucket from thrashing at a
-boundary.
+observed neighbor peak has stayed below the next-smaller ladder entry
+(modulo the offset headroom) and steps the bucket back down once the dwell
+is satisfied.  Temporal hysteresis via ``shrink_dwell`` and the ``offset``
+slack already keep the bucket from thrashing at a boundary; no extra
+shrink-side margin is needed on top.
 
 Both pickers (``_pick_next_bucket`` / ``_pick_prev_bucket``) and the
 ``BucketManager`` orchestrator live here; the two outer loops own only the
@@ -66,22 +66,21 @@ def _pick_prev_bucket(
     current: int,
     ladder: tuple[int, ...],
     offset: int,
-    margin: int,
 ) -> int | None:
     """Return the largest ladder entry strictly less than ``current`` that
-    still safely accommodates ``true_max + offset + margin``, or ``None``
-    when no smaller entry qualifies.
+    still safely accommodates ``true_max + offset``, or ``None`` when no
+    smaller entry qualifies.
 
-    The ``margin`` term implements the hysteresis gap: shrinking only fires
-    when the observed need leaves an explicit slack below the next-smaller
-    bucket, so a single fluctuation that nudges the bucket back up does not
-    instantly happen.  ``None`` signals "no shrink this iteration".
+    ``offset`` plays the dual role of post-grow headroom and post-shrink
+    slack: a shrink only commits when the next-smaller bucket still leaves
+    ``offset`` slots above the observed peak.  Temporal hysteresis comes
+    from ``shrink_dwell`` in the orchestrator.
 
     Going back to a previously-visited bucket reuses the JAX compilation
     cache, so the only cost of a wrong decision is the next overflow re-grow
     — not a fresh compile.
     """
-    target = int(true_max) + int(offset) + int(margin)
+    target = int(true_max) + int(offset)
     best: int | None = None
     for b in ladder:
         if b >= current:
@@ -111,23 +110,15 @@ class BucketManager:
         ladder: tuple[int, ...] | list[int],
         offset: int,
         shrink_dwell: int = 0,
-        shrink_margin: int | None = None,
     ) -> None:
         self.ladder = tuple(int(x) for x in ladder)
         if not self.ladder:
             raise ValueError("ladder must be non-empty.")
         self.offset = int(offset)
         self.shrink_dwell = int(shrink_dwell)
-        self.shrink_margin = (
-            int(shrink_margin) if shrink_margin is not None else int(offset)
-        )
         if self.shrink_dwell < 0:
             raise ValueError(
                 f"shrink_dwell must be >= 0, got {self.shrink_dwell}."
-            )
-        if self.shrink_margin < 0:
-            raise ValueError(
-                f"shrink_margin must be >= 0, got {self.shrink_margin}."
             )
         self.low_count = 0
 
@@ -185,9 +176,9 @@ class BucketManager:
 
         Reads ``ns_state.population.max_neighbor_count`` (the per-walker peak
         observed during the last successful step) and compares the next-
-        smaller ladder entry against ``observed + offset + shrink_margin``.
-        Increments ``low_count`` on a qualifying iteration, resets to zero on
-        a violation, and shrinks when the counter reaches ``shrink_dwell``.
+        smaller ladder entry against ``observed + offset``.  Increments
+        ``low_count`` on a qualifying iteration, resets to zero on a
+        violation, and shrinks when the counter reaches ``shrink_dwell``.
 
         ``shrink_dwell == 0`` (default) bypasses the entire check so the
         method becomes a cheap no-op for users who never opted in.
@@ -201,7 +192,7 @@ class BucketManager:
         obs_max = int(ns_state.population.max_neighbor_count.max())
         current = int(ns_state.population.max_neighbors)
         smaller = _pick_prev_bucket(
-            obs_max, current, self.ladder, self.offset, self.shrink_margin,
+            obs_max, current, self.ladder, self.offset,
         )
         if smaller is None:
             self.low_count = 0
@@ -213,11 +204,9 @@ class BucketManager:
 
         logger.info(
             "Shrinking bucket at iter %d: observed max_neighbors=%d, "
-            "resizing bucket %d -> %d (ladder=%s, offset=%d, margin=%d, "
-            "dwell=%d)",
+            "resizing bucket %d -> %d (ladder=%s, offset=%d, dwell=%d)",
             iteration, obs_max, current, smaller,
-            list(self.ladder), self.offset, self.shrink_margin,
-            self.shrink_dwell,
+            list(self.ladder), self.offset, self.shrink_dwell,
         )
         self.low_count = 0
         return ns_state.set(

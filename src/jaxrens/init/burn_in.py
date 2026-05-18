@@ -154,7 +154,6 @@ def initial_walk(
     max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
-    max_neighbors_shrink_margin: int | None = None,
 ) -> NSState:
     """Run fixed-Emax MCMC to decorrelate walkers from their initialization.
 
@@ -204,10 +203,6 @@ def initial_walk(
             the bucket — see :class:`~jaxrens.sampling.bucket_manager.BucketManager`.
             ``0`` (default) disables shrinking, preserving the existing
             growth-only behaviour.  Mirrors the NS-loop parameter.
-        max_neighbors_shrink_margin: Hysteresis gap below the next-smaller
-            ladder entry that must hold for ``shrink_dwell`` iterations
-            before the bucket is shrunk.  ``None`` reuses
-            ``max_neighbors_offset``.  Mirrors the NS-loop parameter.
 
     Returns:
         New NSState with live walkers advanced. Same pytree shape as input.
@@ -323,7 +318,6 @@ def initial_walk(
         ladder=max_neighbors_list,
         offset=max_neighbors_offset,
         shrink_dwell=max_neighbors_shrink_dwell,
-        shrink_margin=max_neighbors_shrink_margin,
     )
 
     # --- Outer walk loop (while-loop so overflow retries don't advance walk_i) ---

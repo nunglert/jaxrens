@@ -729,6 +729,11 @@ def _make_batched_ns_state_dict(
     # Per-replica emax — empirical max of each replica's energies.
     emax_vals = energies.reshape(batch_shape + (n_walkers,)).max(axis=-1)
 
+    # Batched rng_key matches the batch prefix — production batched NSState
+    # always has rng_key with the batcher's shape_prefix.
+    n_batch = int(np.prod(batch_shape)) if batch_shape else 1
+    batched_key = jax.random.split(jax.random.key(0), n_batch).reshape(batch_shape)
+
     state: dict = {
         "positions": positions,
         "types": types,
@@ -743,7 +748,7 @@ def _make_batched_ns_state_dict(
         "emax": emax_vals,
         "n_dead": n_dead_vals,
         "n_walkers": n_walkers,
-        "rng_key": jax.random.key(0),
+        "rng_key": batched_key,
     }
 
     if npt:

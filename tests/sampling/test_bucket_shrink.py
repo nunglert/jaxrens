@@ -3,7 +3,7 @@
 Covers:
 - ``_pick_prev_bucket`` — pure-Python picker that returns the next-smaller
   ladder entry when it still safely accommodates the observed peak plus
-  offset + margin.
+  offset.
 - ``_run_loop`` integration — shrinks fire only after the dwell window,
   a single high spike resets the streak, ``shrink_dwell=0`` keeps the
   bucket pinned, and an overflow growth invalidates a pending shrink.
@@ -66,7 +66,7 @@ def _build_ns_state(n_walkers: int = 6, n_atoms: int = 2, seed: int = 0):
 
 class TestPickPrevBucket:
     """``_pick_prev_bucket`` returns the largest ladder entry strictly below
-    ``current`` that still satisfies ``entry >= true_max + offset + margin``,
+    ``current`` that still satisfies ``entry >= true_max + offset``,
     or ``None`` when no smaller entry qualifies."""
 
     LADDER = (30, 35, 40, 45, 50)
@@ -75,47 +75,43 @@ class TestPickPrevBucket:
         # current=50, observed peak well below 45 → step down to 45.
         assert _pick_prev_bucket(true_max=20, current=50,
                                  ladder=self.LADDER,
-                                 offset=5, margin=5) == 45
+                                 offset=5) == 45
 
     def test_returns_none_when_target_requires_current_or_larger(self):
-        # observed + offset + margin = 30 + 5 + 5 = 40.  Largest entry
-        # below current=40 is 35 < 40 → no qualifying entry → None.
-        assert _pick_prev_bucket(true_max=30, current=40,
+        # observed + offset = 35 + 5 = 40.  Largest entry strictly below
+        # current=40 is 35 < 40 → no qualifying entry → None.
+        assert _pick_prev_bucket(true_max=35, current=40,
                                  ladder=self.LADDER,
-                                 offset=5, margin=5) is None
+                                 offset=5) is None
 
     def test_returns_none_when_current_is_smallest_entry(self):
         # current=30 is the bottom of the ladder — nothing smaller exists.
         assert _pick_prev_bucket(true_max=5, current=30,
                                  ladder=self.LADDER,
-                                 offset=5, margin=5) is None
+                                 offset=5) is None
 
     def test_steps_down_one_ladder_entry_even_if_much_smaller_qualifies(self):
         # observed peak well below 30 — picker still only returns the
         # immediate-next-smaller entry (45), never a multi-step jump.
         assert _pick_prev_bucket(true_max=5, current=50,
                                  ladder=self.LADDER,
-                                 offset=0, margin=0) == 45
+                                 offset=0) == 45
 
-    def test_honors_margin_gap(self):
-        # Without margin: 35 qualifies for true_max=25, offset=5 (target=30).
+    def test_offset_acts_as_shrink_safety_margin(self):
+        # With offset=5, true_max=25 → target=30 → 35 qualifies (next-smaller).
         assert _pick_prev_bucket(true_max=25, current=40,
                                  ladder=self.LADDER,
-                                 offset=5, margin=0) == 35
-        # With margin=5, target=35 — 35 still qualifies (>= 35).
+                                 offset=5) == 35
+        # With offset=11, true_max=25 → target=36 → 35 < 36 → None.
         assert _pick_prev_bucket(true_max=25, current=40,
                                  ladder=self.LADDER,
-                                 offset=5, margin=5) == 35
-        # With margin=6, target=36 — 35 no longer qualifies → None.
-        assert _pick_prev_bucket(true_max=25, current=40,
-                                 ladder=self.LADDER,
-                                 offset=5, margin=6) is None
+                                 offset=11) is None
 
-    def test_zero_margin_and_offset_picks_immediate_neighbour(self):
+    def test_zero_offset_picks_immediate_neighbour(self):
         # current=45, target=true_max=40 → 40 qualifies → return 40.
         assert _pick_prev_bucket(true_max=40, current=45,
                                  ladder=self.LADDER,
-                                 offset=0, margin=0) == 40
+                                 offset=0) == 40
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +141,6 @@ def _wrap_step_fn_force_observed(real_step_fn, observed_max: int):
 
 def _run_loop_minimal(ns_state, step_fn, *, n_iters: int,
                       shrink_dwell: int = 0,
-                      shrink_margin: int | None = None,
                       ladder=(30, 35, 40, 45, 50),
                       offset: int = 0):
     """Drive ``_run_loop`` with a SingleRun batcher and an iteration cap.
@@ -180,7 +175,6 @@ def _run_loop_minimal(ns_state, step_fn, *, n_iters: int,
         max_neighbors_list=ladder,
         max_neighbors_offset=offset,
         max_neighbors_shrink_dwell=shrink_dwell,
-        max_neighbors_shrink_margin=shrink_margin,
     )
     return ns_state_out
 
@@ -212,11 +206,11 @@ class TestBucketShrinkInLoop:
         )
         wrapped = _wrap_step_fn_force_observed(step_fn, observed_max=5)
 
-        # dwell=3, margin=0, offset=0 → after 3 low iterations the picker
-        # returns the next-smaller entry (45) and the bucket is shrunk once.
+        # dwell=3, offset=0 → after 3 low iterations the picker returns
+        # the next-smaller entry (45) and the bucket is shrunk once.
         result = _run_loop_minimal(
             ns_state, wrapped, n_iters=4,
-            shrink_dwell=3, shrink_margin=0, ladder=self.LADDER, offset=0,
+            shrink_dwell=3, ladder=self.LADDER, offset=0,
         )
         assert int(result.population.max_neighbors) == 45
 
@@ -232,24 +226,23 @@ class TestBucketShrinkInLoop:
         # 35→30 at iter 7.  After 9 iterations the bucket is at 30.
         result = _run_loop_minimal(
             ns_state, wrapped, n_iters=9,
-            shrink_dwell=2, shrink_margin=0, ladder=self.LADDER, offset=0,
+            shrink_dwell=2, ladder=self.LADDER, offset=0,
         )
         assert int(result.population.max_neighbors) == 30
 
-    def test_margin_can_block_shrink_at_boundary(self):
-        """A margin gap prevents shrinking when the observed peak sits right
-        at the next-smaller entry."""
+    def test_offset_can_block_shrink_at_boundary(self):
+        """The offset slack prevents shrinking when the observed peak sits
+        right at the next-smaller entry."""
         ns_state, step_fn, _backend = _build_ns_state(n_walkers=4, n_atoms=2)
         ns_state = ns_state.set(
             population=ns_state.population.set(max_neighbors=50),
         )
-        # observed=45 means target without margin = 45, which still fits
-        # in the 45 bucket — shrink would fire.  With margin=1, target=46
-        # > 45 → no qualifying entry → no shrink.
+        # observed=45 with offset=0 → target=45 fits in 45 → shrink fires.
+        # With offset=1 → target=46 > 45 → no qualifying entry → no shrink.
         wrapped = _wrap_step_fn_force_observed(step_fn, observed_max=45)
         result = _run_loop_minimal(
             ns_state, wrapped, n_iters=10,
-            shrink_dwell=2, shrink_margin=1, ladder=self.LADDER, offset=0,
+            shrink_dwell=2, ladder=self.LADDER, offset=1,
         )
         assert int(result.population.max_neighbors) == 50
 
@@ -314,19 +307,18 @@ class TestBucketManagerDirect:
         """A single high observed peak resets ``low_count`` mid-streak.
 
         Drives ``BucketManager.maybe_shrink`` directly with three observed
-        peaks (5, 46, 5) under ``dwell=3, margin=0`` on the (30,35,40,45,50)
+        peaks (5, 46, 5) under ``dwell=3, offset=0`` on the (30,35,40,45,50)
         ladder starting at bucket=50.  Iter 0 (obs=5) increments the streak
-        to 1; iter 1 (obs=46) fails the gap below the next-smaller bucket 45
-        and resets the streak to 0; iter 2 (obs=5) raises it to 1 again.  Net:
-        no shrink, bucket stays at 50.
+        to 1; iter 1 (obs=46) fails the check against the next-smaller bucket
+        45 and resets the streak to 0; iter 2 (obs=5) raises it to 1 again.
+        Net: no shrink, bucket stays at 50.
 
         Implemented as a direct ``BucketManager`` drive rather than as a
         ``_run_loop`` integration to sidestep ``jax.jit`` tracing — Python
         side-channel state in a wrapped ``step_fn`` does not survive
         compilation.
         """
-        mgr = BucketManager(self.LADDER, offset=0, shrink_dwell=3,
-                            shrink_margin=0)
+        mgr = BucketManager(self.LADDER, offset=0, shrink_dwell=3)
         st = self._stub_state(bucket=50, observed=5)
         st = mgr.maybe_shrink(st, iteration=0)
         assert mgr.low_count == 1
@@ -339,8 +331,7 @@ class TestBucketManagerDirect:
         assert int(st.population.max_neighbors) == 50
 
     def test_shrink_fires_after_dwell(self):
-        mgr = BucketManager(self.LADDER, offset=0, shrink_dwell=2,
-                            shrink_margin=0)
+        mgr = BucketManager(self.LADDER, offset=0, shrink_dwell=2)
         st = self._stub_state(bucket=50, observed=5)
         st = mgr.maybe_shrink(st, iteration=0)
         assert int(st.population.max_neighbors) == 50
@@ -367,12 +358,4 @@ class TestNegativeParamsRejected:
             _run_loop_minimal(
                 ns_state, step_fn, n_iters=1,
                 shrink_dwell=-1,
-            )
-
-    def test_negative_margin_raises(self):
-        ns_state, step_fn, _backend = _build_ns_state(n_walkers=4, n_atoms=2)
-        with pytest.raises(ValueError, match="shrink_margin"):
-            _run_loop_minimal(
-                ns_state, step_fn, n_iters=1,
-                shrink_dwell=1, shrink_margin=-1,
             )

@@ -133,7 +133,7 @@ class TestCheckpoint:
         save_checkpoint(path, ns_state, symbol_map={0: "Si"})
         assert path.exists()
 
-        loaded = load_checkpoint(path, rng_key=jax.random.key(99))
+        loaded = load_checkpoint(path)
         assert loaded["iteration"] == 3
         assert loaded["n_dead"] == 3
         assert loaded["n_walkers"] == 10
@@ -147,6 +147,39 @@ class TestCheckpoint:
         save_checkpoint(path, ns_state)
         loaded = load_checkpoint(path)
         assert loaded["cells"] is None
+
+    def test_rng_key_roundtrip_preserves_stream(self, ns_state, tmp_path):
+        """save_checkpoint persists the PRNG state so load can resume it.
+
+        Pre-fix, save_checkpoint silently dropped ns_state["rng_key"] and
+        load_checkpoint returned a caller-supplied or default key —
+        resumed runs silently reseeded, breaking reproducibility-on-resume.
+        """
+        path = tmp_path / "rng_roundtrip.h5"
+        save_checkpoint(path, ns_state)
+
+        loaded = load_checkpoint(path)
+        # Raw uint32 buffer must be present and match the saved key's data.
+        assert loaded["rng_key_data"] is not None, (
+            "save_checkpoint must persist rng_key as 'rng_key_data'"
+        )
+        original_data = np.asarray(jax.random.key_data(ns_state["rng_key"]))
+        assert np.array_equal(loaded["rng_key_data"], original_data)
+
+        # Re-wrapped key must yield identical draws to the original key.
+        restored = jax.random.wrap_key_data(jnp.asarray(loaded["rng_key_data"]))
+        s_orig = jax.random.uniform(ns_state["rng_key"], (5,))
+        s_restored = jax.random.uniform(restored, (5,))
+        assert jnp.array_equal(s_orig, s_restored)
+
+    def test_legacy_checkpoint_without_rng_key(self, ns_state, tmp_path):
+        """Older checkpoint files have no rng_key_data → load returns None."""
+        path = tmp_path / "legacy.h5"
+        # Build a legacy-style state dict (no rng_key field).
+        legacy = {k: v for k, v in ns_state.items() if k != "rng_key"}
+        save_checkpoint(path, legacy)
+        loaded = load_checkpoint(path)
+        assert loaded["rng_key_data"] is None
 
     def test_scalar_log_evidence_shape_roundtrip(self, ns_state, tmp_path):
         """Scalar log_evidence (SingleRun) round-trips with shape ()."""

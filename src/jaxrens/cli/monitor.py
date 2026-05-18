@@ -363,8 +363,27 @@ class ProgressCallback:
             n_acc = re_stats.get("n_swap_pairs_accepted", 0)
             acc = n_acc / max(n_att, 1)
             re_evals = re_stats.get("n_energy_evals", 0)
+
+            # Per-pair acc rates: shape (n_pairs,) = (n_runs - 1,).  Mean±std
+            # across replica-pair indices exposes spread along the ladder
+            # (e.g. low-P pairs accepting more than high-P pairs).
+            per_pair_str = ""
+            n_acc_pp = re_stats.get("n_accepted_per_pair")
+            n_att_pp = re_stats.get("n_attempted_per_pair")
+            if n_acc_pp is not None and n_att_pp is not None:
+                n_acc_arr = np.asarray(n_acc_pp, dtype=np.float64)
+                n_att_arr = np.asarray(n_att_pp, dtype=np.float64)
+                if n_acc_arr.size > 0:
+                    rates = np.where(
+                        n_att_arr > 0, n_acc_arr / np.maximum(n_att_arr, 1.0), 0.0
+                    )
+                    per_pair_str = (
+                        f"  per_pair={rates.mean():.2f}±{rates.std():.2f}"
+                    )
+
             lines.append(
-                f"  {'inter_re':<16}  n_pairs={n_att:>3d}  acc={acc:.2f}  evals={re_evals}"
+                f"  {'inter_re':<16}  n_pairs={n_att:>3d}  acc={acc:.2f}"
+                f"{per_pair_str}  evals={re_evals}"
             )
 
         logger.info("\n".join(lines))

@@ -49,6 +49,12 @@ class RestartBundle:
             restored iter via the ``i > 0`` gate so a stale +inf can't
             leak into trial-walker constraints.
         n_dead: Number of dead points stored.
+        rng_key_data: Raw uint32 PRNG buffer (output of ``jax.random.key_data``)
+            for this slot, or ``None`` for legacy checkpoints that pre-date
+            persisting the PRNG state.  ``init_ns`` re-wraps with
+            ``jax.random.wrap_key_data`` when present, so resumed runs
+            continue the saved random stream instead of silently reseeding
+            from the CLI seed.
     """
 
     dead_energies: jnp.ndarray
@@ -58,6 +64,7 @@ class RestartBundle:
     iteration: int
     emax: float
     n_dead: int
+    rng_key_data: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,29 @@ class BatchedRestart:
 # Shape-aware checkpoint loader
 # ---------------------------------------------------------------------------
 
+
+_JNP_FIELDS = (
+    "positions", "types", "energies", "cells",
+    "dead_energies", "dead_positions", "dead_volumes", "live_volumes",
+    "log_evidence", "emax",
+)
+
+
+def _coerce_ckpt_to_jnp(ckpt: dict) -> None:
+    """In-place: convert checkpoint array fields from numpy to jax.Array.
+
+    ``load_checkpoint`` is intentionally numpy-only (so headless postprocess
+    paths stay jax-free).  Restart consumers run the loaded arrays through
+    JIT'd NS code which jaxtyping-checks for ``jax.Array``; convert here
+    once.  Scalars (n_dead / iteration / n_walkers / rng_key) are left
+    as-is — they're consumed as Python ints / Optional[Key] downstream.
+    """
+    for name in _JNP_FIELDS:
+        val = ckpt.get(name)
+        if val is not None:
+            ckpt[name] = jnp.asarray(val)
+
+
 def _build_bundle_from_ckpt(
     ckpt: dict,
     idx: tuple[int, ...] | None = None,
@@ -124,6 +154,12 @@ def _build_bundle_from_ckpt(
     Returns:
         A ``RestartBundle`` for the given slot.
     """
+    # Raw uint32 PRNG buffer carried verbatim — wrapping happens in init_ns.
+    # ``rng_key_data`` has trailing dim 2 (the key payload) and a leading
+    # shape matching the checkpoint topology (``()`` for scalar, ``(R,)`` for
+    # VmapRuns, ``(G, P)`` for PmapVmapRuns).
+    full_rng_data = ckpt.get("rng_key_data")
+
     if idx is None:
         # Scalar single-run checkpoint: load_checkpoint already trimmed dead arrays.
         n_dead = int(ckpt["n_dead"])
@@ -135,6 +171,9 @@ def _build_bundle_from_ckpt(
         # ``load_checkpoint`` substitutes ``+inf`` for legacy ckpts missing
         # the emax field, so this is always present.
         emax = float(np.asarray(ckpt["emax"]))
+        rng_key_data = (
+            np.asarray(full_rng_data) if full_rng_data is not None else None
+        )
         return RestartBundle(
             dead_energies=dead_energies,
             dead_positions=dead_positions,
@@ -143,6 +182,7 @@ def _build_bundle_from_ckpt(
             iteration=int(ckpt["iteration"]),
             emax=emax,
             n_dead=n_dead,
+            rng_key_data=rng_key_data,
         )
     else:
         # Batched checkpoint: slice each field by idx.
@@ -165,6 +205,17 @@ def _build_bundle_from_ckpt(
         emax_arr = np.asarray(ckpt["emax"])
         emax = float(emax_arr[idx]) if emax_arr.ndim > 0 else float(emax_arr)
 
+        # rng_key_data: shape (*batch, 2).  Slice the leading batch dims when
+        # the saved key matches the topology; otherwise fall back to None so
+        # init_ns uses the caller's key.  Production batched runs always save
+        # shape-prefix-shaped keys; the fallback covers test fixtures and
+        # legacy mismatches where a scalar key was saved alongside batched
+        # fields.
+        if full_rng_data is not None and full_rng_data.ndim >= len(idx) + 1:
+            rng_key_data = np.asarray(full_rng_data)[idx]
+        else:
+            rng_key_data = None
+
         return RestartBundle(
             dead_energies=dead_energies,
             dead_positions=dead_positions,
@@ -173,6 +224,7 @@ def _build_bundle_from_ckpt(
             iteration=iteration,
             emax=emax,
             n_dead=n_dead,
+            rng_key_data=rng_key_data,
         )
 
 
@@ -262,6 +314,10 @@ def load_restart(
     from jaxrens.io.checkpoint import load_checkpoint
 
     ckpt = load_checkpoint(path)
+    # ``load_checkpoint`` returns numpy arrays (jax-free, for headless
+    # postprocess).  Production restart consumers (init_ns, ns_step) check
+    # types via jaxtyping → convert the live + dead arrays here.
+    _coerce_ckpt_to_jnp(ckpt)
 
     # Recover the saved batcher from log_evidence.shape.  The shape prefix is
     # ``()`` for SingleRun checkpoints, ``(R,)`` for VmapRuns, ``(G, P)`` for
@@ -411,6 +467,10 @@ def load_restart_batched(path: Path | str) -> BatchedRestart:
     from jaxrens.io.checkpoint import load_checkpoint
 
     ckpt = load_checkpoint(path)
+    # ``load_checkpoint`` returns numpy arrays (jax-free, for headless
+    # postprocess).  Production restart consumers (init_ns, ns_step) check
+    # types via jaxtyping → convert the live + dead arrays here.
+    _coerce_ckpt_to_jnp(ckpt)
 
     log_ev_arr = np.asarray(ckpt["log_evidence"])
     try:

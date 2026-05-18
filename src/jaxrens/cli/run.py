@@ -493,7 +493,6 @@ def run_from_config(
             max_neighbors_list=tuple(backend_config.max_neighbors_list),
             max_neighbors_offset=backend_config.max_neighbors_offset,
             max_neighbors_shrink_dwell=backend_config.max_neighbors_shrink_dwell,
-            max_neighbors_shrink_margin=backend_config.max_neighbors_shrink_margin,
         )
 
         # Extract burned-in walker arrays to re-seed run_ns.
@@ -563,7 +562,6 @@ def run_from_config(
         max_neighbors_list=tuple(backend_config.max_neighbors_list),
         max_neighbors_offset=backend_config.max_neighbors_offset,
         max_neighbors_shrink_dwell=backend_config.max_neighbors_shrink_dwell,
-        max_neighbors_shrink_margin=backend_config.max_neighbors_shrink_margin,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
         **full_auto_kwargs,
     )
@@ -710,7 +708,6 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
             max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
             max_neighbors_offset=resolved.backend.max_neighbors_offset,
             max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
-            max_neighbors_shrink_margin=resolved.backend.max_neighbors_shrink_margin,
         )
         pop = ns_state_burn.population
         # Burn-in operated on (G, P, K, ...) state via the PmapVmapRuns batcher.
@@ -945,7 +942,6 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
         max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
         max_neighbors_offset=resolved.backend.max_neighbors_offset,
         max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
-        max_neighbors_shrink_margin=resolved.backend.max_neighbors_shrink_margin,
         initial_max_neighbor_counts=post_burn_in_counts,
         batcher=resolved.batcher,
         restart_states=restart_states_2d,
@@ -1075,7 +1071,6 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
             max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
             max_neighbors_offset=resolved.backend.max_neighbors_offset,
             max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
-            max_neighbors_shrink_margin=resolved.backend.max_neighbors_shrink_margin,
         )
 
         # Flatten sharded (G, K/G, ...) population back to (K, ...) so the
@@ -1260,7 +1255,6 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
         max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
         max_neighbors_offset=resolved.backend.max_neighbors_offset,
         max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
-        max_neighbors_shrink_margin=resolved.backend.max_neighbors_shrink_margin,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
         batcher=batcher,
         **full_auto_kwargs,

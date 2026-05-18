@@ -238,6 +238,12 @@ def init_ns(
         log_evidence = jnp.array(rs.log_evidence, dtype=jnp.float32)
         iteration = jnp.array(rs.iteration, dtype=jnp.int32)
         emax = jnp.array(rs.emax, dtype=jnp.float32)
+        # If the checkpoint persisted the PRNG buffer, resume the saved
+        # stream instead of using the caller-supplied (config-seed-derived)
+        # key.  Legacy checkpoints without a saved key fall through to the
+        # caller's rng_key (the pre-fix behaviour, which silently reseeded).
+        if rs.rng_key_data is not None:
+            rng_key = jax.random.wrap_key_data(jnp.asarray(rs.rng_key_data))
 
     state = NSState(
         population=population,
@@ -790,7 +796,6 @@ def run_ns(
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
-    max_neighbors_shrink_margin: int | None = None,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
 ) -> dict:
     """Run a full nested sampling calculation.
@@ -877,7 +882,6 @@ def run_ns(
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
         max_neighbors_shrink_dwell=int(max_neighbors_shrink_dwell),
-        max_neighbors_shrink_margin=max_neighbors_shrink_margin,
     )
 
     # Final evidence: add contribution from remaining live walkers
@@ -1001,7 +1005,6 @@ def run_ns_parallel(
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
-    max_neighbors_shrink_margin: int | None = None,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
 ) -> dict:
     """Run multiple NS calculations in parallel via vmap(ns_step).
@@ -1196,7 +1199,6 @@ def run_ns_parallel(
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
         max_neighbors_shrink_dwell=int(max_neighbors_shrink_dwell),
-        max_neighbors_shrink_margin=max_neighbors_shrink_margin,
     )
 
     # Final evidence: per-run contribution from remaining live walkers
@@ -1496,7 +1498,6 @@ def run_ns_multi_gpu(
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
-    max_neighbors_shrink_margin: int | None = None,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
     batcher: PmapVmapRuns | None = None,
 ) -> dict:
@@ -1761,7 +1762,6 @@ def run_ns_multi_gpu(
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
         max_neighbors_shrink_dwell=int(max_neighbors_shrink_dwell),
-        max_neighbors_shrink_margin=max_neighbors_shrink_margin,
     )
 
     # Final evidence: per-run contribution from remaining live walkers.
@@ -1841,7 +1841,6 @@ def run_ns_sharded(
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
-    max_neighbors_shrink_margin: int | None = None,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
     batcher: ShardedSingleRun | None = None,
 ) -> dict:
@@ -1989,7 +1988,6 @@ def run_ns_sharded(
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
         max_neighbors_shrink_dwell=int(max_neighbors_shrink_dwell),
-        max_neighbors_shrink_margin=max_neighbors_shrink_margin,
         ns_step_fn=ns_step_sharded,
     )
 

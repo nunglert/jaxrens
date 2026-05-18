@@ -289,7 +289,6 @@ def _run_loop(
     max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
-    max_neighbors_shrink_margin: int | None = None,
     ns_step_fn: Callable | None = None,
 ) -> tuple[NSState, Key[Array, "*B"], dict[str, np.ndarray]]:
     """Unified NS outer loop shared by ``run_ns`` and ``run_ns_parallel``.
@@ -336,17 +335,12 @@ def _run_loop(
             fires after each ``ns_step`` call on iterations where
             ``inter_re_mgr.fires(i)`` is True.  ``None`` → zero overhead.
         max_neighbors_shrink_dwell: Number of consecutive iterations the
-            observed peak must sit ``shrink_margin`` below the next-smaller
-            ladder entry before the bucket is downsized one step.  ``0``
+            observed peak must sit at or below ``next_smaller_entry -
+            offset`` before the bucket is downsized one step.  ``0``
             (default) disables shrinking entirely so existing runs are
             byte-identical.  JAX's compilation cache reuses earlier compiles
             when the bucket revisits a known size, so the only cost paid by
             a wrong downsize is the next overflow re-grow.
-        max_neighbors_shrink_margin: Slack required below the next-smaller
-            ladder entry for a shrink to qualify (``observed + offset +
-            margin <= next_smaller``).  Together with ``shrink_dwell`` this
-            forms the hysteresis gap that prevents bucket thrashing at a
-            ladder boundary.  ``None`` (default) reuses ``max_neighbors_offset``.
 
     Returns:
         ``(ns_state, rng_key, cumulative)`` where:
@@ -416,7 +410,6 @@ def _run_loop(
         ladder=max_neighbors_list,
         offset=max_neighbors_offset,
         shrink_dwell=max_neighbors_shrink_dwell,
-        shrink_margin=max_neighbors_shrink_margin,
     )
 
     i = 0
