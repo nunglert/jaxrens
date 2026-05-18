@@ -242,6 +242,7 @@ def run_from_config(
     adaptation_config=None,
     move_descriptors=None,
     base_backend: Any = None,
+    writer_mode: str = "w",
 ) -> dict:
     """Run NS from typed config objects.
 
@@ -334,11 +335,14 @@ def run_from_config(
         callbacks.append(MemProfileCallback(working_dir / memprof))
 
     traj_path = working_dir / f"{output_config.out_file_prefix}.traj.{output_config.format}"
-    writer = create_trajectory_writer(output_config.format, traj_path, symbol_map)
+    writer = create_trajectory_writer(
+        output_config.format, traj_path, symbol_map, mode=writer_mode,
+    )
     energy_logger = EnergyLogger(
         working_dir / f"{output_config.out_file_prefix}.energies",
         n_walkers=ns_config.n_live,
         n_atoms=initial_positions.shape[-2],
+        mode=writer_mode,
     )
     callbacks.append(
         TrajectoryCallback(
@@ -363,6 +367,7 @@ def run_from_config(
             path=adapt_log_path,
             move_names=move_name_list,
             n_runs=1,
+            mode=writer_mode,
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
 
@@ -379,6 +384,7 @@ def run_from_config(
             move_names=[d.name for d in move_descriptors],
             n_runs=1,
             flush_interval=int(getattr(output_config, "flush_interval", 1000)),
+            mode=writer_mode,
         )
         callbacks.append(AccRatesCallback(
             acc_logger,
@@ -397,6 +403,7 @@ def run_from_config(
             n_runs=1,
             n_walkers=ns_config.n_live,
             flush_interval=int(getattr(output_config, "flush_interval", 1000)),
+            mode=writer_mode,
         )
         callbacks.append(MaxNeighborsCallback(
             mn_logger,
@@ -558,7 +565,7 @@ def run_from_config(
 # ---------------------------------------------------------------------------
 
 
-def run_multi_gpu_from_config(resolved) -> dict:
+def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
     """Execute a multi-replica NS dispatch from a multi-replica ``ResolvedConfig``.
 
     Mirrors :func:`run_from_config` but ends in ``run_ns_multi_gpu`` with
@@ -757,11 +764,15 @@ def run_multi_gpu_from_config(resolved) -> dict:
             / f"{resolved.output.out_file_prefix}.run{r:02d}.traj.{resolved.output.format}"
         )
         writers.append(
-            create_trajectory_writer(resolved.output.format, traj_path, symbol_map)
+            create_trajectory_writer(
+                resolved.output.format, traj_path, symbol_map, mode=writer_mode,
+            )
         )
         energy_path = working_dir / f"{resolved.output.out_file_prefix}.run{r:02d}.energies"
         energy_loggers.append(
-            EnergyLogger(energy_path, n_walkers=n_live, n_atoms=n_atoms)
+            EnergyLogger(
+                energy_path, n_walkers=n_live, n_atoms=n_atoms, mode=writer_mode,
+            )
         )
     callbacks.append(
         BatchedTrajectoryCallback(
@@ -785,6 +796,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
             path=adapt_log_path,
             move_names=move_name_list,
             n_runs=n_total,
+            mode=writer_mode,
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
 
@@ -803,6 +815,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
             move_names=[d.name for d in resolved.move_descriptors],
             n_runs=n_total,
             flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
+            mode=writer_mode,
         )
         callbacks.append(AccRatesCallback(
             acc_logger,
@@ -821,6 +834,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
             n_runs=n_total,
             n_walkers=n_live,
             flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
+            mode=writer_mode,
         )
         callbacks.append(MaxNeighborsCallback(
             mn_logger,
@@ -843,6 +857,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
             n_pairs=max(n_total - 1, 0),
             flavor=resolved.inter_re_config.flavor,
             flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
+            mode=writer_mode,
         )
         callbacks.append(RECallback(re_logger))
 
@@ -904,7 +919,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
     return result
 
 
-def run_sharded_from_config(resolved) -> dict:
+def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
     """Execute a sharded-single NS dispatch from a sharded ``ResolvedConfig``.
 
     One logical NS run with its ``n_live`` walker population sharded
@@ -1092,13 +1107,13 @@ def run_sharded_from_config(resolved) -> dict:
         / f"{resolved.output.out_file_prefix}.traj.{resolved.output.format}"
     )
     writer = create_trajectory_writer(
-        resolved.output.format, traj_path, symbol_map,
+        resolved.output.format, traj_path, symbol_map, mode=writer_mode,
     )
     energy_path = (
         working_dir / f"{resolved.output.out_file_prefix}.energies"
     )
     energy_logger = EnergyLogger(
-        energy_path, n_walkers=n_live, n_atoms=n_atoms,
+        energy_path, n_walkers=n_live, n_atoms=n_atoms, mode=writer_mode,
     )
     callbacks.append(
         TrajectoryCallback(
@@ -1118,6 +1133,7 @@ def run_sharded_from_config(resolved) -> dict:
             path=adapt_log_path,
             move_names=move_name_list,
             n_runs=1,
+            mode=writer_mode,
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
 
@@ -1133,6 +1149,7 @@ def run_sharded_from_config(resolved) -> dict:
             n_runs=1,
             n_walkers=n_live,
             flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
+            mode=writer_mode,
         )
         callbacks.append(MaxNeighborsCallback(
             mn_logger,
@@ -1153,6 +1170,7 @@ def run_sharded_from_config(resolved) -> dict:
             move_names=[d.name for d in resolved.move_descriptors],
             n_runs=1,
             flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
+            mode=writer_mode,
         )
         callbacks.append(AccRatesCallback(
             acc_logger,

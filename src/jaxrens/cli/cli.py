@@ -109,7 +109,7 @@ def _load_and_validate(config_path: str, overrides: list[str]) -> RootSpec:
     return RootSpec.model_validate(raw)
 
 
-def _run_single(resolved) -> None:
+def _run_single(resolved, *, writer_mode: str = "w") -> None:
     """Execute a SingleRun NS dispatch from a SingleRun ``ResolvedConfig``."""
     from jaxrens.cli.run import run_from_config
 
@@ -130,6 +130,7 @@ def _run_single(resolved) -> None:
         adaptation_config=resolved.adaptation_cfg,
         termination_criteria=list(resolved.termination),
         base_backend=resolved.base_backend,
+        writer_mode=writer_mode,
     )
 
 
@@ -200,6 +201,77 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # rather than inside the output dir — keeps them visible from the
     # top of the experiment tree without ``cd output/``.
     root.output.working_dir.mkdir(parents=True, exist_ok=True)
+
+    # Restart-vs-fresh decision tree.  Three start modes:
+    #   * fresh: neither restart_file nor --resume → gate enforces; mode="w"
+    #   * explicit restart: init.restart_file in YAML → skip gate; mode="a"
+    #   * auto restart: --resume → discover ckpt; skip gate; mode="a"
+    # --force is fresh-only.  All three pairs of restart triggers are
+    # mutually exclusive; conflicts are rejected here, before any I/O.
+    from jaxrens.cli.output_gate import (
+        discover_checkpoint,
+        enforce_clean_output_dir,
+        snapshot_path_for_checkpoint,
+        write_config_snapshot,
+    )
+    from jaxrens.cli.restart_validate import validate_restart_compatibility
+
+    yaml_restart_file = root.init.restart_file
+    if args.force and args.resume:
+        sys.stderr.write(
+            "jaxrens run: --force and --resume are mutually exclusive.\n"
+        )
+        return 2
+    if args.force and yaml_restart_file is not None:
+        sys.stderr.write(
+            "jaxrens run: --force is incompatible with init.restart_file; "
+            "remove restart_file from the YAML if you want a fresh start.\n"
+        )
+        return 2
+    if args.resume and yaml_restart_file is not None:
+        sys.stderr.write(
+            "jaxrens run: --resume and init.restart_file are mutually "
+            "exclusive (both request a restart from different sources).\n"
+        )
+        return 2
+
+    restart_intent = (yaml_restart_file is not None) or args.resume
+    writer_mode = "a" if restart_intent else "w"
+
+    if args.resume:
+        # Auto-discovery: pick a checkpoint and inject it into the resolved
+        # init slot.  Downstream Mode-D logic in the resolver kicks in as
+        # if the user had set ``init.restart_file`` explicitly.
+        chosen = discover_checkpoint(
+            root.output.working_dir, root.output.out_file_prefix,
+        )
+        root = root.model_copy(
+            update={"init": root.init.model_copy(update={"restart_file": chosen})},
+        )
+
+    if not restart_intent:
+        enforce_clean_output_dir(
+            root.output.working_dir,
+            root.output.out_file_prefix,
+            force=args.force,
+        )
+        # Snapshot the config so a future ``--resume`` (or explicit
+        # restart_file pointing at this dir) can validate compatibility.
+        write_config_snapshot(
+            root.output.working_dir,
+            root.output.out_file_prefix,
+            root,
+        )
+    else:
+        # Strict compatibility check against the snapshot beside the
+        # checkpoint.  Refuses on immutable diffs; warns on soft diffs.
+        checkpoint_path = Path(root.init.restart_file)
+        validate_restart_compatibility(
+            root,
+            checkpoint_path=checkpoint_path,
+            snapshot_path=snapshot_path_for_checkpoint(checkpoint_path),
+        )
+
     log_dir = root.output.working_dir.parent
     log_dir.mkdir(parents=True, exist_ok=True)
     configure_file_logging(
@@ -240,7 +312,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             resolved.ns.seed,
             f" pressure={pressure:.4g}" if pressure is not None else "",
         )
-        _run_single(resolved)
+        _run_single(resolved, writer_mode=writer_mode)
     elif isinstance(resolved.batcher, ShardedSingleRun):
         pressure = resolved.ensemble_params_per_run[0].get("pressure")
         logger.info(
@@ -251,7 +323,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             resolved.ns.n_live // resolved.batcher.n_gpu,
             f" pressure={pressure:.4g}" if pressure is not None else "",
         )
-        run_sharded_from_config(resolved)
+        run_sharded_from_config(resolved, writer_mode=writer_mode)
     else:
         logger.info(
             "[multi-replica] n_gpu=%d n_per_gpu=%d n_total=%d pressures=%s",
@@ -264,7 +336,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 for p in resolved.ensemble_params_per_run
             ),
         )
-        run_multi_gpu_from_config(resolved)
+        run_multi_gpu_from_config(resolved, writer_mode=writer_mode)
     return 0
 
 
@@ -450,6 +522,26 @@ def _build_parser() -> argparse.ArgumentParser:
             "with a diagnostic on mismatch.  Typically passed from SLURM as "
             "--n-gpus $SLURM_GPUS_ON_NODE so jobs fail fast when the scheduler "
             "downgrades the GPU allocation silently."
+        ),
+    )
+    p_run.add_argument(
+        "--force", action="store_true", default=False,
+        help=(
+            "Delete pre-existing artifacts in working_dir matching "
+            "out_file_prefix (.energies, .traj.*, .adaptation.h5, "
+            ".checkpoint.h5, ...) before starting.  Without --force, the run "
+            "aborts when any such file is present, to prevent silent "
+            "overwrite/append corruption of prior output."
+        ),
+    )
+    p_run.add_argument(
+        "--resume", action="store_true", default=False,
+        help=(
+            "Resume the run by auto-discovering a checkpoint in working_dir "
+            "(prefers <prefix>.final.checkpoint.h5, falls back to "
+            "<prefix>.checkpoint.h5; mtime tie-break).  Skips the output-dir "
+            "gate and switches loggers to append mode.  Mutually exclusive "
+            "with --force and with init.restart_file in the YAML."
         ),
     )
 

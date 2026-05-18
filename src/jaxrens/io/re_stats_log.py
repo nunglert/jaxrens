@@ -80,11 +80,15 @@ class RELogger:
         n_pairs: int,
         flavor: str,
         flush_interval: int = 1000,
+        mode: str = "w",
     ) -> None:
         self.path = Path(path)
         self.n_pairs = int(n_pairs)
         self.flavor = str(flavor)
         self.flush_interval = max(1, int(flush_interval))
+        self._mode = mode
+        # First flush honors ``mode``; subsequent flushes always append.
+        self._first_flush = True
 
         self._buf_iters: list[int] = []
         self._buf_n_acc: list[np.ndarray] = []
@@ -186,8 +190,10 @@ class RELogger:
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-        if not self.path.exists():
-            with h5py.File(self.path, "w") as f:
+        mode = self._mode if self._first_flush else "a"
+        self._first_flush = False
+        with h5py.File(self.path, mode) as f:
+            if "iterations" not in f:
                 f.attrs["n_pairs"] = self.n_pairs
                 f.attrs["flavor"] = self.flavor
                 f.attrs["re_stats_log_schema_version"] = 1
@@ -209,8 +215,7 @@ class RELogger:
                     maxshape=(None, self.n_pairs),
                     chunks=True,
                 )
-        else:
-            with h5py.File(self.path, "a") as f:
+            else:
                 old_n = f["iterations"].shape[0]
                 f["iterations"].resize((old_n + n_new,))
                 f["iterations"][old_n:] = new_iters

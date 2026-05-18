@@ -31,21 +31,26 @@ class EnergyLogger:
         n_cull: int = 1,
         n_dof: int = 0,
         n_atoms: int = 0,
+        mode: str = "w",
     ):
         self.path = Path(path)
         self.n_walkers = n_walkers
         self.n_cull = n_cull
         self.n_dof = n_dof
         self.n_atoms = n_atoms
+        self._mode = mode
         self._file = None
 
     def write_header(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = open(self.path, "w")
-        self._file.write(
-            f"{self.n_walkers} {self.n_cull} {self.n_dof} 0.0 {self.n_atoms}\n"
-        )
-        self._file.flush()
+        # mode="a" + existing non-empty file: header already on disk, skip it.
+        skip_header = self._mode == "a" and self.path.exists() and self.path.stat().st_size > 0
+        self._file = open(self.path, self._mode)
+        if not skip_header:
+            self._file.write(
+                f"{self.n_walkers} {self.n_cull} {self.n_dof} 0.0 {self.n_atoms}\n"
+            )
+            self._file.flush()
 
     def write_entry(
         self, iteration: int, energy: float, volume: float = 0.0

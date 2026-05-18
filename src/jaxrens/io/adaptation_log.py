@@ -95,11 +95,16 @@ class AdaptationLogger:
         path: Path | str,
         move_names: list[str],
         n_runs: int,
+        mode: str = "w",
     ) -> None:
         self.path = Path(path)
         self.move_names = list(move_names)
         self.n_runs = int(n_runs)
         self.n_moves = len(move_names)
+        self._mode = mode
+        # First flush honors ``mode`` (so mode="w" truncates a stale file);
+        # subsequent flushes always append.
+        self._first_flush = True
 
         # In-memory buffers
         self._buf_iters: list[int] = []
@@ -329,7 +334,8 @@ class AdaptationLogger:
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-        mode = "a" if self.path.exists() else "w"
+        mode = self._mode if self._first_flush else "a"
+        self._first_flush = False
         with h5py.File(self.path, mode) as f:
             if "iterations" not in f:
                 # First write: create extensible datasets and write attrs

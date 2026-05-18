@@ -23,10 +23,16 @@ class ExtxyzTrajectoryWriter:
         path: Path | str,
         symbol_map: dict[int, str],
         wrap: bool = True,
+        mode: str = "w",
     ):
         self.path = Path(path)
         self.symbol_map = symbol_map
         self.wrap = wrap
+        self._mode = mode
+        # First write of a run with mode="w" must overwrite any leftover
+        # file; subsequent writes within the same run must append so frames
+        # accumulate instead of replacing each other.
+        self._first_write = True
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def write_dead_point(
@@ -40,7 +46,9 @@ class ExtxyzTrajectoryWriter:
         atoms.info["ns_energy"] = energy
         if self.wrap and any(atoms.get_pbc()):
             atoms.wrap()
-        ase_write(str(self.path), atoms, append=True)
+        append = (self._mode == "a") or not self._first_write
+        ase_write(str(self.path), atoms, append=append)
+        self._first_write = False
 
     def write_walker_snapshot(
         self, iteration: int, walkers: Any
@@ -73,13 +81,19 @@ class ExtxyzTrajectoryWriter:
 class H5TrajectoryWriter:
     """Write dead points in HDF5 format."""
 
-    def __init__(self, path: Path | str, symbol_map: dict[int, str]):
+    def __init__(
+        self,
+        path: Path | str,
+        symbol_map: dict[int, str],
+        mode: str = "w",
+    ):
         import h5py
 
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.symbol_map = symbol_map
-        self._file = h5py.File(self.path, "w")
+        self._mode = mode
+        self._file = h5py.File(self.path, self._mode)
         self._file.attrs["symbol_map"] = str(symbol_map)
 
     def write_dead_point(
@@ -127,7 +141,7 @@ def create_trajectory_writer(
         case "extxyz":
             return ExtxyzTrajectoryWriter(path, symbol_map, **kwargs)
         case "h5":
-            return H5TrajectoryWriter(path, symbol_map)
+            return H5TrajectoryWriter(path, symbol_map, **kwargs)
         case "none":
             return NullTrajectoryWriter()
         case _:

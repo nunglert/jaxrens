@@ -88,12 +88,16 @@ class AccRatesLogger:
         move_names: list[str],
         n_runs: int,
         flush_interval: int = 1000,
+        mode: str = "w",
     ) -> None:
         self.path = Path(path)
         self.move_names = list(move_names)
         self.n_runs = int(n_runs)
         self.n_moves = len(move_names)
         self.flush_interval = max(1, int(flush_interval))
+        self._mode = mode
+        # First flush honors ``mode``; subsequent flushes always append.
+        self._first_flush = True
 
         self._buf_iters: list[int] = []
         self._buf_n_acc: list[np.ndarray] = []
@@ -203,7 +207,8 @@ class AccRatesLogger:
         n_new = len(iters_new)
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        mode = "a" if self.path.exists() else "w"
+        mode = self._mode if self._first_flush else "a"
+        self._first_flush = False
         with h5py.File(self.path, mode) as f:
             if "iterations" not in f:
                 f.create_dataset(

@@ -411,7 +411,7 @@ def _finalise_initial_energies_and_counts(
     if hasattr(energy_backend, "max_neighbors_for"):
         logger.info(
             "[resolve] computing per-walker initial neighbor counts and energies "
-            "(%s, n_walkers=%d, n_atoms=%d, batcher=%s)",
+            "(%s, n_walkers*n_runs=%d, n_atoms=%d, batcher=%s)",
             backend_label, n_walkers_total, n_atoms,
             type(batcher).__name__,
         )
@@ -455,7 +455,7 @@ def _finalise_initial_energies_and_counts(
         return energies, counts
 
     logger.info(
-        "[resolve] computing initial energies (%s, n_walkers=%d, n_atoms=%d, "
+        "[resolve] computing initial energies (%s, n_walkers*n_runs=%d, n_atoms=%d, "
         "batcher=%s)",
         backend_label, n_walkers_total, n_atoms,
         type(batcher).__name__,
