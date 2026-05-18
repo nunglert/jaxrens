@@ -91,11 +91,24 @@ def enforce_clean_output_dir(
         listing = "\n".join(f"  {p.name}" for p in shown)
         if more > 0:
             listing += f"\n  ... +{more} more"
+        has_checkpoint = any(
+            a.name.endswith(suffix) for a in artifacts for suffix in _CHECKPOINT_SUFFIXES
+        )
+        hints = ["Pass --force to delete them and start fresh."]
+        if has_checkpoint:
+            hints.append(
+                "Pass --resume to continue from the existing checkpoint, "
+                "or set output.working_dir to a new path to keep both runs."
+            )
+        else:
+            hints.append(
+                "Or set output.working_dir to a new path to keep the existing artifacts."
+            )
         sys.stderr.write(
             f"jaxrens run: output directory already contains artifacts for "
             f"prefix {prefix!r}:\n{listing}\n"
             f"  in: {working_dir}\n"
-            f"Pass --force to delete them and start fresh.\n"
+            + "\n".join(hints) + "\n"
         )
         raise SystemExit(2)
 

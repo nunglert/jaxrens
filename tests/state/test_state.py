@@ -119,6 +119,7 @@ class TestNSStatePytree:
             population=population,
             log_evidence=jnp.array(-jnp.inf),
             iteration=jnp.array(0, dtype=jnp.int32),
+            emax=jnp.array(jnp.inf, dtype=jnp.float32),
             rng_key=jax.random.key(0),
             n_walkers=10,
             n_atoms=3,

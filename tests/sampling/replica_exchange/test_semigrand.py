@@ -59,6 +59,10 @@ class TestSemiGrandProposeConvention:
     def test_hand_calculated_energies_match(self):
         """propose() must return energies matching the hand-derived formula.
 
+        Stored ``state.energy`` is ``Ω_self = U - μ_self · N`` (EnsembleBackend
+        convention).  The kernel must add ``μ_self · N`` back to recover U
+        before subtracting ``μ_partner · N``.
+
         Setup:
           run A: μ_A = [0.0, 0.0], walker has types=[0, 0, 1], U_A = 3.0
           run B: μ_B = [0.5, 1.0], walker has types=[1, 1, 0], U_B = 5.0
@@ -66,8 +70,11 @@ class TestSemiGrandProposeConvention:
           N_A = [2, 1]  (2 atoms of species 0, 1 of species 1)
           N_B = [1, 2]  (1 atom of species 0, 2 of species 1)
 
-          Ω_A_new = U_A - μ_B · N_A = 3.0 - (0.5*2 + 1.0*1) = 3.0 - 2.0 = 1.0
-          Ω_B_new = U_B - μ_A · N_B = 5.0 - (0.0*1 + 0.0*2) = 5.0
+          stored_A = U_A - μ_A · N_A = 3.0 - 0 = 3.0
+          stored_B = U_B - μ_B · N_B = 5.0 - (0.5·1 + 1.0·2) = 5.0 - 2.5 = 2.5
+
+          Ω_A_new = U_A - μ_B · N_A = 3.0 - (0.5·2 + 1.0·1) = 3.0 - 2.0 = 1.0
+          Ω_B_new = U_B - μ_A · N_B = 5.0 - (0.0·1 + 0.0·2) = 5.0
         """
         kernel = SemiGrandSwap(n_species=2)
         key = jax.random.PRNGKey(0)
@@ -76,11 +83,12 @@ class TestSemiGrandProposeConvention:
         mu_b = [0.5, 1.0]
         types_a = jnp.array([0, 0, 1], dtype=jnp.int32)  # N_A = [2, 1]
         types_b = jnp.array([1, 1, 0], dtype=jnp.int32)  # N_B = [1, 2]
-        u_a = jnp.array(3.0)
-        u_b = jnp.array(5.0)
+        # Stored energies in EnsembleBackend convention: Ω_self = U - μ_self·N
+        stored_a = jnp.array(3.0 - (mu_a[0] * 2 + mu_a[1] * 1))   # = 3.0
+        stored_b = jnp.array(5.0 - (mu_b[0] * 1 + mu_b[1] * 2))   # = 2.5
 
-        sa = _state(jnp.zeros((3, 3)), types_a, u_a)
-        sb = _state(jnp.zeros((3, 3)), types_b, u_b)
+        sa = _state(jnp.zeros((3, 3)), types_a, stored_a)
+        sb = _state(jnp.zeros((3, 3)), types_b, stored_b)
         ea = _ens(mu_a)
         eb = _ens(mu_b)
 
@@ -128,6 +136,52 @@ class TestSemiGrandProposeConvention:
         assert jnp.allclose(proposed["positions_b"], pos_b), "positions_b should be B's positions"
         assert jnp.array_equal(proposed["types_a"], types_a), "types_a must be unchanged"
         assert jnp.array_equal(proposed["types_b"], types_b), "types_b must be unchanged"
+
+    def test_hand_calculated_energies_both_mu_nonzero(self):
+        """Self-subtract regression: μ_A ≠ 0 AND μ_B ≠ 0.
+
+        The pre-fix implementation treated ``state.energy`` as raw U and only
+        subtracted ``μ_partner · N``.  Production has
+        ``state.energy = Ω_self = U - μ_self · N`` (EnsembleBackend
+        convention), so the kernel must add ``μ_self · N`` back to recover U
+        before subtracting ``μ_partner · N``.  This test pins both terms.
+
+        Setup:
+          μ_A = [1.0, 2.0], μ_B = [0.0, 0.0]
+          types_A = [0, 0, 1] → N_A = [2, 1]
+          U_A     = 3.0   (raw potential energy)
+          state.energy_A = U_A - μ_A · N_A = 3.0 - (1·2 + 2·1) = -1.0
+
+          Expected Ω_A_new = U_A - μ_B · N_A = 3.0 - 0 = 3.0
+            Pre-fix code: state.energy_A - μ_B·N_A = -1.0 - 0 = -1.0  (wrong)
+            Post-fix    : state.energy_A + μ_A·N_A - μ_B·N_A
+                       = -1.0 + 4.0 - 0 = 3.0  (correct)
+        """
+        kernel = SemiGrandSwap(n_species=2)
+        key = jax.random.PRNGKey(0)
+
+        mu_a = [1.0, 2.0]
+        mu_b = [0.0, 0.0]
+        types_a = jnp.array([0, 0, 1], dtype=jnp.int32)  # N_A = [2, 1]
+        types_b = jnp.array([1, 1, 0], dtype=jnp.int32)  # N_B = [1, 2]
+        # Stored energies in the EnsembleBackend convention.
+        u_a = 3.0
+        u_b = 5.0
+        stored_a = u_a - (mu_a[0] * 2 + mu_a[1] * 1)  # = -1.0
+        stored_b = u_b - (mu_b[0] * 1 + mu_b[1] * 2)  # = 5.0
+
+        sa = _state(jnp.zeros((3, 3)), types_a, jnp.array(stored_a))
+        sb = _state(jnp.zeros((3, 3)), types_b, jnp.array(stored_b))
+        proposed, _, _ = kernel.propose(sa, sb, _ens(mu_a), _ens(mu_b), key, None)
+
+        # Ω_A_new = U_A - μ_B · N_A = 3.0 - 0 = 3.0
+        # Ω_B_new = U_B - μ_A · N_B = 5.0 - (1·1 + 2·2) = 0.0
+        assert abs(float(proposed["energy_a"]) - 3.0) < 1e-5, (
+            f"Ω_A_new = {float(proposed['energy_a'])}, expected 3.0"
+        )
+        assert abs(float(proposed["energy_b"]) - 0.0) < 1e-5, (
+            f"Ω_B_new = {float(proposed['energy_b'])}, expected 0.0"
+        )
 
     def test_symmetric_zero_mu(self):
         """With μ_A = μ_B = 0, propose returns Ω = U (unchanged energies)."""

@@ -227,15 +227,23 @@ def init_ns(
         # (strong) and forces a redundant re-trace at iter 1.
         log_evidence = jnp.array(-jnp.inf, dtype=jnp.float32)
         iteration = jnp.array(0, dtype=jnp.int32)
+        # No NS contour yet — the first ``ns_step`` defines ``L_0``.  Using
+        # ``+inf`` (rather than ``max(initial_pop.energy)``) makes the
+        # "contour is algorithm state, not derivable from samples" invariant
+        # explicit: adapt cannot read a meaningful contour until ns_step has
+        # set one, and ``run_loop`` doesn't fire adapt at iter 0.
+        emax = jnp.array(jnp.inf, dtype=jnp.float32)
     else:
         rs = restart_state
         log_evidence = jnp.array(rs.log_evidence, dtype=jnp.float32)
         iteration = jnp.array(rs.iteration, dtype=jnp.int32)
+        emax = jnp.array(rs.emax, dtype=jnp.float32)
 
     state = NSState(
         population=population,
         log_evidence=log_evidence,
         iteration=iteration,
+        emax=emax,
         rng_key=rng_key,
         n_walkers=n_walkers,
         n_atoms=n_atoms,
@@ -434,10 +442,14 @@ def ns_step(
 
     # 8. Build new state — algorithm fields only; dead-point history is
     # handled host-side by ``_run_loop`` via the info dict below.
+    # ``emax = potential_max`` is the contour we just culled at — the
+    # algorithm-state NS contour, NOT a re-derived ``max(pop.energy)``.
+    # Downstream consumers (adapt, RE) read ``ns_state.emax`` verbatim.
     new_ns_state = ns_state.set(
         population=new_pop,
         log_evidence=log_evidence,
         iteration=ns_state.iteration + 1,
+        emax=potential_max,
         rng_key=key,
     )
 
@@ -672,11 +684,14 @@ def ns_step_sharded(
 
     new_pop_local = jax.tree.map(_slice_my_shard, new_pop_global)
 
-    # 8. Build new state.
+    # 8. Build new state.  ``potential_max`` is identical on every shard
+    # (gathered globally pre-cull), so writing it to ``emax`` produces a
+    # broadcast-compatible (G,) leaf when broadcast by the pmap wrapper.
     new_ns_state = ns_state.set(
         population=new_pop_local,
         log_evidence=log_evidence,
         iteration=ns_state.iteration + 1,
+        emax=potential_max,
         rng_key=key,
     )
 

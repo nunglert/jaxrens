@@ -53,12 +53,17 @@ def configure_file_logging(
     working_dir: Path,
     prefix: str,
     level: str,
+    mode: str = "w",
 ) -> None:
     """Attach file + stderr handlers to the ``jaxrens`` logger.
 
     Always writes INFO+ to ``<working_dir>/<prefix>.log`` and mirrors
     INFO+ to stderr.  If ``level`` is ``debug``, additionally writes
     DEBUG+ to ``<working_dir>/<prefix>.debug.log``.
+
+    ``mode`` mirrors the ``writer_mode`` plumbed through to the I/O
+    writers: ``"w"`` on a fresh run, ``"a"`` on restart so the prior
+    run's diagnostic log is preserved.
 
     Should be called once per process, early.  ``cli._cmd_run`` hoists
     this before the resolver so resolver-phase logs (which can take
@@ -74,7 +79,7 @@ def configure_file_logging(
             root.removeHandler(h)
             h.close()
 
-    info_h = logging.FileHandler(working_dir / f"{prefix}.log", mode="w")
+    info_h = logging.FileHandler(working_dir / f"{prefix}.log", mode=mode)
     info_h.setLevel(logging.INFO)
     info_h.setFormatter(logging.Formatter(_LOG_FORMAT))
     info_h._jaxrens_managed = True  # type: ignore[attr-defined]
@@ -87,7 +92,9 @@ def configure_file_logging(
     # root.addHandler(stream_h)
 
     if level == "debug":
-        debug_h = logging.FileHandler(working_dir / f"{prefix}.debug.log", mode="w")
+        debug_h = logging.FileHandler(
+            working_dir / f"{prefix}.debug.log", mode=mode
+        )
         debug_h.setLevel(logging.DEBUG)
         debug_h.setFormatter(logging.Formatter(_LOG_FORMAT))
         debug_h._jaxrens_managed = True  # type: ignore[attr-defined]
@@ -477,6 +484,10 @@ def run_from_config(
             walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
             per_move_fns=burn_per_move_fns,
             adaptation_policies=burn_adaptation_policies,
+            move_names=(
+                tuple(d.name for d in move_descriptors)
+                if move_descriptors is not None else None
+            ),
             adjust_n_samples=getattr(adaptation_config, "adjust_n_samples", 50) if adaptation_config is not None else 50,
             adjust_max_rounds=getattr(adaptation_config, "adjust_max_rounds", 15) if adaptation_config is not None else 15,
             max_neighbors_list=tuple(backend_config.max_neighbors_list),
@@ -640,8 +651,14 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
     )
 
     # --- Burn-in (batched=True) -------------------------------------------
+    # Skip burn-in on the restart branch: the checkpoint already holds
+    # walkers from the prior run's NS loop (well past the burn-in level).
     burn_in_cfg = resolved.initial_walk_config
-    do_burn_in = burn_in_cfg is not None and burn_in_cfg.n_walks > 0
+    do_burn_in = (
+        burn_in_cfg is not None
+        and burn_in_cfg.n_walks > 0
+        and resolved.init.restart_state is None
+    )
     if do_burn_in:
         from jaxrens.init.burn_in import initial_walk
 
@@ -687,6 +704,7 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
             walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
             per_move_fns=burn_per_move_fns,
             adaptation_policies=adaptation_policies,
+            move_names=tuple(d.name for d in resolved.move_descriptors),
             adjust_n_samples=getattr(resolved.adaptation_cfg, "adjust_n_samples", 50),
             adjust_max_rounds=getattr(resolved.adaptation_cfg, "adjust_max_rounds", 15),
             max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
@@ -885,6 +903,22 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
         ns.n_mcmc_steps, ns.max_iterations,
     )
 
+    # Multi-replica restart: the resolver attached ``list[list[RestartBundle]]``
+    # of shape (n_gpu, n_per_gpu) when ``init.restart_file`` was set; pass it
+    # through so ``run_ns_multi_gpu`` seeds per-replica NSState from the
+    # checkpoint instead of from a fresh ``init_ns``.
+    restart_states_2d = resolved.init.restart_state
+    if restart_states_2d is not None and not (
+        isinstance(restart_states_2d, list)
+        and len(restart_states_2d) > 0
+        and isinstance(restart_states_2d[0], list)
+    ):
+        raise RuntimeError(
+            f"run_multi_gpu_from_config: expected resolved.init.restart_state "
+            f"to be list[list[RestartBundle]] for the multi-replica path, "
+            f"got {type(restart_states_2d).__name__}."
+        )
+
     result = run_ns_multi_gpu(
         positions=positions,
         types=types,
@@ -914,6 +948,7 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
         max_neighbors_shrink_margin=resolved.backend.max_neighbors_shrink_margin,
         initial_max_neighbor_counts=post_burn_in_counts,
         batcher=resolved.batcher,
+        restart_states=restart_states_2d,
         **full_auto_kwargs,
     )
     return result
@@ -1030,6 +1065,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
             walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
             per_move_fns=burn_per_move_fns,
             adaptation_policies=adaptation_policies,
+            move_names=tuple(d.name for d in resolved.move_descriptors),
             adjust_n_samples=getattr(
                 resolved.adaptation_cfg, "adjust_n_samples", 50,
             ),

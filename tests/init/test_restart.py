@@ -67,6 +67,7 @@ def _make_ns_state_dict(
         "live_volumes": None,
         "log_evidence": -12.5,
         "iteration": n_dead,
+        "emax": float(energies.max()),
         "n_dead": n_dead,
         "n_walkers": n_walkers,
         "rng_key": jax.random.key(0),
@@ -725,6 +726,9 @@ def _make_batched_ns_state_dict(
     # log_evidence: per-run float
     log_evidence_vals = rng.uniform(-20, -5, batch_shape).astype(np.float64)
 
+    # Per-replica emax — empirical max of each replica's energies.
+    emax_vals = energies.reshape(batch_shape + (n_walkers,)).max(axis=-1)
+
     state: dict = {
         "positions": positions,
         "types": types,
@@ -736,6 +740,7 @@ def _make_batched_ns_state_dict(
         "live_volumes": None,
         "log_evidence": log_evidence_vals,
         "iteration": iteration_vals,
+        "emax": emax_vals,
         "n_dead": n_dead_vals,
         "n_walkers": n_walkers,
         "rng_key": jax.random.key(0),
@@ -1182,3 +1187,96 @@ class TestInferRestartShape:
         from jaxrens.init.restart import infer_restart_shape
         with pytest.raises(TypeError, match="unrecognised"):
             infer_restart_shape("not_a_bundle")
+
+
+# ---------------------------------------------------------------------------
+# load_restart_batched: multi-replica restart loader
+# ---------------------------------------------------------------------------
+
+class TestLoadRestartBatched:
+    """Multi-replica loader returning flat (n_total, ...) arrays + 2-D bundles."""
+
+    def test_vmap_1d_checkpoint_returns_single_gpu_layout(self, tmp_path):
+        from jaxrens.init.restart import load_restart_batched
+
+        n_runs = 4
+        state = _make_batched_ns_state_dict(batch_shape=(n_runs,), n_walkers=3, n_atoms=2)
+        p = tmp_path / "vmap.checkpoint.h5"
+        save_checkpoint(p, state)
+
+        batched = load_restart_batched(p)
+        assert batched.n_gpu == 1
+        assert batched.n_per_gpu == n_runs
+        assert batched.n_total == n_runs
+        assert batched.positions.shape == (n_runs, 3, 2, 3)
+        assert batched.cells.shape == (n_runs, 3, 3, 3)
+        assert batched.types.shape == (n_runs, 3, 2)
+        assert len(batched.bundles_2d) == 1
+        assert len(batched.bundles_2d[0]) == n_runs
+        assert all(isinstance(b, RestartBundle) for b in batched.bundles_2d[0])
+
+    def test_pmap_2d_checkpoint_preserves_g_p_split(self, tmp_path):
+        from jaxrens.init.restart import load_restart_batched
+
+        G, P = 1, 4  # n_gpu=1 to avoid the cross-topology guard on this host.
+        state = _make_batched_ns_state_dict(batch_shape=(G, P), n_walkers=3, n_atoms=2)
+        p = tmp_path / "pmap.checkpoint.h5"
+        save_checkpoint(p, state)
+
+        batched = load_restart_batched(p)
+        assert batched.n_gpu == G
+        assert batched.n_per_gpu == P
+        assert batched.n_total == G * P
+        assert batched.positions.shape == (G * P, 3, 2, 3)
+        assert len(batched.bundles_2d) == G
+        assert len(batched.bundles_2d[0]) == P
+
+    def test_bundles_flat_round_trips_through_bundles_2d(self, tmp_path):
+        from jaxrens.init.restart import load_restart_batched
+
+        state = _make_batched_ns_state_dict(batch_shape=(1, 6), n_walkers=2)
+        p = tmp_path / "rt.checkpoint.h5"
+        save_checkpoint(p, state)
+
+        batched = load_restart_batched(p)
+        flat = batched.bundles_flat
+        assert len(flat) == batched.n_total
+        rebuilt = [
+            flat[g * batched.n_per_gpu:(g + 1) * batched.n_per_gpu]
+            for g in range(batched.n_gpu)
+        ]
+        assert rebuilt == batched.bundles_2d
+
+    def test_single_run_checkpoint_rejected(self, tmp_path):
+        from jaxrens.init.restart import load_restart_batched
+
+        state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=3)
+        p = _write_checkpoint(tmp_path, state, name="scalar.checkpoint.h5")
+
+        with pytest.raises(ValueError, match="scalar single-run"):
+            load_restart_batched(p)
+
+    def test_missing_file_raises_file_not_found(self, tmp_path):
+        from jaxrens.init.restart import load_restart_batched
+        with pytest.raises(FileNotFoundError):
+            load_restart_batched(tmp_path / "nope.h5")
+
+    def test_per_slot_bundles_independent(self, tmp_path):
+        """Each bundle carries its own iteration / n_dead, not a single shared one."""
+        from jaxrens.init.restart import load_restart_batched
+
+        state = _make_batched_ns_state_dict(batch_shape=(1, 3), n_walkers=2)
+        # Stamp distinct iteration values so we can tell slots apart.
+        state["iteration"] = np.array([[10, 20, 30]], dtype=np.int32)
+        state["n_dead"] = np.array([[5, 6, 7]], dtype=np.int32)
+        p = tmp_path / "per_slot.checkpoint.h5"
+        save_checkpoint(p, state)
+
+        batched = load_restart_batched(p)
+        flat = batched.bundles_flat
+        assert flat[0].iteration == 10
+        assert flat[1].iteration == 20
+        assert flat[2].iteration == 30
+        assert flat[0].n_dead == 5
+        assert flat[1].n_dead == 6
+        assert flat[2].n_dead == 7

@@ -195,6 +195,7 @@ def _gather_sharded_ns_state(ns_state: NSState) -> NSState:
         population=new_pop,
         log_evidence=_collapse(ns_state.log_evidence),
         iteration=_collapse(ns_state.iteration),
+        emax=_collapse(ns_state.emax),
         rng_key=_collapse(ns_state.rng_key),
     )
     return new_ns_state
@@ -423,9 +424,13 @@ def _run_loop(
         # ---- Adaptation ----
         adjust_info = None
         if adapt_step is not None and i > 0 and i % adjust_interval == 0:
-            emax = batcher.reduce_emax(ns_state.population.energy)
+            # ``ns_state.emax`` holds the contour the previous ``ns_step``
+            # just culled at (algorithm state, not a re-derived
+            # ``max(pop.energy)``).  Adapt trial walkers experience the
+            # same constraint the population was sampled under — minor
+            # off-by-one vs. the upcoming step's L_{i+1}, but principled.
             ns_state, per_move_outputs, rng_key = adapt_step(
-                ns_state, emax, rng_key,
+                ns_state, ns_state.emax, rng_key,
             )
             # Re-extract for the downstream callbacks / info dict.
             current_step_sizes = batcher.extract_step_sizes(
@@ -460,6 +465,10 @@ def _run_loop(
         # Zero overhead when inter_re_mgr is None or is_active=False.
         if inter_re_mgr is not None and inter_re_mgr.is_active and inter_re_mgr.fires(i):
             inter_re_key, key_re = jax.random.split(inter_re_key)
+            # RE reads the contour off ``ns_state.emax`` (set by the
+            # ns_step that just ran).  No emax recomputation here, no
+            # plumbing — the contour lives on state precisely so every
+            # consumer reads the same algorithm-defined value.
             ns_state, re_stats, _ = inter_re_mgr.apply(ns_state, key_re)
             info["inter_re_stats"] = re_stats
             # Roll RE energy evals into the cumulative counters so that the

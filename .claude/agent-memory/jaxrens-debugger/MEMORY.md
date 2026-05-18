@@ -11,6 +11,7 @@ Each entry points to a pathology memory file. Read all of these at the start of 
 - [Log columns mislabeled](pathology_log_columns_mislabeled.md) — format-string / arg-order mismatches
 - [Slow Monitor observables](pathology_slow_monitor_observables.md) — plot.py takes minutes per 200 T points
 - [NeuralILwithMorse NaN grad on padded atoms](pathology_neuralil_morse_padded_inf_nan.md) — center_at_atoms emits inf radii for type<0 pairs; MorseModel's exp(-a*(inf-b)) yields 0*inf=NaN in the gradient even though the forward is fine
+- [Pressure-RENS acceptance decays to 0](pathology_pressure_rens_double_pv.md) — PressureRENSSwap.accept treats stored enthalpy as raw U, double-counts P·V; severity scales with Emax tightening
 
 ## Diagnostic templates
 

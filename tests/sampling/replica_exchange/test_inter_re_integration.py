@@ -324,6 +324,10 @@ class TestPmapVmapRunsInterRE:
         )
 
         descriptor = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+        # Seed emax from initial pop max — mirror what one ns_step would do.
+        ns_state = ns_state.set(
+            emax=descriptor.reduce_emax(ns_state.population.energy),
+        )
         mgr = InterREManager(PressureRENSSwap(), descriptor, backend, re_interval=1)
 
         swap_key = jax.random.key(7)

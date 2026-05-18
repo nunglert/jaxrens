@@ -162,6 +162,77 @@ def test_inter_re_change_refused(tmp_path):
         )
 
 
+def test_replica_count_change_refused_via_pressure_list(tmp_path, capsys):
+    """Growing/shrinking ``ensemble.pressure`` list across restart is refused
+    with a targeted replica-count message before the generic ensemble diff."""
+    snap_payload = _baseline_config()
+    snap_payload["ensemble"] = {"type": "npt", "pressure": [0.001, 0.005]}
+    snap = _write_snapshot(tmp_path, snap_payload)
+    ckpt = _checkpoint_path(tmp_path)
+
+    current = _baseline_config()
+    current["ensemble"] = {"type": "npt", "pressure": [0.001, 0.005, 0.01, 0.05]}
+
+    with pytest.raises(SystemExit) as ex:
+        validate_restart_compatibility(
+            _FakeRoot(current), checkpoint_path=ckpt, snapshot_path=snap,
+        )
+    assert ex.value.code == 2
+    err = capsys.readouterr().err
+    assert "replica count changed" in err
+    assert "n_total = 2" in err
+    assert "n_total = 4" in err
+
+
+def test_replica_count_change_refused_via_composition_targets(tmp_path, capsys):
+    snap_payload = _baseline_config()
+    snap_payload["inter_re"] = {
+        "flavor": "xrens",
+        "composition_targets": [[8, 0], [4, 4]],
+    }
+    snap = _write_snapshot(tmp_path, snap_payload)
+    ckpt = _checkpoint_path(tmp_path)
+
+    current = _baseline_config()
+    current["inter_re"] = {
+        "flavor": "xrens",
+        "composition_targets": [[8, 0], [4, 4], [0, 8]],
+    }
+
+    with pytest.raises(SystemExit) as ex:
+        validate_restart_compatibility(
+            _FakeRoot(current), checkpoint_path=ckpt, snapshot_path=snap,
+        )
+    assert ex.value.code == 2
+    err = capsys.readouterr().err
+    assert "replica count changed" in err
+    assert "n_total = 2" in err
+    assert "n_total = 3" in err
+
+
+def test_replica_count_unchanged_but_values_changed_still_refused(tmp_path, capsys):
+    """Length-preserved value changes fall through to the generic ensemble
+    subtree diff and are still refused — just via the broader path."""
+    snap_payload = _baseline_config()
+    snap_payload["ensemble"] = {"type": "npt", "pressure": [0.001, 0.005, 0.01, 0.05]}
+    snap = _write_snapshot(tmp_path, snap_payload)
+    ckpt = _checkpoint_path(tmp_path)
+
+    current = _baseline_config()
+    current["ensemble"] = {"type": "npt", "pressure": [0.002, 0.005, 0.01, 0.05]}
+
+    with pytest.raises(SystemExit) as ex:
+        validate_restart_compatibility(
+            _FakeRoot(current), checkpoint_path=ckpt, snapshot_path=snap,
+        )
+    assert ex.value.code == 2
+    err = capsys.readouterr().err
+    # The replica-count check must NOT fire (lengths match);
+    # the generic ensemble immutable-subtree check must fire instead.
+    assert "replica count changed" not in err
+    assert "ensemble" in err
+
+
 def test_cell_change_refused(tmp_path):
     snap = _write_snapshot(tmp_path, _baseline_config())
     ckpt = _checkpoint_path(tmp_path)

@@ -111,6 +111,7 @@ def _write_checkpoint(
         "live_volumes": None,
         "log_evidence": log_evidence,
         "iteration": n_dead,
+        "emax": float(np.asarray(s["energies"]).max()),
         "n_dead": n_dead,
         "n_walkers": n_walkers,
         "rng_key": jax.random.key(1),

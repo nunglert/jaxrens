@@ -260,28 +260,40 @@ class TestXRENSAccept:
             f"accept() under jit should return scalar, got shape {result.shape}"
         )
 
-    def test_accept_matches_pressure_rens(self):
-        """accept() output must match PressureRENSSwap.accept on same inputs."""
-        from jaxrens.sampling.moves.replica_exchange import PressureRENSSwap
-        xrens_kernel = XRENSSwap(n_species=2)
-        pressure_kernel = PressureRENSSwap()
+    def test_accept_uses_destination_pressure_via_propose(self):
+        """XRENS no longer delegates to PressureRENSSwap.accept.
 
+        After the unified-fix landed (matching production state.energy
+        semantics), ``XRENSSwap.propose`` threads each receiving run's
+        ensemble_params (incl. pressure) into the backend call, so the
+        returned ``energy_a``/``energy_b`` are already enthalpies at the
+        destination pressure.  ``XRENSSwap.accept`` is therefore a plain
+        ``E < Emax`` threshold check.
+
+        This test asserts that ``XRENSSwap.accept`` returns the same boolean
+        as a hand-evaluated ``e < emax`` check, regardless of whether
+        ensemble_params carry a pressure — the kernel must NOT add another
+        PV term on top.
+        """
+        kernel = XRENSSwap(n_species=2)
         proposed = self._make_proposed(0.5, 0.4)
-        emax_a = jnp.array(1.0)
-        emax_b = jnp.array(1.0)
+        # With pressure dicts present in ensemble_params: accept must still
+        # be a simple threshold check (no PV double-add).
         ens_a = {"pressure": jnp.array(0.1)}
         ens_b = {"pressure": jnp.array(0.2)}
+        proposed["cell_a"] = jnp.eye(3) * 2.0
+        proposed["cell_b"] = jnp.eye(3) * 2.0
 
-        # Add cell with nonzero volume for pressure test
-        cell = jnp.eye(3) * 2.0
-        proposed["cell_a"] = cell
-        proposed["cell_b"] = cell
+        # Emax just above the stored energies → must accept.
+        emax_a = jnp.array(1.0)
+        emax_b = jnp.array(1.0)
+        assert bool(kernel.accept(proposed, emax_a, emax_b, ens_a, ens_b))
 
-        xrens_result = xrens_kernel.accept(proposed, emax_a, emax_b, ens_a, ens_b)
-        pressure_result = pressure_kernel.accept(proposed, emax_a, emax_b, ens_a, ens_b)
-        assert bool(xrens_result) == bool(pressure_result), (
-            "XRENSSwap.accept should give same result as PressureRENSSwap.accept "
-            "on identical proposed/emax/ens_params"
+        # Emax just below energy_a → must reject (even though delegated to
+        # PressureRENSSwap.accept with double-counted PV would still accept).
+        emax_a_tight = jnp.array(0.45)
+        assert not bool(
+            kernel.accept(proposed, emax_a_tight, emax_b, ens_a, ens_b)
         )
 
 

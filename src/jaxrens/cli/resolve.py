@@ -36,7 +36,12 @@ from jaxrens.cli.schema.termination import IterationTerminationSpec
 from jaxrens.init.cells import cell_shape_walk, sample_initial_volume
 from jaxrens.init.positions import grid_positions_in_cell, uniform_positions_in_cell
 from jaxrens.init.rejection import rejection_sample_positions
-from jaxrens.init.restart import RestartBundle, load_restart
+from jaxrens.init.restart import (
+    BatchedRestart,
+    RestartBundle,
+    load_restart,
+    load_restart_batched,
+)
 from jaxrens.init.structure import load_structure
 from jaxrens.init.walker_set import load_walker_set
 from jaxrens.sampling.move_kernel import MoveKernel
@@ -173,7 +178,10 @@ class ResolvedInit:
     initial_energies: Any    # shape: (n_live,) or None — None until evaluated
     initial_max_neighbor_counts: Any = None  # shape: (n_live,) int32 or None
     symbol_map: dict[int, str] | None = None
-    restart_state: RestartBundle | None = None
+    # ``RestartBundle`` for single-replica restart; ``list[list[RestartBundle]]``
+    # of shape ``(n_gpu, n_per_gpu)`` for multi-replica restart; ``None`` when
+    # starting fresh.  Consumer (``cli/run.py``) dispatches by isinstance.
+    restart_state: RestartBundle | list[list[RestartBundle]] | None = None
 
 
 def _build_cells(
@@ -1287,14 +1295,42 @@ def _resolve_multi_replica(
     # through ``ensemble_params`` rather than separate backend objects.
     from jaxrens.backends.ensemble import EnsembleBackend
 
+    # --- Multi-replica restart: load once, slice per replica --------------
+    # When ``init.restart_file`` is set, every replica's positions / cells /
+    # types come from the checkpoint instead of from the fresh species path.
+    # We load the checkpoint exactly once and verify its shape matches the
+    # YAML's (n_gpu, n_per_gpu) topology before slicing into per-replica
+    # ResolvedInits.  This bypasses ``_resolve_init`` entirely on the restart
+    # branch — that helper only knows the scalar single-run case.
+    batched_restart: BatchedRestart | None = None
+    if root.init.restart_file is not None:
+        batched_restart = load_restart_batched(Path(root.init.restart_file))
+        if batched_restart.n_total != n_total:
+            raise ValueError(
+                f"restart_file checkpoint has n_total={batched_restart.n_total} "
+                f"replicas (n_gpu={batched_restart.n_gpu}, "
+                f"n_per_gpu={batched_restart.n_per_gpu}) but the current "
+                f"YAML implies n_total={n_total} "
+                f"(n_gpu={n_gpu}, n_per_gpu={n_per_gpu}). "
+                f"Match the replica-list length (ensemble.pressure / "
+                f"inter_re.*) to the checkpoint, or restart into a different "
+                f"output dir."
+            )
+        # Cross-topology check (G mismatch) when both sides have >1 GPU is
+        # raised inside ``load_restart_batched`` already.  The other case —
+        # saved n_gpu=1 (VmapRuns) but current n_gpu>1 — we accept: the data
+        # is the same n_total replicas, just re-tiled across devices.
+        if batched_restart.n_gpu != n_gpu and batched_restart.n_gpu != 1:
+            raise ValueError(
+                f"restart_file checkpoint topology (n_gpu="
+                f"{batched_restart.n_gpu}) does not match the current host "
+                f"(n_gpu={n_gpu}). Cross-topology restart is only supported "
+                f"when the saved checkpoint has n_gpu=1."
+            )
+
     per_run_init: list[ResolvedInit] = []
     for r in range(n_total):
         p = params_per_run[r].get("pressure", None)
-        per_run_backend = (
-            EnsembleBackend(base_backend, pressure=float(p))
-            if p is not None
-            else base_backend
-        )
         # Seed policy: distinct per-replica seed = root.run.seed + r.
         seed_r = root.run.seed + r
         logger.info(
@@ -1302,13 +1338,32 @@ def _resolve_multi_replica(
             r + 1, n_total, seed_r,
             f", pressure={p:.4g}" if p is not None else "",
         )
-        init_r = _resolve_init(
-            root.init,
-            n_live=root.run.n_live,
-            seed=seed_r,
-            energy_backend=per_run_backend,
-            cell_cfg=root.cell,
-        )
+        if batched_restart is not None:
+            # Mode D (multi-replica): slice the pre-loaded checkpoint.
+            # Energies / neighbor counts left as None — the consolidated
+            # finalize below recomputes them from the loaded positions.
+            init_r = ResolvedInit(
+                initial_positions=batched_restart.positions[r],
+                initial_types=batched_restart.types[r],
+                initial_cells=batched_restart.cells[r],
+                initial_energies=None,
+                initial_max_neighbor_counts=None,
+                symbol_map=batched_restart.symbol_map,
+                restart_state=None,  # 2-D list attached at the stacked level
+            )
+        else:
+            per_run_backend = (
+                EnsembleBackend(base_backend, pressure=float(p))
+                if p is not None
+                else base_backend
+            )
+            init_r = _resolve_init(
+                root.init,
+                n_live=root.run.n_live,
+                seed=seed_r,
+                energy_backend=per_run_backend,
+                cell_cfg=root.cell,
+            )
         per_run_init.append(init_r)
 
     # Validate structural shapes (energies/counts are None at this
@@ -1394,6 +1449,22 @@ def _resolve_multi_replica(
 
     # symbol_map, restart_state from ref (must be identical across replicas).
     symbol_map = per_run_init[0].symbol_map
+    # For the multi-replica restart branch, the 2-D bundle list was loaded
+    # once at the top of this function; attach it here so the dispatcher in
+    # ``run_multi_gpu_from_config`` can forward it as ``restart_states=`` to
+    # ``run_ns_multi_gpu``.  Reshape from saved n_gpu=1 to (n_gpu_current,
+    # n_per_gpu_current) when the host re-tiles the replicas across more
+    # devices than the checkpoint was saved on (saved n_gpu=1 → current n_gpu>1).
+    restart_state_2d: list[list[RestartBundle]] | None = None
+    if batched_restart is not None:
+        if batched_restart.n_gpu == n_gpu:
+            restart_state_2d = batched_restart.bundles_2d
+        else:
+            # saved n_gpu=1 retile case: flatten then re-nest as (n_gpu, n_per_gpu).
+            flat = batched_restart.bundles_flat
+            restart_state_2d = [
+                flat[g * n_per_gpu:(g + 1) * n_per_gpu] for g in range(n_gpu)
+            ]
     stacked_init = ResolvedInit(
         initial_positions=initial_positions,
         initial_types=initial_types,
@@ -1401,7 +1472,7 @@ def _resolve_multi_replica(
         initial_energies=initial_energies,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
         symbol_map=symbol_map,
-        restart_state=None,  # multi-run restart is a follow-up; see plan.
+        restart_state=restart_state_2d,
     )
 
     # ns_config with derived topology fields.
@@ -1529,14 +1600,6 @@ def resolve(root: RootSpec) -> ResolvedConfig:
     root = _apply_interval_units(root)
 
     n_total, n_gpu, n_per_gpu, params_per_run = _derive_replica_axes(root)
-
-    if root.init.restart_file is not None and n_total > 1:
-        raise ValueError(
-            "restart_file is only supported for single NS runs; the YAML "
-            f"implies a {n_total}-replica multi-run topology. Remove "
-            "ensemble.pressure list / inter_re.composition_targets / "
-            "inter_re.chemical_potentials, or remove restart_file."
-        )
 
     if n_total == 1:
         # SingleRun (or sharded-single) path.  ``params_per_run`` is

@@ -73,6 +73,7 @@ def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
         "cells": pop.cell,
         "log_evidence": ns_state.log_evidence,
         "iteration": iteration,
+        "emax": ns_state.emax,
         "n_dead": n_dead,
         "n_walkers": ns_state.n_walkers,
     }
@@ -729,24 +730,49 @@ class RECallback:
 
 
 class EnergyCheckCallback:
-    """Warns if energy is not decreasing as expected.
+    """Warns if any replica's Emax fails to decrease between iterations.
 
-    ndim-agnostic: reduces batched ``info["emax"]`` to a scalar via ``max``
-    before comparing to the previous iteration.
+    Compares ``info["emax"]`` element-wise against the previous iteration; a
+    global ``max``-reduction would let one descending replica mask another
+    replica's non-monotonic contour (the failure mode that previously hid
+    `https://github.com/.../pressure-rens-writeback-bug`).  Works for any
+    batched shape — scalars (``SingleRun``), 1-D ``(R,)`` (``VmapRuns``),
+    2-D ``(G, P)`` (``PmapVmapRuns``).
     """
 
     def __init__(self):
-        self._prev_emax = float("inf")
+        self._prev_emax: np.ndarray | None = None
 
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
-        emax_raw = info.get("emax", 0)
-        emax_arr = jnp.asarray(emax_raw)
-        emax = float(emax_arr if emax_arr.ndim == 0 else jnp.max(emax_arr))
-        if emax > self._prev_emax and iteration > 0:
-            logger.warning(
-                "iter=%d: Emax increased (%.6f > %.6f)", iteration, emax, self._prev_emax
-            )
-        self._prev_emax = emax
+        emax_arr = np.asarray(info.get("emax", 0.0), dtype=np.float64)
+
+        if iteration > 0 and self._prev_emax is not None:
+            offenders = emax_arr > self._prev_emax
+            if bool(np.any(offenders)):
+                # Build per-replica diagnostic for the offending indices.
+                idxs = np.argwhere(offenders)
+                deltas = (emax_arr - self._prev_emax)[offenders]
+                # Report up to 4 worst, sorted by delta descending.
+                order = np.argsort(-deltas)
+                def _fmt_idx(coords: np.ndarray) -> str:
+                    parts = tuple(int(c) for c in coords)
+                    return str(parts[0]) if len(parts) == 1 else (
+                        ",".join(str(p) for p in parts)
+                    )
+
+                worst = [
+                    (_fmt_idx(idxs[k]), float(deltas[k]))
+                    for k in order[:4]
+                ]
+                summary = ", ".join(
+                    f"replica[{i}]: Δ=+{d:.4g}" for i, d in worst
+                )
+                logger.warning(
+                    "iter=%d: Emax non-monotonic on %d replica(s) (worst: %s)",
+                    iteration, int(offenders.sum()), summary,
+                )
+
+        self._prev_emax = emax_arr
 
     def on_finish(self, ns_state: Any) -> None:
         pass

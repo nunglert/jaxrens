@@ -148,6 +148,7 @@ def initial_walk(
     walker_batch_size: int | None = None,
     per_move_fns: list[Callable] | None = None,
     adaptation_policies: tuple | None = None,
+    move_names: tuple[str, ...] | None = None,
     adjust_n_samples: int = 50,
     adjust_max_rounds: int = 15,
     max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
@@ -269,9 +270,18 @@ def initial_walk(
                 "build_adapt_step should only read static fields."
             )
 
+        # Use caller-supplied move names when available so the adapt-tracing
+        # log shows ``move=random_walk`` etc. instead of ``move=move_0``.
+        # Falls back to positional names for back-compat with direct callers
+        # (tests / scripts) that don't have descriptors handy.
+        if move_names is not None and len(move_names) != len(adaptation_policies):
+            raise ValueError(
+                f"initial_walk: len(move_names)={len(move_names)} does not "
+                f"match len(adaptation_policies)={len(adaptation_policies)}."
+            )
         descs = [
             MoveKernel(
-                name=f"move_{i}",
+                name=(move_names[i] if move_names is not None else f"move_{i}"),
                 build_kernel=_noop_build_kernel,
                 min_rate=p.min_rate,
                 max_rate=p.max_rate,

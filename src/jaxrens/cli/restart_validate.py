@@ -80,6 +80,36 @@ def _dig(tree: Any, path: str) -> Any:
     return node
 
 
+def _implied_n_total(tree: dict) -> int:
+    """Replicate ``_derive_replica_axes`` n_total inference from a dumped config.
+
+    Reads only the fields that participate in the replica-axis derivation:
+    ``ensemble.pressure`` (when list-valued), ``inter_re.composition_targets``,
+    ``inter_re.chemical_potentials``. Returns 1 for the single-replica case.
+    Unknown / inconsistent shapes return ``-1`` so a downstream diff bubbles
+    up clearly.
+    """
+    lengths: list[int] = []
+    ens = _dig(tree, "ensemble")
+    if isinstance(ens, dict):
+        p = ens.get("pressure")
+        if isinstance(p, list) and len(p) > 1:
+            lengths.append(len(p))
+    ire = _dig(tree, "inter_re")
+    if isinstance(ire, dict):
+        comp = ire.get("composition_targets")
+        if isinstance(comp, list) and len(comp) > 1:
+            lengths.append(len(comp))
+        chem = ire.get("chemical_potentials")
+        if isinstance(chem, list) and len(chem) > 1:
+            lengths.append(len(chem))
+    if not lengths:
+        return 1
+    if any(n != lengths[0] for n in lengths[1:]):
+        return -1
+    return lengths[0]
+
+
 def _classify_diffs(
     snapshot: dict, current: dict, paths: Iterable[str]
 ) -> list[tuple[str, Any, Any]]:
@@ -135,6 +165,28 @@ def validate_restart_compatibility(
 
     snapshot = read_config_snapshot(snapshot_path)
     current = root.model_dump(mode="json")
+
+    # Replica-count check: dedicated, fires before the broader ensemble/inter_re
+    # subtree diff so the user sees a targeted message rather than a 60-char
+    # truncation of the full subtree.  Any change to the implied n_total breaks
+    # the checkpoint's batch shape and would crash later in the resolver, so
+    # refuse here with a clearer message.
+    snap_n_total = _implied_n_total(snapshot)
+    cur_n_total = _implied_n_total(current)
+    if snap_n_total != cur_n_total:
+        sys.stderr.write(
+            f"jaxrens run: restart from {checkpoint_path} is incompatible "
+            f"with the current config: replica count changed.\n"
+            f"  snapshot implies n_total = {snap_n_total} replicas\n"
+            f"  current  implies n_total = {cur_n_total} replicas\n"
+            f"  (driven by len(ensemble.pressure) / "
+            f"len(inter_re.composition_targets) / "
+            f"len(inter_re.chemical_potentials))\n"
+            f"  snapshot: {snapshot_path}\n"
+            f"Use a different working_dir for this configuration, or revert "
+            f"the replica-list length.\nAborting.\n"
+        )
+        raise SystemExit(2)
 
     hard = _classify_diffs(snapshot, current, _IMMUTABLE_PATHS)
     soft = _classify_diffs(snapshot, current, _WARN_PATHS)

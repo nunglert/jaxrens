@@ -278,6 +278,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         working_dir=log_dir,
         prefix=root.output.out_file_prefix,
         level=root.output.log_level,
+        mode=writer_mode,
     )
 
     # Dump the validated config (with all pydantic defaults filled in)

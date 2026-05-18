@@ -21,7 +21,11 @@ matplotlib.use("Agg")  # headless, must be before any other matplotlib import
 import numpy as np
 import pytest
 
-from jaxrens.cli.monitor import _format_reject_breakdown, ProgressCallback
+from jaxrens.cli.monitor import (
+    _format_reject_breakdown,
+    EnergyCheckCallback,
+    ProgressCallback,
+)
 from jaxrens.postprocess.monitor import Monitor
 from jaxrens.postprocess.collection import MonitorCollection
 from jaxrens.postprocess import (
@@ -491,6 +495,7 @@ class TestMonitorFromDirectory:
             "live_volumes": None,
             "log_evidence": 55.5,
             "iteration": n_dead,
+            "emax": float(live_e.max()),
             "n_dead": n_dead,
             "n_walkers": n_live,
         }
@@ -548,6 +553,7 @@ class TestMonitorFromDirectory:
                 "live_volumes": None,
                 "log_evidence": log_evidence_val,
                 "iteration": n_dead,
+                "emax": float(live_e.max()),
                 "n_dead": n_dead,
                 "n_walkers": n_live,
             }
@@ -825,6 +831,7 @@ class TestMonitorCollection:
                 "live_volumes": None,
                 "log_evidence": float(i * 10),
                 "iteration": n_dead,
+                "emax": float(live_e.max()),
                 "n_dead": n_dead,
                 "n_walkers": n_live,
             }
@@ -1328,3 +1335,79 @@ class TestProgressCallbackPmapVmap:
         assert ".." in header, (
             f"Expected min..max format in log_Z bracket, got: {repr(header)}"
         )
+
+
+class TestEnergyCheckCallbackPerReplica:
+    """Per-replica monotonicity: a global-max reduction would mask the failure."""
+
+    @staticmethod
+    def _capture_warnings(cb_action):
+        import jax.numpy as jnp  # local; jnp used downstream in test bodies
+        records: list[str] = []
+
+        class _Rec(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        h = _Rec()
+        target = logging.getLogger("jaxrens.cli.monitor")
+        target.addHandler(h)
+        old = target.level
+        target.setLevel(logging.WARNING)
+        try:
+            cb_action()
+        finally:
+            target.removeHandler(h)
+            target.setLevel(old)
+        return records
+
+    def test_scalar_singlerun_descending_no_warn(self):
+        cb = EnergyCheckCallback()
+        msgs = self._capture_warnings(lambda: (
+            cb.on_iteration(0, None, {"emax": np.array(10.0)}),
+            cb.on_iteration(1, None, {"emax": np.array(8.0)}),
+            cb.on_iteration(2, None, {"emax": np.array(5.0)}),
+        ))
+        assert msgs == []
+
+    def test_scalar_singlerun_ascending_warns(self):
+        cb = EnergyCheckCallback()
+        msgs = self._capture_warnings(lambda: (
+            cb.on_iteration(0, None, {"emax": np.array(10.0)}),
+            cb.on_iteration(1, None, {"emax": np.array(11.0)}),
+        ))
+        assert len(msgs) == 1
+        assert "non-monotonic" in msgs[0]
+
+    def test_one_replica_ascends_others_descend_warns(self):
+        """The bug-of-record case: global max would hide a single regression."""
+        cb = EnergyCheckCallback()
+        # 16 replicas, all descending — except replica 3 which jumps up.
+        prev = np.linspace(50.0, 35.0, 16)            # descending across runs
+        curr = np.linspace(48.0, 34.0, 16).copy()     # mostly descending
+        curr[3] = prev[3] + 2.5                        # replica 3 ASCENDS
+        msgs = self._capture_warnings(lambda: (
+            cb.on_iteration(0, None, {"emax": prev}),
+            cb.on_iteration(1, None, {"emax": curr}),
+        ))
+        assert len(msgs) == 1
+        assert "non-monotonic on 1 replica" in msgs[0]
+        assert "replica[3]" in msgs[0]
+
+    def test_pmap_vmap_shape_warns(self):
+        cb = EnergyCheckCallback()
+        prev = np.array([[20.0, 19.0], [18.0, 17.0]])
+        curr = np.array([[19.0, 19.5], [17.5, 16.5]])  # (0,1) ascends
+        msgs = self._capture_warnings(lambda: (
+            cb.on_iteration(0, None, {"emax": prev}),
+            cb.on_iteration(1, None, {"emax": curr}),
+        ))
+        assert len(msgs) == 1
+        assert "replica[0,1]" in msgs[0]
+
+    def test_iteration_zero_never_warns(self):
+        cb = EnergyCheckCallback()
+        msgs = self._capture_warnings(lambda: cb.on_iteration(
+            0, None, {"emax": np.array([[100.0, 200.0]])}
+        ))
+        assert msgs == []

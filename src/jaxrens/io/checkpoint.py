@@ -155,6 +155,16 @@ def save_checkpoint(
         # for batched runs they can be arrays.  Use _store_field to avoid
         # float()/int() casts on arrays.
         _store_field(f, "iteration", ns_state["iteration"])
+        # emax defaults to +inf with shape matching log_evidence — symmetric
+        # with load_checkpoint's legacy-tolerant default.  Real runs always
+        # include emax (set by ns_state_to_checkpoint_dict); the default is
+        # for test fixtures and legacy callers that built dicts by hand.
+        if "emax" in ns_state:
+            emax_val = ns_state["emax"]
+        else:
+            le_arr = _to_np(ns_state["log_evidence"])
+            emax_val = np.full(le_arr.shape, np.inf, dtype=np.float32)
+        _store_field(f, "emax", emax_val)
         _store_field(f, "n_dead", ns_state["n_dead"])
         # n_walkers is always a plain Python int in all three result dicts.
         f.attrs["n_walkers"] = int(ns_state["n_walkers"])
@@ -235,6 +245,15 @@ def load_checkpoint(
 
         # iteration / n_dead: may be dataset or attr.
         iteration_raw = _read_field(f, "iteration")
+        # emax is new (added with the NS-contour-on-state refactor).
+        # Legacy checkpoints without it restart with emax=+inf — first
+        # post-restart ns_step rewrites it from pop.energy.  Adapt is
+        # suppressed at iter 0 of the restarted loop because run_loop
+        # gates adapt on ``i > 0`` from the restored iteration value.
+        try:
+            emax_raw = _read_field(f, "emax")
+        except KeyError:
+            emax_raw = None
         n_dead_raw = _read_field(f, "n_dead")
         n_walkers = int(f.attrs["n_walkers"])
 
@@ -278,6 +297,11 @@ def load_checkpoint(
     _iter_log = int(np.asarray(iteration_raw).flat[0]) if np.asarray(iteration_raw).size > 0 else -1
     logger.info("Checkpoint loaded from %s (iteration %s)", path, _iter_log)
 
+    emax = (
+        jnp.array(emax_raw) if emax_raw is not None
+        else jnp.array(jnp.inf, dtype=jnp.float32)
+    )
+
     return {
         "positions": positions,
         "types": types,
@@ -289,6 +313,7 @@ def load_checkpoint(
         "live_volumes": live_volumes,
         "log_evidence": log_evidence,
         "iteration": iteration,
+        "emax": emax,
         "n_dead": n_dead,
         "n_walkers": n_walkers,
         "rng_key": rng_key,

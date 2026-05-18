@@ -35,7 +35,14 @@ _EXPECTED_STATS_KEYS = frozenset({
 
 
 def _make_vmap_ns_state(n_runs=2, n_walkers=10, pressures=None, seed=42):
-    """Create a batched NSState suitable for VmapRuns tests."""
+    """Create a batched NSState suitable for VmapRuns tests.
+
+    Seeds ``ns_state.emax`` from the empirical per-replica max of the
+    initial population — this mirrors what would happen after one
+    ``ns_step`` (which is the first place ``emax`` gets a meaningful
+    value; ``init_ns`` sets it to ``+inf``).  Without this, RE swap
+    tests would see an unbounded constraint and accept every swap.
+    """
     backend = create_harmonic(k=1.0)
     descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
     init_fn, step_fn, _ = build_mwg(backend, descriptors)
@@ -63,6 +70,9 @@ def _make_vmap_ns_state(n_runs=2, n_walkers=10, pressures=None, seed=42):
         rng_keys,
         step_sizes=jnp.array([0.2]),
         ensemble_params_per_run=ensemble_params_per_run,
+    )
+    ns_state = ns_state.set(
+        emax=jnp.max(ns_state.population.energy, axis=1),
     )
     return ns_state, step_fn, backend
 
@@ -307,6 +317,10 @@ class TestApplyPmapVmapRuns:
         )
 
         descriptor = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+        # Seed emax from initial pop max — mirror what one ns_step would do.
+        ns_state = ns_state.set(
+            emax=descriptor.reduce_emax(ns_state.population.energy),
+        )
         mgr = InterREManager(
             PressureRENSSwap(), descriptor, backend, re_interval=1
         )

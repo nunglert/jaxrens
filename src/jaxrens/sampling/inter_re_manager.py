@@ -154,6 +154,12 @@ class InterREManager:
         For ``VmapRuns``: operates on ``(n_runs, K, ...)`` population directly.
         For ``PmapVmapRuns``: all_gathers across the pmap axis, swaps, re-shards.
 
+        The swap-acceptance constraint is read off ``ns_state.emax`` — the
+        per-replica NS contour the most recent ``ns_step`` culled at.
+        This is algorithm state set by ``ns_step``, not a value re-derived
+        from ``pop.energy``: recomputing here would be strictly tighter
+        post-MCMC and would reject otherwise-legal swaps.
+
         Args:
             ns_state: Current ``NSState`` (single, vmapped, or pmap-vmapped).
             rng_key: Scalar PRNG key for swap randomness.
@@ -467,6 +473,10 @@ class InterREManager:
         For VmapRuns the population has shape ``(n_runs, K, ...)``.
         For PmapVmapRuns the population has shape ``(G, P, K, ...)``.
 
+        ``emax`` is read off ``ns_state.emax`` — the per-replica NS
+        contour set by the most recent ``ns_step``.  Not re-derived from
+        ``pop.energy`` (which would be strictly tighter post-MCMC).
+
         Returns:
             Tuple of JAX arrays:
             ``(positions, types, energies, cells, emax, pressures,
@@ -476,14 +486,12 @@ class InterREManager:
             ``SemiGrandSwap`` mode is active.
         """
         pop = ns_state.population
+        emax = ns_state.emax        # (*shape_prefix,)
 
         positions = pop.positions   # (*shape_prefix, K, n_atoms, 3)
         types = pop.types           # varies
         energies = pop.energy       # (*shape_prefix, K)
         cells = pop.cell            # (*shape_prefix, K, 3, 3)
-
-        # Per-replica Emax via the descriptor's walker-axis reduction.
-        emax = self._batcher.reduce_emax(energies)
 
         # Pressures, composition_targets, chemical_potentials: extract from
         # ensemble_params.  After vmapping init_ns, per-replica scalar values

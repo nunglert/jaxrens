@@ -58,7 +58,10 @@ Code: {mod}`jaxrens.cli.output_gate`, `enforce_clean_output_dir`.
 
 The glob set is the catalogue of every file a run writes into
 `working_dir`. Log files (`{prefix}.log`, `{prefix}.debug.log`) live in
-the *parent* directory and are out of scope. Per-walker snapshot files
+the *parent* directory and are out of scope of the gate — they follow
+the same `mode="w"` / `mode="a"` rule as the writers (see [below](#writer-behavior-across-restart)),
+so on `--resume` the prior run's log is preserved and the new segment
+is appended to it. Per-walker snapshot files
 (`{prefix}.traj.snap.NNNN.extxyz`) are included via the `.traj.*` glob
 — without that, `--force` would leave stale snapshots from a longer
 prior run silently mixing iteration ranges into a re-run.
@@ -131,6 +134,7 @@ A mismatch on any of these is a `SystemExit(2)` with a per-field diff:
 |---|---|
 | `run.n_live` | walker-population shape; NS estimator depends on constant `n_live` |
 | `run.n_gpu`, `run.n_per_gpu` | `pmap × vmap` topology; checkpoint pytree shapes won't match otherwise |
+| **replica count** (`len(ensemble.pressure)`, `len(inter_re.composition_targets)`, `len(inter_re.chemical_potentials)`) | sets `n_total`; changing it re-shapes the checkpoint's batch axis — a dedicated check fires before the broader ensemble/inter_re diff so the message names `n_total` directly |
 | `backend` subtree | energy function identity — including model file paths for ML backends |
 | `ensemble` subtree | pressure, temperature, volume limits — physical meaning of the trace |
 | `inter_re` subtree | replica-exchange flavor + per-replica conditions (pressures, μ) |
@@ -183,7 +187,9 @@ Code: {mod}`jaxrens.cli.restart_validate`.
 ## Writer behavior across restart
 
 All seven I/O writers honor a `mode: Literal["w", "a"]` constructor
-parameter set once per run by the dispatcher.
+parameter set once per run by the dispatcher. The log handlers
+(`{prefix}.log`, `{prefix}.debug.log`) honor the same mode so the
+diagnostic trail spans the boundary too.
 
 | Writer | `mode="w"` (fresh) | `mode="a"` (restart) |
 |---|---|---|
@@ -194,6 +200,7 @@ parameter set once per run by the dispatcher.
 | `RELogger` (`.re_stats.h5`) | same | same |
 | `MaxNeighborsLogger` (`.max_neighbors.h5`) | same | same |
 | `AccRatesLogger` (`.acc_rates.h5`) | same | same |
+| `{prefix}.log`, `{prefix}.debug.log` (in parent dir) | truncate | append |
 
 On a restart, each file ends up containing the prior run's
 0..N<sub>checkpoint</sub> rows followed by the new segment's
@@ -208,6 +215,11 @@ The strict policy refuses these by design:
 - **Resize the walker population** — `n_live`, `n_gpu`, `n_per_gpu`
   immutable. The NS evidence estimator assumes constant `n_live` across
   iterations; changing it silently invalidates `log_Z`.
+- **Change the replica count** — `len(ensemble.pressure)` /
+  `len(inter_re.composition_targets)` / `len(inter_re.chemical_potentials)`
+  determine `n_total`; a change re-shapes the checkpoint's batch axis.
+  The validator names this case explicitly before the broader
+  ensemble/inter_re diff fires.
 - **Swap the energy function** — `backend` immutable. The energy scale
   shifts, the contour history becomes meaningless, the appended trace
   is garbage.
@@ -223,6 +235,38 @@ For all of these the workaround is the same: **set
 `init.restart_file`**. The new dir is empty so the gate passes, the
 new run produces fresh files, and the original artifacts are
 preserved.
+
+## Multi-replica restart
+
+A multi-replica YAML — one that implies `n_total > 1` via a
+list-valued `ensemble.pressure`, `inter_re.composition_targets`, or
+`inter_re.chemical_potentials` — restarts the same way as single-run:
+either `--resume` (auto-discovers the checkpoint in `working_dir`) or
+`init.restart_file: <path>` in the YAML.
+
+The resolver loads the checkpoint exactly once and slices it per
+replica. The data layer handles both checkpoint shapes:
+
+- **1-D `(n_runs,)`** (saved by `run_ns_parallel` on a single-GPU host)
+  → loaded as `n_gpu=1, n_per_gpu=n_runs`.
+- **2-D `(G, P)`** (saved by `run_ns_multi_gpu`) → loaded as
+  `n_gpu=G, n_per_gpu=P`. Cross-topology restart (saved G ≠ current
+  host's GPU count) is refused unless the saved checkpoint had
+  `n_gpu=1`, in which case the replicas are re-tiled across the
+  current host's GPUs.
+
+Constraints specific to multi-replica restart:
+
+- The implied `n_total` from the current YAML must match the
+  checkpoint's `n_total`. The validator catches this before the
+  resolver does (with a targeted "replica count changed" message).
+- Per-replica conditions (entries of `ensemble.pressure` list, etc.)
+  are still immutable across restart — they live under the `ensemble`
+  / `inter_re` subtrees and any value change fails the broader diff.
+  The workaround stays the same: branch to a new `working_dir`.
+- Burn-in is skipped on restart for the multi-replica path, same as
+  for single-run — the checkpoint already holds NS-loop walkers, well
+  past the burn-in level.
 
 ## Common scenarios
 
