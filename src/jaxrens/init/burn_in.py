@@ -28,6 +28,7 @@ import jax.numpy as jnp
 from jaxrens.sampling.adaptation.manager import build_adapt_step
 from jaxrens.sampling.batch_descriptor import (
     BatchDescriptor,
+    ShardedSingleRun,
     SingleRun,
     VmapRuns,
 )
@@ -320,6 +321,18 @@ def initial_walk(
     while walk_i < n_walks:
         if adapt_step is not None and walk_i > 0 and walk_i % adjust_interval == 0:
             key, key_adapt = jax.random.split(key)
+            # adapt_step requires a shape-prefix-shaped key; burn-in
+            # carries a scalar so promote here.  Sharded: BROADCAST
+            # (identical per shard — required for lax.psum coherence).
+            # Other batched: SPLIT (independent per replica).
+            if isinstance(batcher, ShardedSingleRun):
+                key_adapt = jnp.broadcast_to(
+                    key_adapt, (batcher.n_gpu,) + key_adapt.shape,
+                )
+            elif batcher.is_batched:
+                key_adapt = jax.random.split(
+                    key_adapt, batcher.n_runs,
+                ).reshape(batcher.shape_prefix)
             ns_state, _diag, _new_key = adapt_step(
                 ns_state, emax, key_adapt,
             )

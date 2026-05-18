@@ -449,7 +449,7 @@ def test_adapt_step_trial_batch_size_matches_full_vmap():
 
     Pins the chunked-trial-vmap path's correctness on the cheapest
     batcher (``SingleRun``) at a divisor chunk size.  Ensures the
-    closure that propagates ``trial_batch_size`` to ``_one_bisection_round``
+    closure that propagates ``trial_batch_size`` to ``adjust_step_size``
     doesn't perturb the result.
     """
     from jaxrens.sampling.adaptation.manager import build_adapt_step
