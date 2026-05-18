@@ -306,13 +306,35 @@ def _build_python_driver_per_move(
     ):
         # Trace-time logger fires once per JIT cache miss of the one-round
         # body (i.e. once per distinct signature per move type).
+        #
+        # When two trace lines fire back-to-back for the same move, diff
+        # the ``leaves=`` summary below — the differing entry is the cache
+        # key that flipped (shape, dtype, or weak_type).  If the leaves
+        # look identical, compare ``treedef_hash`` (pytree structure) and
+        # ``fn_id`` (the wrapped function's Python id — if it differs the
+        # JIT wrapper itself was rebuilt, so cache was never reusable).
+        _args_pytree = (sample, ss, ss_prev, rate_prev, key, emax)
+        _leaves_flat, _treedef = jax.tree_util.tree_flatten(_args_pytree)
+        def _fmt(v):
+            return (
+                f"{getattr(v, 'shape', '?')}:{getattr(v, 'dtype', type(v).__name__)}"
+                f"{'(weak)' if getattr(v, 'weak_type', False) else ''}"
+            )
+        _leaf_str = "  ".join(_fmt(v) for v in _leaves_flat)
         logger.info(
             "adapt _per_replica_one_round tracing: move=%s  "
-            "sample_shape=%s  max_neighbors=%d  n_samp=%d",
+            "sample_shape=%s  max_neighbors=%d  n_samp=%d  "
+            "n_leaves=%d  treedef_hash=%x  fn_id=%x  move_fn_id=%x  "
+            "leaves=[%s]",
             _desc_name,
             sample.positions.shape,
             int(sample.max_neighbors),
             int(_n_samp),
+            len(_leaves_flat),
+            hash(_treedef) & 0xFFFFFFFF,
+            id(_per_replica_one_round) & 0xFFFFFFFF,
+            id(_move_fn) & 0xFFFFFFFF,
+            _leaf_str,
         )
         return _one_bisection_round(
             sample, _move_fn, ss, ss_prev, rate_prev, key, emax,
@@ -435,14 +457,25 @@ def _build_sharded_per_move(
         _trial_chunk=trial_chunk,
         _desc_name=name,
     ):
+        _args_pytree = (pop, ss, emax, key)
+        _leaves_flat, _ = jax.tree_util.tree_flatten(_args_pytree)
+        def _fmt(v):
+            return (
+                f"{getattr(v, 'shape', '?')}:{getattr(v, 'dtype', type(v).__name__)}"
+                f"{'(weak)' if getattr(v, 'weak_type', False) else ''}"
+            )
+        _leaf_str = "  ".join(_fmt(v) for v in _leaves_flat)
         logger.info(
             "adapt _per_replica (sharded) tracing: move=%s  "
-            "pop_shape=%s  max_neighbors=%d  n_samp=%d  max_rounds=%d",
+            "pop_shape=%s  max_neighbors=%d  n_samp=%d  max_rounds=%d  "
+            "n_leaves=%d  leaves=[%s]",
             _desc_name,
             pop.positions.shape,
             int(pop.max_neighbors),
             int(_n_samp),
             int(_max_rounds),
+            len(_leaves_flat),
+            _leaf_str,
         )
         if _trial_chunk is None:
             return adjust_step_size_sharded(

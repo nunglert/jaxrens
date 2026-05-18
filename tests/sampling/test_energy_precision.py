@@ -1,10 +1,12 @@
-"""Tests for energy precision strategy (Step 16).
+"""Tests for `_find_worst_walker`.
 
 Verifies:
-- Energy per atom comparison works correctly
-- Random tie-breaking selects uniformly among tied walkers
-- No split_float (float32x2) code exists in the codebase
-- Backward compatibility: existing NS runs unaffected
+- Argmax behavior on the (now scale-invariant, exact-equality) tie set.
+- Random tie-breaking selects uniformly among walkers exactly tied at the max.
+- Returned value is the strict `jnp.max(potentials)` (invariant: no survivor
+  ends up above the reported `potential_max`, which used to leak through the
+  old `isclose` tie window and produce "Emax increased" warnings).
+- JIT compatibility.
 """
 
 from __future__ import annotations
@@ -24,15 +26,6 @@ class TestFindWorstWalker:
         idx, val = _find_worst_walker(energies, rng_key=key)
         assert idx == 1
         assert val == pytest.approx(5.0)
-
-    def test_per_atom_comparison(self):
-        """Per-atom normalization shouldn't change which walker is worst
-        when all walkers have the same n_atoms (just rescales uniformly)."""
-        energies = jnp.array([1.0, 5.0, 3.0, 2.0])
-        key = jax.random.key(0)
-        idx, val = _find_worst_walker(energies, rng_key=key, n_atoms=10)
-        assert idx == 1
-        assert val == pytest.approx(5.0)  # returns original energy, not per-atom
 
     def test_tie_breaking_uniform(self):
         """With tied energies, different keys should select different walkers."""
@@ -70,15 +63,42 @@ class TestFindWorstWalker:
         idx2, _ = _find_worst_walker(energies, rng_key=key)
         assert idx1 == idx2  # deterministic with same key
 
-    def test_per_atom_large_system(self):
-        """Per-atom normalization keeps values in a good float32 range."""
-        n_atoms = 10000
-        # Energies that are large in absolute terms but small per atom
-        energies = jnp.array([1e6, 2e6, 1.5e6])
-        key = jax.random.key(42)
-        idx, val = _find_worst_walker(energies, rng_key=key, n_atoms=n_atoms)
-        assert idx == 1
-        assert val == pytest.approx(2e6)
+    def test_near_ties_not_collapsed(self):
+        """Walkers within float ULP but not exactly equal are not tied.
+
+        Regression for the old `isclose(rtol=1e-7)` tie window: distinct
+        float values that fell inside the relative tolerance used to be
+        treated as ties, and the function could return ``potentials[idx]``
+        from a non-strict-max walker. Then a survivor with energy higher
+        than the reported `potential_max` would resurface the next
+        iteration as the new worst, raising the reported emax and
+        triggering monitor warnings. The new contract — exact equality
+        for ties, strict max as the returned value — eliminates both.
+        """
+        # Two walkers within float32 rtol but distinct floats.
+        energies = jnp.array([-105.213005, -105.212997], dtype=jnp.float32)
+        strict_max = jnp.max(energies)
+        for seed in range(50):
+            key = jax.random.key(seed)
+            idx, val = _find_worst_walker(energies, rng_key=key)
+            # The strict-max walker is unique (no exact tie), so idx must
+            # always pick it, and val must equal the strict max.
+            assert int(idx) == int(jnp.argmax(energies))
+            assert float(val) == float(strict_max)
+
+    def test_value_is_strict_max(self):
+        """Returned value equals jnp.max(potentials) under any tie pattern."""
+        cases = [
+            jnp.array([1.0, 2.0, 3.0]),
+            jnp.array([5.0, 5.0, 5.0, 1.0]),
+            jnp.array([-105.213005, -105.212997], dtype=jnp.float32),
+            jnp.array([0.0, 0.0]),
+        ]
+        for energies in cases:
+            for seed in range(5):
+                key = jax.random.key(seed)
+                _, val = _find_worst_walker(energies, rng_key=key)
+                assert float(val) == float(jnp.max(energies))
 
     def test_jit_compatible(self):
         """_find_worst_walker works under JIT."""
@@ -87,10 +107,8 @@ class TestFindWorstWalker:
 
         @jax.jit
         def find(e, k):
-            return _find_worst_walker(e, rng_key=k, n_atoms=5)
+            return _find_worst_walker(e, rng_key=k)
 
         idx, val = find(energies, key)
         assert idx == 1
         assert val == pytest.approx(3.0)
-
-

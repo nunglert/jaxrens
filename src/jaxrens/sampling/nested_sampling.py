@@ -76,28 +76,27 @@ def _choose_starting_bucket(
 def _find_worst_walker(
     potentials: jnp.ndarray,
     rng_key: jax.Array,
-    n_atoms: int = 1,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Find the walker with the highest potential (worst likelihood).
 
-    Fully JIT-compatible. Uses per-atom comparison for float precision
-    and random tie-breaking among walkers sharing the maximum.
+    Random tie-breaking is uniform among walkers that *exactly* match the
+    maximum. The returned value is the strict ``jnp.max(potentials)``,
+    not ``potentials[idx]`` — this keeps the constraint level a true
+    upper bound on every survivor's energy.
 
     Args:
         potentials: Per-walker potentials, shape (n_walkers,).
         rng_key: PRNG key for random tie-breaking.
-        n_atoms: Number of atoms per walker (for per-atom precision).
 
     Returns:
-        (index, value) of the worst walker.
+        (index, value) of the worst walker. ``value == jnp.max(potentials)``.
     """
-    comparison = potentials / n_atoms
-    max_val = jnp.max(comparison)
-    is_max = jnp.isclose(comparison, max_val, rtol=1e-7, atol=0.0)
-    noise = jax.random.uniform(rng_key, shape=comparison.shape)
+    max_val = jnp.max(potentials)
+    is_max = potentials == max_val
+    noise = jax.random.uniform(rng_key, shape=potentials.shape)
     tie_scores = jnp.where(is_max, noise, -jnp.inf)
     idx = jnp.argmax(tie_scores)
-    return idx, potentials[idx]
+    return idx, max_val
 
 
 def _find_worst_walkers(
@@ -314,7 +313,7 @@ def ns_step(
     # 1. Find worst walker (highest potential)
     key, key_worst = jax.random.split(key)
     worst_idx, potential_max = _find_worst_walker(
-        potentials, rng_key=key_worst, n_atoms=ns_state.n_atoms,
+        potentials, rng_key=key_worst,
     )
 
     # 2. Identify dead point.  We no longer write it onto NSState — the
@@ -565,7 +564,7 @@ def ns_step_sharded(
     # 1. Find worst walker on the global population (same on every shard).
     key, key_worst = jax.random.split(key)
     worst_idx, potential_max = _find_worst_walker(
-        potentials_global, rng_key=key_worst, n_atoms=ns_state.n_atoms,
+        potentials_global, rng_key=key_worst,
     )
 
     # 2. Dead-point info — extracted from the global gathered pop.

@@ -85,7 +85,7 @@ This shape convention flows through `WalkerState`, `NSState`, moves, energies, s
 - **No multi-line `python -c "..."` with `#` comments.** The pattern triggers a permission safety check that blocks regardless of allowlist. For any diagnostic longer than a one-liner, write it to `/tmp/<topic>.py` and run `python /tmp/<topic>.py` — matches the existing `/tmp/` scratch convention. If inline is truly unavoidable, use `python - <<'EOF' ... EOF` heredoc instead.
 - **JIT testing is mandatory**: any code path intended to be JIT-compilable must have a test that exercises it under `jax.jit`, not just eager.
 - **Scratch / diagnostic scripts go in `/tmp/`**, not in the repo.
-- **Do not use `split_float` / float32x2 tricks.** Energy precision is handled by comparing `E / n_atoms` with random tie-breaking (see `_find_worst_walker` in `sampling/nested_sampling.py`).
+- **Do not use `split_float` / float32x2 tricks.** Float32 ties at the NS contour are handled by random tie-breaking on exact equality in `_find_worst_walker` (`sampling/nested_sampling.py`), and the returned `potential_max` is the strict `jnp.max(potentials)` so every survivor sits at-or-below the reported contour.
 - **pmap, not `shard_map`** — explicit user preference. Don't migrate.
 - **Test markers**: `heavy` (slow), `gpu`, `multi_gpu`. Default `pytest` run excludes `heavy`.
 
