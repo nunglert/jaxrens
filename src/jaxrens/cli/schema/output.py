@@ -101,6 +101,31 @@ class OutputSpec(BaseModel):
     temperature_interval: int | float = 100
     temperature_kB: float = 8.6173324e-5
 
+    # Pairwise-distance "collision" check.  When ``collision_check_threshold``
+    # is set, the runtime registers a ``CollisionCheckCallback`` that every
+    # ``collision_check_interval`` iterations computes the minimum
+    # interatomic distance per walker (minimum-image when cells are present,
+    # all-pairs otherwise) and logs a warning when any walker has atoms
+    # closer than the threshold.  Diagnostic only — never feeds back into
+    # the run.  ``None`` (default) disables the callback entirely.  Honours
+    # ``interval_units`` like the other interval fields.
+    collision_check_threshold: float | None = Field(
+        default=None,
+        description=(
+            "Minimum interatomic distance below which ``CollisionCheckCallback``"
+            " emits a warning.  Backend length units (typically Å).  ``None``"
+            " disables the callback."
+        ),
+    )
+    collision_check_interval: int | float = Field(
+        default=100,
+        gt=0,
+        description=(
+            "Fire CollisionCheckCallback every N iterations.  Default 100;"
+            " a diagnostic, not a per-iter signal."
+        ),
+    )
+
     # -- Deferred fields (see module docstring) --
     snapshot_time: float | None = None
     snapshot_clean: bool = False

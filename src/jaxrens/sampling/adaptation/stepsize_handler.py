@@ -29,6 +29,8 @@ from jaxtyping import Array, Bool, Float, Int, Key
 from jaxrens.utils.padding import pad_to_multiple
 
 
+FLOOR_THRESHOLD = 1.e-7
+
 def _process_rate_jax(
     rate: Float[Array, ""],
     step_size: Float[Array, ""],
@@ -54,7 +56,7 @@ def _process_rate_jax(
         where:
           - converged: bool scalar, True iff within window or bracketed
           - cap_hit: bool scalar, True iff the proposed adjusted ss hit max_step_size
-          - floor_hit: bool scalar, True iff the proposed adjusted ss hit the 1e-20 floor
+          - floor_hit: bool scalar, True iff the proposed adjusted ss hit the FLOOR_THRESHOLD floor
           - too_high: bool scalar, True iff rate >= max_rate (used to track bracket formation)
           - too_low: bool scalar, True iff rate < min_rate (used to track bracket formation)
     """
@@ -83,8 +85,8 @@ def _process_rate_jax(
     # Check for cap/floor hits before clamp
     proposed_ss = step_size * scale
     cap_hit = proposed_ss >= max_step_size
-    floor_hit = proposed_ss <= 1e-20
-    adjusted_ss = jnp.clip(proposed_ss, 1e-20, max_step_size)
+    floor_hit = proposed_ss <= FLOOR_THRESHOLD
+    adjusted_ss = jnp.clip(proposed_ss, FLOOR_THRESHOLD, max_step_size)
 
     # Pick result: in_window > brackets > adjusted
     new_ss = jnp.where(

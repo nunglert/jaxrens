@@ -107,6 +107,16 @@ class OutputConfig:
     temperature_interval: int = 100
     temperature_kB: float = 8.6173324e-5
 
+    # Pairwise-distance "collision" check.  When ``collision_check_threshold``
+    # is set (non-None and > 0), a ``CollisionCheckCallback`` fires every
+    # ``collision_check_interval`` iterations: it computes the minimum
+    # interatomic distance per walker (minimum-image convention if cells are
+    # present, all-pairs otherwise) and emits a logging warning when any
+    # walker has atoms closer than the threshold.  Diagnostic only — never
+    # feeds back into the run.  Default-off (no overhead unless enabled).
+    collision_check_threshold: float | None = None
+    collision_check_interval: int = 100
+
 
 @dataclass(frozen=True)
 class InterREConfig:

@@ -323,7 +323,7 @@ def initial_walk(
     # --- Outer walk loop (while-loop so overflow retries don't advance walk_i) ---
     walk_i = 0
     while walk_i < n_walks:
-        if adapt_step is not None and walk_i > 0 and walk_i % adjust_interval == 0:
+        if adapt_step is not None and walk_i % adjust_interval == 0:
             key, key_adapt = jax.random.split(key)
             # adapt_step requires a shape-prefix-shaped key; burn-in
             # carries a scalar so promote here.  Sharded: BROADCAST

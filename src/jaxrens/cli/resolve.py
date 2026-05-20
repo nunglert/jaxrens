@@ -99,6 +99,7 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
         output.{info,traj,snapshot,checkpoint}_interval
         output.{temperature_lag,temperature_interval}
         output.{acc_rates_interval,max_neighbors_interval}
+        output.collision_check_interval
         output.flush_interval
         run.max_iterations  (None preserved)
         termination[iteration].max_iterations
@@ -118,6 +119,7 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
             "temperature_interval",
             "acc_rates_interval",
             "max_neighbors_interval",
+            "collision_check_interval",
             "flush_interval",
         )
     }
@@ -1029,6 +1031,8 @@ def _resolve_single_replica(
         temperature_lag=root.output.temperature_lag,
         temperature_interval=int(root.output.temperature_interval),
         temperature_kB=float(root.output.temperature_kB),
+        collision_check_threshold=root.output.collision_check_threshold,
+        collision_check_interval=int(root.output.collision_check_interval),
     )
 
     _warn_unused_output_fields(root.output)
@@ -1510,6 +1514,8 @@ def _resolve_multi_replica(
         temperature_lag=root.output.temperature_lag,
         temperature_interval=int(root.output.temperature_interval),
         temperature_kB=float(root.output.temperature_kB),
+        collision_check_threshold=root.output.collision_check_threshold,
+        collision_check_interval=int(root.output.collision_check_interval),
     )
     _warn_unused_output_fields(root.output)
 

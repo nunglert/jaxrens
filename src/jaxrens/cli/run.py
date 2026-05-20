@@ -23,6 +23,7 @@ from jaxrens.cli.monitor import (
     AdaptationCallback,
     BatchedTrajectoryCallback,
     CheckpointCallback,
+    CollisionCheckCallback,
     EnergyCheckCallback,
     MemProfileCallback,
     ProgressCallback,
@@ -327,6 +328,12 @@ def run_from_config(
             lag=output_config.temperature_lag,
             interval=output_config.temperature_interval,
             kB=output_config.temperature_kB,
+        ))
+
+    if output_config.collision_check_threshold is not None:
+        callbacks.append(CollisionCheckCallback(
+            threshold=output_config.collision_check_threshold,
+            interval=output_config.collision_check_interval,
         ))
 
     callbacks.append(
@@ -757,6 +764,12 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
             kB=resolved.output.temperature_kB,
         ))
 
+    if resolved.output.collision_check_threshold is not None:
+        callbacks.append(CollisionCheckCallback(
+            threshold=resolved.output.collision_check_threshold,
+            interval=resolved.output.collision_check_interval,
+        ))
+
     symbol_map = resolved.init.symbol_map
     callbacks.append(
         CheckpointCallback(
@@ -1117,6 +1130,12 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
             lag=resolved.output.temperature_lag,
             interval=resolved.output.temperature_interval,
             kB=resolved.output.temperature_kB,
+        ))
+
+    if resolved.output.collision_check_threshold is not None:
+        callbacks.append(CollisionCheckCallback(
+            threshold=resolved.output.collision_check_threshold,
+            interval=resolved.output.collision_check_interval,
         ))
 
     symbol_map = resolved.init.symbol_map

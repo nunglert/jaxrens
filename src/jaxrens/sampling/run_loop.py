@@ -416,7 +416,7 @@ def _run_loop(
     while True:
         # ---- Adaptation ----
         adjust_info = None
-        if adapt_step is not None and i > 0 and i % adjust_interval == 0:
+        if adapt_step is not None and i % adjust_interval == 0:
             # ``ns_state.emax`` holds the contour the previous ``ns_step``
             # just culled at (algorithm state, not a re-derived
             # ``max(pop.energy)``).  Adapt trial walkers experience the

@@ -161,7 +161,6 @@ def build_adapt_step(
         adapt_key = rng_key
 
         per_move_results: list[tuple] = []
-        log_per_move = not batcher.is_batched
 
         for move_idx, desc in enumerate(descriptors):
             pairs = split_keys(adapt_key, 2)
@@ -172,11 +171,31 @@ def build_adapt_step(
             new_ss = result[0]
             ss = ss.at[..., move_idx].set(new_ss)
 
-            if log_per_move:
+            if logger.isEnabledFor(logging.DEBUG):
+                # result indexing follows _DIAG_KEYS (offset by +1 for new_ss
+                # at result[0]): rate=1, n_rounds=3, converged=4, cap_hits=5,
+                # floor_hits=6, bracket_detected=7.  Flatten over the batcher
+                # prefix so SingleRun/VmapRuns/PmapVmapRuns/ShardedSingleRun
+                # all yield 1-D arrays printable as scalars.
+                new_ss_flat = jnp.asarray(new_ss).reshape(-1)
+                rate_flat = jnp.asarray(result[1]).reshape(-1)
+                n_rounds_flat = jnp.asarray(result[3]).reshape(-1)
+                converged_flat = jnp.asarray(result[4]).reshape(-1)
+                cap_hits_flat = jnp.asarray(result[5]).reshape(-1)
+                floor_hits_flat = jnp.asarray(result[6]).reshape(-1)
+                bracket_flat = jnp.asarray(result[7]).reshape(-1)
+                n_total = int(new_ss_flat.shape[0])
                 logger.debug(
-                    "Adjusted %s: ss=%.4g rate=%.3f rounds=%d converged=%s",
-                    desc.name, float(new_ss), float(result[1]),
-                    int(result[3]), bool(result[4]),
+                    "adapted %s: ss=%.3e±%.1e  rate=%.3f±%.3f  "
+                    "rounds=%d (max)  conv=%d/%d  bracket=%d  floor=%d  cap=%d",
+                    desc.name,
+                    float(new_ss_flat.mean()), float(new_ss_flat.std()),
+                    float(rate_flat.mean()), float(rate_flat.std()),
+                    int(n_rounds_flat.max()),
+                    int(converged_flat.sum()), n_total,
+                    int(bracket_flat.sum()),
+                    int(floor_hits_flat.sum()),
+                    int(cap_hits_flat.sum()),
                 )
 
             per_move_results.append(result[1:])  # skip new_ss

@@ -426,12 +426,34 @@ class AdaptationCallback:
     is present.  Iterations between adaptation adjustments are skipped (the
     info key is absent).
 
+    Also surfaces two adapter-health WARNINGs to the textual log on top of
+    the silent h5 trace:
+
+      * First-hit floor warning — fires once per move the first time any
+        replica's bisection clamps the step size to the configured floor.
+        Signals "the move can't shrink further; remaining rejections are
+        not informative for the adapter".
+      * Stall guard — fires once (then suppressed for ``_STALL_SUPPRESS_EVENTS``
+        adjust events) when a move shows mean-trial-acceptance < 0.01 AND
+        any replica at the floor AND no replica detecting a bracket, for
+        ``_STALL_HISTORY_LEN`` consecutive adjust events.
+
     Args:
         logger_obj: A ready-to-use ``AdaptationLogger`` instance.
     """
 
+    _STALL_HISTORY_LEN = 5
+    _STALL_SUPPRESS_EVENTS = 50
+
     def __init__(self, logger_obj: Any) -> None:
         self._adaptation_logger = logger_obj
+        n_moves = logger_obj.n_moves
+        self._floor_warned: set[int] = set()
+        self._stall_history: list[collections.deque] = [
+            collections.deque(maxlen=self._STALL_HISTORY_LEN)
+            for _ in range(n_moves)
+        ]
+        self._stall_cooldown: list[int] = [0] * n_moves
 
     def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
         """Write the mandatory iter-0 baseline row.
@@ -583,6 +605,87 @@ class AdaptationCallback:
             n_evaluations=n_evals_np,
             n_grad_evaluations=n_grad_evals_np,
         )
+
+        self._check_adapter_health(
+            iteration=iteration,
+            ss_np=np.asarray(ss_np),
+            acc_np=np.asarray(acc_np),
+            adjustment_stats=adjustment_stats,
+        )
+
+    def _check_adapter_health(
+        self,
+        iteration: int,
+        ss_np: np.ndarray,
+        acc_np: np.ndarray,
+        adjustment_stats: "dict[str, np.ndarray] | None",
+    ) -> None:
+        """Emit WARNINGs when adapter diagnostics indicate a dying move.
+
+        Reads the same arrays the h5 logger just wrote (``(n_runs, n_moves)``
+        layout) and applies two cheap heuristics:
+
+          * first-hit floor — set membership so each move warns at most once;
+          * stall guard — fixed-length deque of bool flags per move, warning
+            when every entry is ``True`` and the cooldown counter has elapsed.
+
+        ``adjustment_stats == None`` is the non-``full_auto`` case (no
+        bisection ever ran).  Floor / bracket info is absent, so we silently
+        return — there's nothing to diagnose.
+        """
+        if adjustment_stats is None:
+            return
+        floor_hits = adjustment_stats.get("floor_hits")
+        if floor_hits is None:
+            return
+        floor_hits = np.asarray(floor_hits)  # (n_runs, n_moves) int32
+        bracket_detected = adjustment_stats.get("bracket_detected")
+        bracket_detected = (
+            np.asarray(bracket_detected)
+            if bracket_detected is not None
+            else np.zeros_like(floor_hits, dtype=bool)
+        )
+        move_names = self._adaptation_logger.move_names
+        n_runs, n_moves = floor_hits.shape
+
+        for m in range(n_moves):
+            name = move_names[m]
+            floor_runs = int((floor_hits[:, m] > 0).sum())
+            bracketed_runs = int(bracket_detected[:, m].sum())
+            mean_acc = float(acc_np[:, m].mean())
+            mean_ss = float(ss_np[:, m].mean())
+
+            if floor_runs > 0 and m not in self._floor_warned:
+                logger.warning(
+                    "[adapt] iter=%d move=%s hit step-size floor on %d/%d "
+                    "replicas (ss=%.2e, mean trial acc=%.3f). Further "
+                    "shrinking is a no-op; if acc stays ~0 the move is "
+                    "functionally dead.",
+                    iteration, name, floor_runs, n_runs, mean_ss, mean_acc,
+                )
+                self._floor_warned.add(m)
+
+            is_pathological = (
+                mean_acc < 0.01
+                and floor_runs > 0
+                and bracketed_runs == 0
+            )
+            self._stall_history[m].append(is_pathological)
+            if self._stall_cooldown[m] > 0:
+                self._stall_cooldown[m] -= 1
+                continue
+            hist = self._stall_history[m]
+            if len(hist) == hist.maxlen and all(hist):
+                logger.warning(
+                    "[adapt] iter=%d move=%s STALLED: mean trial acc<0.01, "
+                    "ss=%.2e at floor on %d/%d replicas, bracket never "
+                    "detected across last %d adjustment events. This move's "
+                    "DOFs are effectively frozen; subsequent dead points are "
+                    "correlated clones in this DOF.",
+                    iteration, name, mean_ss, floor_runs, n_runs,
+                    self._STALL_HISTORY_LEN,
+                )
+                self._stall_cooldown[m] = self._STALL_SUPPRESS_EVENTS
 
     def on_finish(self, ns_state: Any) -> None:
         self._adaptation_logger.close()
@@ -792,6 +895,125 @@ class EnergyCheckCallback:
                 )
 
         self._prev_emax = emax_arr
+
+    def on_finish(self, ns_state: Any) -> None:
+        pass
+
+
+def _min_pair_distance_pbc(positions: jnp.ndarray, cell: jnp.ndarray) -> jnp.ndarray:
+    """Minimum interatomic distance under PBC, vmapped over (n_runs, K).
+
+    ``positions``: ``(n_runs, K, N, 3)``.  ``cell``: ``(n_runs, K, 3, 3)``.
+    Returns ``(n_runs, K)`` minimum pair distance per walker, using the
+    minimum-image convention.
+    """
+    def _one(p, c):
+        cell_inv = jnp.linalg.inv(c)
+        frac = p @ cell_inv
+        diff_frac = frac[:, None, :] - frac[None, :, :]
+        diff_frac = diff_frac - jnp.round(diff_frac)
+        diff = diff_frac @ c
+        d2 = jnp.sum(diff ** 2, axis=-1)
+        n = p.shape[0]
+        d2 = jnp.where(jnp.eye(n, dtype=bool), jnp.inf, d2)
+        return jnp.sqrt(jnp.min(d2))
+    return jax.vmap(jax.vmap(_one))(positions, cell)
+
+
+def _min_pair_distance_open(positions: jnp.ndarray) -> jnp.ndarray:
+    """All-pairs minimum distance (no PBC), vmapped over (n_runs, K).
+
+    ``positions``: ``(n_runs, K, N, 3)``.  Returns ``(n_runs, K)``.
+    """
+    def _one(p):
+        diff = p[:, None, :] - p[None, :, :]
+        d2 = jnp.sum(diff ** 2, axis=-1)
+        n = p.shape[0]
+        d2 = jnp.where(jnp.eye(n, dtype=bool), jnp.inf, d2)
+        return jnp.sqrt(jnp.min(d2))
+    return jax.vmap(jax.vmap(_one))(positions)
+
+
+class CollisionCheckCallback:
+    """Periodically scans walkers for unphysically close atom pairs.
+
+    Computes the minimum interatomic distance per walker using the
+    minimum-image convention when ``population.cell`` is present, and
+    plain all-pairs otherwise.  When any walker falls below
+    ``threshold``, a warning is logged identifying the worst-offender
+    replicas + walkers and their minimum pair distance.
+
+    Diagnostic only — never feeds back into the run.  Works for
+    SingleRun, VmapRuns, and PmapVmapRuns shape conventions via
+    ``info["_batcher"]``.
+
+    Args:
+        threshold: Pair distance below which a warning fires.  Backend
+            length units (typically Å).
+        interval: Fire every ``interval`` iterations.  Default 100 —
+            this is a diagnostic, not a per-iter signal.
+        max_offenders: Cap on the number of (run, walker) entries
+            included in the warning message.  Default 4.
+    """
+
+    def __init__(
+        self,
+        threshold: float,
+        interval: int = 100,
+        max_offenders: int = 4,
+    ) -> None:
+        self._threshold = float(threshold)
+        self._interval = max(1, int(interval))
+        self._max_offenders = max(1, int(max_offenders))
+        self._jit_pbc = jax.jit(_min_pair_distance_pbc)
+        self._jit_open = jax.jit(_min_pair_distance_open)
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        if iteration % self._interval != 0:
+            return
+        pop = ns_state.population
+        positions = jnp.asarray(pop.positions)
+        cell = pop.cell
+
+        batcher = info.get("_batcher")
+        if batcher is not None:
+            positions_flat = batcher.flatten(positions)
+            cell_flat = batcher.flatten(cell) if cell is not None else None
+        else:
+            positions_flat = positions[None, ...] if positions.ndim == 3 else positions
+            if cell is not None:
+                cell_flat = cell[None, ...] if cell.ndim == 3 else cell
+            else:
+                cell_flat = None
+
+        if cell_flat is not None:
+            mins = self._jit_pbc(positions_flat, jnp.asarray(cell_flat))
+        else:
+            mins = self._jit_open(positions_flat)
+        mins_np = np.asarray(mins)
+
+        offenders = mins_np < self._threshold
+        if not bool(np.any(offenders)):
+            return
+
+        idxs = np.argwhere(offenders)
+        offending_d = mins_np[offenders]
+        order = np.argsort(offending_d)
+        worst = [
+            (int(idxs[k, 0]), int(idxs[k, 1]), float(offending_d[k]))
+            for k in order[: self._max_offenders]
+        ]
+        summary = ", ".join(
+            f"run[{r}].walker[{w}]: d_min={d:.4g}" for r, w, d in worst
+        )
+        logger.warning(
+            "iter=%d: %d walker(s) have atom pairs below %.4g "
+            "(worst: %s)",
+            iteration,
+            int(offenders.sum()),
+            self._threshold,
+            summary,
+        )
 
     def on_finish(self, ns_state: Any) -> None:
         pass
