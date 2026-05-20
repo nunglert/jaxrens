@@ -166,6 +166,12 @@ class NeuralILBackendSpec(BaseBackendSpec):
     # backwards compatibility with the no-supercell-needed integration
     # test; bump to (2,2,2) or (3,3,3) for tight unit cells.
     supercell_trafo: tuple[int, int, int] = (1, 1, 1)
+    # Soft-core override. ``None`` means "use whatever the pickle says"
+    # (read from ``constructor_kwargs['softcore']``); explicit ``True``/
+    # ``False`` overrides the pickle. ``softcore_kwargs`` overrides the
+    # pickle-stored kwargs (merged on top of package defaults).
+    softcore: Optional[bool] = None
+    softcore_kwargs: Optional[dict[str, float]] = None
 
     def _backend_config_extras(self) -> dict:
         return {"checkpoint_path": self.checkpoint_path, "cutoff": None}
@@ -175,6 +181,8 @@ class NeuralILBackendSpec(BaseBackendSpec):
         return create_neuralil(
             pickle_file=self.checkpoint_path,
             supercell_trafo=self.supercell_trafo,
+            softcore=self.softcore,
+            softcore_kwargs=self.softcore_kwargs,
         )
 
 

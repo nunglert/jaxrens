@@ -12,6 +12,7 @@ from jaxrens.postprocess.plotting import (
     plot_max_neighbors,
     plot_partition_function,
     plot_re_acceptance,
+    plot_re_acceptance_stacked,
     plot_step_sizes,
 )
 from jaxrens.postprocess.thermodynamics import (
@@ -38,6 +39,7 @@ __all__ = [
     "plot_max_neighbors",
     "plot_partition_function",
     "plot_re_acceptance",
+    "plot_re_acceptance_stacked",
     "plot_step_sizes",
     # Thermodynamics
     "calc_log_weights",

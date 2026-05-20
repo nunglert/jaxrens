@@ -514,6 +514,111 @@ def plot_re_acceptance(
     return ax
 
 
+def plot_re_acceptance_stacked(
+    monitor_or_trace,
+    *,
+    ax: "Axes | None" = None,
+    window: int | None = None,
+    pair_labels: list[str] | None = None,
+    cmap: str = "viridis",
+    raw_alpha: float = 0.3,
+    raw_lw: float = 0.5,
+    smooth_lw: float = 1.5,
+    offset_scale: float = 1.0,
+) -> "Axes":
+    """Plot per-pair RE swap acceptance with vertical stacking.
+
+    Each adjacent-pair acceptance trace is shifted vertically by
+    ``p * offset_scale`` so overlapping curves do not crowd a single
+    [0, 1] band.  A faint raw line is overlaid by a boxcar-smoothed line
+    in the same color; black baselines mark each pair's zero.  A right-hand
+    twin axis carries the pair labels.
+
+    Mirrors the legacy ``jaxnest.plot.plot_output.plot_acc_rates`` style.
+
+    Args:
+        monitor_or_trace: Populated Monitor with a non-None ``re_trace``
+            or an ``RELog`` directly.
+        ax: Existing axes to plot into.  Created if None.
+        window: Optional boxcar smoothing window length (in fire entries).
+            Defaults to ``max(1, n_entries // 50)``.
+        pair_labels: Optional per-pair labels for the right-hand twin axis.
+            Length must equal ``n_pairs``.  Defaults to ``"p↔p+1"``.
+        cmap: Colormap name used to color the per-pair curves.
+        raw_alpha: Alpha for the raw (unsmoothed) curves.
+        raw_lw: Linewidth for the raw curves.
+        smooth_lw: Linewidth for the smoothed overlay.
+        offset_scale: Vertical separation between pairs in [0, 1] units.
+
+    Returns:
+        The left Axes object (the right twin can be retrieved via
+        ``ax.figure.axes[-1]``).
+    """
+    import matplotlib.pyplot as plt
+
+    re_log = _resolve_re_trace(monitor_or_trace)
+    if re_log.n_pairs == 0:
+        raise ValueError(
+            "re_trace has zero pairs — nothing to plot (single-replica run)."
+        )
+
+    iters = np.asarray(re_log.iterations, dtype=np.float64)
+    acc = np.asarray(re_log.acceptance_rates, dtype=np.float64)
+    n_entries, n_pairs = acc.shape
+
+    if pair_labels is not None and len(pair_labels) != n_pairs:
+        raise ValueError(
+            f"len(pair_labels)={len(pair_labels)} does not match "
+            f"n_pairs={n_pairs}"
+        )
+
+    if window is None:
+        window = max(1, n_entries // 50)
+
+    if window > 1:
+        kernel = np.ones(int(window), dtype=np.float64) / float(window)
+        acc_smooth = np.stack(
+            [
+                np.convolve(acc[:, p], kernel, mode="same")
+                for p in range(n_pairs)
+            ],
+            axis=1,
+        )
+    else:
+        acc_smooth = acc
+
+    ax = _get_ax(ax)
+    colors = plt.get_cmap(cmap)(np.linspace(0.0, 0.95, n_pairs))
+
+    for p in range(n_pairs):
+        offset = p * offset_scale
+        ax.axhline(offset, lw=0.5, alpha=0.5, color="black")
+        ax.plot(
+            iters, acc[:, p] + offset,
+            color=colors[p], alpha=raw_alpha, lw=raw_lw,
+        )
+        ax.plot(
+            iters, acc_smooth[:, p] + offset,
+            color=colors[p], lw=smooth_lw,
+        )
+
+    ax.set_ylim(-0.1 * offset_scale, (n_pairs - 1) * offset_scale + 1.1)
+    ax.set_yticks([0.0, 1.0])
+    ax.set_yticklabels(["0%", "100%"])
+    ax.set_xlabel("iteration")
+    ax.set_ylabel(f"swap acceptance rate ({re_log.flavor})")
+
+    twin = ax.twinx()
+    twin.set_ylim(ax.get_ylim())
+    twin.set_yticks(np.arange(n_pairs) * offset_scale)
+    if pair_labels is None:
+        pair_labels = [f"{p}↔{p + 1}" for p in range(n_pairs)]
+    twin.set_yticklabels(pair_labels, ha="left", fontfamily="monospace")
+    twin.tick_params(axis="y", length=0)
+
+    return ax
+
+
 def _resolve_max_neighbors_trace(monitor_or_trace):
     """Accept either a Monitor or a MaxNeighborsLog; return the log."""
     from jaxrens.io.max_neighbors_log import MaxNeighborsLog
