@@ -4,14 +4,28 @@ A persistent-direction move that follows a straight-line trajectory,
 reflecting off the energy constraint surface when violated. Much more
 efficient than random walk for exploring constrained regions.
 
-Algorithm per NS step:
-1. Initialize or perturb the velocity direction
-2. For each of n_reflect iterations:
-   a. Step: new_pos = pos + step_size * direction
-   b. Evaluate energy at new_pos
-   c. If energy >= Emax: reflect direction off constraint surface
-      using forces: direction -= 2 * (F_hat . direction) * F_hat
-3. Accept if final energy < Emax, else reject and flip direction
+Algorithm per NS step (Baldock semantics — mirrors
+``jaxnest_dev/src/jaxnest/mcmc.py::create_GMC_atom_walk``):
+
+1. Initialize or perturb the velocity direction.
+2. For each of ``n_reflect`` iterations:
+   a. Step: ``new_pos = pos + step_size * direction``.  Position always
+      advances — even into the violated region.
+   b. Evaluate energy at ``new_pos``.  NaN energies are coerced to
+      ``+inf`` so they always trigger reflection (matches legacy
+      ``mcmc.py:788-792``).
+   c. If ``new_energy >= Emax``: reflect direction off the constraint
+      surface using forces: ``direction -= 2 * (F_hat . direction) * F_hat``.
+3. Accept iff the trajectory's *final* energy is below ``Emax`` — i.e.
+   the walker has exited the violated region by the last step.  Reject
+   reverts to the initial position and flips the direction.
+
+The non-obvious bit: position drifts through violated regions inside
+the scan; the final-state gate is what enforces in-region acceptance.
+This is the standard Baldock construction.  An earlier variant of this
+kernel reverted ``pos``/``energy`` on every violation, which made the
+final accept-gate trivially True (carry always held the last *good*
+state) and silently NaN-corrupted under NaN-producing backends.
 
 Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
 """
@@ -109,7 +123,13 @@ def build_kernel(
             acc_count = jnp.maximum(acc_count, count)
             acc_overflow = acc_overflow | overflow
 
-            # Check if constraint is violated
+            # NaN trap: a NaN energy (e.g. from a degenerate proposed
+            # geometry under a model with r^-N singularities) must
+            # trigger reflection just like an over-Emax energy.  Without
+            # this, ``NaN >= Emax`` evaluates to False, the carry
+            # advances with NaN energy, and the final accept gate
+            # silently reports rejected.  Mirrors mcmc.py:788-792.
+            new_energy = jnp.where(jnp.isnan(new_energy), jnp.inf, new_energy)
             violated = new_energy >= likelihood_constraint
 
             if use_forces:
@@ -119,9 +139,13 @@ def build_kernel(
             else:
                 reflected_dir = _random_direction(step_key, direction.shape)
 
+            # Position and energy advance unconditionally — the walker
+            # drifts through violated regions.  Only the direction
+            # reflects on violation.  The trajectory's terminal energy
+            # is what gates acceptance, not the per-step energies.
             direction_out = jnp.where(violated, reflected_dir, direction)
-            pos_out = jnp.where(violated, pos, new_pos)
-            energy_out = jnp.where(violated, energy, new_energy)
+            pos_out = new_pos
+            energy_out = new_energy
 
             return (pos_out, direction_out, energy_out, acc_count, acc_overflow), None
 

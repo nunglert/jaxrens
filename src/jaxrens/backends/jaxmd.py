@@ -189,7 +189,12 @@ class JaxMDBackend:
     ) -> tuple[jnp.ndarray, int, bool]:
         del species, max_neighbors, ensemble_params  # all-pairs single-species
         if self.periodic:
-            e = self._energy_fn(positions, new_box=cell)
+            # ``_build_displacement_fn`` uses ``fractional_coordinates=True``
+            # because jax-md's Tersoff is numerically broken in absolute
+            # coords (see that helper's docstring).  Convert here so the
+            # rest of jaxrens can keep storing Cartesian positions.
+            frac_positions = positions @ jnp.linalg.inv(cell)
+            e = self._energy_fn(frac_positions, new_box=cell)
         else:
             e = self._energy_fn(positions)
         return e, 0, False
@@ -213,10 +218,20 @@ def _build_displacement_fn(periodic: bool) -> Any:
     Periodic case uses ``periodic_general`` with a dummy initial box
     (``eye(3)``); the real cell is supplied per call via the
     ``new_box=`` kwarg that jax-md threads through smap's ``**kwargs``.
+
+    ``fractional_coordinates=True`` is non-negotiable for Tersoff: with
+    ``False`` the 3-body bond-order accumulation in jax-md's
+    ``energy.tersoff`` produces non-monotonic, supercell-dependent
+    garbage energies (8-atom unit cell and 2×2×2 supercell of the same
+    crystal disagree by ~12 eV/atom; the published Si '88 cohesive minimum
+    is missed entirely).  See ``/home/nico.unglert/dump/probe_tersoff_frac.py``
+    for the comparison.  ``JaxMDBackend.__call__`` accordingly converts
+    incoming Cartesian positions to fractional before calling the energy
+    function on every step.
     """
     if periodic:
         disp_fn, _ = _jmd_space.periodic_general(
-            jnp.eye(3), fractional_coordinates=False,
+            jnp.eye(3), fractional_coordinates=True,
         )
         return disp_fn
     disp_fn, _ = _jmd_space.free()

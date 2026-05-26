@@ -134,20 +134,25 @@ def test_si_dimer_energy_negative_and_finite():
 
 
 def test_si_diamond_energy_finite():
-    """8-atom diamond Si at a = 5.431 Å must yield finite energy."""
+    """8-atom diamond Si at a = 5.431 Å must yield Tersoff '88 cohesive E.
+
+    With the ``fractional_coordinates=True`` convention now used in
+    ``_build_displacement_fn`` (jax-md's Tersoff is broken otherwise —
+    see that helper's docstring), the published Tersoff '88 minimum
+    sits at a ≈ 5.431 Å with E/atom = -4.630 eV.  The narrow tolerance
+    below catches accidental reversions to ``fractional_coordinates=False``,
+    which would push this back up toward -2.77 eV/atom.
+    """
     b = _make_backend(periodic=True)
     positions = _si_diamond_positions()
     species = jnp.zeros(8, dtype=jnp.int32)
     cell = SI_LATTICE_CONST * jnp.eye(3, dtype=jnp.float32)
     e, n, overflow = b(positions, species, cell, max_neighbors=0)
     assert jnp.isfinite(e)
-    # Si diamond is bound: per-atom energy should be < 0 by a few eV.
-    # Tersoff '88's cohesive energy for Si is ≈ -4.63 eV/atom; allow a
-    # wide window since the lattice constant isn't at this set's minimum.
     e_per_atom = float(e) / 8.0
-    assert -6.0 < e_per_atom < -2.0, (
+    assert -4.7 < e_per_atom < -4.5, (
         f"Si diamond energy/atom = {e_per_atom:.3f} eV, "
-        f"expected ≈ -4.6 eV"
+        f"expected ≈ -4.63 eV (Tersoff '88 cohesive minimum at a = 5.431)"
     )
 
 

@@ -311,3 +311,134 @@ class TestGalileanStep:
         key = jax.random.key(0)
         new_state, info = jax.jit(step)(key, state, 10.0)
         assert new_state.energy.shape == ()
+
+
+class TestGalileanBaldockSemantics:
+    """Pin the post-Phase-1 Baldock semantics: position advances through
+    violations inside the scan; accept gates on FINAL energy only; NaN
+    energies trigger reflection.  Mirrors jaxnest_dev/src/jaxnest/mcmc.py.
+
+    The earlier in-tree variant reverted position+energy on every
+    violation, making ``accepted`` trivially True (carry energy was
+    always the last *good* energy, < Emax by construction) and silently
+    propagating NaN energies as "valid".  These tests would have failed
+    under that variant.
+    """
+
+    def test_reject_when_no_path_below_constraint(
+        self, harmonic, positions, types,
+    ):
+        """With Emax STRICTLY below the initial state.energy, the
+        trajectory cannot end below Emax — must report ``accepted=False``.
+
+        Pre-fix this would have spuriously reported ``accepted=True``
+        because the carry would have held the initial (below-Emax)
+        energy throughout."""
+        backend = harmonic
+        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.5)
+        # Emax BELOW state.energy — every reflection step lands at
+        # E > Emax (harmonic potential at perturbed positions only grows).
+        step = jax.jit(gmc_build_kernel(backend, n_reflect=4))
+        key = jax.random.key(0)
+        new_state, info = step(key, state, likelihood_constraint=0.1)
+        assert not bool(info.accepted), (
+            f"GMC must reject when state.energy ({float(state.energy)}) "
+            f"already exceeds Emax (0.1); got accepted={bool(info.accepted)}"
+        )
+        # Reject path: position must revert to original.
+        assert jnp.allclose(new_state.positions, state.positions)
+        # Reject path: direction flips relative to state.direction (which
+        # is zero on first call, so this just checks final_dir is not
+        # used in the reject branch — position-invariance is the real
+        # signal here).
+
+    def test_accept_advances_through_intermediate_violations(
+        self, harmonic, positions, types,
+    ):
+        """When ``n_reflect`` is large enough that reflections recover
+        the walker, the move accepts AND the final position is NOT the
+        initial position (i.e. the trajectory genuinely traversed the
+        violated region rather than rejecting at the first step).
+        Pre-fix this passed by luck (revert + early-Emax-check), but
+        the new semantics make it a meaningful check."""
+        backend = harmonic
+        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
+        step = jax.jit(gmc_build_kernel(backend, n_reflect=5))
+        key = jax.random.key(7)
+        accept_count = 0
+        moved_count = 0
+        last_state = state
+        for _ in range(50):
+            key, sub = jax.random.split(key)
+            last_state, info = step(sub, last_state, likelihood_constraint=0.5)
+            if bool(info.accepted):
+                accept_count += 1
+                # Accepted → positions must differ from prior state by at
+                # least ``step_size`` (since position advances unconditionally
+                # inside the scan, then on accept we keep final_pos).
+                # (We can't compare to the per-iter prior here without a
+                # separate carry; use the moved counter as a proxy below.)
+            moved_count += int(not jnp.allclose(last_state.positions, state.positions))
+        assert accept_count > 5, (
+            f"Expected nonzero acceptance under reasonable settings; got {accept_count}/50"
+        )
+        # Trajectory must have actually evolved (positions changed from
+        # the original) — under the broken revert-on-violation kernel
+        # walkers could "accept" with no displacement and this would fail.
+        assert moved_count > 0
+
+    def test_nan_energy_triggers_reflection_not_silent_reject(
+        self, positions, types,
+    ):
+        """A backend that returns NaN at certain configurations must
+        not cause the carry to propagate NaN energy through the scan
+        and silently report ``accepted=False`` at the end (which is
+        what happens without the NaN trap).  After the fix, NaN ⇒ inf
+        ⇒ violation ⇒ reflection, exactly like an over-Emax energy.
+        """
+        # Synthetic backend: returns NaN at any displacement from
+        # original positions, finite at original.
+        positions = positions  # (2, 3)
+        nan_check_pos = positions
+
+        def nan_backend(p, types, cell, max_neighbors=0, ensemble_params=None):
+            # Returns NaN whenever ANY coord differs from the initial
+            # (forcing every proposed step to NaN-out).
+            diff = jnp.any(jnp.abs(p - nan_check_pos) > 1e-6)
+            e = jnp.where(diff, jnp.nan, 0.25)
+            return e, 0, False
+
+        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
+        step = jax.jit(gmc_build_kernel(nan_backend, n_reflect=3, use_forces=False))
+        key = jax.random.key(0)
+        new_state, info = step(key, state, likelihood_constraint=10.0)
+        # Every step NaN-violated → final energy = +inf → accepted=False
+        # (NOT a NaN-corrupted "rejected" that silently passes through).
+        assert not bool(info.accepted)
+        # The reject path keeps state.positions and state.energy intact
+        # — verify they survived a sea of NaN proposals.
+        assert jnp.allclose(new_state.positions, state.positions)
+        assert float(new_state.energy) == 0.25
+
+    def test_final_energy_below_constraint_when_accepted(
+        self, harmonic, positions, types,
+    ):
+        """When accepted, the stored state.energy must be < Emax.
+        This is the post-fix invariant: accept ⇔ final-state energy
+        below Emax.  Run for many trials to actually exercise the
+        accept path."""
+        backend = harmonic
+        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.02)
+        step = jax.jit(gmc_build_kernel(backend, n_reflect=5))
+        key = jax.random.key(99)
+        n_accepted = 0
+        for _ in range(60):
+            key, sub = jax.random.split(key)
+            state, info = step(sub, state, likelihood_constraint=1.0)
+            if bool(info.accepted):
+                n_accepted += 1
+                assert float(state.energy) < 1.0, (
+                    f"Accepted move left state.energy={float(state.energy)} "
+                    f"≥ Emax=1.0 — invariant violated"
+                )
+        assert n_accepted > 0  # sanity: the test actually exercised the accept path
