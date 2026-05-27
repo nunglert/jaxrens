@@ -279,6 +279,14 @@ def run_from_config(
 
         base_backend = load_backend(backend_config.backend_type, **backend_kwargs)
 
+    # Soft-core wrapper applied first (closest to the bare backend) so
+    # the EnsembleBackend PV correction sits outside it.
+    if backend_config.softcore_repulsion is not None:
+        from jaxrens.backends.softcore import SoftCoreBackend
+        base_backend = SoftCoreBackend(
+            base_backend, **backend_config.softcore_repulsion,
+        )
+
     # Wrap with ensemble corrections if needed
     ensemble_params = None
     if ns_config.pressure:
@@ -610,7 +618,10 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
 
     # --- Backend: one base, wrapped once with EnsembleBackend --------------
     # Per-call ``ensemble_params`` dicts override the wrapper's closured
-    # defaults (see backends/ensemble.py __call__).
+    # defaults (see backends/ensemble.py __call__).  The resolver already
+    # applied the soft-core wrapper (if configured) to ``base_backend``
+    # before stashing it on ``resolved`` (see ``_resolve_multi_replica``),
+    # so no additional wrap is needed here.
     base_backend = resolved.base_backend
     backend = EnsembleBackend(base_backend, pressure=0.0)
 
@@ -996,6 +1007,9 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
     n_gpu = batcher.n_gpu
     n_live = ns.n_live
 
+    # The resolver already applied the soft-core wrapper (if configured)
+    # to ``base_backend`` before stashing it on ``resolved``, so no
+    # additional wrap is needed here.
     base_backend = resolved.base_backend
     backend = EnsembleBackend(base_backend, pressure=0.0)
     init_fn, step_fn, per_move_fns = build_mwg(

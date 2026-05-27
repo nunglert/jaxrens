@@ -1000,6 +1000,14 @@ def _resolve_single_replica(
     backend = root.backend.to_backend_config()
     base_backend = root.backend.build_backend()
 
+    # Soft-core repulsion wrapper: applied closest to the bare backend so
+    # the ensemble PV term sits outside it.  Mutates ``base_backend`` so
+    # both single-replica and downstream multi-replica / rejection-mode
+    # init paths inherit the wrap automatically.
+    if backend.softcore_repulsion is not None:
+        from jaxrens.backends.softcore import SoftCoreBackend
+        base_backend = SoftCoreBackend(base_backend, **backend.softcore_repulsion)
+
     # For initial-energy evaluation, locally wrap with EnsembleBackend so the
     # resolver's energies match the NS-loop scale (U + P*V for NPT) — without
     # this, walkers are initialized with bare LJ energies while the MWG
@@ -1291,6 +1299,16 @@ def _resolve_multi_replica(
     logger.info("[resolve] building base backend (%s)", root.backend.__class__.__name__)
     base_backend = root.backend.build_backend()
     backend_cfg = root.backend.to_backend_config()
+
+    # Soft-core repulsion wrapper applied closest to the bare backend so
+    # the per-replica EnsembleBackend (PV term) sits outside it.  Mutates
+    # ``base_backend`` so the per-replica EnsembleBackend wrap below and
+    # the runtime in ``run_multi_gpu_from_config`` both inherit it.
+    if backend_cfg.softcore_repulsion is not None:
+        from jaxrens.backends.softcore import SoftCoreBackend
+        base_backend = SoftCoreBackend(
+            base_backend, **backend_cfg.softcore_repulsion,
+        )
 
     # Build a per-replica EnsembleBackend for the *rejection-mode*
     # ceiling check inside ``_sample_per_walker_positions`` (grid mode

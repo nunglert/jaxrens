@@ -50,6 +50,13 @@ class BackendConfig:
     # plays the role of post-shrink safety margin.
     max_neighbors_shrink_dwell: int = 0
 
+    # Soft-core repulsion wrapper kwargs.  ``None`` disables.  When set,
+    # the runtime wraps ``base_backend`` with ``SoftCoreBackend`` before
+    # any ``EnsembleBackend`` wrap.  Expected keys: ``a0``, ``b0``,
+    # ``d0``, ``r_core_cut``, ``r_core_switch``.  See
+    # ``jaxrens.backends.softcore`` and the ``SoftCoreSpec`` schema.
+    softcore_repulsion: dict | None = None
+
 
 @dataclass(frozen=True)
 class OutputConfig:

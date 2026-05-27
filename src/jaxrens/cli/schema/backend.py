@@ -8,12 +8,44 @@ dispatch that used to live in ``cli/resolve.py``.
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, Optional, Union
+from typing import Annotated, Any, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from jaxrens.backends.base import EnergyBackend
 from jaxrens.state.config import BackendConfig
+
+
+# ---------------------------------------------------------------------------
+# Soft-core wrapper spec
+# ---------------------------------------------------------------------------
+
+class SoftCoreSpec(BaseModel):
+    """Fixed repulsive Morse soft-core wrapper.
+
+    When present on a backend spec, the resolver and runtime wrap the
+    built backend with ``SoftCoreBackend`` (see
+    ``jaxrens.backends.softcore``).  Adds a parameter-free, isotropic
+    repulsive Morse term to the underlying potential to suppress
+    close-contact pathologies during nested sampling.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    a0: float = 1.0
+    b0: float = 3.0
+    d0: float = 1.0
+    r_core_cut: float = 1.25
+    r_core_switch: float = 0.75
+
+    @model_validator(mode="after")
+    def _check_cutoff_order(self) -> "SoftCoreSpec":
+        if self.r_core_switch >= self.r_core_cut:
+            raise ValueError(
+                f"r_core_switch ({self.r_core_switch}) must be strictly "
+                f"less than r_core_cut ({self.r_core_cut})."
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -26,6 +58,16 @@ class BaseBackendSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     periodic: bool = False
+
+    # Optional soft-core repulsion wrapper.  When set, the resolver and
+    # runtime wrap the built backend with ``SoftCoreBackend`` (adds a
+    # parameter-free repulsive Morse term to the bare potential).  See
+    # ``jaxrens.backends.softcore`` for the wrapper and ``SoftCoreSpec``
+    # above for the parameters.  Backend-agnostic: works with MACE,
+    # Nequix, LJ, NeuralIL, etc.  For NeuralIL, prefer the (slightly
+    # cheaper) per-backend ``softcore: true`` flag on ``NeuralILBackendSpec``
+    # — the two are mutually exclusive (would otherwise double-count).
+    softcore_repulsion: Optional[SoftCoreSpec] = None
 
     # Overflow-retry ladder.  The outer NS loop picks the smallest entry
     # >= (observed max neighbor count + max_neighbors_offset) as the new
@@ -75,12 +117,18 @@ class BaseBackendSpec(BaseModel):
         ``n_atoms`` is derived from the initial walker positions at resolve
         time, not stored on the backend spec.
         """
+        softcore_repulsion = (
+            self.softcore_repulsion.model_dump()
+            if self.softcore_repulsion is not None
+            else None
+        )
         return BackendConfig(
             backend_type=self.type,  # type: ignore[attr-defined]
             periodic=self.periodic,
             max_neighbors_list=list(self.max_neighbors_list),
             max_neighbors_offset=self.max_neighbors_offset,
             max_neighbors_shrink_dwell=self.max_neighbors_shrink_dwell,
+            softcore_repulsion=softcore_repulsion,
             **self._backend_config_extras(),
         )
 
@@ -170,8 +218,25 @@ class NeuralILBackendSpec(BaseBackendSpec):
     # (read from ``constructor_kwargs['softcore']``); explicit ``True``/
     # ``False`` overrides the pickle. ``softcore_kwargs`` overrides the
     # pickle-stored kwargs (merged on top of package defaults).
+    #
+    # Mutually exclusive with the inherited ``softcore_repulsion`` wrapper
+    # field on ``BaseBackendSpec``: enabling both would add the Morse
+    # repulsion twice. Pick one — the per-backend flag here uses the
+    # ``SoftCoreNeuralIL`` subclass which shares the descriptor's
+    # neighbor discovery (slightly cheaper); the wrapper field is
+    # backend-agnostic.
     softcore: Optional[bool] = None
     softcore_kwargs: Optional[dict[str, float]] = None
+
+    @model_validator(mode="after")
+    def _check_softcore_mutex(self) -> "NeuralILBackendSpec":
+        if self.softcore is True and self.softcore_repulsion is not None:
+            raise ValueError(
+                "Set either `softcore: true` (NeuralIL-internal path) OR "
+                "`softcore_repulsion: {...}` (generic wrapper), not both — "
+                "enabling both would add the soft-core Morse term twice."
+            )
+        return self
 
     def _backend_config_extras(self) -> dict:
         return {"checkpoint_path": self.checkpoint_path, "cutoff": None}
