@@ -89,6 +89,7 @@ class AccRatesLogger:
         n_runs: int,
         flush_interval: int = 1000,
         mode: str = "w",
+        restart_iteration: int = 0,
     ) -> None:
         self.path = Path(path)
         self.move_names = list(move_names)
@@ -98,6 +99,10 @@ class AccRatesLogger:
         self._mode = mode
         # First flush honors ``mode``; subsequent flushes always append.
         self._first_flush = True
+        # Restart: rewind entries flushed past the checkpoint before appending.
+        if mode == "a" and restart_iteration > 0:
+            from jaxrens.io.restart_truncate import truncate_h5_iterations
+            truncate_h5_iterations(self.path, restart_iteration)
 
         self._buf_iters: list[int] = []
         self._buf_n_acc: list[np.ndarray] = []

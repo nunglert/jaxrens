@@ -32,6 +32,7 @@ class EnergyLogger:
         n_dof: int = 0,
         n_atoms: int = 0,
         mode: str = "w",
+        restart_iteration: int = 0,
     ):
         self.path = Path(path)
         self.n_walkers = n_walkers
@@ -39,10 +40,16 @@ class EnergyLogger:
         self.n_dof = n_dof
         self.n_atoms = n_atoms
         self._mode = mode
+        self._restart_iteration = restart_iteration
         self._file = None
 
     def write_header(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Restart: rewind the on-disk log to the checkpoint before appending,
+        # dropping any dead-point rows the previous process flushed past it.
+        if self._mode == "a" and self._restart_iteration > 0:
+            from jaxrens.io.restart_truncate import truncate_energies
+            truncate_energies(self.path, self._restart_iteration)
         # mode="a" + existing non-empty file: header already on disk, skip it.
         skip_header = self._mode == "a" and self.path.exists() and self.path.stat().st_size > 0
         self._file = open(self.path, self._mode)

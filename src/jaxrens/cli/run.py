@@ -356,15 +356,24 @@ def run_from_config(
     if (memprof := os.environ.get("JAXRENS_MEMPROF")):
         callbacks.append(MemProfileCallback(working_dir / memprof))
 
+    # On restart, the global iteration the checkpoint was taken at — every
+    # output stream is rewound to drop records the previous process flushed
+    # past it (see io/restart_truncate.py).  0 for a fresh run (no-op).
+    restart_iteration = (
+        int(restart_state.iteration) if restart_state is not None else 0
+    )
+
     traj_path = working_dir / f"{output_config.out_file_prefix}.traj.{output_config.format}"
     writer = create_trajectory_writer(
         output_config.format, traj_path, symbol_map, mode=writer_mode,
+        restart_iteration=restart_iteration,
     )
     energy_logger = EnergyLogger(
         working_dir / f"{output_config.out_file_prefix}.energies",
         n_walkers=ns_config.n_live,
         n_atoms=initial_positions.shape[-2],
         mode=writer_mode,
+        restart_iteration=restart_iteration,
     )
     callbacks.append(
         TrajectoryCallback(
@@ -390,6 +399,7 @@ def run_from_config(
             move_names=move_name_list,
             n_runs=1,
             mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
 
@@ -407,6 +417,7 @@ def run_from_config(
             n_runs=1,
             flush_interval=int(getattr(output_config, "flush_interval", 1000)),
             mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(AccRatesCallback(
             acc_logger,
@@ -426,6 +437,7 @@ def run_from_config(
             n_walkers=ns_config.n_live,
             flush_interval=int(getattr(output_config, "flush_interval", 1000)),
             mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(MaxNeighborsCallback(
             mn_logger,
@@ -582,6 +594,28 @@ def run_from_config(
     )
 
     return result
+
+
+def _restart_iteration_from(restart_state: Any) -> int:
+    """Global iteration to rewind output streams to on restart.
+
+    Accepts the single-run ``RestartBundle``, the multi-GPU 2-D nested
+    bundle list, or a flat list — every replica shares one checkpoint, so
+    the first non-``None`` bundle's ``iteration`` is authoritative.  Returns
+    0 for a fresh run (``restart_state is None``), making truncation a no-op.
+    """
+    if restart_state is None:
+        return 0
+    stack = [restart_state]
+    while stack:
+        item = stack.pop()
+        if item is None:
+            continue
+        if isinstance(item, list):
+            stack.extend(item)
+        elif hasattr(item, "iteration"):
+            return int(item.iteration)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -794,6 +828,9 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
     if (memprof := os.environ.get("JAXRENS_MEMPROF")):
         callbacks.append(MemProfileCallback(working_dir / memprof))
 
+    # Rewind every output stream to the checkpoint on restart (0 = fresh).
+    restart_iteration = _restart_iteration_from(resolved.init.restart_state)
+
     n_atoms = positions.shape[-2]
     writers = []
     energy_loggers = []
@@ -805,12 +842,14 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
         writers.append(
             create_trajectory_writer(
                 resolved.output.format, traj_path, symbol_map, mode=writer_mode,
+                restart_iteration=restart_iteration,
             )
         )
         energy_path = working_dir / f"{resolved.output.out_file_prefix}.run{r:02d}.energies"
         energy_loggers.append(
             EnergyLogger(
                 energy_path, n_walkers=n_live, n_atoms=n_atoms, mode=writer_mode,
+                restart_iteration=restart_iteration,
             )
         )
     callbacks.append(
@@ -836,6 +875,7 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
             move_names=move_name_list,
             n_runs=n_total,
             mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
 
@@ -855,6 +895,7 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
             n_runs=n_total,
             flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
             mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(AccRatesCallback(
             acc_logger,
@@ -874,6 +915,7 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
             n_walkers=n_live,
             flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
             mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(MaxNeighborsCallback(
             mn_logger,
@@ -897,6 +939,7 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
             flavor=resolved.inter_re_config.flavor,
             flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
             mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(RECallback(re_logger))
 
@@ -1165,6 +1208,9 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
     if (memprof := os.environ.get("JAXRENS_MEMPROF")):
         callbacks.append(MemProfileCallback(working_dir / memprof))
 
+    # Rewind output streams to the checkpoint on restart (0 = fresh).
+    restart_iteration = _restart_iteration_from(resolved.init.restart_state)
+
     n_atoms = positions.shape[-2]
     traj_path = (
         working_dir
@@ -1172,12 +1218,14 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
     )
     writer = create_trajectory_writer(
         resolved.output.format, traj_path, symbol_map, mode=writer_mode,
+        restart_iteration=restart_iteration,
     )
     energy_path = (
         working_dir / f"{resolved.output.out_file_prefix}.energies"
     )
     energy_logger = EnergyLogger(
         energy_path, n_walkers=n_live, n_atoms=n_atoms, mode=writer_mode,
+        restart_iteration=restart_iteration,
     )
     callbacks.append(
         TrajectoryCallback(
@@ -1198,6 +1246,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
             move_names=move_name_list,
             n_runs=1,
             mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
 
@@ -1214,6 +1263,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
             n_walkers=n_live,
             flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
             mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(MaxNeighborsCallback(
             mn_logger,
@@ -1235,6 +1285,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
             n_runs=1,
             flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
             mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(AccRatesCallback(
             acc_logger,

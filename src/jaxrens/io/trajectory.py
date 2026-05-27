@@ -24,6 +24,7 @@ class ExtxyzTrajectoryWriter:
         symbol_map: dict[int, str],
         wrap: bool = True,
         mode: str = "w",
+        restart_iteration: int = 0,
     ):
         self.path = Path(path)
         self.symbol_map = symbol_map
@@ -34,6 +35,10 @@ class ExtxyzTrajectoryWriter:
         # accumulate instead of replacing each other.
         self._first_write = True
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Restart: rewind frames flushed past the checkpoint before appending.
+        if mode == "a" and restart_iteration > 0:
+            from jaxrens.io.restart_truncate import truncate_extxyz
+            truncate_extxyz(self.path, restart_iteration)
 
     def write_dead_point(
         self, iteration: int, walker: Any, energy: float
@@ -86,6 +91,7 @@ class H5TrajectoryWriter:
         path: Path | str,
         symbol_map: dict[int, str],
         mode: str = "w",
+        restart_iteration: int = 0,
     ):
         import h5py
 
@@ -93,6 +99,11 @@ class H5TrajectoryWriter:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.symbol_map = symbol_map
         self._mode = mode
+        # Restart: drop per-iteration groups flushed past the checkpoint.
+        # Done before opening so the append handle sees the rewound file.
+        if mode == "a" and restart_iteration > 0:
+            from jaxrens.io.restart_truncate import truncate_h5_traj
+            truncate_h5_traj(self.path, restart_iteration)
         self._file = h5py.File(self.path, self._mode)
         self._file.attrs["symbol_map"] = str(symbol_map)
 

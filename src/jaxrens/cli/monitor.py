@@ -504,8 +504,17 @@ class AdaptationCallback:
             "bracket_detected": np.zeros((n_runs, n_moves), dtype=bool),
             "reject_reason_counts": np.zeros((n_runs, n_moves, 4), dtype=np.int32),
         }
+        # Label the baseline with the run's starting global iteration: 0 for
+        # a fresh run, the restored checkpoint iteration on restart.  This
+        # keeps the row monotonic with the rest of the log so truncate-on-
+        # restart (drop iter >= restart_iteration) leaves exactly one
+        # baseline at the resume boundary instead of a duplicate at 0.
+        baseline_iter = (
+            0 if ns_state is None
+            else int(jnp.asarray(ns_state.iteration).reshape(-1)[0])
+        )
         self._adaptation_logger.write_entry(
-            iteration=0,
+            iteration=baseline_iter,
             step_sizes=ss_np,
             acceptance_rates=acc_np,
             adjustment_stats=baseline_adj_stats,

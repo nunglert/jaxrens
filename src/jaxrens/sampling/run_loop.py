@@ -412,8 +412,19 @@ def _run_loop(
         shrink_dwell=max_neighbors_shrink_dwell,
     )
 
+    # ``i`` is the segment-local loop counter (0-based each invocation) and
+    # drives termination + adapt phase — keeping it segment-local preserves
+    # "run N more iterations per restart" semantics.  ``record_iteration``
+    # is the *global* iteration used for every on-disk artifact (dead-point
+    # labels, output cadence): on a fresh run ``restart_iteration == 0`` so
+    # it equals ``i``; on restart it continues monotonically from the
+    # checkpoint's iteration, so the ``.energies`` / ``.traj`` / HDF5 streams
+    # stay continuous and truncate-on-restart has a well-defined cut point.
+    restart_iteration = int(jnp.asarray(ns_state.iteration).reshape(-1)[0])
+
     i = 0
     while True:
+        record_iteration = i + restart_iteration
         # ---- Adaptation ----
         adjust_info = None
         if adapt_step is not None and i % adjust_interval == 0:
@@ -442,7 +453,7 @@ def _run_loop(
         # ---- Overflow retry ----
         # For PmapVmapRuns, any overflow across any (G, P) shard triggers a retry.
         ns_state, retry = bucket_mgr.grow_if_overflow(
-            ns_state, new_ns_state, label="iter", iteration=i,
+            ns_state, new_ns_state, label="iter", iteration=record_iteration,
         )
         if retry:
             continue
@@ -451,7 +462,7 @@ def _run_loop(
         # No-op when shrink_dwell == 0; otherwise steps the bucket down one
         # ladder entry once the observed peak has stayed below the next-
         # smaller bucket (with margin) for ``shrink_dwell`` iterations.
-        ns_state = bucket_mgr.maybe_shrink(ns_state, iteration=i)
+        ns_state = bucket_mgr.maybe_shrink(ns_state, iteration=record_iteration)
 
         # ---- Inter-RE phase ----
         # Fires after ns_step, before cumulative counter bump and callbacks.
@@ -520,7 +531,7 @@ def _run_loop(
         else:
             ns_state_for_cb = ns_state
 
-        _dispatch_callbacks(callbacks, i, ns_state_for_cb, info)
+        _dispatch_callbacks(callbacks, record_iteration, ns_state_for_cb, info)
 
         # ---- Termination ----
         log_z_scalar, hmax_scalar = batcher.reduce_for_termination(
