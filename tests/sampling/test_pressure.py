@@ -13,6 +13,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from jaxrens.backends.toy import create_harmonic
@@ -124,20 +125,62 @@ class TestEnsembleBackend:
 # ns_step with pressure
 # ---------------------------------------------------------------------------
 
-class TestNSStepPressure:
-    def test_step_records_dead_volume(self, periodic_setup_npt):
+class TestNSStepDeadWalker:
+    """``info['dead_walker']`` is a ``WalkerState`` pytree (positions /
+    types / energy / cell) holding the dead walker's pre-cull state.  This
+    replaces the older parallel ``dead_position`` / ``dead_volume`` /
+    ``dead_cell`` / ``dead_energy`` keys — see WORKLOG 2026-05-28.
+    """
+
+    def test_dead_walker_has_walker_state_fields(self, periodic_setup_npt):
         s = periodic_setup_npt
         state = init_ns(
             s["init_fn"],
             s["positions"], s["types"], s["energies"],
             cells=s["cells"], rng_key=s["key"],
         )
+        _, info = ns_step(state, s["step_fn"], n_mcmc_steps=5)
 
-        new_state, info = ns_step(state, s["step_fn"], n_mcmc_steps=5)
+        assert "dead_walker" in info
+        dw = info["dead_walker"]
+        n_atoms = s["positions"].shape[-2]
+        assert dw.positions.shape == (n_atoms, 3)
+        assert dw.types.shape == (n_atoms,)
+        assert dw.cell.shape == (3, 3)
+        assert dw.energy.shape == ()
 
-        dv = float(info["dead_volume"])
-        assert dv > 0, "Dead volume should be recorded"
-        assert dv == pytest.approx(125.0, abs=1e-3)
+    def test_dead_walker_volume_from_cell_matches_fixture(
+        self, periodic_setup_npt,
+    ):
+        """Volume must derive correctly from ``dead_walker.cell``."""
+        s = periodic_setup_npt
+        state = init_ns(
+            s["init_fn"],
+            s["positions"], s["types"], s["energies"],
+            cells=s["cells"], rng_key=s["key"],
+        )
+        _, info = ns_step(state, s["step_fn"], n_mcmc_steps=5)
+        vol = float(jnp.abs(jnp.linalg.det(info["dead_walker"].cell)))
+        assert vol == pytest.approx(125.0, abs=1e-3)
+
+    def test_dead_walker_cell_matches_pre_cull_slot(self, periodic_setup_npt):
+        """Dead walker's cell is the pre-cull cell at ``worst_idx``, not the
+        clone's post-MCMC cell that now occupies that slot.
+        """
+        s = periodic_setup_npt
+        state = init_ns(
+            s["init_fn"],
+            s["positions"], s["types"], s["energies"],
+            cells=s["cells"], rng_key=s["key"],
+        )
+        _, info = ns_step(state, s["step_fn"], n_mcmc_steps=5)
+
+        worst_idx = int(info["worst_idx"])
+        np.testing.assert_allclose(
+            np.asarray(info["dead_walker"].cell),
+            np.asarray(s["cells"][worst_idx]),
+            atol=1e-6,
+        )
 
 
 # ---------------------------------------------------------------------------

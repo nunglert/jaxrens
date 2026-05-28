@@ -42,7 +42,7 @@ from jaxrens.cli.schema.moves import (
 from jaxrens.cli.resolve import resolve, ResolvedConfig
 from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
 
-_DATA = Path(__file__).parent / "data" / "cli"
+_DATA = Path(__file__).parent.parent / "data" / "cli"
 _MINIMAL_YAML = _DATA / "minimal.yaml"
 _LJ_BACKEND_YAML = _DATA / "lj_backend.yaml"
 _FULL_CONFIG_YAML = _DATA / "full_config.yaml"
@@ -786,14 +786,14 @@ class TestExtendedOutputResolve:
         from jaxrens.cli.schema.output import OutputSpec
         schema = OutputSpec(
             format="none",
-            wrap_atoms=True,
             write_traj_db=True,
+            write_walkers_db=True,
         )
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             _warn_unused_output_fields(schema)
         warned = [r.message for r in caplog.records]
-        assert any("wrap_atoms" in m for m in warned)
         assert any("write_traj_db" in m for m in warned)
+        assert any("write_walkers_db" in m for m in warned)
 
     def test_default_output_no_warnings(self, caplog):
         import logging
@@ -807,11 +807,26 @@ class TestExtendedOutputResolve:
     def test_resolve_warns_for_deferred_output_fields(self, caplog):
         import logging
         d = _minimal_dict()
-        d["output"]["wrap_atoms"] = True
+        d["output"]["write_traj_db"] = True
         root = RootSpec.model_validate(d)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             resolve(root)
-        assert any("wrap_atoms" in r.message for r in caplog.records)
+        assert any("write_traj_db" in r.message for r in caplog.records)
+
+    def test_wrap_atoms_is_wired_no_longer_deferred(self, caplog):
+        """``wrap_atoms`` was previously a deferred field that only warned.
+        It is now wired through OutputConfig → ExtxyzTrajectoryWriter, so
+        setting it must NOT emit a deferred-field warning and must land on
+        ``ResolvedConfig.output.wrap_atoms``.
+        """
+        import logging
+        d = _minimal_dict()
+        d["output"]["wrap_atoms"] = True
+        root = RootSpec.model_validate(d)
+        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+            resolved = resolve(root)
+        assert not any("wrap_atoms" in r.message for r in caplog.records)
+        assert resolved.output.wrap_atoms is True
 
 
 # ---------------------------------------------------------------------------

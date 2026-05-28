@@ -299,10 +299,10 @@ def _run_loop(
 
     Per-iteration culled walker data lives only in the ``info`` dict —
     callbacks that need it (``EnergyLogger``, ``TrajectoryCallback``) read
-    ``info["dead_energy"]`` / ``info["dead_position"]`` / ``info["dead_volume"]``
-    directly and persist to disk on the spot.  No host-side history buffer
-    is accumulated; the canonical record of dead points lives on disk via
-    those callbacks.
+    ``info["dead_walker"]`` (a ``WalkerState`` pytree with positions /
+    types / energy / cell) and persist to disk on the spot.  No host-side
+    history buffer is accumulated; the canonical record of dead points
+    lives on disk via those callbacks.
 
     Args:
         batcher: ``BatchDescriptor`` instance controlling JIT-compilation,

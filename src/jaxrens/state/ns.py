@@ -7,8 +7,9 @@ as a JAX pytree for compatibility with JIT/vmap.
 Dead points are *not* on NSState — the algorithm never reads them, only
 emits them via ``ns_step``'s ``info`` dict at cull time, so they don't
 belong on the state.  Per-iteration callbacks (``EnergyLogger``,
-``TrajectoryCallback``) consume ``info["dead_*"]`` and persist the values
-straight to disk — there is no in-memory dead-point buffer.
+``TrajectoryCallback``) consume ``info["dead_walker"]`` (a ``WalkerState``
+pytree) and persist the values straight to disk — there is no in-memory
+dead-point buffer.
 
 NSState is ensemble-agnostic — it doesn't know about pressure, chemical
 potentials, or ensemble type. The full ensemble potential is stored in

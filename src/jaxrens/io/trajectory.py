@@ -154,6 +154,6 @@ def create_trajectory_writer(
         case "h5":
             return H5TrajectoryWriter(path, symbol_map, **kwargs)
         case "none":
-            return NullTrajectoryWriter()
+            return NullTrajectoryWriter()  # ignores mode/wrap/restart_iteration kwargs
         case _:
             raise ValueError(f"Unknown trajectory format: {format!r}")

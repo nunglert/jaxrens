@@ -41,7 +41,7 @@ from jaxrens.cli.resolve import resolve, ResolvedConfig
 from jaxrens.sampling.batch_descriptor import PmapVmapRuns, SingleRun
 from jaxrens.cli.cli import _apply_overrides, _parse_set_override
 
-_DATA = Path(__file__).parent / "data" / "cli"
+_DATA = Path(__file__).parent.parent / "data" / "cli"
 _MINIMAL_YAML = _DATA / "minimal.yaml"
 _MIXED_MOVES_YAML = _DATA / "mixed_moves.yaml"
 _LJ_BACKEND_YAML = _DATA / "lj_backend.yaml"

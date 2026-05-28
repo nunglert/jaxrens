@@ -562,11 +562,14 @@ class TestAdjustmentInfoKeysBatched:
         assert log.n_evaluations.shape == (n_entries, n_runs, n_moves)
         # Row 0 is the iter-0 baseline (zeros / converged=True);
         # subsequent rows are real adjust events at multiples of adjust_interval.
+        # As of commit 763a4e4 the adjuster fires before the first ns step,
+        # so row 1 is also at iter 0 — distinguished from the baseline by
+        # ``n_rounds >= 1`` on the adjustment_stats subgroup.
         assert int(log.iterations[0]) == 0
         assert np.all(log.adjustment_stats["n_rounds"][0] == 0)
         assert np.all(log.adjustment_stats["converged"][0] == True)
-        assert np.all(log.iterations[1:] > 0)
-        assert np.all(log.iterations[1:] % 10 == 0)
+        assert np.all(log.iterations % 10 == 0)
+        assert np.all(log.adjustment_stats["n_rounds"][1:] >= 1)
 
 
 class TestAdaptationIter0BaselineRow:

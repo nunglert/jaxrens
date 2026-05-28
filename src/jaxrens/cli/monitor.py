@@ -1245,45 +1245,33 @@ class TrajectoryCallback:
         self.snapshot_interval = snapshot_interval
 
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        # The dead walker is surfaced by ``ns_step`` as a single
+        # ``WalkerState`` pytree under ``info["dead_walker"]`` (positions,
+        # types, energy, cell).  Energy is also exposed as ``info["emax"]``
+        # for consumers that only need the scalar.
+        dead_ws = info["dead_walker"]
+        dead_cell = dead_ws.cell
+
         if iteration % self.traj_interval == 0:
-            # Latest culled walker: read directly from info (set by ns_step).
-            # No need to look it up in any history buffer.
-            worst_idx = int(info.get("worst_idx", 0))
-            if isinstance(ns_state, NSState):
-                dead_walker = {
-                    "positions": info["dead_position"],
-                    "types": ns_state.population.types[0],
-                    "energy": float(info.get("emax", 0)),
-                }
-                cell = ns_state.population.cell[worst_idx]
-                if jnp.any(cell != 0):
-                    dead_walker["box"] = cell
-            else:
-                # Dict-fallback path for non-NSState callers.  Latest dead point
-                # comes from info if available, else falls back to the legacy
-                # state["dead_positions"][n_dead-1] read.
-                if "dead_position" in info:
-                    pos_latest = info["dead_position"]
-                else:
-                    n_dead_local = int(ns_state.get("n_dead", 0))
-                    pos_latest = ns_state["dead_positions"][n_dead_local - 1]
-                dead_walker = {
-                    "positions": pos_latest,
-                    "types": ns_state["types"][0],
-                    "energy": float(info.get("emax", 0)),
-                }
-                if ns_state.get("cells") is not None:
-                    dead_walker["box"] = ns_state["cells"][worst_idx]
+            dead_walker = {
+                "positions": dead_ws.positions,
+                "types": dead_ws.types,
+                "energy": float(info.get("emax", 0)),
+            }
+            if jnp.any(dead_cell != 0):
+                dead_walker["box"] = dead_cell
             self.writer.write_dead_point(iteration, dead_walker, float(info["emax"]))
 
         if self.energy_logger is not None:
             # Write the culled-walker energy and volume so postprocess can
             # reconstruct the dead-point trace from this single file.
-            dead_v = info.get("dead_volume", 0.0)
+            # Volume is derived from the dead walker's cell (det) — no
+            # separate ``dead_volume`` field needed in ``info``.
+            dead_v = float(jnp.abs(jnp.linalg.det(dead_cell)))
             self.energy_logger.write_entry(
                 iteration,
                 float(info.get("emax", 0)),
-                volume=float(np.asarray(dead_v)),
+                volume=dead_v,
             )
 
         if self.snapshot_interval and iteration > 0 and iteration % self.snapshot_interval == 0:
@@ -1353,10 +1341,8 @@ class BatchedTrajectoryCallback:
             )
 
         pop = ns_state.population
-        types = flatten(pop.types)
-        cells = flatten(pop.cell)
 
-        # info["emax"] is (*shape_prefix,) when batched; flatten via the
+        # ``info["emax"]`` is (*shape_prefix,) when batched; flatten via the
         # batcher (or by ravel for the legacy fallback).
         emax_arr = jnp.asarray(info.get("emax", 0.0))
         if batcher is not None:
@@ -1365,21 +1351,23 @@ class BatchedTrajectoryCallback:
             emax_flat = (
                 emax_arr.reshape(-1) if emax_arr.ndim >= 1 else emax_arr[None]
             )
-        # Latest culled position per replica — sourced from info, shape
-        # ``(*shape_prefix, n_atoms, 3)``; flatten leading dims for indexing.
-        latest_pos = np.asarray(info["dead_position"])
-        latest_pos_flat = np.asarray(flatten(latest_pos))
-        # For SingleRun (n_batch_axes=0 effectively but we set min 1), the
-        # batched callback shouldn't be used; assume we always have a batch.
+
+        # Dead walker is a single ``WalkerState`` pytree from ns_step.
+        # Flatten each leaf over the replica axis once; per-replica slicing
+        # then uses simple integer indexing on each leaf.
+        dead_ws = info["dead_walker"]
+        dead_pos_flat = np.asarray(flatten(dead_ws.positions))
+        dead_types_flat = np.asarray(flatten(dead_ws.types))
+        dead_cell_flat = np.asarray(flatten(dead_ws.cell))
 
         if iteration % self.traj_interval == 0:
             for r in range(n_runs):
+                cell_r = dead_cell_flat[r]
                 dead_walker = {
-                    "positions": latest_pos_flat[r],
-                    "types": types[r, 0] if types.ndim >= 2 else types[0],
+                    "positions": dead_pos_flat[r],
+                    "types": dead_types_flat[r],
                     "energy": float(emax_flat[r]),
                 }
-                cell_r = cells[r, 0] if cells.ndim >= 3 else cells[0]
                 if jnp.any(cell_r != 0):
                     dead_walker["box"] = cell_r
                 self.writers[r].write_dead_point(
@@ -1387,17 +1375,13 @@ class BatchedTrajectoryCallback:
                 )
 
         if self.energy_loggers is not None:
-            # Per-replica volume of the culled walker, sourced from info.
-            dv_arr = np.asarray(info.get("dead_volume", 0.0))
-            dv_flat = (
-                dv_arr.reshape(-1) if dv_arr.ndim >= 1
-                else np.broadcast_to(dv_arr, (n_runs,))
-            )
+            # Per-replica volume derived from the dead walker's own cell.
             for r in range(n_runs):
+                vol = float(np.abs(np.linalg.det(dead_cell_flat[r])))
                 self.energy_loggers[r].write_entry(
                     iteration,
                     float(emax_flat[r]),
-                    volume=float(dv_flat[r]),
+                    volume=vol,
                 )
 
         if (
@@ -1405,16 +1389,19 @@ class BatchedTrajectoryCallback:
             and iteration > 0
             and iteration % self.snapshot_interval == 0
         ):
+            # Live-walker snapshot — separate from the dead-point write
+            # path; needs the full per-replica live population, not the
+            # culled walker.
             positions_flat = flatten(pop.positions)
             energies_flat = flatten(pop.energy)
+            types_flat = flatten(pop.types)
+            cells_flat = flatten(pop.cell)
             for r in range(n_runs):
-                # Live-walker snapshot only.  Dead-point history lives on
-                # disk via the per-iteration writers above.
                 snap = {
                     "positions": positions_flat[r],
-                    "types": types[r] if types.ndim >= 2 else types,
+                    "types": types_flat[r] if types_flat.ndim >= 2 else types_flat,
                     "energies": energies_flat[r],
-                    "cells": cells[r] if cells.ndim >= 3 else cells,
+                    "cells": cells_flat[r] if cells_flat.ndim >= 3 else cells_flat,
                     "iteration": iteration,
                     "n_dead": iteration,
                 }

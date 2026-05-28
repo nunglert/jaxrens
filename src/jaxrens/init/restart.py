@@ -57,8 +57,12 @@ class RestartBundle:
             from the CLI seed.
     """
 
-    dead_energies: jnp.ndarray
-    dead_positions: jnp.ndarray
+    # Dead-point history is streamed to ``.energies`` / ``.traj``, not stored in
+    # the checkpoint; these are ``None`` for real checkpoints and only populated
+    # from legacy/test fixtures that still embed dead arrays.  ``init_ns`` does
+    # not read them — resume uses log_evidence / iteration / emax / rng only.
+    dead_energies: jnp.ndarray | None
+    dead_positions: jnp.ndarray | None
     dead_volumes: jnp.ndarray | None
     log_evidence: float
     iteration: int
@@ -163,8 +167,16 @@ def _build_bundle_from_ckpt(
     if idx is None:
         # Scalar single-run checkpoint: load_checkpoint already trimmed dead arrays.
         n_dead = int(ckpt["n_dead"])
-        dead_energies = ckpt["dead_energies"][:n_dead]
-        dead_positions = ckpt["dead_positions"][:n_dead]
+        # Dead arrays are absent from real checkpoints (streamed to disk); only
+        # legacy/test fixtures embed them.  Default to None when missing.
+        dead_energies = (
+            ckpt["dead_energies"][:n_dead]
+            if ckpt.get("dead_energies") is not None else None
+        )
+        dead_positions = (
+            ckpt["dead_positions"][:n_dead]
+            if ckpt.get("dead_positions") is not None else None
+        )
         dead_volumes: jnp.ndarray | None = None
         if ckpt.get("dead_volumes") is not None:
             dead_volumes = ckpt["dead_volumes"][:n_dead]
@@ -189,10 +201,17 @@ def _build_bundle_from_ckpt(
         # n_dead is an array of shape (n_runs,) or (G, P).
         n_dead = int(np.asarray(ckpt["n_dead"])[idx])
 
-        # dead_energies / dead_positions: shape (*batch, max_dead) or (*batch, max_dead, ...)
-        # Slice the leading batch dims with idx, then trim to [:n_dead].
-        dead_energies = jnp.asarray(ckpt["dead_energies"])[idx][:n_dead]
-        dead_positions = jnp.asarray(ckpt["dead_positions"])[idx][:n_dead]
+        # dead_energies / dead_positions are absent from real checkpoints
+        # (streamed to disk); only legacy/test fixtures embed them.  When
+        # present: slice leading batch dims with idx, then trim to [:n_dead].
+        dead_energies = (
+            jnp.asarray(ckpt["dead_energies"])[idx][:n_dead]
+            if ckpt.get("dead_energies") is not None else None
+        )
+        dead_positions = (
+            jnp.asarray(ckpt["dead_positions"])[idx][:n_dead]
+            if ckpt.get("dead_positions") is not None else None
+        )
         dead_volumes = None
         if ckpt.get("dead_volumes") is not None:
             dead_volumes = jnp.asarray(ckpt["dead_volumes"])[idx][:n_dead]
@@ -295,7 +314,12 @@ def load_restart(
             raw = json.loads(_f.attrs["symbol_map"])
             symbol_map = {int(k): v for k, v in raw.items()}
 
-    missing_datasets = {"energies", "dead_energies", "dead_positions"} - present_datasets
+    # Dead-point history (``dead_energies`` / ``dead_positions``) is NOT in the
+    # checkpoint — it is streamed to ``<prefix>.energies`` / ``.traj`` and read
+    # back by postprocess.  ``init_ns`` resumes from live state + the NS scalars
+    # only, so requiring dead arrays here would wrongly reject every real
+    # checkpoint.  Only the live ``energies`` dataset is required.
+    missing_datasets = {"energies"} - present_datasets
     # log_evidence, iteration, n_dead may be stored as either attr or dataset
     # (see save_checkpoint / _store_field); check for presence in either location.
     missing = set()
@@ -451,7 +475,12 @@ def load_restart_batched(path: Path | str) -> BatchedRestart:
             raw = json.loads(_f.attrs["symbol_map"])
             symbol_map = {int(k): v for k, v in raw.items()}
 
-    missing_datasets = {"energies", "dead_energies", "dead_positions"} - present_datasets
+    # Dead-point history (``dead_energies`` / ``dead_positions``) is NOT in the
+    # checkpoint — it is streamed to ``<prefix>.energies`` / ``.traj`` and read
+    # back by postprocess.  ``init_ns`` resumes from live state + the NS scalars
+    # only, so requiring dead arrays here would wrongly reject every real
+    # checkpoint.  Only the live ``energies`` dataset is required.
+    missing_datasets = {"energies"} - present_datasets
     missing = set()
     with _h5py.File(path, "r") as _f:
         for field in ("log_evidence", "iteration", "n_dead"):

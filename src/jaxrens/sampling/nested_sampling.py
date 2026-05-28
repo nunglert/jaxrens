@@ -41,6 +41,7 @@ from jaxrens.sampling.termination import (
     check_any,
 )
 from jaxrens.state.ns import NSState
+from jaxrens.state.walker import WalkerState
 from jaxrens.utils.cell import get_volume
 
 logger = logging.getLogger(__name__)
@@ -336,9 +337,21 @@ def ns_step(
     # persist them straight to disk.  Inside JIT, the dead point only
     # matters for the log-evidence accumulator below; the rest is pure
     # history / output.
-    volumes = jax.vmap(get_volume)(pop.cell)  # (n_walkers,)
-    dead_position = pop.positions[worst_idx]
-    dead_volume = volumes[worst_idx]
+    #
+    # Slice the WHOLE dead walker as a ``WalkerState`` (positions / types /
+    # energy / cell) so consumers read one pytree instead of four parallel
+    # arrays — and so adding e.g. per-walker species lists later doesn't
+    # require touching every consumer.  Crucially this is captured BEFORE
+    # the slot at ``worst_idx`` is overwritten by the clone (and further
+    # mutated by MCMC cell moves); otherwise the traj writer pairs dead
+    # positions with the clone's post-MCMC cell and wrapping produces
+    # apparent close contacts that aren't in the real config.
+    dead_walker = WalkerState(
+        positions=pop.positions[worst_idx],
+        types=pop.types[worst_idx],
+        energy=pop.energy[worst_idx],
+        cell=pop.cell[worst_idx],
+    )
 
     # 3. Update evidence estimate
     n_walkers = ns_state.n_walkers
@@ -478,9 +491,11 @@ def ns_step(
         # Per-iteration culled-walker (the "dead point").  Read by
         # ``EnergyLogger`` / ``TrajectoryCallback`` for streaming-to-disk;
         # not stored anywhere on NSState.
-        "dead_energy": potential_max,
-        "dead_position": dead_position,
-        "dead_volume": dead_volume,
+        # Per-iteration culled walker as a ``WalkerState`` pytree, captured
+        # before the slot at ``worst_idx`` was overwritten by the clone.
+        # Energy of the dead walker is also exposed as ``info["emax"]`` for
+        # consumers that only need the scalar (adapt, RE, monitor).
+        "dead_walker": dead_walker,
         # Chain-level per-move statistics (raw counts; let consumers compute rates).
         # Bucket convention: reject_reason_counts_per_move[:, 0] = accepted,
         #   [:, 1] = energy reject, [:, 2] = cell reject, [:, 3] = prior reject.
@@ -586,9 +601,14 @@ def ns_step_sharded(
     )
 
     # 2. Dead-point info — extracted from the global gathered pop.
-    volumes_global = jax.vmap(get_volume)(pop_global.cell)  # (K_total,)
-    dead_position = pop_global.positions[worst_idx]
-    dead_volume = volumes_global[worst_idx]
+    # See scalar ``ns_step`` for why we snapshot the whole WalkerState here
+    # (and why it must happen BEFORE the slot at ``worst_idx`` is replaced).
+    dead_walker = WalkerState(
+        positions=pop_global.positions[worst_idx],
+        types=pop_global.types[worst_idx],
+        energy=pop_global.energy[worst_idx],
+        cell=pop_global.cell[worst_idx],
+    )
 
     # 3. Update evidence (uses global walker count).
     log_weight = -ns_state.iteration / n_walkers_global + jnp.log(1.0 / n_walkers_global)
@@ -715,9 +735,9 @@ def ns_step_sharded(
         "worst_idx": worst_idx,
         "clone_idx": clone_idx,
         "acceptance_rate": total_accepted / total_steps,
-        "dead_energy": potential_max,
-        "dead_position": dead_position,
-        "dead_volume": dead_volume,
+        # See scalar ``ns_step`` — single dead-walker pytree replaces the
+        # four parallel ``dead_*`` keys.
+        "dead_walker": dead_walker,
         "n_accepted_per_move": agg_n_accepted,
         "n_proposed_per_move": agg_n_proposed,
         "reject_reason_counts_per_move": agg_rr_counts,

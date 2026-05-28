@@ -124,6 +124,12 @@ class OutputConfig:
     collision_check_threshold: float | None = None
     collision_check_interval: int = 100
 
+    # Whether ``ExtxyzTrajectoryWriter`` wraps dead-point atom positions into
+    # the (correct, dead-walker-own) cell before writing.  Default False
+    # keeps absolute Cartesians so off-the-shelf viewers don't show
+    # boundary-wrap artifacts; set True if you want all atoms inside ``[0,L)``.
+    wrap_atoms: bool = False
+
 
 @dataclass(frozen=True)
 class InterREConfig:

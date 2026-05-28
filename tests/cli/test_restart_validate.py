@@ -376,3 +376,112 @@ def test_none_snapshot_path_warns_and_proceeds(tmp_path, caplog):
             snapshot_path=None,
         )
     assert any("snapshot not found" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: schema-evolution tolerance — a newly-added Optional field (absent in
+# an older snapshot, None in the current dump) must not read as a change.
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_missing_optional_backend_field_not_refused(tmp_path):
+    """Snapshot predates ``backend.softcore_repulsion``; current fills None."""
+    snap = _write_snapshot(tmp_path, _baseline_config())  # no softcore_repulsion
+    ckpt = _checkpoint_path(tmp_path)
+
+    current = _baseline_config()
+    current["backend"]["softcore_repulsion"] = None  # schema default
+
+    # Must NOT raise — missing-vs-None is not a real change.
+    validate_restart_compatibility(
+        _FakeRoot(current), checkpoint_path=ckpt, snapshot_path=snap,
+    )
+
+
+def test_added_backend_field_with_nondefault_value_still_refused(tmp_path, capsys):
+    """A newly-set non-default value for an added field IS a real change."""
+    snap = _write_snapshot(tmp_path, _baseline_config())  # no softcore_repulsion
+    ckpt = _checkpoint_path(tmp_path)
+
+    current = _baseline_config()
+    current["backend"]["softcore_repulsion"] = {"a0": 4.0, "d0": 1000.0}
+
+    with pytest.raises(SystemExit) as ex:
+        validate_restart_compatibility(
+            _FakeRoot(current), checkpoint_path=ckpt, snapshot_path=snap,
+        )
+    assert ex.value.code == 2
+    assert "backend" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: interval-unit normalisation — per_walker vs absolute must compare on
+# scaled (absolute) values, not raw, for the immutable inter_re.re_interval.
+# ---------------------------------------------------------------------------
+
+
+def _config_with_inter_re(units: str, re_interval, n_live: int) -> dict:
+    c = _baseline_config()
+    c["interval_units"] = units
+    c["run"]["n_live"] = n_live
+    c["ensemble"] = {"type": "npt", "pressure": [0.001, 0.002]}  # 2 replicas
+    c["inter_re"] = {
+        "flavor": "pressure", "re_interval": re_interval, "n_swap_cycles": 50,
+    }
+    return c
+
+
+def test_per_walker_inter_re_interval_scaled_not_refused(tmp_path):
+    """re_interval 0.002 per_walker × n_live 500 = 1 == snapshot's absolute 1."""
+    snap = _write_snapshot(
+        tmp_path, _config_with_inter_re("absolute", 1, n_live=500),
+    )
+    ckpt = _checkpoint_path(tmp_path)
+    current = _config_with_inter_re("per_walker", 0.002, n_live=500)
+
+    # Must NOT raise — both normalise to re_interval=1.
+    validate_restart_compatibility(
+        _FakeRoot(current), checkpoint_path=ckpt, snapshot_path=snap,
+    )
+
+
+def test_inter_re_interval_genuine_change_still_refused(tmp_path, capsys):
+    """0.01 per_walker × 500 = 5 ≠ snapshot's 1 → genuine change, refused."""
+    snap = _write_snapshot(
+        tmp_path, _config_with_inter_re("absolute", 1, n_live=500),
+    )
+    ckpt = _checkpoint_path(tmp_path)
+    current = _config_with_inter_re("per_walker", 0.01, n_live=500)
+
+    with pytest.raises(SystemExit) as ex:
+        validate_restart_compatibility(
+            _FakeRoot(current), checkpoint_path=ckpt, snapshot_path=snap,
+        )
+    assert ex.value.code == 2
+    assert "inter_re" in capsys.readouterr().err
+
+
+def test_per_walker_output_intervals_do_not_warn(tmp_path, caplog):
+    """Soft output.*_interval fields also normalise → no spurious warning."""
+    snap_payload = _baseline_config()  # absolute: traj=1, snapshot=100, ...
+    snap_payload["run"]["n_live"] = 100  # n_live is immutable — match both sides
+    snap = _write_snapshot(tmp_path, snap_payload)
+    ckpt = _checkpoint_path(tmp_path)
+
+    current = _baseline_config()
+    current["interval_units"] = "per_walker"
+    current["run"]["n_live"] = 100
+    # per_walker values that scale back to the snapshot's absolute ones.
+    current["output"]["traj_interval"] = 0.01      # *100 = 1
+    current["output"]["snapshot_interval"] = 1.0   # *100 = 100
+    current["output"]["checkpoint_interval"] = 10.0 # *100 = 1000
+    current["output"]["info_interval"] = 0.1       # *100 = 10
+    current["termination"][0]["max_iterations"] = 100.0  # *100 = 10000
+    current["run"]["max_iterations"] = 100.0       # *100 = 10000
+
+    with caplog.at_level(logging.WARNING):
+        validate_restart_compatibility(
+            _FakeRoot(current), checkpoint_path=ckpt, snapshot_path=snap,
+        )
+    msgs = [r.getMessage() for r in caplog.records]
+    assert not any("traj_interval" in m or "interval_units" in m for m in msgs)

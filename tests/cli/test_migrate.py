@@ -93,7 +93,7 @@ class TestRoundTrip:
     def test_legacy_ns_inp_file(self):
         """The fixture file in tests/data/cli/legacy_ns.inp must validate."""
         from jaxrens.cli.parser import parse_input_file
-        path = Path(__file__).parent / "data" / "cli" / "legacy_ns.inp"
+        path = Path(__file__).parent.parent / "data" / "cli" / "legacy_ns.inp"
         raw = parse_input_file(path)
         cfg = _migrate_and_validate(raw)
         assert cfg.run.n_live == 200

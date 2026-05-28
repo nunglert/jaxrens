@@ -23,7 +23,7 @@ mace_required = pytest.mark.skipif(
     reason="mace-jax not installed",
 )
 
-FIXTURE_DIR = Path(__file__).parent / "fixtures" / "mace_mp_small"
+FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "mace_mp_small"
 
 
 # ---------------------------------------------------------------------------

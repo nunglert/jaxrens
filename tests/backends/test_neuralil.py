@@ -18,7 +18,7 @@ neuralil_required = pytest.mark.skipif(
     reason=f"NeuralIL not installed: {_NEURALIL_IMPORT_ERROR}",
 )
 
-FIXTURE_DIR = Path(__file__).parent / "fixtures" / "neuralil_tiny"
+FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "neuralil_tiny"
 
 
 # ---------------------------------------------------------------------------

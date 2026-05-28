@@ -80,6 +80,21 @@ def _make_ns_state_dict(
     return state
 
 
+def _make_ns_state_dict_no_dead(
+    n_walkers: int = 4, n_atoms: int = 1, n_dead: int = 3,
+) -> dict:
+    """NS-state dict WITHOUT dead arrays — matches production checkpoints.
+
+    ``_ns_state_to_checkpoint_dict`` never embeds dead-point history (it is
+    streamed to ``.energies`` / ``.traj``), so real checkpoints lack
+    ``dead_energies`` / ``dead_positions``.
+    """
+    state = _make_ns_state_dict(n_walkers, n_atoms, n_dead)
+    del state["dead_energies"]
+    del state["dead_positions"]
+    return state
+
+
 def _write_checkpoint(tmp_path: Path, state: dict, name: str = "ckpt.h5") -> Path:
     p = tmp_path / name
     save_checkpoint(p, state, symbol_map={0: "Si"})
@@ -96,6 +111,22 @@ class TestRoundTrip:
         p = _write_checkpoint(tmp_path, state)
         ws, _ = load_restart(p)
         assert ws.positions.shape == (4, 2, 3)
+
+    def test_checkpoint_without_dead_arrays_loads(self, tmp_path):
+        """Real checkpoints omit dead arrays (streamed to disk) — must load.
+
+        Regression: ``load_restart`` previously required ``dead_energies`` /
+        ``dead_positions`` and rejected every production checkpoint.
+        """
+        state = _make_ns_state_dict_no_dead(n_walkers=4, n_atoms=2, n_dead=7)
+        p = _write_checkpoint(tmp_path, state)
+        ws, bundle = load_restart(p)
+        assert ws.positions.shape == (4, 2, 3)
+        assert bundle.iteration == 7
+        assert bundle.n_dead == 7
+        # Dead arrays absent → None, and init_ns never reads them.
+        assert bundle.dead_energies is None
+        assert bundle.dead_positions is None
 
     def test_walker_set_types_shape(self, tmp_path):
         state = _make_ns_state_dict(n_walkers=4, n_atoms=2, n_dead=3)

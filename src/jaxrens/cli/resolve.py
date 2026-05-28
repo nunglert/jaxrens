@@ -62,7 +62,6 @@ logger = logging.getLogger(__name__)
 _DEFERRED_OUTPUT_FIELDS: tuple[str, ...] = (
     "snapshot_time",
     "snapshot_clean",
-    "wrap_atoms",
     "write_traj_db",
     "write_walkers_db",
 )
@@ -870,7 +869,6 @@ def _warn_unused_output_fields(output_schema: Any) -> None:
     deferred_defaults: dict[str, Any] = {
         "snapshot_time": None,
         "snapshot_clean": False,
-        "wrap_atoms": False,
         "write_traj_db": False,
         "write_walkers_db": False,
     }
@@ -1041,6 +1039,7 @@ def _resolve_single_replica(
         temperature_kB=float(root.output.temperature_kB),
         collision_check_threshold=root.output.collision_check_threshold,
         collision_check_interval=int(root.output.collision_check_interval),
+        wrap_atoms=bool(root.output.wrap_atoms),
     )
 
     _warn_unused_output_fields(root.output)
@@ -1326,7 +1325,23 @@ def _resolve_multi_replica(
     # branch — that helper only knows the scalar single-run case.
     batched_restart: BatchedRestart | None = None
     if root.init.restart_file is not None:
-        batched_restart = load_restart_batched(Path(root.init.restart_file))
+        try:
+            batched_restart = load_restart_batched(Path(root.init.restart_file))
+        except ValueError as exc:
+            # ``load_restart_batched`` raises when the checkpoint is a scalar
+            # single-run snapshot.  Re-raise with a multi-replica-specific
+            # message that names both ``restart_file`` and the expected
+            # ``n_total`` so the user can see which side of the mismatch to
+            # fix without parsing the lower-level loader's diagnostics.
+            if "single-run checkpoint" in str(exc):
+                raise ValueError(
+                    f"restart_file at {root.init.restart_file!r} is a scalar "
+                    f"single-run checkpoint, but the current YAML implies "
+                    f"n_total={n_total} replicas (n_gpu={n_gpu}, "
+                    f"n_per_gpu={n_per_gpu}). Multi-replica resume requires a "
+                    f"batched checkpoint with matching n_total."
+                ) from exc
+            raise
         if batched_restart.n_total != n_total:
             raise ValueError(
                 f"restart_file checkpoint has n_total={batched_restart.n_total} "
@@ -1534,6 +1549,7 @@ def _resolve_multi_replica(
         temperature_kB=float(root.output.temperature_kB),
         collision_check_threshold=root.output.collision_check_threshold,
         collision_check_interval=int(root.output.collision_check_interval),
+        wrap_atoms=bool(root.output.wrap_atoms),
     )
     _warn_unused_output_fields(root.output)
 

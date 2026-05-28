@@ -68,6 +68,71 @@ _WARN_PATHS: tuple[str, ...] = (
 
 _MISSING = object()
 
+# Interval-counted ``output.*`` fields scaled by ``_apply_interval_units``
+# (resolve.py).  Kept in sync with that list — both convert per_walker counts
+# to absolute iterations by multiplying by ``run.n_live``.
+_OUTPUT_INTERVAL_FIELDS: tuple[str, ...] = (
+    "info_interval",
+    "traj_interval",
+    "snapshot_interval",
+    "checkpoint_interval",
+    "temperature_lag",
+    "temperature_interval",
+    "acc_rates_interval",
+    "max_neighbors_interval",
+    "collision_check_interval",
+    "flush_interval",
+)
+
+
+def _normalise_intervals(tree: dict) -> dict:
+    """Scale a dumped config's interval fields to absolute iterations.
+
+    Mirrors ``resolve._apply_interval_units`` but works on the dumped dict
+    (so it is independent of RootSpec construction): when
+    ``interval_units == "per_walker"`` every interval field is multiplied by
+    ``run.n_live`` and rounded (clamped to >= 1); ``"absolute"`` only rounds.
+    ``interval_units`` itself is set to ``"absolute"`` afterwards so the two
+    sides no longer differ on that soft field once their values agree.
+    Returns a deep copy; the input is left untouched.
+    """
+    import copy
+
+    if not isinstance(tree, dict):
+        return tree
+    out = copy.deepcopy(tree)
+    units = out.get("interval_units", "absolute")
+    n_live = (out.get("run") or {}).get("n_live", 1)
+    factor = n_live if units == "per_walker" else 1
+
+    def scale(v: Any) -> Any:
+        if v is None or not isinstance(v, (int, float)) or isinstance(v, bool):
+            return v
+        return max(1, round(float(v) * factor))
+
+    output = out.get("output")
+    if isinstance(output, dict):
+        for f in _OUTPUT_INTERVAL_FIELDS:
+            if f in output:
+                output[f] = scale(output[f])
+    run = out.get("run")
+    if isinstance(run, dict) and "max_iterations" in run:
+        run["max_iterations"] = scale(run["max_iterations"])
+    adaptation = out.get("adaptation")
+    if isinstance(adaptation, dict) and "adjust_interval" in adaptation:
+        adaptation["adjust_interval"] = scale(adaptation["adjust_interval"])
+    inter_re = out.get("inter_re")
+    if isinstance(inter_re, dict) and "re_interval" in inter_re:
+        inter_re["re_interval"] = scale(inter_re["re_interval"])
+    termination = out.get("termination")
+    if isinstance(termination, list):
+        for t in termination:
+            if isinstance(t, dict) and t.get("type") == "iteration":
+                t["max_iterations"] = scale(t.get("max_iterations"))
+
+    out["interval_units"] = "absolute"
+    return out
+
 
 def _dig(tree: Any, path: str) -> Any:
     """Walk ``tree`` following a dotted ``path``; return ``_MISSING`` on miss."""
@@ -110,6 +175,32 @@ def _implied_n_total(tree: dict) -> int:
     return lengths[0]
 
 
+def _immutable_equal(a: Any, b: Any) -> bool:
+    """Schema-evolution-tolerant equality for immutable-subtree comparison.
+
+    Differs from ``==`` in one way: a key absent on one side is treated as
+    equal to ``None`` on the other.  A newly-added ``Optional`` field defaults
+    to ``None`` and must not read as a config change versus an older snapshot
+    written before the field existed (e.g. ``backend.softcore_repulsion``).
+    A key present-and-non-``None`` on one side but absent on the other is a
+    genuine diff (the user set a new field to a non-default value).
+    """
+    if isinstance(a, dict) and isinstance(b, dict):
+        for key in set(a) | set(b):
+            va = a.get(key, _MISSING)
+            vb = b.get(key, _MISSING)
+            if (va is _MISSING and vb is None) or (vb is _MISSING and va is None):
+                continue
+            if not _immutable_equal(va, vb):
+                return False
+        return True
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(
+            _immutable_equal(x, y) for x, y in zip(a, b)
+        )
+    return a == b
+
+
 def _classify_diffs(
     snapshot: dict, current: dict, paths: Iterable[str]
 ) -> list[tuple[str, Any, Any]]:
@@ -119,7 +210,7 @@ def _classify_diffs(
         b = _dig(current, path)
         if a is _MISSING and b is _MISSING:
             continue
-        if a != b:
+        if not _immutable_equal(a, b):
             out.append((path, a, b))
     return out
 
@@ -163,8 +254,16 @@ def validate_restart_compatibility(
         )
         return
 
-    snapshot = read_config_snapshot(snapshot_path)
-    current = root.model_dump(mode="json")
+    # Normalise interval-counted fields to absolute iterations on BOTH sides
+    # before comparing, so a per_walker config restarting against an
+    # absolute-units snapshot (or vice versa) is not flagged on the immutable
+    # ``inter_re.re_interval`` (nor warned on the soft ``output.*_interval``
+    # fields).  Each side is scaled per its own ``interval_units`` × n_live;
+    # operating on the dumped dicts keeps this independent of RootSpec
+    # construction.  ``_immutable_equal`` separately tolerates schema-added
+    # ``Optional`` fields (missing-vs-None).
+    snapshot = _normalise_intervals(read_config_snapshot(snapshot_path))
+    current = _normalise_intervals(root.model_dump(mode="json"))
 
     # Replica-count check: dedicated, fires before the broader ensemble/inter_re
     # subtree diff so the user sees a targeted message rather than a 60-char

@@ -1236,7 +1236,7 @@ class TestFromMultiRunDirectoryConfigInference:
 # Smoke test: load existing lj8_npt example output (ships in repo)
 # ---------------------------------------------------------------------------
 
-_LJ8_NPT_OUTPUT = Path(__file__).parent.parent / "experiments" / "examples" / "lj8_npt" / "output"
+_LJ8_NPT_OUTPUT = Path(__file__).parent.parent.parent / "experiments" / "examples" / "lj8_npt" / "output"
 
 
 class TestSmokeRealRun:

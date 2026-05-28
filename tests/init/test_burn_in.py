@@ -370,7 +370,7 @@ class TestAdaptationCallCount:
         return patched_builder
 
     def test_adjust_called_correct_number_of_times(self):
-        """With n_walks=5 and adjust_interval=2, adaptation fires at walks 2 and 4."""
+        """With n_walks=5 and adjust_interval=2, adaptation fires at walks 0, 2, and 4."""
         from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
 
         ns_state, step_fn, per_move_fns, _ = _build_ns_state(n_walkers=4, n_atoms=2)
@@ -404,12 +404,13 @@ class TestAdaptationCallCount:
                 adjust_max_rounds=5,
             )
 
-        assert adapt_call_count[0] == 2, (
-            f"Expected 2 adaptation calls, got {adapt_call_count[0]}"
+        assert adapt_call_count[0] == 3, (
+            f"Expected 3 adaptation calls, got {adapt_call_count[0]}"
         )
 
-    def test_adjust_skipped_at_walk_zero(self):
-        """Adaptation must not fire on the very first walk (walk_i=0)."""
+    def test_adjust_fires_at_walk_zero(self):
+        """Adaptation fires on the very first walk (walk_i=0) — adjuster runs
+        before burn-in / first ns step as of commit 763a4e4."""
         from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
 
         ns_state, step_fn, per_move_fns, _ = _build_ns_state(n_walkers=4, n_atoms=2)
@@ -439,8 +440,8 @@ class TestAdaptationCallCount:
                 adjust_max_rounds=3,
             )
 
-        assert adapt_call_count[0] == 0, (
-            f"Adaptation fired on walk_i=0, expected 0 calls, got {adapt_call_count[0]}"
+        assert adapt_call_count[0] == 1, (
+            f"Expected adapt to fire once at walk_i=0, got {adapt_call_count[0]}"
         )
 
 
