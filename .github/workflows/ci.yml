@@ -114,8 +114,15 @@ jobs:
       #       jaxrens-ci:${{ github.sha }} \
       #       pytest tests -v --tb=short -m multi_gpu -o addopts=""
       - name: pytest -m multi_gpu (whole tree)
+        # ``--shm-size=1g``: the 4× T4 on g4dn.12xlarge have no NVLink, so
+        # NCCL uses its SHM/direct transport for intra-node GPU↔GPU comms,
+        # which lives in /dev/shm.  Docker's default 64 MB /dev/shm is too
+        # small for 4-rank NCCL (~9.6 MB segments per peer-channel) — ranks
+        # error out mid-init while others wire channels, deadlocking the
+        # collective until the pytest timeout fires.  1 GB is ample headroom.
         run: |
           docker run --rm --gpus all \
+            --shm-size=1g \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             -e PYTHONUNBUFFERED=1 \
