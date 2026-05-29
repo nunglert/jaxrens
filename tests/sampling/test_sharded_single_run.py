@@ -9,9 +9,10 @@ Covers:
 - divisibility / cohort incompatibility error paths
 
 The parity tests use a harmonic toy backend so the run is fast and the
-parity comparison is deterministic.  They run on a single device by
-default (``n_gpu=1``) and on 2 devices when at least 2 local devices are
-visible.
+parity comparison is deterministic.  The ``n_gpu=1`` case runs on every
+CI job; the ``n_gpu=2`` case is marked ``@pytest.mark.multi_gpu`` so it
+is collected only when pytest is invoked with ``-m multi_gpu`` (the
+multi-GPU CI job and local 2-GPU dev boxes).
 """
 
 from __future__ import annotations
@@ -38,9 +39,6 @@ from jaxrens.sampling.nested_sampling import (
     run_ns_sharded,
 )
 from jaxrens.sampling.termination import IterationTermination
-
-
-N_LOCAL = len(jax.local_devices())
 
 
 def _make_harmonic_problem(seed: int, n_walkers: int):
@@ -80,9 +78,9 @@ def _make_harmonic_problem(seed: int, n_walkers: int):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("n_gpu", [1, pytest.param(2, marks=pytest.mark.skipif(
-    N_LOCAL < 2, reason="requires 2 local devices",
-))])
+@pytest.mark.parametrize(
+    "n_gpu", [1, pytest.param(2, marks=pytest.mark.multi_gpu)],
+)
 def test_run_ns_sharded_matches_single_run(n_gpu):
     """Sharded run reproduces the SingleRun reference exactly.
 
@@ -146,7 +144,7 @@ def test_run_ns_sharded_matches_single_run(n_gpu):
     )
 
 
-@pytest.mark.skipif(N_LOCAL < 2, reason="requires 2 local devices")
+@pytest.mark.multi_gpu
 def test_init_ns_sharded_divisibility_error():
     """``init_ns_sharded`` rejects K not divisible by n_gpu."""
     setup = _make_harmonic_problem(seed=0, n_walkers=7)
@@ -162,7 +160,7 @@ def test_init_ns_sharded_divisibility_error():
         )
 
 
-@pytest.mark.skipif(N_LOCAL < 2, reason="requires 2 local devices")
+@pytest.mark.multi_gpu
 def test_run_ns_sharded_divisibility_error():
     """``run_ns_sharded`` rejects K not divisible by n_gpu."""
     setup = _make_harmonic_problem(seed=0, n_walkers=7)
@@ -290,9 +288,9 @@ def test_resolver_rejects_indivisible_n_live(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("n_gpu", [1, pytest.param(2, marks=pytest.mark.skipif(
-    N_LOCAL < 2, reason="requires 2 local devices",
-))])
+@pytest.mark.parametrize(
+    "n_gpu", [1, pytest.param(2, marks=pytest.mark.multi_gpu)],
+)
 def test_burn_in_sharded_completes_under_emax(n_gpu):
     """Sharded burn-in finishes; final energies stay below the fixed Emax.
 
@@ -354,7 +352,7 @@ def test_burn_in_sharded_completes_under_emax(n_gpu):
     )
 
 
-@pytest.mark.skipif(N_LOCAL < 2, reason="requires 2 local devices")
+@pytest.mark.multi_gpu
 def test_burn_in_sharded_g2_shards_walk_independently():
     """At G=2 each shard must walk its own walkers — populations must differ."""
     from jaxrens.init.burn_in import initial_walk
@@ -388,7 +386,7 @@ def test_burn_in_sharded_g2_shards_walk_independently():
     )
 
 
-@pytest.mark.skipif(N_LOCAL < 2, reason="requires 2 local devices")
+@pytest.mark.multi_gpu
 def test_burn_in_sharded_g2_step_sizes_equal_across_shards():
     """Adaptation under sharding must produce identical step sizes per shard.
 

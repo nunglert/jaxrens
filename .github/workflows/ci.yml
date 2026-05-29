@@ -106,10 +106,22 @@ jobs:
       - name: Build CI image
         run: docker build -f Dockerfile.ci -t jaxrens-ci:${{ github.sha }} .
 
-      - name: pytest tests/integration -m multi_gpu
+      # - name: pytest tests/integration -m multi_gpu
+      #   run: |
+      #     docker run --rm --gpus all \
+      #       -v "${{ github.workspace }}:/workspace" \
+      #       -w /workspace \
+      #       jaxrens-ci:${{ github.sha }} \
+      #       pytest tests -v --tb=short -m multi_gpu -o addopts=""
+      - name: pytest -m multi_gpu (whole tree)
         run: |
           docker run --rm --gpus all \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
+            -e PYTHONUNBUFFERED=1 \
+            -e JAX_LOG_COMPILES=1 \
+            -e NCCL_DEBUG=INFO \
             jaxrens-ci:${{ github.sha }} \
-            pytest tests/integration -v --tb=short -m multi_gpu -o addopts=""
+            pytest tests -v -s --tb=long -m multi_gpu \
+              --timeout=600 --timeout-method=thread \
+              -o addopts=""
