@@ -197,7 +197,9 @@ class TestRunNSPressure:
             rng_key=s["key"], max_iterations=30,
             n_mcmc_steps=5, initial_step_size=0.3,
         )
-        assert result["dead_volumes"] is None
+        # Dead-point history (incl. dead_volumes) is no longer returned in the
+        # result dict — it is persisted to disk by callbacks.  For an NVT run
+        # the live-volume array is None because no pressure/ensemble term is set.
         assert result["live_volumes"] is None
 
     def test_npt_converges(self, periodic_setup_npt):

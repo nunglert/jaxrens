@@ -86,12 +86,15 @@ jobs:
 
   multi_gpu:
     name: Multi-GPU integration (4× T4)
-    # TEMPORARILY DISABLED: no g4dn.12xlarge quota.  Job is dormant for
-    # all automatic events but still runnable via the Actions UI
-    # (workflow_dispatch).  Restore the original trigger set by adding
-    # ``pull_request`` and ``push to main`` back to the ``if:`` below
-    # once quota is available.
-    if: github.event_name == 'workflow_dispatch'
+    # Runs on PR to main and push to main (parallel to ``full``), plus
+    # on-demand via the Actions UI (workflow_dispatch).  Requires
+    # g4dn.12xlarge quota; if that quota lapses again, narrow the ``if:``
+    # back to ``github.event_name == 'workflow_dispatch'`` to make the job
+    # dormant for automatic events.
+    if: |
+      github.event_name == 'pull_request'
+      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on:
       - runs-on=${{ github.run_id }}
       - family=g4dn.12xlarge

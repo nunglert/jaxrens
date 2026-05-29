@@ -475,10 +475,11 @@ class TestTempTerminationIntegration:
         )
 
         assert result["iteration"] < max_iters
-        # The last dead energy should be near or below the target
-        last_dead_idx = result["n_dead"] - 1
-        last_dead_e = float(result["dead_energies"][last_dead_idx])
-        assert last_dead_e < energy_target + 1.0  # some tolerance
+        # Dead-point history is no longer returned in the result dict (it is
+        # persisted to disk by callbacks).  EnergyTermination fires when the
+        # contour (worst live energy) drops below the target, so every
+        # surviving live walker sits at or below it.
+        assert float(jnp.max(result["energies"])) < energy_target
 
 
 # ---------------------------------------------------------------------------

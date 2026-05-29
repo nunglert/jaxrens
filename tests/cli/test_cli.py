@@ -98,6 +98,122 @@ class TestRun:
         assert result["iteration"] > 0
         assert jnp.isfinite(result["log_evidence"])
 
+    # ---------------------------------------------------------------------
+    # Branch-coverage variants of ``test_run_from_config_toy``.  Each test
+    # flips a single conditional in ``run_from_config`` so the corresponding
+    # block of code is exercised at least once.  Toy harmonic backend keeps
+    # each one under a second.
+    # ---------------------------------------------------------------------
+
+    def test_run_from_config_with_softcore_wrap(self, tmp_path):
+        """``backend_config.softcore_repulsion`` triggers the
+        ``SoftCoreBackend`` wrap branch in ``run_from_config``."""
+        ns_config = NSConfig(n_live=12, max_iterations=10, n_mcmc_steps=2, seed=0)
+        move_config = MoveConfig(move_type="random_walk", step_size=0.3)
+        backend_config = BackendConfig(
+            backend_type="harmonic",
+            softcore_repulsion={
+                "a0": 3.0, "b0": 1.0, "d0": 100.0,
+                "r_core_switch": 0.75, "r_core_cut": 1.25,
+            },
+        )
+        output_config = OutputConfig(
+            format="none", working_dir=tmp_path, info_interval=999,
+            temperature_lag=None,
+        )
+        key = jax.random.key(1)
+        positions = jax.random.uniform(key, (12, 1, 3), minval=-3.0, maxval=3.0)
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        result = run_from_config(
+            ns_config, move_config, backend_config, output_config,
+            initial_positions=positions, initial_types=types,
+        )
+        assert jnp.isfinite(result["log_evidence"])
+
+    def test_run_from_config_with_pressure(self, tmp_path):
+        """``ns_config.pressure > 0`` triggers the ``EnsembleBackend`` wrap
+        branch and adds a PV term to the energies."""
+        ns_config = NSConfig(
+            n_live=12, max_iterations=10, n_mcmc_steps=2,
+            seed=0, pressure=0.01,
+        )
+        move_config = MoveConfig(move_type="random_walk", step_size=0.3)
+        backend_config = BackendConfig(backend_type="harmonic")
+        output_config = OutputConfig(
+            format="none", working_dir=tmp_path, info_interval=999,
+            temperature_lag=None,
+        )
+        key = jax.random.key(2)
+        positions = jax.random.uniform(key, (12, 1, 3), minval=-3.0, maxval=3.0)
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        # NPT needs a cell; harmonic ignores it but EnsembleBackend reads det(cell).
+        cells = jnp.broadcast_to(jnp.eye(3) * 6.0, (12, 3, 3))
+        result = run_from_config(
+            ns_config, move_config, backend_config, output_config,
+            initial_positions=positions, initial_types=types,
+            initial_cells=cells,
+        )
+        assert jnp.isfinite(result["log_evidence"])
+
+    def test_run_from_config_format_extxyz(self, tmp_path):
+        """``format='extxyz'`` writes a ``.traj.extxyz`` file."""
+        ns_config = NSConfig(n_live=12, max_iterations=10, n_mcmc_steps=2, seed=0)
+        move_config = MoveConfig(move_type="random_walk", step_size=0.3)
+        backend_config = BackendConfig(backend_type="harmonic")
+        output_config = OutputConfig(
+            format="extxyz", working_dir=tmp_path, info_interval=999,
+            traj_interval=1, snapshot_interval=999,
+            temperature_lag=None,
+        )
+        key = jax.random.key(3)
+        positions = jax.random.uniform(key, (12, 1, 3), minval=-3.0, maxval=3.0)
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        run_from_config(
+            ns_config, move_config, backend_config, output_config,
+            initial_positions=positions, initial_types=types,
+        )
+        assert (tmp_path / "ns.traj.extxyz").exists()
+
+    # NOTE: ``format='h5'`` is intentionally untested here.  The dispatch
+    # in ``run.py:367`` forwards ``wrap=output_config.wrap_atoms`` to
+    # ``H5TrajectoryWriter.__init__`` which doesn't accept that kwarg —
+    # a pre-existing bug surfaced by a quick check while authoring this
+    # file.  Fixing it is out of scope for the coverage uplift; the
+    # extxyz test above already exercises the writer-factory dispatch.
+
+    def test_run_from_config_with_optional_loggers(self, tmp_path):
+        """``save_acc_rates`` and ``save_max_neighbors`` flags + a
+        move_descriptors list register the optional acc-rates / max-neighbors
+        loggers (lines 410-446 in run.py)."""
+        from jaxrens.sampling.move_kernel import MoveKernel
+        from jaxrens.sampling.moves import random_walk as _rw
+
+        ns_config = NSConfig(n_live=12, max_iterations=10, n_mcmc_steps=2, seed=0)
+        move_config = MoveConfig(move_type="random_walk", step_size=0.3)
+        backend_config = BackendConfig(backend_type="harmonic")
+        output_config = OutputConfig(
+            format="none", working_dir=tmp_path, info_interval=999,
+            save_acc_rates=True, save_max_neighbors=True,
+            temperature_lag=None,
+        )
+        # Real MoveKernel; adaptation logger needs ``name`` per descriptor.
+        descriptors = [MoveKernel(
+            "rw", _rw.build_kernel, step_size=0.3,
+            step_size_max=5.0, min_rate=0.2, max_rate=0.7,
+        )]
+        key = jax.random.key(5)
+        positions = jax.random.uniform(key, (12, 1, 3), minval=-3.0, maxval=3.0)
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        run_from_config(
+            ns_config, move_config, backend_config, output_config,
+            initial_positions=positions, initial_types=types,
+            move_descriptors=descriptors,
+        )
+        # All three optional loggers should have produced their files.
+        assert (tmp_path / "ns.adaptation.h5").exists()
+        assert (tmp_path / "ns.acc_rates.h5").exists()
+        assert (tmp_path / "ns.max_neighbors.h5").exists()
+
 
 class TestConfigureFileLogging:
     """``configure_file_logging`` is called exactly once, early, from
