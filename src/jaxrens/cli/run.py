@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
 import jax
 import jax.numpy as jnp
 
@@ -22,9 +23,11 @@ from jaxrens.cli.monitor import (
     AdaptationCallback,
     BatchedTrajectoryCallback,
     CheckpointCallback,
+    CollisionCheckCallback,
     EnergyCheckCallback,
     MemProfileCallback,
     ProgressCallback,
+    TemperatureCallback,
     TrajectoryCallback,
 )
 from jaxrens.io.energy_log import EnergyLogger
@@ -36,6 +39,7 @@ from jaxrens.sampling.nested_sampling import (
     init_ns_parallel,
     run_ns,
     run_ns_multi_gpu,
+    run_ns_sharded,
 )
 from jaxrens.state.config import BackendConfig, MoveConfig, NSConfig, OutputConfig
 
@@ -50,12 +54,17 @@ def configure_file_logging(
     working_dir: Path,
     prefix: str,
     level: str,
+    mode: str = "w",
 ) -> None:
     """Attach file + stderr handlers to the ``jaxrens`` logger.
 
     Always writes INFO+ to ``<working_dir>/<prefix>.log`` and mirrors
     INFO+ to stderr.  If ``level`` is ``debug``, additionally writes
     DEBUG+ to ``<working_dir>/<prefix>.debug.log``.
+
+    ``mode`` mirrors the ``writer_mode`` plumbed through to the I/O
+    writers: ``"w"`` on a fresh run, ``"a"`` on restart so the prior
+    run's diagnostic log is preserved.
 
     Should be called once per process, early.  ``cli._cmd_run`` hoists
     this before the resolver so resolver-phase logs (which can take
@@ -71,20 +80,22 @@ def configure_file_logging(
             root.removeHandler(h)
             h.close()
 
-    info_h = logging.FileHandler(working_dir / f"{prefix}.log", mode="w")
+    info_h = logging.FileHandler(working_dir / f"{prefix}.log", mode=mode)
     info_h.setLevel(logging.INFO)
     info_h.setFormatter(logging.Formatter(_LOG_FORMAT))
     info_h._jaxrens_managed = True  # type: ignore[attr-defined]
     root.addHandler(info_h)
 
-    stream_h = logging.StreamHandler(sys.stderr)
-    stream_h.setLevel(logging.INFO)
-    stream_h.setFormatter(logging.Formatter(_LOG_FORMAT))
-    stream_h._jaxrens_managed = True  # type: ignore[attr-defined]
-    root.addHandler(stream_h)
+    # stream_h = logging.StreamHandler(sys.stderr)
+    # stream_h.setLevel(logging.INFO)
+    # stream_h.setFormatter(logging.Formatter(_LOG_FORMAT))
+    # stream_h._jaxrens_managed = True  # type: ignore[attr-defined]
+    # root.addHandler(stream_h)
 
     if level == "debug":
-        debug_h = logging.FileHandler(working_dir / f"{prefix}.debug.log", mode="w")
+        debug_h = logging.FileHandler(
+            working_dir / f"{prefix}.debug.log", mode=mode
+        )
         debug_h.setLevel(logging.DEBUG)
         debug_h.setFormatter(logging.Formatter(_LOG_FORMAT))
         debug_h._jaxrens_managed = True  # type: ignore[attr-defined]
@@ -239,6 +250,7 @@ def run_from_config(
     adaptation_config=None,
     move_descriptors=None,
     base_backend: Any = None,
+    writer_mode: str = "w",
 ) -> dict:
     """Run NS from typed config objects.
 
@@ -266,6 +278,14 @@ def run_from_config(
             backend_kwargs["cutoff"] = backend_config.cutoff
 
         base_backend = load_backend(backend_config.backend_type, **backend_kwargs)
+
+    # Soft-core wrapper applied first (closest to the bare backend) so
+    # the EnsembleBackend PV correction sits outside it.
+    if backend_config.softcore_repulsion is not None:
+        from jaxrens.backends.softcore import SoftCoreBackend
+        base_backend = SoftCoreBackend(
+            base_backend, **backend_config.softcore_repulsion,
+        )
 
     # Wrap with ensemble corrections if needed
     ensemble_params = None
@@ -309,6 +329,21 @@ def run_from_config(
         EnergyCheckCallback(),
     ]
 
+    if output_config.temperature_lag is not None:
+        callbacks.append(TemperatureCallback(
+            n_live=ns_config.n_live,
+            n_cull=ns_config.n_cull,
+            lag=output_config.temperature_lag,
+            interval=output_config.temperature_interval,
+            kB=output_config.temperature_kB,
+        ))
+
+    if output_config.collision_check_threshold is not None:
+        callbacks.append(CollisionCheckCallback(
+            threshold=output_config.collision_check_threshold,
+            interval=output_config.collision_check_interval,
+        ))
+
     callbacks.append(
         CheckpointCallback(
             working_dir=working_dir,
@@ -321,12 +356,25 @@ def run_from_config(
     if (memprof := os.environ.get("JAXRENS_MEMPROF")):
         callbacks.append(MemProfileCallback(working_dir / memprof))
 
+    # On restart, the global iteration the checkpoint was taken at — every
+    # output stream is rewound to drop records the previous process flushed
+    # past it (see io/restart_truncate.py).  0 for a fresh run (no-op).
+    restart_iteration = (
+        int(restart_state.iteration) if restart_state is not None else 0
+    )
+
     traj_path = working_dir / f"{output_config.out_file_prefix}.traj.{output_config.format}"
-    writer = create_trajectory_writer(output_config.format, traj_path, symbol_map)
+    writer = create_trajectory_writer(
+        output_config.format, traj_path, symbol_map, mode=writer_mode,
+        restart_iteration=restart_iteration,
+        wrap=output_config.wrap_atoms,
+    )
     energy_logger = EnergyLogger(
         working_dir / f"{output_config.out_file_prefix}.energies",
         n_walkers=ns_config.n_live,
         n_atoms=initial_positions.shape[-2],
+        mode=writer_mode,
+        restart_iteration=restart_iteration,
     )
     callbacks.append(
         TrajectoryCallback(
@@ -351,6 +399,8 @@ def run_from_config(
             path=adapt_log_path,
             move_names=move_name_list,
             n_runs=1,
+            mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
 
@@ -366,10 +416,33 @@ def run_from_config(
             path=acc_log_path,
             move_names=[d.name for d in move_descriptors],
             n_runs=1,
+            flush_interval=int(getattr(output_config, "flush_interval", 1000)),
+            mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(AccRatesCallback(
             acc_logger,
             interval=int(getattr(output_config, "acc_rates_interval", 1)),
+        ))
+
+    if getattr(output_config, "save_max_neighbors", False):
+        from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
+        from jaxrens.cli.monitor import MaxNeighborsCallback
+
+        mn_log_path = (
+            working_dir / f"{output_config.out_file_prefix}.max_neighbors.h5"
+        )
+        mn_logger = MaxNeighborsLogger(
+            path=mn_log_path,
+            n_runs=1,
+            n_walkers=ns_config.n_live,
+            flush_interval=int(getattr(output_config, "flush_interval", 1000)),
+            mode=writer_mode,
+            restart_iteration=restart_iteration,
+        )
+        callbacks.append(MaxNeighborsCallback(
+            mn_logger,
+            interval=int(getattr(output_config, "max_neighbors_interval", 1)),
         ))
 
     first_mc = move_config[0] if isinstance(move_config, list) else move_config
@@ -437,11 +510,17 @@ def run_from_config(
             emax_offset_per_atom=burn_in_cfg.emax_offset_per_atom,
             n_atoms=n_atoms,
             walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
-            run_batch_size=getattr(burn_in_cfg, "run_batch_size", None),
             per_move_fns=burn_per_move_fns,
             adaptation_policies=burn_adaptation_policies,
+            move_names=(
+                tuple(d.name for d in move_descriptors)
+                if move_descriptors is not None else None
+            ),
             adjust_n_samples=getattr(adaptation_config, "adjust_n_samples", 50) if adaptation_config is not None else 50,
             adjust_max_rounds=getattr(adaptation_config, "adjust_max_rounds", 15) if adaptation_config is not None else 15,
+            max_neighbors_list=tuple(backend_config.max_neighbors_list),
+            max_neighbors_offset=backend_config.max_neighbors_offset,
+            max_neighbors_shrink_dwell=backend_config.max_neighbors_shrink_dwell,
         )
 
         # Extract burned-in walker arrays to re-seed run_ns.
@@ -487,6 +566,7 @@ def run_from_config(
             adjust_n_samples=adaptation_config.adjust_n_samples,
             adjust_max_rounds=adaptation_config.adjust_max_rounds,
             adjust_factor=adjust_factor,
+            trial_batch_size=adaptation_config.trial_batch_size,
         )
 
     result = run_ns(
@@ -509,6 +589,7 @@ def run_from_config(
         restart_state=restart_state,
         max_neighbors_list=tuple(backend_config.max_neighbors_list),
         max_neighbors_offset=backend_config.max_neighbors_offset,
+        max_neighbors_shrink_dwell=backend_config.max_neighbors_shrink_dwell,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
         **full_auto_kwargs,
     )
@@ -516,13 +597,35 @@ def run_from_config(
     return result
 
 
+def _restart_iteration_from(restart_state: Any) -> int:
+    """Global iteration to rewind output streams to on restart.
+
+    Accepts the single-run ``RestartBundle``, the multi-GPU 2-D nested
+    bundle list, or a flat list — every replica shares one checkpoint, so
+    the first non-``None`` bundle's ``iteration`` is authoritative.  Returns
+    0 for a fresh run (``restart_state is None``), making truncation a no-op.
+    """
+    if restart_state is None:
+        return 0
+    stack = [restart_state]
+    while stack:
+        item = stack.pop()
+        if item is None:
+            continue
+        if isinstance(item, list):
+            stack.extend(item)
+        elif hasattr(item, "iteration"):
+            return int(item.iteration)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Multi-run (multi-GPU) dispatch
 # ---------------------------------------------------------------------------
 
 
-def run_multi_gpu_from_config(resolved) -> dict:
-    """Execute a multi-run NS dispatch from a ``ResolvedMultiRunConfig``.
+def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
+    """Execute a multi-replica NS dispatch from a multi-replica ``ResolvedConfig``.
 
     Mirrors :func:`run_from_config` but ends in ``run_ns_multi_gpu`` with
     per-replica ``ensemble_params_per_run``.  Wires all five callbacks with
@@ -550,7 +653,10 @@ def run_multi_gpu_from_config(resolved) -> dict:
 
     # --- Backend: one base, wrapped once with EnsembleBackend --------------
     # Per-call ``ensemble_params`` dicts override the wrapper's closured
-    # defaults (see backends/ensemble.py __call__).
+    # defaults (see backends/ensemble.py __call__).  The resolver already
+    # applied the soft-core wrapper (if configured) to ``base_backend``
+    # before stashing it on ``resolved`` (see ``_resolve_multi_replica``),
+    # so no additional wrap is needed here.
     base_backend = resolved.base_backend
     backend = EnsembleBackend(base_backend, pressure=0.0)
 
@@ -596,8 +702,14 @@ def run_multi_gpu_from_config(resolved) -> dict:
     )
 
     # --- Burn-in (batched=True) -------------------------------------------
+    # Skip burn-in on the restart branch: the checkpoint already holds
+    # walkers from the prior run's NS loop (well past the burn-in level).
     burn_in_cfg = resolved.initial_walk_config
-    do_burn_in = burn_in_cfg is not None and burn_in_cfg.n_walks > 0
+    do_burn_in = (
+        burn_in_cfg is not None
+        and burn_in_cfg.n_walks > 0
+        and resolved.init.restart_state is None
+    )
     if do_burn_in:
         from jaxrens.init.burn_in import initial_walk
 
@@ -623,12 +735,10 @@ def run_multi_gpu_from_config(resolved) -> dict:
 
         logger.info(
             "Starting initial burn-in: n_walks=%d, walklength=%d, "
-            "adjust_interval=%d, walker_batch_size=%s, run_batch_size=%s, "
-            "n_atoms=%d",
+            "adjust_interval=%d, walker_batch_size=%s, n_atoms=%d",
             burn_in_cfg.n_walks, burn_in_cfg.walklength,
             burn_in_cfg.adjust_interval,
             getattr(burn_in_cfg, "walker_batch_size", None),
-            getattr(burn_in_cfg, "run_batch_size", None),
             n_atoms,
         )
 
@@ -643,11 +753,14 @@ def run_multi_gpu_from_config(resolved) -> dict:
             n_atoms=n_atoms,
             batcher=resolved.batcher,
             walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
-            run_batch_size=getattr(burn_in_cfg, "run_batch_size", None),
             per_move_fns=burn_per_move_fns,
             adaptation_policies=adaptation_policies,
+            move_names=tuple(d.name for d in resolved.move_descriptors),
             adjust_n_samples=getattr(resolved.adaptation_cfg, "adjust_n_samples", 50),
             adjust_max_rounds=getattr(resolved.adaptation_cfg, "adjust_max_rounds", 15),
+            max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
+            max_neighbors_offset=resolved.backend.max_neighbors_offset,
+            max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
         )
         pop = ns_state_burn.population
         # Burn-in operated on (G, P, K, ...) state via the PmapVmapRuns batcher.
@@ -688,6 +801,21 @@ def run_multi_gpu_from_config(resolved) -> dict:
         EnergyCheckCallback(),
     ]
 
+    if resolved.output.temperature_lag is not None:
+        callbacks.append(TemperatureCallback(
+            n_live=ns.n_live,
+            n_cull=ns.n_cull,
+            lag=resolved.output.temperature_lag,
+            interval=resolved.output.temperature_interval,
+            kB=resolved.output.temperature_kB,
+        ))
+
+    if resolved.output.collision_check_threshold is not None:
+        callbacks.append(CollisionCheckCallback(
+            threshold=resolved.output.collision_check_threshold,
+            interval=resolved.output.collision_check_interval,
+        ))
+
     symbol_map = resolved.init.symbol_map
     callbacks.append(
         CheckpointCallback(
@@ -701,6 +829,9 @@ def run_multi_gpu_from_config(resolved) -> dict:
     if (memprof := os.environ.get("JAXRENS_MEMPROF")):
         callbacks.append(MemProfileCallback(working_dir / memprof))
 
+    # Rewind every output stream to the checkpoint on restart (0 = fresh).
+    restart_iteration = _restart_iteration_from(resolved.init.restart_state)
+
     n_atoms = positions.shape[-2]
     writers = []
     energy_loggers = []
@@ -710,11 +841,18 @@ def run_multi_gpu_from_config(resolved) -> dict:
             / f"{resolved.output.out_file_prefix}.run{r:02d}.traj.{resolved.output.format}"
         )
         writers.append(
-            create_trajectory_writer(resolved.output.format, traj_path, symbol_map)
+            create_trajectory_writer(
+                resolved.output.format, traj_path, symbol_map, mode=writer_mode,
+                restart_iteration=restart_iteration,
+                wrap=resolved.output.wrap_atoms,
+            )
         )
         energy_path = working_dir / f"{resolved.output.out_file_prefix}.run{r:02d}.energies"
         energy_loggers.append(
-            EnergyLogger(energy_path, n_walkers=n_live, n_atoms=n_atoms)
+            EnergyLogger(
+                energy_path, n_walkers=n_live, n_atoms=n_atoms, mode=writer_mode,
+                restart_iteration=restart_iteration,
+            )
         )
     callbacks.append(
         BatchedTrajectoryCallback(
@@ -738,6 +876,8 @@ def run_multi_gpu_from_config(resolved) -> dict:
             path=adapt_log_path,
             move_names=move_name_list,
             n_runs=n_total,
+            mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(AdaptationCallback(adaptation_logger))
 
@@ -755,11 +895,55 @@ def run_multi_gpu_from_config(resolved) -> dict:
             path=acc_log_path,
             move_names=[d.name for d in resolved.move_descriptors],
             n_runs=n_total,
+            flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
+            mode=writer_mode,
+            restart_iteration=restart_iteration,
         )
         callbacks.append(AccRatesCallback(
             acc_logger,
             interval=int(getattr(resolved.output, "acc_rates_interval", 1)),
         ))
+
+    if getattr(resolved.output, "save_max_neighbors", False):
+        from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
+        from jaxrens.cli.monitor import MaxNeighborsCallback
+
+        mn_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.max_neighbors.h5"
+        )
+        mn_logger = MaxNeighborsLogger(
+            path=mn_log_path,
+            n_runs=n_total,
+            n_walkers=n_live,
+            flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
+            mode=writer_mode,
+            restart_iteration=restart_iteration,
+        )
+        callbacks.append(MaxNeighborsCallback(
+            mn_logger,
+            interval=int(getattr(resolved.output, "max_neighbors_interval", 1)),
+        ))
+
+    # Per-fire inter-RE swap counts (multi-run + inter_re only).
+    if (
+        resolved.inter_re_config is not None
+        and getattr(resolved.output, "save_re_stats", False)
+    ):
+        from jaxrens.io.re_stats_log import RELogger
+        from jaxrens.cli.monitor import RECallback
+
+        re_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.re_stats.h5"
+        )
+        re_logger = RELogger(
+            path=re_log_path,
+            n_pairs=max(n_total - 1, 0),
+            flavor=resolved.inter_re_config.flavor,
+            flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
+            mode=writer_mode,
+            restart_iteration=restart_iteration,
+        )
+        callbacks.append(RECallback(re_logger))
 
     first_mc = resolved.moves[0]
     full_auto_kwargs: dict[str, Any] = {}
@@ -775,6 +959,7 @@ def run_multi_gpu_from_config(resolved) -> dict:
             adjust_n_samples=resolved.adaptation_cfg.adjust_n_samples,
             adjust_max_rounds=resolved.adaptation_cfg.adjust_max_rounds,
             adjust_factor=adjust_factor,
+            trial_batch_size=resolved.adaptation_cfg.trial_batch_size,
         )
 
     logger.info(
@@ -783,6 +968,22 @@ def run_multi_gpu_from_config(resolved) -> dict:
         n_gpu, n_per_gpu, n_total, n_live,
         ns.n_mcmc_steps, ns.max_iterations,
     )
+
+    # Multi-replica restart: the resolver attached ``list[list[RestartBundle]]``
+    # of shape (n_gpu, n_per_gpu) when ``init.restart_file`` was set; pass it
+    # through so ``run_ns_multi_gpu`` seeds per-replica NSState from the
+    # checkpoint instead of from a fresh ``init_ns``.
+    restart_states_2d = resolved.init.restart_state
+    if restart_states_2d is not None and not (
+        isinstance(restart_states_2d, list)
+        and len(restart_states_2d) > 0
+        and isinstance(restart_states_2d[0], list)
+    ):
+        raise RuntimeError(
+            f"run_multi_gpu_from_config: expected resolved.init.restart_state "
+            f"to be list[list[RestartBundle]] for the multi-replica path, "
+            f"got {type(restart_states_2d).__name__}."
+        )
 
     result = run_ns_multi_gpu(
         positions=positions,
@@ -809,8 +1010,340 @@ def run_multi_gpu_from_config(resolved) -> dict:
         backend=base_backend,
         max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
         max_neighbors_offset=resolved.backend.max_neighbors_offset,
+        max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
         initial_max_neighbor_counts=post_burn_in_counts,
         batcher=resolved.batcher,
+        restart_states=restart_states_2d,
+        **full_auto_kwargs,
+    )
+    return result
+
+
+def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
+    """Execute a sharded-single NS dispatch from a sharded ``ResolvedConfig``.
+
+    One logical NS run with its ``n_live`` walker population sharded
+    across ``shard_n_gpu`` GPUs.  Sibling of :func:`run_from_config`
+    (one population on one device) and :func:`run_multi_gpu_from_config`
+    (G*P independent populations).
+
+    The resolver populates ``resolved.batcher`` with a
+    :class:`ShardedSingleRun(n_gpu=...)` and keeps the init arrays in
+    the flat ``(K, ...)`` layout — ``init_ns_sharded`` (inside
+    ``run_ns_sharded``) does the reshape and per-device placement.
+
+    Burn-in (`initial_walk`) runs through ``ShardedSingleRun`` natively
+    — adaptation goes through :func:`build_adapt_step` (which
+    dispatches to ``adjust_step_size_sharded``) and the walking step
+    pmaps with per-shard distinct keys.  After burn-in the sharded
+    NSState's ``(G, K/G, ...)`` population is flattened back to
+    ``(K, ...)`` for the post-burn-in neighbor-count refresh and for
+    re-init by ``run_ns_sharded`` (which re-shards via
+    ``init_ns_sharded``).
+    """
+    from jaxrens.io.adaptation_log import AdaptationLogger
+    from jaxrens.sampling.nested_sampling import (
+        _choose_starting_bucket,
+        init_ns_sharded,
+    )
+
+    ns = resolved.ns
+    batcher = resolved.batcher  # ShardedSingleRun
+    n_gpu = batcher.n_gpu
+    n_live = ns.n_live
+
+    # The resolver already applied the soft-core wrapper (if configured)
+    # to ``base_backend`` before stashing it on ``resolved``, so no
+    # additional wrap is needed here.
+    base_backend = resolved.base_backend
+    backend = EnsembleBackend(base_backend, pressure=0.0)
+    init_fn, step_fn, per_move_fns = build_mwg(
+        backend, list(resolved.move_descriptors),
+    )
+
+    working_dir = resolved.output.working_dir
+    working_dir.mkdir(parents=True, exist_ok=True)
+
+    positions = resolved.init.initial_positions  # (K, A, 3)
+    types = resolved.init.initial_types
+    cells = resolved.init.initial_cells
+    energies = resolved.init.initial_energies
+
+    if positions.shape[0] != n_live:
+        raise RuntimeError(
+            f"run_sharded_from_config: init positions axis 0 is "
+            f"{positions.shape[0]} but n_live={n_live}."
+        )
+
+    key = jax.random.key(ns.seed)
+
+    # --- Burn-in (sharded) -------------------------------------------------
+    burn_in_cfg = resolved.initial_walk_config
+    do_burn_in = burn_in_cfg is not None and burn_in_cfg.n_walks > 0
+    initial_max_neighbor_counts = resolved.init.initial_max_neighbor_counts
+    if do_burn_in:
+        from jaxrens.init.burn_in import initial_walk
+
+        _ladder = tuple(int(x) for x in resolved.backend.max_neighbors_list)
+        _offset = int(resolved.backend.max_neighbors_offset)
+        starting_bucket = _choose_starting_bucket(
+            initial_max_neighbor_counts, _ladder, _offset,
+        )
+
+        key, key_init, key_burn = jax.random.split(key, 3)
+        step_sizes = jnp.full(
+            len(resolved.move_descriptors), resolved.moves[0].step_size,
+        )
+        ns_state_burn = init_ns_sharded(
+            init_fn,
+            positions, types, energies, cells, key_init,
+            n_gpu=n_gpu,
+            step_sizes=step_sizes,
+            ensemble_params=(
+                resolved.ensemble_params_per_run[0]
+                if resolved.ensemble_params_per_run else None
+            ),
+            max_neighbors=starting_bucket,
+            max_neighbor_counts=initial_max_neighbor_counts,
+        )
+
+        n_atoms_burn = positions.shape[-2]
+        adaptation_policies = resolved.adaptation_policies
+        burn_per_move_fns = per_move_fns
+
+        logger.info(
+            "Starting sharded burn-in: n_walks=%d, walklength=%d, "
+            "adjust_interval=%d, walker_batch_size=%s, n_gpu=%d, n_atoms=%d",
+            burn_in_cfg.n_walks, burn_in_cfg.walklength,
+            burn_in_cfg.adjust_interval,
+            getattr(burn_in_cfg, "walker_batch_size", None),
+            n_gpu, n_atoms_burn,
+        )
+
+        ns_state_burn = initial_walk(
+            key=key_burn,
+            ns_state=ns_state_burn,
+            step_fn=step_fn,
+            n_walks=burn_in_cfg.n_walks,
+            walklength=burn_in_cfg.walklength,
+            adjust_interval=burn_in_cfg.adjust_interval,
+            emax_offset_per_atom=burn_in_cfg.emax_offset_per_atom,
+            n_atoms=n_atoms_burn,
+            batcher=batcher,
+            walker_batch_size=getattr(burn_in_cfg, "walker_batch_size", None),
+            per_move_fns=burn_per_move_fns,
+            adaptation_policies=adaptation_policies,
+            move_names=tuple(d.name for d in resolved.move_descriptors),
+            adjust_n_samples=getattr(
+                resolved.adaptation_cfg, "adjust_n_samples", 50,
+            ),
+            adjust_max_rounds=getattr(
+                resolved.adaptation_cfg, "adjust_max_rounds", 15,
+            ),
+            max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
+            max_neighbors_offset=resolved.backend.max_neighbors_offset,
+            max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
+        )
+
+        # Flatten sharded (G, K/G, ...) population back to (K, ...) so the
+        # neighbor-count refresh and ``run_ns_sharded``'s ``init_ns_sharded``
+        # see the canonical flat input layout.
+        pop_burn = ns_state_burn.population
+
+        def _flatten_shard(arr):
+            if arr is None:
+                return None
+            return arr.reshape((-1,) + arr.shape[2:])
+
+        positions = _flatten_shard(pop_burn.positions)
+        energies = _flatten_shard(pop_burn.energy)
+        cells = _flatten_shard(pop_burn.cell)
+        logger.info("Sharded burn-in complete")
+
+        # Post-burn-in neighbor-count refresh — burn-in drifts
+        # positions/cells; the resolver's pre-burn-in counts are stale.
+        if hasattr(base_backend, "max_neighbors_for"):
+            logger.info(
+                "Recomputing post-burn-in max neighbor counts (n_walkers=%d)",
+                positions.shape[0],
+            )
+            initial_max_neighbor_counts = _recompute_max_neighbor_counts(
+                base_backend, positions, cells,
+            )
+
+    ensemble_params = (
+        resolved.ensemble_params_per_run[0]
+        if resolved.ensemble_params_per_run
+        else None
+    )
+
+    callbacks: list[Any] = [
+        ProgressCallback(info_interval=resolved.output.info_interval),
+        EnergyCheckCallback(),
+    ]
+
+    if resolved.output.temperature_lag is not None:
+        callbacks.append(TemperatureCallback(
+            n_live=ns.n_live,
+            n_cull=ns.n_cull,
+            lag=resolved.output.temperature_lag,
+            interval=resolved.output.temperature_interval,
+            kB=resolved.output.temperature_kB,
+        ))
+
+    if resolved.output.collision_check_threshold is not None:
+        callbacks.append(CollisionCheckCallback(
+            threshold=resolved.output.collision_check_threshold,
+            interval=resolved.output.collision_check_interval,
+        ))
+
+    symbol_map = resolved.init.symbol_map
+    callbacks.append(
+        CheckpointCallback(
+            working_dir=working_dir,
+            interval=resolved.output.checkpoint_interval,
+            prefix=resolved.output.out_file_prefix,
+            symbol_map=symbol_map,
+        )
+    )
+
+    if (memprof := os.environ.get("JAXRENS_MEMPROF")):
+        callbacks.append(MemProfileCallback(working_dir / memprof))
+
+    # Rewind output streams to the checkpoint on restart (0 = fresh).
+    restart_iteration = _restart_iteration_from(resolved.init.restart_state)
+
+    n_atoms = positions.shape[-2]
+    traj_path = (
+        working_dir
+        / f"{resolved.output.out_file_prefix}.traj.{resolved.output.format}"
+    )
+    writer = create_trajectory_writer(
+        resolved.output.format, traj_path, symbol_map, mode=writer_mode,
+        restart_iteration=restart_iteration,
+        wrap=resolved.output.wrap_atoms,
+    )
+    energy_path = (
+        working_dir / f"{resolved.output.out_file_prefix}.energies"
+    )
+    energy_logger = EnergyLogger(
+        energy_path, n_walkers=n_live, n_atoms=n_atoms, mode=writer_mode,
+        restart_iteration=restart_iteration,
+    )
+    callbacks.append(
+        TrajectoryCallback(
+            writer=writer,
+            energy_logger=energy_logger,
+            traj_interval=resolved.output.traj_interval,
+            snapshot_interval=resolved.output.snapshot_interval,
+        )
+    )
+
+    if resolved.move_descriptors:
+        adapt_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.adaptation.h5"
+        )
+        move_name_list = [d.name for d in resolved.move_descriptors]
+        adaptation_logger = AdaptationLogger(
+            path=adapt_log_path,
+            move_names=move_name_list,
+            n_runs=1,
+            mode=writer_mode,
+            restart_iteration=restart_iteration,
+        )
+        callbacks.append(AdaptationCallback(adaptation_logger))
+
+    if getattr(resolved.output, "save_max_neighbors", False):
+        from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
+        from jaxrens.cli.monitor import MaxNeighborsCallback
+
+        mn_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.max_neighbors.h5"
+        )
+        mn_logger = MaxNeighborsLogger(
+            path=mn_log_path,
+            n_runs=1,
+            n_walkers=n_live,
+            flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
+            mode=writer_mode,
+            restart_iteration=restart_iteration,
+        )
+        callbacks.append(MaxNeighborsCallback(
+            mn_logger,
+            interval=int(getattr(resolved.output, "max_neighbors_interval", 1)),
+        ))
+
+    if resolved.move_descriptors and getattr(
+        resolved.output, "save_acc_rates", False,
+    ):
+        from jaxrens.io.acc_rates_log import AccRatesLogger
+        from jaxrens.cli.monitor import AccRatesCallback
+
+        acc_log_path = (
+            working_dir / f"{resolved.output.out_file_prefix}.acc_rates.h5"
+        )
+        acc_logger = AccRatesLogger(
+            path=acc_log_path,
+            move_names=[d.name for d in resolved.move_descriptors],
+            n_runs=1,
+            flush_interval=int(getattr(resolved.output, "flush_interval", 1000)),
+            mode=writer_mode,
+            restart_iteration=restart_iteration,
+        )
+        callbacks.append(AccRatesCallback(
+            acc_logger,
+            interval=int(getattr(resolved.output, "acc_rates_interval", 1)),
+        ))
+
+    first_mc = resolved.moves[0]
+    full_auto_kwargs: dict[str, Any] = {}
+    if resolved.adaptation_cfg is not None and resolved.adaptation_cfg.full_auto:
+        adjust_factor = (
+            resolved.adaptation_cfg.defaults.adjust_factor
+            if resolved.adaptation_cfg.defaults.adjust_factor is not None
+            else 1.5
+        )
+        full_auto_kwargs = dict(
+            per_move_fns=per_move_fns,
+            adjust_interval=resolved.adaptation_cfg.adjust_interval,
+            adjust_n_samples=resolved.adaptation_cfg.adjust_n_samples,
+            adjust_max_rounds=resolved.adaptation_cfg.adjust_max_rounds,
+            adjust_factor=adjust_factor,
+            trial_batch_size=resolved.adaptation_cfg.trial_batch_size,
+        )
+
+    logger.info(
+        "Starting sharded-single NS: n_gpu=%d, n_live=%d "
+        "(K_per_gpu=%d), n_mcmc=%d, max_iter=%s",
+        n_gpu, n_live, n_live // n_gpu,
+        ns.n_mcmc_steps, ns.max_iterations,
+    )
+
+    result = run_ns_sharded(
+        positions=positions,
+        types=types,
+        energies=energies,
+        cells=cells,
+        init_fn=init_fn,
+        step_fn=step_fn,
+        rng_key=key,
+        n_gpu=n_gpu,
+        n_walkers=n_live,
+        max_iterations=ns.max_iterations,
+        n_mcmc_steps=ns.n_mcmc_steps,
+        n_extra=ns.n_extra,
+        convergence_threshold=ns.convergence_threshold,
+        initial_step_size=first_mc.step_size,
+        target_acceptance=first_mc.target_acceptance,
+        callbacks=callbacks,
+        termination_criteria=list(resolved.termination),
+        ensemble_params=ensemble_params,
+        move_descriptors=list(resolved.move_descriptors),
+        max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
+        max_neighbors_offset=resolved.backend.max_neighbors_offset,
+        max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
+        initial_max_neighbor_counts=initial_max_neighbor_counts,
+        batcher=batcher,
         **full_auto_kwargs,
     )
     return result

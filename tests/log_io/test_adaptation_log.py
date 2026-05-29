@@ -190,6 +190,7 @@ def _write_minimal_checkpoint(tmp_path: Path, prefix: str = "ns") -> None:
     """Write the bare minimum files for Monitor.from_directory to succeed."""
     import jax.numpy as jnp
     from jaxrens.io.checkpoint import save_checkpoint
+    from jaxrens.io.energy_log import EnergyLogger
 
     rng = np.random.default_rng(7)
     n_live, n_dead = 5, 10
@@ -216,6 +217,14 @@ def _write_minimal_checkpoint(tmp_path: Path, prefix: str = "ns") -> None:
         "n_walkers": n_live,
     }
     save_checkpoint(tmp_path / f"{prefix}.final.checkpoint.h5", ns_state)
+
+    energy_logger = EnergyLogger(
+        tmp_path / f"{prefix}.energies", n_walkers=n_live, n_cull=1,
+    )
+    energy_logger.write_header()
+    for i, e in enumerate(dead_e):
+        energy_logger.write_entry(i, float(e))
+    energy_logger.close()
 
 
 class TestMonitorFromDirectoryAdaptation:

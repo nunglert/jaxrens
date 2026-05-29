@@ -144,7 +144,7 @@ times.
 
 ## Inter-replica exchange (RENS)
 
-Every `inter_re.every` iterations, the manager runs `n_swap_cycles`
+Every `inter_re.re_interval` iterations, the manager runs `n_swap_cycles`
 even/odd swap passes between adjacent replicas in the pressure (or
 composition / μ) ladder. Three flavors exist:
 

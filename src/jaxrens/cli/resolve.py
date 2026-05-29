@@ -1,8 +1,16 @@
 """Resolution layer: pydantic schemas -> library dataclasses.
 
 ``resolve`` is the single seam between the CLI config layer and the
-library core.  Cohort expansion (pressure sweeps, seed sweeps) lives in
-``expand_cohort``; the CLI iterates the resulting list sequentially.
+library core.  It always returns one :class:`ResolvedConfig` carrying a
+``batcher`` field that picks the execution topology:
+
+* ``SingleRun()`` when the YAML implies a single NS run (scalar
+  ``ensemble.pressure``, no inter-RE replica-axis list).
+* ``PmapVmapRuns(n_gpu, n_per_gpu)`` when the YAML implies multiple
+  replicas (list-valued pressure, ``inter_re.composition_targets``,
+  ``inter_re.chemical_potentials``).
+
+There is no longer a separate "cohort" (independent sequential) path.
 """
 
 from __future__ import annotations
@@ -12,6 +20,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -27,7 +36,12 @@ from jaxrens.cli.schema.termination import IterationTerminationSpec
 from jaxrens.init.cells import cell_shape_walk, sample_initial_volume
 from jaxrens.init.positions import grid_positions_in_cell, uniform_positions_in_cell
 from jaxrens.init.rejection import rejection_sample_positions
-from jaxrens.init.restart import RestartBundle, load_restart
+from jaxrens.init.restart import (
+    BatchedRestart,
+    RestartBundle,
+    load_restart,
+    load_restart_batched,
+)
 from jaxrens.init.structure import load_structure
 from jaxrens.init.walker_set import load_walker_set
 from jaxrens.sampling.move_kernel import MoveKernel
@@ -48,7 +62,6 @@ logger = logging.getLogger(__name__)
 _DEFERRED_OUTPUT_FIELDS: tuple[str, ...] = (
     "snapshot_time",
     "snapshot_clean",
-    "wrap_atoms",
     "write_traj_db",
     "write_walkers_db",
 )
@@ -81,11 +94,15 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
     dataclasses always see ints).  When ``"per_walker"`` every affected field
     is multiplied by ``root.run.n_live`` first.
 
-    The eight scaled fields:
+    The scaled fields:
         output.{info,traj,snapshot,checkpoint}_interval
+        output.{temperature_lag,temperature_interval}
+        output.{acc_rates_interval,max_neighbors_interval}
+        output.collision_check_interval
+        output.flush_interval
         run.max_iterations  (None preserved)
         termination[iteration].max_iterations
-        inter_re.every
+        inter_re.re_interval
         adaptation.adjust_interval
     """
     factor = root.run.n_live if root.interval_units == "per_walker" else 1
@@ -97,6 +114,12 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
             "traj_interval",
             "snapshot_interval",
             "checkpoint_interval",
+            "temperature_lag",
+            "temperature_interval",
+            "acc_rates_interval",
+            "max_neighbors_interval",
+            "collision_check_interval",
+            "flush_interval",
         )
     }
     run_upd = {
@@ -116,7 +139,7 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
 
     if root.inter_re is not None:
         update["inter_re"] = root.inter_re.model_copy(
-            update={"every": _scale_interval(root.inter_re.every, factor=factor)},
+            update={"re_interval": _scale_interval(root.inter_re.re_interval, factor=factor)},
         )
 
     if root.termination is not None:
@@ -156,7 +179,10 @@ class ResolvedInit:
     initial_energies: Any    # shape: (n_live,) or None — None until evaluated
     initial_max_neighbor_counts: Any = None  # shape: (n_live,) int32 or None
     symbol_map: dict[int, str] | None = None
-    restart_state: RestartBundle | None = None
+    # ``RestartBundle`` for single-replica restart; ``list[list[RestartBundle]]``
+    # of shape ``(n_gpu, n_per_gpu)`` for multi-replica restart; ``None`` when
+    # starting fresh.  Consumer (``cli/run.py``) dispatches by isinstance.
+    restart_state: RestartBundle | list[list[RestartBundle]] | None = None
 
 
 def _build_cells(
@@ -338,11 +364,12 @@ def _finalise_initial_energies_and_counts(
     compute uses ``jax.jit`` / ``jax.jit(vmap)`` / ``pmap(vmap)``
     appropriate for the call site:
 
-    * Cohort path (``_resolve_one``) → ``SingleRun()`` (default).
-      ``positions`` shape ``(K, N, 3)``, ``cells`` ``(K, 3, 3)``.
-    * Multi-run path (``_resolve_multi_run``) →
+    * SingleRun path (``_resolve_single_replica``) → ``SingleRun()``
+      (default).  ``positions`` shape ``(K, N, 3)``, ``cells``
+      ``(K, 3, 3)``.
+    * Multi-replica path (``_resolve_multi_replica``) →
       ``PmapVmapRuns(G, P)`` (the same ``batcher`` instance stored on
-      ``ResolvedMultiRunConfig.batcher``).  ``positions`` shape
+      ``ResolvedConfig.batcher``).  ``positions`` shape
       ``(G, P, K, N, 3)``, ``cells`` ``(G, P, K, 3, 3)``.  Energy
       compile happens in parallel across G GPUs and at the same shape
       burn-in + NS step use, so all three stages share one JIT cache
@@ -371,7 +398,7 @@ def _finalise_initial_energies_and_counts(
     replica's initial energy reflects its own P·V term — even though
     a single EnsembleBackend instance handles all replicas in the
     consolidated finalize.  When ``None``, the backend's own closured
-    pressure is used (cohort path).
+    pressure is used (SingleRun path).
 
     Returns ``(energies, counts)``; either or both may be ``None``.
     """
@@ -393,7 +420,7 @@ def _finalise_initial_energies_and_counts(
     if hasattr(energy_backend, "max_neighbors_for"):
         logger.info(
             "[resolve] computing per-walker initial neighbor counts and energies "
-            "(%s, n_walkers=%d, n_atoms=%d, batcher=%s)",
+            "(%s, n_walkers*n_runs=%d, n_atoms=%d, batcher=%s)",
             backend_label, n_walkers_total, n_atoms,
             type(batcher).__name__,
         )
@@ -437,7 +464,7 @@ def _finalise_initial_energies_and_counts(
         return energies, counts
 
     logger.info(
-        "[resolve] computing initial energies (%s, n_walkers=%d, n_atoms=%d, "
+        "[resolve] computing initial energies (%s, n_walkers*n_runs=%d, n_atoms=%d, "
         "batcher=%s)",
         backend_label, n_walkers_total, n_atoms,
         type(batcher).__name__,
@@ -528,7 +555,7 @@ def _resolve_init_walker_set(
 
     Returns structural-init only.  ``initial_energies`` and
     ``initial_max_neighbor_counts`` are left as ``None``; the caller
-    (``_resolve_one`` / ``_resolve_multi_run``) finalises them once.
+    (``_resolve_single_replica`` / ``_resolve_multi_replica``) finalises them once.
     """
     logger.info(
         "[resolve] init mode C: loading walker set from %s (n_live=%d)",
@@ -564,7 +591,7 @@ def _resolve_init_restart(
 
     Returns structural-init only.  ``initial_energies`` and
     ``initial_max_neighbor_counts`` are left as ``None``; the caller
-    (``_resolve_one`` / ``_resolve_multi_run``) finalises them once.
+    (``_resolve_single_replica`` / ``_resolve_multi_replica``) finalises them once.
     """
     logger.info(
         "[resolve] init mode D: restarting from checkpoint %s (n_live=%d)",
@@ -606,8 +633,8 @@ def _resolve_init(
 
     Returns structural-init only — ``initial_energies`` and
     ``initial_max_neighbor_counts`` are left as ``None`` on the returned
-    ``ResolvedInit``.  The caller (``_resolve_one`` or
-    ``_resolve_multi_run``) performs a single consolidated finalize via
+    ``ResolvedInit``.  The caller (``_resolve_single_replica`` or
+    ``_resolve_multi_replica``) performs a single consolidated finalize via
     ``_finalise_initial_energies_and_counts`` after this returns.
 
     Args:
@@ -842,7 +869,6 @@ def _warn_unused_output_fields(output_schema: Any) -> None:
     deferred_defaults: dict[str, Any] = {
         "snapshot_time": None,
         "snapshot_clean": False,
-        "wrap_atoms": False,
         "write_traj_db": False,
         "write_walkers_db": False,
     }
@@ -859,12 +885,21 @@ def _warn_unused_output_fields(output_schema: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ResolvedConfig
+# ResolvedConfig (unified single-/multi-replica)
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class ResolvedConfig:
-    """Holds all library dataclasses produced by ``resolve``.
+    """All library dataclasses produced by :func:`resolve`.
+
+    Single-/multi-replica unified type.  Shape conventions:
+
+    * ``batcher == SingleRun()``: arrays in ``init`` carry shape ``(K, ...)``.
+      ``ensemble_params_per_run`` is a length-1 tuple.
+    * ``batcher == PmapVmapRuns(G, P)``: arrays in ``init`` carry shape
+      ``(n_total, K, ...)`` with ``n_total == G * P``.
+      ``ensemble_params_per_run`` is a length-``n_total`` tuple in
+      ``flat_idx = g * P + p`` order (matches ``init_ns_multi_gpu``).
 
     ``base_backend`` is the unwrapped backend produced by
     ``BackendSpec.build_backend()`` (e.g. the raw MACE / NeuralIL / LJ
@@ -884,38 +919,70 @@ class ResolvedConfig:
     adaptation_policies: tuple[ResolvedAdaptationPolicy, ...]
     init: ResolvedInit
     cell: CellSpec
-    cohort_index: int = 0
-    ensemble_params: dict = field(default_factory=dict)
+    # Per-replica ensemble params.  Length 1 for SingleRun; length n_total
+    # for PmapVmapRuns.  Ordering is flat_idx = g * n_per_gpu + p.
+    ensemble_params_per_run: tuple[dict, ...] = ()
     initial_walk_config: Any = None
     adaptation_cfg: Any = None
+    inter_re_config: Any = None  # InterREConfig | None
+    # Batcher describing the (G, P) topology.  ``SingleRun`` when
+    # n_total == 1, ``PmapVmapRuns(n_gpu, n_per_gpu)`` otherwise.
+    # Consumed uniformly by ``_run_loop``, ``build_adapt_step``,
+    # ``InterREManager`` and the dispatcher in ``cli/run.py``.
+    batcher: BatchDescriptor | None = None
 
 
-def _cohort_size(root: RootSpec) -> int:
-    """Return the number of cohort elements implied by the ensemble spec."""
-    from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-    if isinstance(root.ensemble, NPTEnsembleSpec):
-        return root.ensemble.cohort_size()
-    return 1
+def _resolve_single_replica(
+    root: RootSpec,
+    *,
+    ensemble_params: dict,
+    shard_n_gpu: int = 1,
+) -> ResolvedConfig:
+    """Resolve ``root`` into a single-replica ``ResolvedConfig`` (n_total = 1).
 
+    ``shard_n_gpu`` (default 1) selects the batcher:
 
-def _seed_list(root: RootSpec, n: int) -> list[int]:
-    """Return a list of *n* seeds derived from ``root.run.seed``.
+    * ``1`` → :class:`SingleRun` (the historical behaviour).
+    * ``> 1`` → :class:`ShardedSingleRun(n_gpu=shard_n_gpu)`.  The
+      walker population is split across ``shard_n_gpu`` devices at
+      ``init_ns_sharded`` time; ``run_sharded_from_config`` is the
+      runtime dispatcher.
 
-    If ``run.seed`` is a scalar, generate ``[seed + i for i in range(n)]``.
+    The structural init layout is identical between the two — initial
+    positions / energies / counts come out of the resolver as flat
+    ``(K, ...)`` arrays.  The reshape to ``(G, K // G, ...)`` happens
+    later in ``init_ns_sharded`` so this resolver doesn't need to know
+    about the physical sharding layout.
+
+    Validates ``n_live % shard_n_gpu == 0`` and rejects the
+    ``inter_re ∧ shard_n_gpu > 1`` combination (sharded single run is
+    one population — there's nothing to swap with).
     """
-    return [root.run.seed + i for i in range(n)]
-
-
-def _resolve_one(root: RootSpec, cohort_index: int = 0) -> ResolvedConfig:
-    """Resolve ``root`` into library dataclasses for a single cohort element."""
+    if shard_n_gpu > 1:
+        if root.run.n_live % shard_n_gpu != 0:
+            raise ValueError(
+                f"run.n_live ({root.run.n_live}) is not divisible by "
+                f"run.shard_n_gpu ({shard_n_gpu}).  Adjust n_live or "
+                f"shard_n_gpu so that n_live % shard_n_gpu == 0."
+            )
+        if root.inter_re is not None:
+            raise ValueError(
+                "run.shard_n_gpu > 1 is incompatible with inter_re.  "
+                "Sharded single run holds one population spread across "
+                "GPUs — there's no second replica to swap with.  "
+                "Either remove inter_re or set shard_n_gpu = 1 (and "
+                "supply a multi-replica axis like ensemble.pressure: "
+                "[...] for inter-RE)."
+            )
     # Scale iteration-counted fields once at the top so every downstream read
     # of root.{output,run,adaptation,inter_re,termination} sees absolute-iter
     # values (see ``_apply_interval_units`` for the field list).
-    root = _apply_interval_units(root)
-    ensemble_params = root.ensemble.to_ensemble_params(cohort_index=cohort_index)
+    #
+    # ``ensemble_params`` is passed in by ``resolve`` (the caller already
+    # built it via ``root.ensemble.to_ensemble_params(cohort_index=0)``).
     pressure = ensemble_params.get("pressure", None)
 
-    seed = root.run.seed + cohort_index if cohort_index > 0 else root.run.seed
+    seed = root.run.seed
 
     ns = NSConfig(
         n_live=root.run.n_live,
@@ -930,6 +997,14 @@ def _resolve_one(root: RootSpec, cohort_index: int = 0) -> ResolvedConfig:
 
     backend = root.backend.to_backend_config()
     base_backend = root.backend.build_backend()
+
+    # Soft-core repulsion wrapper: applied closest to the bare backend so
+    # the ensemble PV term sits outside it.  Mutates ``base_backend`` so
+    # both single-replica and downstream multi-replica / rejection-mode
+    # init paths inherit the wrap automatically.
+    if backend.softcore_repulsion is not None:
+        from jaxrens.backends.softcore import SoftCoreBackend
+        base_backend = SoftCoreBackend(base_backend, **backend.softcore_repulsion)
 
     # For initial-energy evaluation, locally wrap with EnsembleBackend so the
     # resolver's energies match the NS-loop scale (U + P*V for NPT) — without
@@ -953,8 +1028,18 @@ def _resolve_one(root: RootSpec, cohort_index: int = 0) -> ResolvedConfig:
         out_file_prefix=root.output.out_file_prefix,
         working_dir=Path(root.output.working_dir),
         log_level=root.output.log_level,
+        flush_interval=int(root.output.flush_interval),
         save_acc_rates=root.output.save_acc_rates,
         acc_rates_interval=int(root.output.acc_rates_interval),
+        save_max_neighbors=root.output.save_max_neighbors,
+        max_neighbors_interval=int(root.output.max_neighbors_interval),
+        save_re_stats=root.output.save_re_stats,
+        temperature_lag=root.output.temperature_lag,
+        temperature_interval=int(root.output.temperature_interval),
+        temperature_kB=float(root.output.temperature_kB),
+        collision_check_threshold=root.output.collision_check_threshold,
+        collision_check_interval=int(root.output.collision_check_interval),
+        wrap_atoms=bool(root.output.wrap_atoms),
     )
 
     _warn_unused_output_fields(root.output)
@@ -990,7 +1075,7 @@ def _resolve_one(root: RootSpec, cohort_index: int = 0) -> ResolvedConfig:
     )
 
     # Single consolidated finalize for the single-run path.  Multi-run has
-    # its own equivalent seam in ``_resolve_multi_run`` after stacking.
+    # its own equivalent seam in ``_resolve_multi_replica`` after stacking.
     # Passes ``ladder``/``offset`` from the backend config so the chosen
     # initial bucket matches ``cli/run.py``'s starting-bucket pick
     # (previously this path used the legacy ``int(max(counts))`` fallback).
@@ -1028,6 +1113,12 @@ def _resolve_one(root: RootSpec, cohort_index: int = 0) -> ResolvedConfig:
         for m, policy in zip(root.moves, adaptation_policies)
     )
 
+    if shard_n_gpu > 1:
+        from jaxrens.sampling.batch_descriptor import ShardedSingleRun
+        chosen_batcher: BatchDescriptor = ShardedSingleRun(n_gpu=shard_n_gpu)
+    else:
+        chosen_batcher = SingleRun()
+
     return ResolvedConfig(
         ns=ns,
         moves=moves,
@@ -1039,119 +1130,19 @@ def _resolve_one(root: RootSpec, cohort_index: int = 0) -> ResolvedConfig:
         adaptation_policies=adaptation_policies,
         init=resolved_init,
         cell=root.cell,
-        cohort_index=cohort_index,
-        ensemble_params=ensemble_params,
+        ensemble_params_per_run=(ensemble_params,),
         initial_walk_config=root.init.initial_walk,
         adaptation_cfg=root.adaptation,
+        inter_re_config=(
+            root.inter_re.to_inter_re_config() if root.inter_re is not None else None
+        ),
+        batcher=chosen_batcher,
     )
 
 
-def expand_cohort(root: RootSpec) -> list[ResolvedConfig]:
-    """Expand a ``RootSpec`` into one ``ResolvedConfig`` per cohort element.
-
-    Cohort axes are defined by the ensemble spec (e.g. a list of pressures in
-    ``NPTEnsembleSpec``).  Scalar specs produce a single-element cohort.
-
-    Alignment rule: all list-valued axes must have the same length, or be
-    scalars (broadcast to the common length).  Mismatched lengths raise
-    ``ValueError`` with a clear message.
-
-    Seed handling: ``run.seed`` is a scalar; each cohort element receives
-    ``seed + cohort_index`` so runs are distinct but deterministically
-    reproducible from the base seed.
-
-    Args:
-        root: Fully validated ``RootSpec``.
-
-    Returns:
-        List of ``ResolvedConfig`` objects, one per cohort element.  The list
-        is always non-empty; single-element cohorts are the common case.
-    """
-    n = _cohort_size(root)
-
-    if root.init.restart_file is not None and n > 1:
-        raise ValueError(
-            "restart_file is only supported for single NS runs; cohort size is "
-            f"{n}. Remove ensemble.pressure list / run.seed list, or "
-            "remove restart_file."
-        )
-
-    if n == 1:
-        return [_resolve_one(root, cohort_index=0)]
-
-    results = []
-    for i in range(n):
-        results.append(_resolve_one(root, cohort_index=i))
-    return results
-
-
-def resolve(root: RootSpec) -> ResolvedConfig:
-    """Translate a validated ``RootSpec`` into library dataclasses.
-
-    This is a thin wrapper around ``expand_cohort`` for single-element cohorts.
-    For multi-element cohorts (pressure sweeps etc.) use ``expand_cohort``
-    directly.
-
-    Args:
-        root: Fully validated pydantic config.
-
-    Returns:
-        ``ResolvedConfig`` for cohort index 0.
-
-    Raises:
-        AssertionError: If the config implies a multi-element cohort.  Callers
-            that intentionally run sweeps should use ``expand_cohort`` instead.
-    """
-    cohort = expand_cohort(root)
-    assert len(cohort) == 1, (
-        f"resolve() called on a multi-element cohort (size {len(cohort)}). "
-        "Use expand_cohort() instead."
-    )
-    return cohort[0]
-
-
 # ---------------------------------------------------------------------------
-# Multi-run resolution (multi-GPU pressure-RENS, XRENS, semi_grand)
+# Multi-replica resolution helpers (PmapVmapRuns(G, P))
 # ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class ResolvedMultiRunConfig:
-    """Resolved library dataclasses for a multi-run (multi-GPU) NS dispatch.
-
-    Produced by :func:`_resolve_multi_run` when the YAML implies more than one
-    replica (e.g. ``ensemble.pressure`` is a list or an inter-RE flavor has a
-    replica-axis list).  Consumed by ``run_multi_gpu_from_config`` in
-    ``cli/run.py``.
-
-    Shape convention: ``n_total = n_gpu * n_per_gpu`` replicas, with arrays
-    flat along the replica axis (``(n_total, n_walkers, ...)``).  The target
-    dispatcher reshapes to ``(n_gpu, n_per_gpu, n_walkers, ...)``.
-    """
-
-    ns: NSConfig
-    moves: tuple[MoveConfig, ...]
-    move_descriptors: tuple[MoveKernel, ...]
-    backend: BackendConfig
-    # Unwrapped base backend; EnsembleBackend wrapping happens once inside
-    # run_multi_gpu_from_config with a default pressure overridden per-call
-    # via ensemble_params_per_run.
-    base_backend: EnergyBackend
-    output: OutputConfig
-    termination: tuple[TerminationCriterion, ...]
-    adaptation_policies: tuple[ResolvedAdaptationPolicy, ...]
-    init: ResolvedInit
-    cell: CellSpec
-    # Per-replica ensemble_params, flat list of length n_total.  Ordering is
-    # ``flat_idx = g * n_per_gpu + p`` — matches ``init_ns_multi_gpu``.
-    ensemble_params_per_run: tuple[dict, ...]
-    initial_walk_config: Any = None
-    adaptation_cfg: Any = None
-    inter_re_config: Any = None  # InterREConfig | None
-    # Batcher describing the (n_gpu, n_per_gpu) topology.  Carries the same
-    # information as ``ns.n_gpu``/``ns.n_per_gpu`` but in the canonical form
-    # consumed by ``_run_loop``, ``AdaptationManager``, ``InterREManager``,
-    # and (post-§C) ``initial_walk``.
-    batcher: BatchDescriptor | None = None
 
 
 def _local_device_count() -> int:
@@ -1268,42 +1259,55 @@ def _derive_replica_axes(
     return n_total, n_gpu, n_per_gpu, params_per_run
 
 
-def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
-    """Resolve ``root`` into a ``ResolvedMultiRunConfig``.
+def _resolve_multi_replica(
+    root: RootSpec,
+    *,
+    n_total: int,
+    n_gpu: int,
+    n_per_gpu: int,
+    params_per_run: list[dict],
+) -> ResolvedConfig:
+    """Resolve ``root`` into a multi-replica (PmapVmapRuns) ``ResolvedConfig``.
 
     Builds per-replica initial positions / cells / energies by calling
     ``_resolve_init`` once per replica with its own seed and EnsembleBackend
     (so initial energies already include the replica's P·V term).  Stacks the
-    per-replica arrays along axis 0 to produce ``(n_total, K, ...)`` pytrees.
+    per-replica arrays along axis 0 to produce ``(n_total, K, ...)`` pytrees,
+    then runs a single consolidated PmapVmapRuns finalize so that resolver,
+    burn-in, and NS step all dispatch through the same ``PmapVmapRuns(G, P)``
+    batcher.
 
-    This intentionally mirrors the single-run :func:`_resolve_one` — the two
-    paths diverge only in the init loop.
+    Topology (``n_total``, ``n_gpu``, ``n_per_gpu``, ``params_per_run``) is
+    pre-computed by :func:`resolve` via :func:`_derive_replica_axes` and
+    passed through, so this helper does not re-derive it.
     """
-    # Scale iteration-counted fields once up-front; ditto _resolve_one.
-    root = _apply_interval_units(root)
-    n_total, n_gpu, n_per_gpu, params_per_run = _derive_replica_axes(root)
-    if n_total < 2:
-        raise ValueError(
-            "_resolve_multi_run called without a multi-replica axis — "
-            "use expand_cohort() for single-run configs instead."
-        )
     logger.info(
         "[resolve] multi-run topology: n_total=%d replicas across n_gpu=%d "
         "device(s), n_per_gpu=%d", n_total, n_gpu, n_per_gpu,
     )
 
     # Single batcher instance shared by the consolidated initial-energy
-    # finalize below and the ResolvedMultiRunConfig dataclass we
-    # construct at the end of this function — so resolver, burn-in,
-    # and NS step all dispatch through the *same* PmapVmapRuns(G, P)
-    # instance.  Burn-in / NS step pick it up from
-    # ``ResolvedMultiRunConfig.batcher`` (see ``run_multi_gpu_from_config``).
+    # finalize below and the ResolvedConfig dataclass we construct at the
+    # end of this function — so resolver, burn-in, and NS step all
+    # dispatch through the *same* PmapVmapRuns(G, P) instance.  Burn-in
+    # and NS step pick it up from ``ResolvedConfig.batcher`` (see
+    # ``run_multi_gpu_from_config``).
     batcher = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
 
     # Base (unwrapped) backend — the multi-GPU dispatch wraps it once.
     logger.info("[resolve] building base backend (%s)", root.backend.__class__.__name__)
     base_backend = root.backend.build_backend()
     backend_cfg = root.backend.to_backend_config()
+
+    # Soft-core repulsion wrapper applied closest to the bare backend so
+    # the per-replica EnsembleBackend (PV term) sits outside it.  Mutates
+    # ``base_backend`` so the per-replica EnsembleBackend wrap below and
+    # the runtime in ``run_multi_gpu_from_config`` both inherit it.
+    if backend_cfg.softcore_repulsion is not None:
+        from jaxrens.backends.softcore import SoftCoreBackend
+        base_backend = SoftCoreBackend(
+            base_backend, **backend_cfg.softcore_repulsion,
+        )
 
     # Build a per-replica EnsembleBackend for the *rejection-mode*
     # ceiling check inside ``_sample_per_walker_positions`` (grid mode
@@ -1312,28 +1316,91 @@ def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
     # through ``ensemble_params`` rather than separate backend objects.
     from jaxrens.backends.ensemble import EnsembleBackend
 
+    # --- Multi-replica restart: load once, slice per replica --------------
+    # When ``init.restart_file`` is set, every replica's positions / cells /
+    # types come from the checkpoint instead of from the fresh species path.
+    # We load the checkpoint exactly once and verify its shape matches the
+    # YAML's (n_gpu, n_per_gpu) topology before slicing into per-replica
+    # ResolvedInits.  This bypasses ``_resolve_init`` entirely on the restart
+    # branch — that helper only knows the scalar single-run case.
+    batched_restart: BatchedRestart | None = None
+    if root.init.restart_file is not None:
+        try:
+            batched_restart = load_restart_batched(Path(root.init.restart_file))
+        except ValueError as exc:
+            # ``load_restart_batched`` raises when the checkpoint is a scalar
+            # single-run snapshot.  Re-raise with a multi-replica-specific
+            # message that names both ``restart_file`` and the expected
+            # ``n_total`` so the user can see which side of the mismatch to
+            # fix without parsing the lower-level loader's diagnostics.
+            if "single-run checkpoint" in str(exc):
+                raise ValueError(
+                    f"restart_file at {root.init.restart_file!r} is a scalar "
+                    f"single-run checkpoint, but the current YAML implies "
+                    f"n_total={n_total} replicas (n_gpu={n_gpu}, "
+                    f"n_per_gpu={n_per_gpu}). Multi-replica resume requires a "
+                    f"batched checkpoint with matching n_total."
+                ) from exc
+            raise
+        if batched_restart.n_total != n_total:
+            raise ValueError(
+                f"restart_file checkpoint has n_total={batched_restart.n_total} "
+                f"replicas (n_gpu={batched_restart.n_gpu}, "
+                f"n_per_gpu={batched_restart.n_per_gpu}) but the current "
+                f"YAML implies n_total={n_total} "
+                f"(n_gpu={n_gpu}, n_per_gpu={n_per_gpu}). "
+                f"Match the replica-list length (ensemble.pressure / "
+                f"inter_re.*) to the checkpoint, or restart into a different "
+                f"output dir."
+            )
+        # Cross-topology check (G mismatch) when both sides have >1 GPU is
+        # raised inside ``load_restart_batched`` already.  The other case —
+        # saved n_gpu=1 (VmapRuns) but current n_gpu>1 — we accept: the data
+        # is the same n_total replicas, just re-tiled across devices.
+        if batched_restart.n_gpu != n_gpu and batched_restart.n_gpu != 1:
+            raise ValueError(
+                f"restart_file checkpoint topology (n_gpu="
+                f"{batched_restart.n_gpu}) does not match the current host "
+                f"(n_gpu={n_gpu}). Cross-topology restart is only supported "
+                f"when the saved checkpoint has n_gpu=1."
+            )
+
     per_run_init: list[ResolvedInit] = []
     for r in range(n_total):
         p = params_per_run[r].get("pressure", None)
-        per_run_backend = (
-            EnsembleBackend(base_backend, pressure=float(p))
-            if p is not None
-            else base_backend
-        )
-        # Seed policy mirrors _resolve_one's `seed + cohort_index`.
+        # Seed policy: distinct per-replica seed = root.run.seed + r.
         seed_r = root.run.seed + r
         logger.info(
             "[resolve] replica %d/%d: seed=%d%s",
             r + 1, n_total, seed_r,
             f", pressure={p:.4g}" if p is not None else "",
         )
-        init_r = _resolve_init(
-            root.init,
-            n_live=root.run.n_live,
-            seed=seed_r,
-            energy_backend=per_run_backend,
-            cell_cfg=root.cell,
-        )
+        if batched_restart is not None:
+            # Mode D (multi-replica): slice the pre-loaded checkpoint.
+            # Energies / neighbor counts left as None — the consolidated
+            # finalize below recomputes them from the loaded positions.
+            init_r = ResolvedInit(
+                initial_positions=batched_restart.positions[r],
+                initial_types=batched_restart.types[r],
+                initial_cells=batched_restart.cells[r],
+                initial_energies=None,
+                initial_max_neighbor_counts=None,
+                symbol_map=batched_restart.symbol_map,
+                restart_state=None,  # 2-D list attached at the stacked level
+            )
+        else:
+            per_run_backend = (
+                EnsembleBackend(base_backend, pressure=float(p))
+                if p is not None
+                else base_backend
+            )
+            init_r = _resolve_init(
+                root.init,
+                n_live=root.run.n_live,
+                seed=seed_r,
+                energy_backend=per_run_backend,
+                cell_cfg=root.cell,
+            )
         per_run_init.append(init_r)
 
     # Validate structural shapes (energies/counts are None at this
@@ -1419,6 +1486,22 @@ def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
 
     # symbol_map, restart_state from ref (must be identical across replicas).
     symbol_map = per_run_init[0].symbol_map
+    # For the multi-replica restart branch, the 2-D bundle list was loaded
+    # once at the top of this function; attach it here so the dispatcher in
+    # ``run_multi_gpu_from_config`` can forward it as ``restart_states=`` to
+    # ``run_ns_multi_gpu``.  Reshape from saved n_gpu=1 to (n_gpu_current,
+    # n_per_gpu_current) when the host re-tiles the replicas across more
+    # devices than the checkpoint was saved on (saved n_gpu=1 → current n_gpu>1).
+    restart_state_2d: list[list[RestartBundle]] | None = None
+    if batched_restart is not None:
+        if batched_restart.n_gpu == n_gpu:
+            restart_state_2d = batched_restart.bundles_2d
+        else:
+            # saved n_gpu=1 retile case: flatten then re-nest as (n_gpu, n_per_gpu).
+            flat = batched_restart.bundles_flat
+            restart_state_2d = [
+                flat[g * n_per_gpu:(g + 1) * n_per_gpu] for g in range(n_gpu)
+            ]
     stacked_init = ResolvedInit(
         initial_positions=initial_positions,
         initial_types=initial_types,
@@ -1426,7 +1509,7 @@ def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
         initial_energies=initial_energies,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
         symbol_map=symbol_map,
-        restart_state=None,  # multi-run restart is a follow-up; see plan.
+        restart_state=restart_state_2d,
     )
 
     # ns_config with derived topology fields.
@@ -1455,8 +1538,18 @@ def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
         out_file_prefix=root.output.out_file_prefix,
         working_dir=Path(root.output.working_dir),
         log_level=root.output.log_level,
+        flush_interval=int(root.output.flush_interval),
         save_acc_rates=root.output.save_acc_rates,
         acc_rates_interval=int(root.output.acc_rates_interval),
+        save_max_neighbors=root.output.save_max_neighbors,
+        max_neighbors_interval=int(root.output.max_neighbors_interval),
+        save_re_stats=root.output.save_re_stats,
+        temperature_lag=root.output.temperature_lag,
+        temperature_interval=int(root.output.temperature_interval),
+        temperature_kB=float(root.output.temperature_kB),
+        collision_check_threshold=root.output.collision_check_threshold,
+        collision_check_interval=int(root.output.collision_check_interval),
+        wrap_atoms=bool(root.output.wrap_atoms),
     )
     _warn_unused_output_fields(root.output)
 
@@ -1495,7 +1588,7 @@ def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
         for m, policy in zip(root.moves, adaptation_policies)
     )
 
-    return ResolvedMultiRunConfig(
+    return ResolvedConfig(
         ns=ns,
         moves=moves,
         move_descriptors=move_descriptors,
@@ -1516,29 +1609,66 @@ def _resolve_multi_run(root: RootSpec) -> ResolvedMultiRunConfig:
     )
 
 
-def expand_multi_run_or_cohort(
-    root: RootSpec,
-) -> list[ResolvedConfig] | ResolvedMultiRunConfig:
-    """Dispatch between multi-run and single-run (cohort) resolution.
+def resolve(root: RootSpec) -> ResolvedConfig:
+    """Translate a validated ``RootSpec`` into one unified :class:`ResolvedConfig`.
 
-    Returns a :class:`ResolvedMultiRunConfig` when the YAML implies more than
-    one replica via a replica-axis list (pressure list, composition_targets,
-    chemical_potentials).  Otherwise returns a list of :class:`ResolvedConfig`
-    from :func:`expand_cohort` — same output shape as before (single-element
-    list for scalar configs, multi-element for cohort sweeps).
+    Topology resolution decides the batcher:
+
+    * ``n_total == 1`` (scalar pressure, no inter-RE replica-axis list) →
+      :class:`SingleRun()`.  Init arrays carry shape ``(K, ...)``.
+    * ``n_total >= 2`` → :class:`PmapVmapRuns(n_gpu, n_per_gpu)` with
+      ``n_gpu = max(1, len(jax.local_devices()))`` clamped to ``n_total``.
+      Init arrays carry shape ``(n_total, K, ...)``; the dispatcher
+      reshapes to ``(n_gpu, n_per_gpu, K, ...)`` at consume time.
+
+    Future case "single NS sharded across multiple GPUs" will be a third
+    branch keyed on a new batcher type — orthogonal to this dispatcher.
+
+    Args:
+        root: Fully validated pydantic config.
+
+    Returns:
+        Single :class:`ResolvedConfig` carrying the resolved batcher.
+
+    Raises:
+        ValueError: Replica-axis list lengths disagree, ``n_total`` is not
+            divisible by the detected device count, or a ``pressure``-flavor
+            inter-RE has a scalar ``ensemble.pressure``.
     """
-    # Cheap pre-check to avoid building per-run init when we don't need it.
-    has_multi_axis = False
-    if isinstance(root.ensemble, NPTEnsembleSpec):
-        if len(root.ensemble._pressure_list()) > 1:
-            has_multi_axis = True
-    if root.inter_re is not None:
-        if (root.inter_re.composition_targets and len(root.inter_re.composition_targets) > 1) or (
-            root.inter_re.chemical_potentials and len(root.inter_re.chemical_potentials) > 1
-        ):
-            has_multi_axis = True
-        # Pressure-RENS with scalar pressure gets caught by _derive_replica_axes.
+    # Scale iteration-counted fields once up-front so every downstream read
+    # sees absolute-iter values (see ``_apply_interval_units``).
+    root = _apply_interval_units(root)
 
-    if has_multi_axis:
-        return _resolve_multi_run(root)
-    return expand_cohort(root)
+    n_total, n_gpu, n_per_gpu, params_per_run = _derive_replica_axes(root)
+
+    if n_total == 1:
+        # SingleRun (or sharded-single) path.  ``params_per_run`` is
+        # empty here per the contract of ``_derive_replica_axes``;
+        # reconstruct the scalar dict from the ensemble spec directly
+        # so ``ensemble_params_per_run`` always has length 1 in the
+        # resolved config.
+        ensemble_params = root.ensemble.to_ensemble_params(cohort_index=0)
+        return _resolve_single_replica(
+            root,
+            ensemble_params=ensemble_params,
+            shard_n_gpu=root.run.shard_n_gpu,
+        )
+
+    if root.run.shard_n_gpu > 1:
+        raise ValueError(
+            f"run.shard_n_gpu ({root.run.shard_n_gpu}) is incompatible "
+            f"with the multi-replica topology implied by this config "
+            f"(n_total = {n_total} > 1).  Sharded single-run holds one "
+            f"population spread across GPUs; multi-replica runs hold "
+            f"n_total *independent* populations.  Pick one — remove the "
+            f"replica-axis list (ensemble.pressure / inter_re.*) or set "
+            f"shard_n_gpu = 1."
+        )
+
+    return _resolve_multi_replica(
+        root,
+        n_total=n_total,
+        n_gpu=n_gpu,
+        n_per_gpu=n_per_gpu,
+        params_per_run=params_per_run,
+    )

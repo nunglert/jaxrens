@@ -44,6 +44,12 @@ class Monitor:
         energy_trace: Per-iteration culled energy from .energies file, or None.
         iteration_trace: Iteration indices matching energy_trace, or None.
         adaptation_trace: Per-move step sizes and acceptance rates, or None.
+        re_trace: Per-fire inter-replica swap counts and acceptance rates, or
+            None.
+        max_neighbors_trace: Per-iteration neighbor-bucket diagnostics
+            (per-walker max_neighbor_count + bucket size + overflow), or
+            None.  Loaded from ``<prefix>.max_neighbors.h5`` when the run
+            opted in via ``output.save_max_neighbors``.
         label: Human-readable label for plots.
         path: Source directory, or None.
     """
@@ -110,15 +116,6 @@ class Monitor:
         if state.get("live_volumes") is not None:
             live_volumes = np.asarray(state["live_volumes"], dtype=np.float64)
 
-        # Source for dead arrays: prefer HDF5 (legacy / future write paths
-        # that include them), fall back to the streamed ``.energies`` text
-        # file (the canonical record under the current architecture, where
-        # dead arrays no longer live in HDF5).
-        de_h5 = state.get("dead_energies")
-        dv_h5 = state.get("dead_volumes")
-        h5_has_dead = (
-            de_h5 is not None and np.asarray(de_h5).size > 0
-        )
         energies_path = path / f"{prefix}.energies"
         # Pre-load the energies log when present — used for both the dead-
         # array fallback and the iteration trace below.
@@ -126,15 +123,7 @@ class Monitor:
             EnergyLogger.read(energies_path) if energies_path.exists() else None
         )
 
-        if h5_has_dead:
-            # Prefer HDF5 dead arrays when present — preserves behaviour for
-            # checkpoints written by older jaxrens versions.
-            dead_energies = np.asarray(de_h5[:n_dead], dtype=np.float64)
-            dead_volumes = (
-                np.asarray(dv_h5[:n_dead], dtype=np.float64)
-                if dv_h5 is not None else None
-            )
-        elif energies_log is not None:
+        if energies_log is not None:
             # New canonical path: read dead_energies (and dead_volumes when
             # NPT) from the per-iteration ``.energies`` log written by
             # ``EnergyLogger``.  The volume column is zero for NVT runs;
@@ -177,6 +166,20 @@ class Monitor:
             from jaxrens.io.adaptation_log import AdaptationLogger
             adaptation_trace = AdaptationLogger.read(adaptation_path)
 
+        # Optional inter-RE swap trace.
+        re_trace = None
+        re_path = path / f"{prefix}.re_stats.h5"
+        if re_path.exists():
+            from jaxrens.io.re_stats_log import RELogger
+            re_trace = RELogger.read(re_path)
+
+        # Optional max-neighbors diagnostic trace.
+        max_neighbors_trace = None
+        mn_path = path / f"{prefix}.max_neighbors.h5"
+        if mn_path.exists():
+            from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
+            max_neighbors_trace = MaxNeighborsLogger.read(mn_path)
+
         return cls(
             dead_energies=dead_energies,
             dead_volumes=dead_volumes,
@@ -190,6 +193,8 @@ class Monitor:
             energy_trace=energy_trace,
             iteration_trace=iteration_trace,
             adaptation_trace=adaptation_trace,
+            re_trace=re_trace,
+            max_neighbors_trace=max_neighbors_trace,
             label=label,
             path=path,
         )
@@ -209,6 +214,8 @@ class Monitor:
         energy_trace: np.ndarray | None = None,
         iteration_trace: np.ndarray | None = None,
         adaptation_trace=None,
+        re_trace=None,
+        max_neighbors_trace=None,
         label: str = "",
         path: Path | None = None,
     ) -> None:
@@ -241,6 +248,10 @@ class Monitor:
         )
         # adaptation_trace is an AdaptationLog dataclass or None
         self.adaptation_trace = adaptation_trace
+        # re_trace is an RELog dataclass or None
+        self.re_trace = re_trace
+        # max_neighbors_trace is a MaxNeighborsLog dataclass or None
+        self.max_neighbors_trace = max_neighbors_trace
         self.label = label
         self.path = Path(path) if path is not None else None
 
@@ -267,45 +278,39 @@ class Monitor:
         T = np.asarray(T, dtype=np.float64)
         return 1.0 / (k_B * T)
 
-    def _jax_arrays(self):
-        """Convert numpy arrays to jnp arrays once, cache for reuse."""
-        import jax.numpy as jnp
-        if not hasattr(self, "_cached_jax"):
-            self._cached_jax = {
-                "dead_e": jnp.asarray(self.dead_energies),
-                "live_e": jnp.asarray(self.live_energies),
+    def _arrays(self):
+        """Cache the energies / volumes as float64 numpy arrays."""
+        if not hasattr(self, "_cached_np"):
+            self._cached_np = {
+                "dead_e": np.asarray(self.dead_energies, dtype=np.float64),
+                "live_e": np.asarray(self.live_energies, dtype=np.float64),
                 "dead_v": (
-                    jnp.asarray(self.dead_volumes)
+                    np.asarray(self.dead_volumes, dtype=np.float64)
                     if self.dead_volumes is not None else None
                 ),
                 "live_v": (
-                    jnp.asarray(self.live_volumes)
+                    np.asarray(self.live_volumes, dtype=np.float64)
                     if self.live_volumes is not None else None
                 ),
             }
-        return self._cached_jax
+        return self._cached_np
 
-    def _vmap_over_beta(self, scalar_fn, betas, **fn_kwargs):
-        """Apply scalar_fn(beta, ...) over an array of betas via vmap+jit.
+    def _map_over_beta(self, scalar_fn, betas, **fn_kwargs):
+        """Apply ``scalar_fn(beta, ...)`` over a 1-D ``betas`` array.
 
-        Returns a numpy array with one entry per beta.
+        Plain Python loop — the thermodynamics kernels are NumPy / fp64 so
+        the JIT-vmap indirection that previously lived here is gone.  ``betas``
+        is typically O(100) entries; the per-call cost is dominated by the
+        O(n_dead) reductions, not by the loop overhead.
         """
-        import jax
-        import jax.numpy as jnp
-
-        jitted = jax.jit(scalar_fn)
-        vmapped = jax.vmap(
-            lambda b: jitted(b, **fn_kwargs),
-            in_axes=0,
-        )
-        return np.asarray(vmapped(jnp.asarray(betas)))
+        return np.array([scalar_fn(b, **fn_kwargs) for b in betas])
 
     def log_Z(self, T: np.ndarray | float) -> np.ndarray:
         """Compute log partition function at each temperature."""
         T = np.asarray(T, dtype=np.float64)
         scalar = T.ndim == 0
         betas = 1.0 / np.atleast_1d(T)
-        arrs = self._jax_arrays()
+        arrs = self._arrays()
 
         def scalar_fn(beta):
             return _partition_function(
@@ -314,7 +319,7 @@ class Monitor:
                 dead_volumes=arrs["dead_v"], live_volumes=arrs["live_v"],
             )
 
-        results = self._vmap_over_beta(scalar_fn, betas)
+        results = self._map_over_beta(scalar_fn, betas)
         return results[0] if scalar else results
 
     def heat_capacity(
@@ -324,7 +329,7 @@ class Monitor:
         T = np.asarray(T, dtype=np.float64)
         scalar = T.ndim == 0
         betas = self._beta(np.atleast_1d(T), k_B)
-        arrs = self._jax_arrays()
+        arrs = self._arrays()
 
         def scalar_fn(beta):
             return _heat_capacity(
@@ -332,7 +337,7 @@ class Monitor:
                 n_live=self.n_live, n_cull=self.n_cull,
             )
 
-        results = self._vmap_over_beta(scalar_fn, betas)
+        results = self._map_over_beta(scalar_fn, betas)
         return results[0] if scalar else results
 
     def expectation(
@@ -351,8 +356,6 @@ class Monitor:
                 ``8.617e-5`` (eV/K) when ``T`` is in Kelvin and the energies
                 are in eV.
         """
-        import jax.numpy as jnp
-
         observable = np.asarray(observable, dtype=np.float64)
         if observable.shape != (self.n_dead,):
             raise ValueError(
@@ -363,10 +366,13 @@ class Monitor:
         T = np.asarray(T, dtype=np.float64)
         scalar = T.ndim == 0
         betas = self._beta(np.atleast_1d(T), k_B)
-        arrs = self._jax_arrays()
+        arrs = self._arrays()
 
-        live_obs = jnp.full(self.live_energies.shape[0], float(np.mean(observable)))
-        obs_full = jnp.concatenate([jnp.asarray(observable), live_obs])
+        live_obs = np.full(
+            self.live_energies.shape[0], float(np.mean(observable)),
+            dtype=np.float64,
+        )
+        obs_full = np.concatenate([observable, live_obs])
 
         def scalar_fn(beta):
             return _expectation(
@@ -374,7 +380,7 @@ class Monitor:
                 n_live=self.n_live, n_cull=self.n_cull,
             )
 
-        results = self._vmap_over_beta(scalar_fn, betas)
+        results = self._map_over_beta(scalar_fn, betas)
         return results[0] if scalar else results
 
     def free_energy(
@@ -384,7 +390,7 @@ class Monitor:
         T = np.asarray(T, dtype=np.float64)
         scalar = T.ndim == 0
         betas = self._beta(np.atleast_1d(T), k_B)
-        arrs = self._jax_arrays()
+        arrs = self._arrays()
 
         def scalar_fn(beta):
             logZ = _partition_function(
@@ -394,7 +400,7 @@ class Monitor:
             )
             return _free_energy(beta, logZ)
 
-        results = self._vmap_over_beta(scalar_fn, betas)
+        results = self._map_over_beta(scalar_fn, betas)
         return results[0] if scalar else results
 
     def partition_function(
@@ -404,7 +410,7 @@ class Monitor:
         T = np.asarray(T, dtype=np.float64)
         scalar = T.ndim == 0
         betas = self._beta(np.atleast_1d(T), k_B)
-        arrs = self._jax_arrays()
+        arrs = self._arrays()
 
         def scalar_fn(beta):
             return _partition_function(
@@ -413,7 +419,7 @@ class Monitor:
                 dead_volumes=arrs["dead_v"], live_volumes=arrs["live_v"],
             )
 
-        results = self._vmap_over_beta(scalar_fn, betas)
+        results = self._map_over_beta(scalar_fn, betas)
         return results[0] if scalar else results
 
     def __repr__(self) -> str:

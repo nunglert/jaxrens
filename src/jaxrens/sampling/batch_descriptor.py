@@ -241,6 +241,25 @@ class BatchDescriptor(ABC):
         arr = jnp.asarray(rng_key)
         return arr if arr.ndim == 0 else arr.reshape(-1)[0]
 
+    def distinct_keys(self, rng_key: jax.Array) -> jax.Array:
+        """Split a scalar key into ``shape_prefix``-shaped INDEPENDENT keys.
+
+        Distinct from :meth:`split_keys`: that one returns COHERENT
+        (same-key-broadcast for ShardedSingleRun) sub-keys for adapt
+        bisection.  This one returns INDEPENDENT keys — each replica /
+        shard gets a different RNG stream.  Used by burn-in's walking
+        step where each replica's walkers evolve independently.
+
+        Default: ``jax.random.split(rng_key, n_runs).reshape(shape_prefix)``
+        for batched batchers; identity for SingleRun.  ShardedSingleRun
+        overrides to place the result on the ``'shard'``-named mesh.
+        """
+        if not self.is_batched:
+            return rng_key
+        return jax.random.split(rng_key, self.n_runs).reshape(
+            self.shape_prefix,
+        )
+
     def wrap_for_batch(self, per_element_fn):
         """Wrap a per-replica callable with jit/vmap/pmap as appropriate.
 
@@ -566,6 +585,236 @@ class PmapVmapRuns(BatchDescriptor):
             Worst-case scalars across all runs on all GPUs.
         """
         return float(jnp.min(log_evidence)), float(jnp.max(hmax))
+
+
+@dataclass(frozen=True)
+class ShardedSingleRun(BatchDescriptor):
+    """Descriptor for a single NS run sharded across ``n_gpu`` GPUs.
+
+    Logically one NS run; physically the ``K``-walker population is
+    split into ``n_gpu`` chunks of ``K // n_gpu`` walkers, one per
+    device.  ``ns_step_sharded`` uses ``lax.all_gather`` /
+    ``lax.argmax`` / ``lax.psum`` collectives across the
+    ``"shard"`` axis to act on the global population coherently
+    while letting each device hold only its share.  Use case:
+    memory scaling for heavy backends (MACE, NeuralIL, Nequix) on
+    large populations that overflow a single GPU.
+
+    Distinct from :class:`PmapVmapRuns` — that class runs ``G * P``
+    *independent* NS replicas.  ``ShardedSingleRun`` runs one
+    population spread across G devices.
+
+    Shape conventions:
+
+    * Population leaves: ``(G, K // G, ...)``.
+    * ``shape_prefix = (n_gpu,)`` — matches the physical layout.
+      The ``n_runs == prod(shape_prefix)`` invariant that the other
+      batchers happen to satisfy does NOT hold here: ``n_runs = 1``
+      logically, but the leading ``G`` axis is the sharding axis,
+      not a replica axis.  Consumers iterating ``shape_prefix`` (the
+      cumulative counters in ``_run_loop``, the per-move
+      ``stack_axis`` in ``build_adapt_step``) end up with a length-G
+      axis where each row is identical post-``lax.psum``.  Correct;
+      G× redundant memory on small counters.  Acceptable cost.
+
+    Reductions (``reduce_emax``, ``reduce_for_termination``) collapse
+    the (G,) axis to a scalar — every shard sees the same global
+    value after the in-step collectives.
+
+    Inputs to :meth:`wrap_for_batch`-wrapped callables are scalar
+    (ss / emax / key); the wrapper broadcasts to (G,) before
+    ``pmap`` and takes ``[0]`` of the result on the way out.  This
+    keeps the per-replica callable signature identical to
+    SingleRun so :func:`build_adapt_step` doesn't need a different
+    closure shape — only the underlying ``adjust_step_size_sharded``
+    call needs to know it's running under pmap.
+
+    Attributes
+    ----------
+    n_gpu : int
+        Number of GPU devices (G) the population is sharded across.
+    n_runs : int
+        Always 1 — one logical NS run.
+    shape_prefix : tuple[int, ...]
+        ``(n_gpu,)`` — physical sharding axis.
+    """
+
+    n_gpu: int
+    n_runs: int = 1
+    shape_prefix: tuple[int, ...] = ()  # set by __post_init__
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "shape_prefix", (self.n_gpu,))
+
+    @property
+    def is_batched(self) -> bool:
+        """Always ``True`` — the population is distributed across G devices."""
+        return True
+
+    def wrap_step(
+        self,
+        ns_step_fn,
+        step_fn,
+        n_mcmc_steps: int,
+        n_extra: int,
+    ):
+        """Return a ``pmap``-compiled NS step callable.
+
+        ``ns_step_fn`` here should be ``ns_step_sharded`` (not the
+        plain ``ns_step``) — it uses ``lax.all_gather`` / ``lax.psum``
+        collectives that only work inside a ``pmap`` context with
+        matching ``axis_name="shard"``.
+
+        The returned callable has signature::
+
+            pmap_step(ns_state)  ->  (ns_state, info)
+
+        with leading shape ``(G, ...)`` on every leaf.
+        """
+        def per_shard(ns_state):
+            return ns_step_fn(ns_state, step_fn, n_mcmc_steps, n_extra)
+
+        return jax.pmap(per_shard, axis_name="shard")
+
+    def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
+        """Split a (G,)-broadcast key into ``(G, n_sub_keys)`` sub-keys.
+
+        ``rng_key`` may be either:
+
+        * A scalar key — auto-broadcast to ``(G,)`` (every shard then
+          gets the same sub-keys post-split).
+        * A ``(G,)`` array of identical broadcast keys — same outcome,
+          just skips the broadcast step.
+
+        The load-bearing invariant for ``ns_step_sharded`` and
+        ``adjust_step_size_sharded`` is that every shard makes the
+        *same* RNG decisions, so the broadcast-then-split pattern is
+        equivalent to "every shard splits the same key" — used by
+        the ``adapt_step`` closure (which sees a ``(G,)``-shaped
+        key from its ``rng_key`` parameter).
+
+        Returns shape ``(G, n_sub_keys)`` with typed-key dtype.
+        """
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+        # Collapse (G,) → scalar so jax.random.split (which only accepts
+        # a single key) works.  All G entries are identical by
+        # construction (broadcast upstream); take [0] is exact.
+        scalar_key = rng_key[0] if rng_key.ndim > 0 else rng_key
+        sub = jax.random.split(scalar_key, n_sub_keys)  # (n_sub_keys,)
+        broadcast = jnp.broadcast_to(sub[None, ...], (self.n_gpu,) + sub.shape)
+        # Place on the same shard mesh as ``reduce_emax`` /
+        # ``extract_step_sizes`` so the per-move pmap accepts every
+        # input uniformly without per-call ``jax.device_put``.
+        shard_mesh = NamedSharding(
+            Mesh(jax.local_devices()[:self.n_gpu], ("shard",)),
+            PartitionSpec("shard"),
+        )
+        return jax.device_put(broadcast, shard_mesh)
+
+    def reduce_for_termination(
+        self,
+        log_evidence: jax.typing.ArrayLike,
+        hmax: jax.typing.ArrayLike,
+    ) -> tuple[float, float]:
+        """Take ``[0]`` from the (G,) axis — every shard has the same value.
+
+        ``ns_step_sharded`` writes identical ``log_evidence`` /
+        ``hmax`` on every shard (post-psum), so ``[0]`` is exact.
+        """
+        log_z_arr = jnp.asarray(log_evidence)
+        hmax_arr = jnp.asarray(hmax)
+        log_z = log_z_arr[0] if log_z_arr.ndim > 0 else log_z_arr
+        h = hmax_arr[0] if hmax_arr.ndim > 0 else hmax_arr
+        return float(log_z), float(h)
+
+    # ------------------------------------------------------------------
+    # Override base helpers where the (G,) prefix needs special treatment
+    # ------------------------------------------------------------------
+
+    def reduce_emax(
+        self, energy: Float[Array, "G K"]
+    ) -> Float[Array, "G"]:
+        """Global ``max`` over the entire (G, K_per_gpu) population, broadcast to (G,).
+
+        Returns shape ``(G,)`` (every entry identical) on the
+        ``'shard'``-named mesh — same convention as
+        :meth:`VmapRuns.reduce_emax` returning ``(R,)`` and
+        :meth:`PmapVmapRuns.reduce_emax` returning ``(G, P)``.
+        Following the shape_prefix convention everywhere lets
+        consumers (the ``adapt_step`` closure, `_run_loop`'s
+        adaptation block) handle every batcher uniformly without
+        per-batcher emax broadcast/reshape.
+
+        The G entries are physically identical (one logical Emax for
+        one logical population); the redundancy is G floats per
+        adapt call — trivial vs. the per-shard isinstance branches it
+        eliminates.
+        """
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+        scalar = jnp.max(energy)
+        broadcast = jnp.broadcast_to(scalar[None], (self.n_gpu,))
+        shard_mesh = NamedSharding(
+            Mesh(jax.local_devices()[:self.n_gpu], ("shard",)),
+            PartitionSpec("shard"),
+        )
+        return jax.device_put(broadcast, shard_mesh)
+
+    def flatten(
+        self, arr: Shaped[np.ndarray | Array, "G ..."]
+    ) -> Shaped[np.ndarray | Array, "1 ..."]:
+        """Take ``[0:1]`` from the G axis — one logical run.
+
+        All shards hold identical per-run data after ``lax.psum`` in
+        ``ns_step_sharded`` / ``adjust_step_size_sharded``, so
+        slicing one shard is exact.  Returns a length-1 leading
+        axis to match the ``flatten`` contract (``(n_runs, ...)``).
+        """
+        arr_np = np.asarray(arr) if isinstance(arr, np.ndarray) else arr
+        return arr_np[:1]
+
+    def unflatten(
+        self, arr_flat: Shaped[np.ndarray | Array, "1 ..."]
+    ) -> Shaped[np.ndarray | Array, "G ..."]:
+        """Re-broadcast a length-1 leading axis to (G, ...)."""
+        return jnp.broadcast_to(arr_flat[0:1], (self.n_gpu,) + arr_flat.shape[1:])
+
+    def wrap_for_batch(self, per_element_fn):
+        """Wrap a per-replica callable in ``pmap`` over the shard axis.
+
+        Signature contract: every input has a leading ``(G,)`` axis on
+        the ``'shard'``-named mesh; outputs preserve that axis.  This
+        matches :meth:`VmapRuns.wrap_for_batch` and
+        :meth:`PmapVmapRuns.wrap_for_batch`'s contracts (each "row"
+        of the leading axis is fed to ``per_element_fn``).
+
+        For ShardedSingleRun the per-shard "row" of every coherent
+        input (ss / emax / key) is identical by construction — that's
+        the load-bearing invariant for ``adjust_step_size_sharded``'s
+        coherent bisection.  Producers (``reduce_emax``,
+        ``split_keys``, ``extract_step_sizes``) all return shape
+        ``(G, ...)`` on the shard mesh, so callers don't need to
+        massage shapes themselves.
+        """
+        return jax.pmap(per_element_fn, axis_name="shard")
+
+    def distinct_keys(self, rng_key: jax.Array) -> jax.Array:
+        """Split a scalar key into G INDEPENDENT keys on the shard mesh.
+
+        Overrides the base default (``split + reshape``) to also
+        ``device_put`` the result onto the ``'shard'``-named mesh so
+        the per-shard pmap accepts it alongside the sharded NSState.
+
+        Returns shape ``(G,)`` typed-key array sharded along axis 0.
+        """
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec
+        keys = jax.random.split(rng_key, self.n_gpu)
+        shard_mesh = NamedSharding(
+            Mesh(jax.local_devices()[:self.n_gpu], ("shard",)),
+            PartitionSpec("shard"),
+        )
+        return jax.device_put(keys, shard_mesh)
 
 
 # ---------------------------------------------------------------------------

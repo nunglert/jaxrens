@@ -28,9 +28,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_FLUSH_INTERVAL = 256  # buffer entries before flushing; per-iter writes
-# are cheap-but-not-free, so we batch.  Closing flushes the remainder.
-
 
 @dataclass
 class AccRatesLog:
@@ -68,15 +65,21 @@ class AccRatesLog:
 class AccRatesLogger:
     """Append-only HDF5 writer for per-iteration chain acc counts.
 
-    Buffers writes in memory and flushes every ``_FLUSH_INTERVAL``
-    entries (and on ``close()``).  The file is only created on the
-    first flush, so runs without the callback never produce an empty
+    Buffers writes in memory and flushes once the NS iteration index has
+    advanced by ``flush_interval`` since the last flush (and on
+    ``close()``).  The threshold is in absolute NS iterations; per-walker
+    YAML units are handled upstream by ``_apply_interval_units`` exactly
+    like every other ``*_interval`` field.  The file is only created on
+    the first flush, so runs without the callback never produce an empty
     artefact.
 
     Args:
-        path:        Destination file path (.acc_rates.h5).
-        move_names:  Ordered list of move names.
-        n_runs:      Number of parallel NS runs (use 1 for single-run).
+        path:           Destination file path (.acc_rates.h5).
+        move_names:     Ordered list of move names.
+        n_runs:         Number of parallel NS runs (use 1 for single-run).
+        flush_interval: Flush after the NS iteration index has advanced by
+                        this many absolute iterations since the previous
+                        flush.  Default 1000.
     """
 
     def __init__(
@@ -84,15 +87,27 @@ class AccRatesLogger:
         path: Path | str,
         move_names: list[str],
         n_runs: int,
+        flush_interval: int = 1000,
+        mode: str = "w",
+        restart_iteration: int = 0,
     ) -> None:
         self.path = Path(path)
         self.move_names = list(move_names)
         self.n_runs = int(n_runs)
         self.n_moves = len(move_names)
+        self.flush_interval = max(1, int(flush_interval))
+        self._mode = mode
+        # First flush honors ``mode``; subsequent flushes always append.
+        self._first_flush = True
+        # Restart: rewind entries flushed past the checkpoint before appending.
+        if mode == "a" and restart_iteration > 0:
+            from jaxrens.io.restart_truncate import truncate_h5_iterations
+            truncate_h5_iterations(self.path, restart_iteration)
 
         self._buf_iters: list[int] = []
         self._buf_n_acc: list[np.ndarray] = []
         self._buf_n_prop: list[np.ndarray] = []
+        self._last_flush_iter: int | None = None
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -105,7 +120,8 @@ class AccRatesLogger:
         n_accepted: np.ndarray,
         n_proposed: np.ndarray,
     ) -> None:
-        """Buffer one entry.  Auto-flushes every ``_FLUSH_INTERVAL`` entries.
+        """Buffer one entry.  Auto-flushes once the iteration index has
+        advanced by ``flush_interval`` absolute iters since the last flush.
 
         Args:
             iteration:   NS iteration index (Python int).
@@ -118,12 +134,16 @@ class AccRatesLogger:
         n_acc = self._coerce(n_accepted)
         n_prop = self._coerce(n_proposed)
 
-        self._buf_iters.append(int(iteration))
+        iter_int = int(iteration)
+        self._buf_iters.append(iter_int)
         self._buf_n_acc.append(n_acc)
         self._buf_n_prop.append(n_prop)
 
-        if len(self._buf_iters) >= _FLUSH_INTERVAL:
+        if self._last_flush_iter is None:
+            self._last_flush_iter = iter_int
+        elif iter_int - self._last_flush_iter >= self.flush_interval:
             self._flush()
+            self._last_flush_iter = iter_int
 
     def close(self) -> None:
         """Flush remaining buffer and close the logger.
@@ -192,7 +212,8 @@ class AccRatesLogger:
         n_new = len(iters_new)
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        mode = "a" if self.path.exists() else "w"
+        mode = self._mode if self._first_flush else "a"
+        self._first_flush = False
         with h5py.File(self.path, mode) as f:
             if "iterations" not in f:
                 f.create_dataset(

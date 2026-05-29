@@ -7,8 +7,12 @@ from jaxrens.postprocess.plotting import (
     plot_energy_trace,
     plot_free_energy,
     plot_heat_capacity,
+    plot_heatmap,
     plot_log_evidence_trace,
+    plot_max_neighbors,
     plot_partition_function,
+    plot_re_acceptance,
+    plot_re_acceptance_stacked,
     plot_step_sizes,
 )
 from jaxrens.postprocess.thermodynamics import (
@@ -30,8 +34,12 @@ __all__ = [
     "plot_energy_trace",
     "plot_free_energy",
     "plot_heat_capacity",
+    "plot_heatmap",
     "plot_log_evidence_trace",
+    "plot_max_neighbors",
     "plot_partition_function",
+    "plot_re_acceptance",
+    "plot_re_acceptance_stacked",
     "plot_step_sizes",
     # Thermodynamics
     "calc_log_weights",

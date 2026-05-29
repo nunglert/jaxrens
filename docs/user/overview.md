@@ -17,6 +17,8 @@ relevant mathematics, diagrams, and pointers into the code:
   `EnsembleBackend` adds NPT/μVT corrections per call.
 - {doc}`concepts/replicas` — how `n_total`, `n_gpu`, `n_per_gpu`
   are derived and how inter-replica exchange (RENS) swaps work.
+- {doc}`concepts/restart` — fresh-vs-restart lifecycle, output-dir gate,
+  `--resume` auto-discovery, and the strict compatibility validator.
 
 ```{toctree}
 :hidden:
@@ -28,6 +30,7 @@ concepts/pytree_state
 concepts/moves_mwg
 concepts/backends
 concepts/replicas
+concepts/restart
 ```
 
 The summaries below are the 30-second version of each; follow the

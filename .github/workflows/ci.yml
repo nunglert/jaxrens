@@ -86,6 +86,11 @@ jobs:
 
   multi_gpu:
     name: Multi-GPU integration (4× T4)
+    # Runs on PR to main and push to main (parallel to ``full``), plus
+    # on-demand via the Actions UI (workflow_dispatch).  Requires
+    # g4dn.12xlarge quota; if that quota lapses again, narrow the ``if:``
+    # back to ``github.event_name == 'workflow_dispatch'`` to make the job
+    # dormant for automatic events.
     if: |
       github.event_name == 'pull_request'
       || github.event_name == 'workflow_dispatch'

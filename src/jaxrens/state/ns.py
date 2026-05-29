@@ -7,8 +7,9 @@ as a JAX pytree for compatibility with JIT/vmap.
 Dead points are *not* on NSState — the algorithm never reads them, only
 emits them via ``ns_step``'s ``info`` dict at cull time, so they don't
 belong on the state.  Per-iteration callbacks (``EnergyLogger``,
-``TrajectoryCallback``) consume ``info["dead_*"]`` and persist the values
-straight to disk — there is no in-memory dead-point buffer.
+``TrajectoryCallback``) consume ``info["dead_walker"]`` (a ``WalkerState``
+pytree) and persist the values straight to disk — there is no in-memory
+dead-point buffer.
 
 NSState is ensemble-agnostic — it doesn't know about pressure, chemical
 potentials, or ensemble type. The full ensemble potential is stored in
@@ -67,6 +68,20 @@ class NSState:
         log_evidence: Running log-evidence estimate, shape ``(*B,)``.
         iteration: Current iteration count, shape ``(*B,)``.  Used inside
             JIT for the prior-mass weight in log_evidence accumulation.
+        emax: Per-replica NS contour, shape ``(*B,)`` — the constraint
+            level the most recently completed ``ns_step`` culled at.
+            Algorithm state, NOT a derived quantity: it is set by
+            ``ns_step`` (and ``ns_step_sharded``) at cull time and read
+            verbatim by ``adapt_step`` and replica-exchange, neither of
+            which re-derive it from ``population.energy``.  This
+            separation matters because ``population.energy`` is just
+            *empirical samples* from the likelihood-restricted prior
+            parameterised by ``emax``; collapsing the two via
+            ``max(pop.energy)`` conflates the distribution's defining
+            parameter with a sample statistic and lets post-MCMC noise
+            (or future pop-mutators) silently shift the contour.  Init
+            value is ``+inf`` (no contour enforced yet — the first
+            ``ns_step`` defines ``L_0``).
         rng_key: JAX PRNG key array, shape ``(*B,)``.
         n_walkers: Number of live walkers (compile-time constant).
         n_atoms: Number of atoms (compile-time constant).
@@ -78,6 +93,7 @@ class NSState:
     # NS bookkeeping
     log_evidence: Float[Array, "*B"]
     iteration: Int[Array, "*B"]
+    emax: Float[Array, "*B"]
     rng_key: Key[Array, "*B"]
 
     # Compile-time constants

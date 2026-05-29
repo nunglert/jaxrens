@@ -54,6 +54,27 @@ try:
 except ImportError as exc:
     _NEURALIL_IMPORT_ERROR = str(exc)
 
+try:
+    from neuralil.softcore.model import (
+        SoftCoreNeuralIL,
+        SoftCorePlainEnsemble,
+    )
+
+    _SOFTCORE_AVAILABLE = True
+except ImportError:
+    SoftCoreNeuralIL = None  # type: ignore[assignment]
+    SoftCorePlainEnsemble = None  # type: ignore[assignment]
+    _SOFTCORE_AVAILABLE = False
+
+
+DEFAULT_SOFTCORE_KWARGS: dict[str, float] = {
+    "a0": 1.0,
+    "b0": 3.0,
+    "d0": 1.0,
+    "r_core_cut": 1.25,
+    "r_core_switch": 0.75,
+}
+
 
 def _require_neuralil() -> None:
     if not _NEURALIL_AVAILABLE:
@@ -106,27 +127,58 @@ def _build_dynamics_model(
     has_morse: bool,
     is_ensemble: bool,
     n_ensemble: int,
+    morse_type: str = "RepulsiveMorse",
+    softcore: bool = False,
+    softcore_kwargs: dict[str, float] | None = None,
 ):
     """Build the (max_neighbors-independent) NeuralIL dynamics model.
 
     Returns a single ``NeuralIL[withMorse]`` when ``is_ensemble`` is
     False, otherwise the corresponding ``PlainEnsemble[withMorse]``
-    wrapper.
+    wrapper. ``morse_type`` selects the Morse flavour (``"RepulsiveMorse"``
+    or ``"Morse"``); ignored when ``has_morse`` is False.
+
+    When ``softcore=True`` the dynamics model is a ``SoftCoreNeuralIL``
+    (or ``SoftCorePlainEnsemble`` wrapper) that augments the plain
+    ``NeuralIL`` with a fixed repulsive Morse term parameterised by
+    ``softcore_kwargs`` (``a0``, ``b0``, ``d0``, ``r_core_cut``,
+    ``r_core_switch``). Mutually exclusive with the trainable ``has_morse``
+    branch.
     """
+    if softcore and has_morse:
+        raise ValueError(
+            "softcore and has_morse are mutually exclusive: the soft-core "
+            "model adds its own fixed repulsive Morse term, so the trainable "
+            "Morse branch must be disabled."
+        )
+    if softcore and not _SOFTCORE_AVAILABLE:
+        raise ImportError(
+            "softcore=True requires neuralil.softcore.model, which was not "
+            "importable. Update your neuralil install to a version that "
+            "ships the softcore subpackage."
+        )
+
     descriptor_gen = PowerSpectrumGenerator(
         n_max, r_cutoff, n_types, supercell_trafo,
     )
     core_model = ResNetCore(core_widths)
 
-    if has_morse:
-        # neuralil >= some-version replaced ``morse_type`` with a flax
-        # ``mixer`` submodule.  Constructing with defaults reproduces
-        # the layout the pickle was trained against (since the pickle
-        # encodes whatever module tree the installed neuralil exposes).
+    if softcore:
+        sc_kwargs = dict(DEFAULT_SOFTCORE_KWARGS)
+        if softcore_kwargs is not None:
+            sc_kwargs.update(softcore_kwargs)
+        individual = SoftCoreNeuralIL(
+            n_types, embed_d, r_cutoff,
+            descriptor_gen, descriptor_gen.process_some_data,
+            core_model,
+            **sc_kwargs,
+        )
+    elif has_morse:
         individual = NeuralILwithMorse(
             n_types, embed_d, r_cutoff,
             descriptor_gen, descriptor_gen.process_some_data,
             core_model,
+            morse_type=morse_type,
         )
     else:
         individual = NeuralIL(
@@ -138,6 +190,8 @@ def _build_dynamics_model(
     if not is_ensemble:
         return individual
 
+    if softcore:
+        return SoftCorePlainEnsemble(individual, n_ensemble)
     if has_morse:
         return PlainEnsemblewithMorse(individual, n_ensemble)
     return PlainEnsemble(individual, n_ensemble)
@@ -169,6 +223,9 @@ class NeuralILBackend:
         has_morse: bool,
         n_ensemble: int = 1,
         energy_shift_per_atom: float = 0.0,
+        morse_type: str = "RepulsiveMorse",
+        softcore: bool = False,
+        softcore_kwargs: dict[str, float] | None = None,
     ):
         self.r_cutoff = r_cutoff
         self.model_params = model_params
@@ -180,6 +237,11 @@ class NeuralILBackend:
         self.is_ensemble = is_ensemble
         self.n_ensemble = n_ensemble if is_ensemble else 1
         self.has_morse = has_morse
+        self.morse_type = morse_type
+        self.softcore = softcore
+        self.softcore_kwargs = (
+            None if softcore_kwargs is None else dict(softcore_kwargs)
+        )
         self.energy_shift_per_atom = float(energy_shift_per_atom)
         self._dynamics_model = _build_dynamics_model(
             n_types=len(sorted_elements),
@@ -191,6 +253,9 @@ class NeuralILBackend:
             has_morse=has_morse,
             is_ensemble=is_ensemble,
             n_ensemble=self.n_ensemble,
+            morse_type=morse_type,
+            softcore=softcore,
+            softcore_kwargs=self.softcore_kwargs,
         )
 
     @property
@@ -282,6 +347,8 @@ class NeuralILBackend:
 def create_neuralil(
     pickle_file: str | None = None,
     supercell_trafo: Sequence[int] = (1, 1, 1),
+    softcore: bool | None = None,
+    softcore_kwargs: dict[str, float] | None = None,
     **kwargs: Any,
 ) -> NeuralILBackend:
     """Create a NeuralIL energy backend.
@@ -290,10 +357,27 @@ def create_neuralil(
     or a ``PlainEnsemble[withMorse]`` from the saved params layout, and
     builds the matching dynamics model.
 
+    The soft-core augmentation (a fixed repulsive Morse term that
+    smoothly switches off between ``r_core_switch`` and ``r_core_cut``)
+    is *not* auto-detectable from the saved params since it carries no
+    trainable parameters. It is opt-in via the pickle's
+    ``constructor_kwargs['softcore']`` or via an explicit
+    ``softcore=True`` override here; ``softcore_kwargs`` overrides the
+    pickle-stored kwargs (merged on top of the package defaults).
+
     Args:
         pickle_file: Path to NeuralIL model pickle (``NeuralILModelInfo``).
             Either single-model or ensemble checkpoints are accepted.
         supercell_trafo: Supercell diagonal transformation (s_a, s_b, s_c).
+        softcore: If True, wrap the model with a fixed repulsive Morse
+            soft-core term. ``None`` (default) means "use whatever the
+            pickle says"; explicit ``True``/``False`` overrides the pickle.
+            Mutually exclusive with a trainable Morse model.
+        softcore_kwargs: Optional override of the soft-core hyperparameters
+            (``a0``, ``b0``, ``d0``, ``r_core_cut``, ``r_core_switch``).
+            Merged on top of the package defaults
+            (``DEFAULT_SOFTCORE_KWARGS``) and on top of any kwargs read
+            from the pickle.
 
     Returns:
         NeuralILBackend instance.
@@ -319,11 +403,41 @@ def create_neuralil(
             specific_info.get("energy_shift_per_atom", 0.0)
         )
 
+    # The Morse flavour (full ``MorseModel`` vs purely-repulsive
+    # ``RepulsiveMorseModel``) is *not* recoverable from the flax params
+    # — both classes share the same parameter tree.  Training writes it
+    # into ``constructor_kwargs``; we read it back here and pass it to
+    # ``NeuralILwithMorse(...)``.  Older pickles have
+    # ``constructor_kwargs={}``: fall back to the new default and warn.
+    ckwargs = getattr(model_info, "constructor_kwargs", None) or {}
+    if has_morse and "morse_type" not in ckwargs:
+        logger.warning(
+            "NeuralIL pickle has no 'morse_type' in constructor_kwargs; "
+            "defaulting to 'RepulsiveMorse'. If this model was trained "
+            "with the full MorseModel, pass morse_type='Morse' or "
+            "edit the pickle's constructor_kwargs."
+        )
+    morse_type = ckwargs.get("morse_type", "RepulsiveMorse")
+
+    # Soft-core: pickle is the source of truth unless the caller overrides.
+    pickle_softcore = bool(ckwargs.get("softcore", False))
+    use_softcore = pickle_softcore if softcore is None else bool(softcore)
+    merged_softcore_kwargs: dict[str, float] = {}
+    pickle_softcore_kwargs = ckwargs.get("softcore_kwargs")
+    if isinstance(pickle_softcore_kwargs, dict):
+        merged_softcore_kwargs.update(pickle_softcore_kwargs)
+    if softcore_kwargs is not None:
+        merged_softcore_kwargs.update(softcore_kwargs)
+    final_softcore_kwargs = merged_softcore_kwargs or None
+
     logger.info(
         "NeuralIL backend created: r_cut=%.2f, elements=%s, supercell=%s, "
-        "ensemble=%s, n_ensemble=%d, morse=%s, energy_shift_per_atom=%g",
+        "ensemble=%s, n_ensemble=%d, morse=%s, morse_type=%s, "
+        "softcore=%s, softcore_kwargs=%s, energy_shift_per_atom=%g",
         model_info.r_cut, model_info.sorted_elements, supercell_trafo,
-        is_ensemble, n_ensemble, has_morse, energy_shift_per_atom,
+        is_ensemble, n_ensemble, has_morse, morse_type,
+        use_softcore, final_softcore_kwargs,
+        energy_shift_per_atom,
     )
 
     return NeuralILBackend(
@@ -337,5 +451,8 @@ def create_neuralil(
         is_ensemble=is_ensemble,
         n_ensemble=n_ensemble,
         has_morse=has_morse,
+        morse_type=morse_type,
+        softcore=use_softcore,
+        softcore_kwargs=final_softcore_kwargs,
         energy_shift_per_atom=energy_shift_per_atom,
     )

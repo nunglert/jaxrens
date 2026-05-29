@@ -23,3 +23,6 @@ experiments/*
 !experiments/examples/**/*.h5
 !experiments/examples/**/*.extxyz
 .vscode
+WORKLOG.md
+.claude
+CLAUDE.md

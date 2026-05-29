@@ -142,7 +142,7 @@ def _build_problem(flavor: str):
 
     if flavor == "pressure":
         inter_re_cfg = InterREConfig(
-            flavor="pressure", every=1, n_swap_cycles=1,
+            flavor="pressure", re_interval=1, n_swap_cycles=1,
         )
         ensemble_params_per_run = [
             {"pressure": 0.0},
@@ -152,7 +152,7 @@ def _build_problem(flavor: str):
         ]
     elif flavor == "semi_grand":
         inter_re_cfg = InterREConfig(
-            flavor="semi_grand", every=1, n_swap_cycles=1,
+            flavor="semi_grand", re_interval=1, n_swap_cycles=1,
             chemical_potentials=(
                 (0.0, 0.0),
                 (0.5, 0.0),
@@ -163,7 +163,7 @@ def _build_problem(flavor: str):
         ensemble_params_per_run = None  # injected by run_ns_multi_gpu
     elif flavor == "xrens":
         inter_re_cfg = InterREConfig(
-            flavor="xrens", every=1, n_swap_cycles=1,
+            flavor="xrens", re_interval=1, n_swap_cycles=1,
             composition_targets=_COMP_TARGETS,
         )
         ensemble_params_per_run = None  # injected by run_ns_multi_gpu

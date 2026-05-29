@@ -31,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float, Key
 
-from jaxrens.sampling.adaptation.manager import AdaptationManager
+from jaxrens.sampling.adaptation.manager import build_adapt_step  # noqa: F401
 from jaxrens.sampling.batch_descriptor import BatchDescriptor
 from jaxrens.sampling.inter_re_manager import InterREManager
 from jaxrens.sampling.move_kernel import MoveKernel
@@ -120,7 +120,7 @@ def _pack_adjustment_info(
     ``_bump_cumulative_counters`` consumes when ``include_trial=True``.
 
     All array values are passed through with shape ``(*shape_prefix,
-    n_moves, ...)`` exactly as ``AdaptationManager.apply`` returned
+    n_moves, ...)`` exactly as ``adapt_step`` returned
     them — no list-of-scalars round-trip — so this works uniformly for
     SingleRun (``(n_moves,)`` / ``(n_moves, 4)``), VmapRuns
     (``(n_runs, n_moves, ...)``), and PmapVmapRuns (``(G, P,
@@ -132,7 +132,7 @@ def _pack_adjustment_info(
         info: Info dict to update.
         current_step_sizes: Per-move step sizes after the adjust call,
             shape ``(*shape_prefix, n_moves)``.
-        adjust_info: Dict returned by ``AdaptationManager.apply`` —
+        adjust_info: Dict returned by ``adapt_step`` —
             keys ``rate``, ``counts``, ``n_rounds``, ``converged``,
             ``cap_hits``, ``floor_hits``, ``bracket_detected``,
             ``trial_n_evaluations``, ``trial_n_grad_evaluations``.
@@ -155,6 +155,85 @@ def _pack_adjustment_info(
     info["move_reject_reasons"] = tuple(
         frozenset(d.reject_reasons) for d in move_descriptors
     )
+
+
+_PRESERVE_INFO_KEYS = frozenset({"move_names"})
+_DROP_INFO_KEYS_AFTER_SCALARIZE = frozenset({"_batcher"})
+
+
+def _gather_sharded_ns_state(ns_state: NSState) -> NSState:
+    """Return an NSState with population leaves gathered to ``(K, ...)``.
+
+    For ShardedSingleRun, ``ns_state.population`` carries leaves shaped
+    ``(G, K // G, ...)`` distributed across G devices.  Callbacks that
+    were written for SingleRun expect ``(K, ...)``-shaped leaves.  This
+    helper gathers + reshapes; non-population scalar leaves carry a
+    redundant (G,) axis (post-`lax.psum`) — collapse via ``[0]``.
+    """
+    pop = ns_state.population
+
+    def _gather_leaf(leaf):
+        arr = jnp.asarray(leaf)
+        if arr.ndim == 0:
+            return arr
+        # Population leaves: (G, K_per_gpu, ...) → (K, ...).
+        # Per-shard scalars stored on pop (e.g. step_size, n_atoms): (G,) →
+        # take [0] (every shard identical).
+        if arr.ndim >= 2:
+            return arr.reshape((arr.shape[0] * arr.shape[1],) + arr.shape[2:])
+        return arr[0]
+
+    new_pop = jax.tree.map(_gather_leaf, pop)
+
+    # Top-level NSState scalar leaves (log_evidence, iteration, rng_key)
+    # also carry a (G,) redundant axis — collapse via [0].
+    def _collapse(leaf):
+        arr = jnp.asarray(leaf)
+        return arr[0] if arr.ndim > 0 else arr
+
+    new_ns_state = ns_state.set(
+        population=new_pop,
+        log_evidence=_collapse(ns_state.log_evidence),
+        iteration=_collapse(ns_state.iteration),
+        emax=_collapse(ns_state.emax),
+        rng_key=_collapse(ns_state.rng_key),
+    )
+    return new_ns_state
+
+
+def _scalarize_sharded_info(info: dict[str, Any]) -> dict[str, Any]:
+    """Collapse the redundant leading-G axis from every leaf in ``info``.
+
+    ShardedSingleRun's ``ns_step_sharded`` and ``adjust_step_size_sharded``
+    write per-shard scalars / per-shard arrays where every shard's entry
+    is identical (post-`lax.psum` invariant).  Take ``[0]`` along that
+    axis so SingleRun-shaped callbacks (ProgressCallback,
+    TrajectoryCallback, etc.) see scalar / unsharded shapes without
+    needing to know about the underlying batcher.
+
+    Preserves a small allowlist of keys that are intentionally
+    already-collapsed (``move_names`` is a Python list,
+    ``_batcher`` is the descriptor itself).
+    """
+    out: dict[str, Any] = {}
+    for k, v in info.items():
+        if k in _DROP_INFO_KEYS_AFTER_SCALARIZE:
+            # Hide the sharded batcher reference: the scalarized dict
+            # now looks like SingleRun, so callbacks that branch on
+            # ``info["_batcher"]`` (e.g. AdaptationCallback's
+            # ``batcher.flatten``) should fall back to their
+            # SingleRun-shaped ndim heuristics.
+            continue
+        if k in _PRESERVE_INFO_KEYS or v is None:
+            out[k] = v
+            continue
+        try:
+            arr = jnp.asarray(v)
+        except (TypeError, ValueError):
+            out[k] = v
+            continue
+        out[k] = arr[0] if arr.ndim > 0 else arr
+    return out
 
 
 def _dispatch_callbacks(
@@ -181,39 +260,21 @@ def _dispatch_callbacks(
 # ---------------------------------------------------------------------------
 
 
-def _pick_next_bucket(
-    true_max: int,
-    current: int,
-    ladder: tuple[int, ...],
-    offset: int,
-) -> int:
-    """Return the smallest ladder entry that accommodates the observed need.
-
-    The target size is ``true_max + offset`` — adding headroom prevents the
-    very next MCMC step from tripping the same overflow after a trivial cell
-    fluctuation.  Restricting the choice to ``ladder`` bounds the number of
-    distinct JIT recompilations to ``len(ladder)`` over a whole run.
-
-    Raises ``RuntimeError`` when the ladder is exhausted or cannot make
-    progress; both conditions are user-actionable (extend the list).
-    """
-    target = int(true_max) + int(offset)
-    for b in ladder:
-        if b >= target and b > current:
-            return b
-    raise RuntimeError(
-        f"Overflow retry cannot make progress: observed max neighbor count "
-        f"{int(true_max)} (+ offset {offset}) requires bucket >= {target}, "
-        f"but no entry in max_neighbors_list={list(ladder)} satisfies both "
-        f"> current bucket {int(current)} and >= {target}. "
-        f"Extend backend.max_neighbors_list to cover this regime."
-    )
+# Backward-compatible re-exports.  The pickers (and the BucketManager) now
+# live in ``sampling.bucket_manager``; importing them from this module is
+# preserved so older tests and downstream code keep working.
+from jaxrens.sampling.bucket_manager import (  # noqa: E402
+    BucketManager,
+    _pick_next_bucket,
+    _pick_prev_bucket,
+)
 
 
 def _run_loop(
     *,
     batcher: BatchDescriptor,
-    adapt_mgr: AdaptationManager,
+    adapt_step: Callable | None,
+    adjust_interval: int,
     ns_state: NSState,
     step_fn: Callable,
     n_mcmc_steps: int,
@@ -227,6 +288,8 @@ def _run_loop(
     inter_re_mgr: InterREManager | None = None,
     max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
+    max_neighbors_shrink_dwell: int = 0,
+    ns_step_fn: Callable | None = None,
 ) -> tuple[NSState, Key[Array, "*B"], dict[str, np.ndarray]]:
     """Unified NS outer loop shared by ``run_ns`` and ``run_ns_parallel``.
 
@@ -236,16 +299,19 @@ def _run_loop(
 
     Per-iteration culled walker data lives only in the ``info`` dict —
     callbacks that need it (``EnergyLogger``, ``TrajectoryCallback``) read
-    ``info["dead_energy"]`` / ``info["dead_position"]`` / ``info["dead_volume"]``
-    directly and persist to disk on the spot.  No host-side history buffer
-    is accumulated; the canonical record of dead points lives on disk via
-    those callbacks.
+    ``info["dead_walker"]`` (a ``WalkerState`` pytree with positions /
+    types / energy / cell) and persist to disk on the spot.  No host-side
+    history buffer is accumulated; the canonical record of dead points
+    lives on disk via those callbacks.
 
     Args:
         batcher: ``BatchDescriptor`` instance controlling JIT-compilation,
             key splitting, and termination reduction.
-        adapt_mgr: ``AdaptationManager`` instance. May be inactive
-            (``is_active=False``) when no step-size adaptation is configured.
+        adapt_step: Closure built by :func:`build_adapt_step`, or ``None``
+            when no step-size adaptation is configured.  Called as
+            ``(ns_state, emax, key) -> (new_ns_state, diag, new_key)``.
+        adjust_interval: Iterations between adapt fires.  ``<= 0`` (or
+            ``adapt_step is None``) disables adaptation.
         ns_state: Initial ``NSState`` (single or batched).
         step_fn: MCMC step function from ``build_mwg()``.
         n_mcmc_steps: Number of MCMC steps per walker (static under JIT).
@@ -268,6 +334,13 @@ def _run_loop(
             provided and ``inter_re_mgr.is_active`` is True, a swap pass
             fires after each ``ns_step`` call on iterations where
             ``inter_re_mgr.fires(i)`` is True.  ``None`` → zero overhead.
+        max_neighbors_shrink_dwell: Number of consecutive iterations the
+            observed peak must sit at or below ``next_smaller_entry -
+            offset`` before the bucket is downsized one step.  ``0``
+            (default) disables shrinking entirely so existing runs are
+            byte-identical.  JAX's compilation cache reuses earlier compiles
+            when the bucket revisits a known size, so the only cost paid by
+            a wrong downsize is the next overflow re-grow.
 
     Returns:
         ``(ns_state, rng_key, cumulative)`` where:
@@ -281,8 +354,12 @@ def _run_loop(
     """
     from jaxrens.sampling.nested_sampling import ns_step  # avoid circular at module level
 
-    # JIT-compile ns_step once before the loop.
-    jit_ns_step = batcher.wrap_step(ns_step, step_fn, n_mcmc_steps, n_extra)
+    # JIT-compile ns_step once before the loop.  Callers may override
+    # the underlying step function (e.g. ``ns_step_sharded`` for the
+    # ShardedSingleRun mode) via ``ns_step_fn``; default preserves the
+    # SingleRun / VmapRuns / PmapVmapRuns behaviour.
+    step_to_wrap = ns_step_fn if ns_step_fn is not None else ns_step
+    jit_ns_step = batcher.wrap_step(step_to_wrap, step_fn, n_mcmc_steps, n_extra)
 
     # Per-replica step sizes: pop.step_sizes is (*shape_prefix, K, n_moves).
     # The descriptor drops the walker axis to give (*shape_prefix, n_moves).
@@ -326,24 +403,43 @@ def _run_loop(
         if hasattr(cb, "on_start"):
             cb.on_start(ns_state, start_info)
 
+    # Bucket-ladder hysteresis manager — owns _pick_next/_prev_bucket calls
+    # and the ``low_count`` shrink counter.  Shared with burn-in's
+    # ``initial_walk`` so both sites use the same growth + shrink logic.
+    bucket_mgr = BucketManager(
+        ladder=max_neighbors_list,
+        offset=max_neighbors_offset,
+        shrink_dwell=max_neighbors_shrink_dwell,
+    )
+
+    # ``i`` is the segment-local loop counter (0-based each invocation) and
+    # drives termination + adapt phase — keeping it segment-local preserves
+    # "run N more iterations per restart" semantics.  ``record_iteration``
+    # is the *global* iteration used for every on-disk artifact (dead-point
+    # labels, output cadence): on a fresh run ``restart_iteration == 0`` so
+    # it equals ``i``; on restart it continues monotonically from the
+    # checkpoint's iteration, so the ``.energies`` / ``.traj`` / HDF5 streams
+    # stay continuous and truncate-on-restart has a well-defined cut point.
+    restart_iteration = int(jnp.asarray(ns_state.iteration).reshape(-1)[0])
+
     i = 0
     while True:
+        record_iteration = i + restart_iteration
         # ---- Adaptation ----
         adjust_info = None
-        if adapt_mgr.fires(i):
-            pop = ns_state.population
-            emax = batcher.reduce_emax(pop.energy)
-            # adapt_mgr.apply does its own key splitting internally;
-            # pass rng_key directly and get back the advanced carry.
-            current_step_sizes, per_move_outputs, rng_key = adapt_mgr.apply(
-                pop, emax, rng_key, current_step_sizes,
+        if adapt_step is not None and i % adjust_interval == 0:
+            # ``ns_state.emax`` holds the contour the previous ``ns_step``
+            # just culled at (algorithm state, not a re-derived
+            # ``max(pop.energy)``).  Adapt trial walkers experience the
+            # same constraint the population was sampled under — minor
+            # off-by-one vs. the upcoming step's L_{i+1}, but principled.
+            ns_state, per_move_outputs, rng_key = adapt_step(
+                ns_state, ns_state.emax, rng_key,
             )
-            # Re-broadcast updated step sizes across the walker axis.
-            n_walkers = pop.step_sizes.shape[batcher.walker_axis]
-            new_ss_pop = batcher.broadcast_step_sizes(
-                current_step_sizes, n_walkers,
+            # Re-extract for the downstream callbacks / info dict.
+            current_step_sizes = batcher.extract_step_sizes(
+                ns_state.population,
             )
-            ns_state = ns_state.set(population=pop.set(step_sizes=new_ss_pop))
             adjust_info = per_move_outputs
 
         # ---- NS step ----
@@ -356,30 +452,27 @@ def _run_loop(
 
         # ---- Overflow retry ----
         # For PmapVmapRuns, any overflow across any (G, P) shard triggers a retry.
-        if jnp.any(new_ns_state.population.overflow):
-            true_max = int(new_ns_state.population.max_neighbor_count.max())
-            current = int(ns_state.population.max_neighbors)
-            new_max = _pick_next_bucket(
-                true_max, current, max_neighbors_list, max_neighbors_offset,
-            )
-            logger.warning(
-                "Overflow at iter %d: observed max_neighbors=%d, "
-                "resizing bucket %d -> %d (ladder=%s, offset=%d)",
-                i, true_max, current, new_max,
-                list(max_neighbors_list), max_neighbors_offset,
-            )
-            ns_state = ns_state.set(
-                population=ns_state.population.set(max_neighbors=new_max),
-            )
+        ns_state, retry = bucket_mgr.grow_if_overflow(
+            ns_state, new_ns_state, label="iter", iteration=record_iteration,
+        )
+        if retry:
             continue
 
-        ns_state = new_ns_state
+        # ---- Bucket shrink (hysteresis-gated) ----
+        # No-op when shrink_dwell == 0; otherwise steps the bucket down one
+        # ladder entry once the observed peak has stayed below the next-
+        # smaller bucket (with margin) for ``shrink_dwell`` iterations.
+        ns_state = bucket_mgr.maybe_shrink(ns_state, iteration=record_iteration)
 
         # ---- Inter-RE phase ----
         # Fires after ns_step, before cumulative counter bump and callbacks.
         # Zero overhead when inter_re_mgr is None or is_active=False.
         if inter_re_mgr is not None and inter_re_mgr.is_active and inter_re_mgr.fires(i):
             inter_re_key, key_re = jax.random.split(inter_re_key)
+            # RE reads the contour off ``ns_state.emax`` (set by the
+            # ns_step that just ran).  No emax recomputation here, no
+            # plumbing — the contour lives on state precisely so every
+            # consumer reads the same algorithm-defined value.
             ns_state, re_stats, _ = inter_re_mgr.apply(ns_state, key_re)
             info["inter_re_stats"] = re_stats
             # Roll RE energy evals into the cumulative counters so that the
@@ -400,7 +493,7 @@ def _run_loop(
         # ---- Pack adjustment info (only when fires this iter) ----
         # Works uniformly for SingleRun, VmapRuns, and PmapVmapRuns:
         # adjust_info values are already shaped ``(*shape_prefix, n_moves, ...)``
-        # straight from ``AdaptationManager.apply``; the packer is shape-agnostic
+        # straight from ``adapt_step``; the packer is shape-agnostic
         # and ``AdaptationCallback.on_iteration`` will call ``batcher.flatten``
         # to land them in ``(n_runs_total, n_moves, ...)`` before HDF5.
         if adjust_info is not None:
@@ -424,7 +517,21 @@ def _run_loop(
         info["_batcher"] = batcher
 
         # ---- Callback dispatch ----
-        _dispatch_callbacks(callbacks, i, ns_state, info)
+        # ShardedSingleRun: ``info`` carries a redundant leading (G,)
+        # axis on every leaf (each shard reports the same global value
+        # post-`lax.psum`); the population leaves carry a non-redundant
+        # leading G axis (each shard owns ``K // G`` walkers).
+        # Collapse info via ``[0]`` and gather+reshape population leaves
+        # to ``(K, ...)`` so SingleRun-shaped callbacks see uniform
+        # shapes.
+        from jaxrens.sampling.batch_descriptor import ShardedSingleRun
+        if isinstance(batcher, ShardedSingleRun):
+            info = _scalarize_sharded_info(info)
+            ns_state_for_cb = _gather_sharded_ns_state(ns_state)
+        else:
+            ns_state_for_cb = ns_state
+
+        _dispatch_callbacks(callbacks, record_iteration, ns_state_for_cb, info)
 
         # ---- Termination ----
         log_z_scalar, hmax_scalar = batcher.reduce_for_termination(

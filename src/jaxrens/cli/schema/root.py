@@ -54,7 +54,7 @@ class RootSpec(BaseModel):
     #     the resolver multiplies by ``run.n_live`` before constructing runtime
     #     dataclasses.  Affected fields: ``output.{info,traj,snapshot,checkpoint}_interval``,
     #     ``run.max_iterations``, ``termination[iteration].max_iterations``,
-    #     ``inter_re.every``, ``adaptation.adjust_interval``.
+    #     ``inter_re.re_interval``, ``adaptation.adjust_interval``.
     interval_units: Literal["absolute", "per_walker"] = "absolute"
     run: RunSpec
     moves: list[MoveSpec]

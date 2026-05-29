@@ -6,11 +6,13 @@ Callbacks receive NSState objects (not dicts).
 
 from __future__ import annotations
 
+import collections
 import logging
 import time
 from pathlib import Path
 from typing import Any
 
+import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -19,6 +21,23 @@ from jaxrens.state.ns import NSState
 from jaxrens.utils.cell import get_volume
 
 logger = logging.getLogger(__name__)
+
+
+def _format_elapsed(seconds: float) -> str:
+    """Render a duration as ``Dd HHh MMm SSs``, dropping leading zero units."""
+    s = int(round(seconds))
+    days, s = divmod(s, 86400)
+    hours, s = divmod(s, 3600)
+    minutes, s = divmod(s, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or parts:
+        parts.append(f"{hours}h")
+    if minutes or parts:
+        parts.append(f"{minutes}m")
+    parts.append(f"{s}s")
+    return " ".join(parts)
 
 
 def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
@@ -54,6 +73,7 @@ def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
         "cells": pop.cell,
         "log_evidence": ns_state.log_evidence,
         "iteration": iteration,
+        "emax": ns_state.emax,
         "n_dead": n_dead,
         "n_walkers": ns_state.n_walkers,
     }
@@ -270,7 +290,7 @@ class ProgressCallback:
                 acc_per_move = n_acc / jnp.maximum(n_prop, 1)
                 rc = jnp.asarray(rr_counts_per_move) if rr_counts_per_move is not None else None
             else:
-                # Backward compat: trial-phase rates from adjust_step_size.
+                # Backward compat: trial-phase rates from the adapt step.
                 trial_acc = info.get("acceptance_rates_per_move")
                 if trial_acc is None:
                     acc_per_move = None
@@ -343,8 +363,27 @@ class ProgressCallback:
             n_acc = re_stats.get("n_swap_pairs_accepted", 0)
             acc = n_acc / max(n_att, 1)
             re_evals = re_stats.get("n_energy_evals", 0)
+
+            # Per-pair acc rates: shape (n_pairs,) = (n_runs - 1,).  Mean±std
+            # across replica-pair indices exposes spread along the ladder
+            # (e.g. low-P pairs accepting more than high-P pairs).
+            per_pair_str = ""
+            n_acc_pp = re_stats.get("n_accepted_per_pair")
+            n_att_pp = re_stats.get("n_attempted_per_pair")
+            if n_acc_pp is not None and n_att_pp is not None:
+                n_acc_arr = np.asarray(n_acc_pp, dtype=np.float64)
+                n_att_arr = np.asarray(n_att_pp, dtype=np.float64)
+                if n_acc_arr.size > 0:
+                    rates = np.where(
+                        n_att_arr > 0, n_acc_arr / np.maximum(n_att_arr, 1.0), 0.0
+                    )
+                    per_pair_str = (
+                        f"  per_pair={rates.mean():.2f}±{rates.std():.2f}"
+                    )
+
             lines.append(
-                f"  {'inter_re':<16}  n_pairs={n_att:>3d}  acc={acc:.2f}  evals={re_evals}"
+                f"  {'inter_re':<16}  n_pairs={n_att:>3d}  acc={acc:.2f}"
+                f"{per_pair_str}  evals={re_evals}"
             )
 
         logger.info("\n".join(lines))
@@ -361,20 +400,21 @@ class ProgressCallback:
         # Iterations stay in lock-step across replicas (outer Python loop
         # advances all runs by 1 per tick), so a single int suffices.
         iter_n = int(jnp.max(iteration_arr))
+        elapsed_str = _format_elapsed(elapsed)
         if log_z_arr.ndim > 0:
             logger.info(
-                "NS finished: %d iterations, log_Z=[%.4f..%.4f], elapsed=%.1fs",
+                "NS finished: %d iterations, log_Z=[%.4f..%.4f], elapsed=%s",
                 iter_n,
                 float(jnp.min(log_z_arr)),
                 float(jnp.max(log_z_arr)),
-                elapsed,
+                elapsed_str,
             )
         else:
             logger.info(
-                "NS finished: %d iterations, log_Z=%.4f, elapsed=%.1fs",
+                "NS finished: %d iterations, log_Z=%.4f, elapsed=%s",
                 iter_n,
                 float(log_z_arr),
-                elapsed,
+                elapsed_str,
             )
 
 
@@ -386,12 +426,34 @@ class AdaptationCallback:
     is present.  Iterations between adaptation adjustments are skipped (the
     info key is absent).
 
+    Also surfaces two adapter-health WARNINGs to the textual log on top of
+    the silent h5 trace:
+
+      * First-hit floor warning — fires once per move the first time any
+        replica's bisection clamps the step size to the configured floor.
+        Signals "the move can't shrink further; remaining rejections are
+        not informative for the adapter".
+      * Stall guard — fires once (then suppressed for ``_STALL_SUPPRESS_EVENTS``
+        adjust events) when a move shows mean-trial-acceptance < 0.01 AND
+        any replica at the floor AND no replica detecting a bracket, for
+        ``_STALL_HISTORY_LEN`` consecutive adjust events.
+
     Args:
         logger_obj: A ready-to-use ``AdaptationLogger`` instance.
     """
 
+    _STALL_HISTORY_LEN = 5
+    _STALL_SUPPRESS_EVENTS = 50
+
     def __init__(self, logger_obj: Any) -> None:
         self._adaptation_logger = logger_obj
+        n_moves = logger_obj.n_moves
+        self._floor_warned: set[int] = set()
+        self._stall_history: list[collections.deque] = [
+            collections.deque(maxlen=self._STALL_HISTORY_LEN)
+            for _ in range(n_moves)
+        ]
+        self._stall_cooldown: list[int] = [0] * n_moves
 
     def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
         """Write the mandatory iter-0 baseline row.
@@ -442,8 +504,17 @@ class AdaptationCallback:
             "bracket_detected": np.zeros((n_runs, n_moves), dtype=bool),
             "reject_reason_counts": np.zeros((n_runs, n_moves, 4), dtype=np.int32),
         }
+        # Label the baseline with the run's starting global iteration: 0 for
+        # a fresh run, the restored checkpoint iteration on restart.  This
+        # keeps the row monotonic with the rest of the log so truncate-on-
+        # restart (drop iter >= restart_iteration) leaves exactly one
+        # baseline at the resume boundary instead of a duplicate at 0.
+        baseline_iter = (
+            0 if ns_state is None
+            else int(jnp.asarray(ns_state.iteration).reshape(-1)[0])
+        )
         self._adaptation_logger.write_entry(
-            iteration=0,
+            iteration=baseline_iter,
             step_sizes=ss_np,
             acceptance_rates=acc_np,
             adjustment_stats=baseline_adj_stats,
@@ -477,7 +548,7 @@ class AdaptationCallback:
 
         # Collect per-adjust-call diagnostic stats when present (v2 schema).
         # All values arrive shaped ``(*shape_prefix, n_moves[, 4])`` straight
-        # from ``AdaptationManager.apply`` — for PmapVmapRuns(G, P) that's
+        # from ``adapt_step`` — for PmapVmapRuns(G, P) that's
         # ``(G, P, n_moves[, 4])``.  Coerce to the flat ``(n_runs, ...)``
         # layout the HDF5 schema expects using the same ``batcher.flatten``
         # the ss/acc path uses above.  Without this the dataset is created
@@ -544,6 +615,87 @@ class AdaptationCallback:
             n_grad_evaluations=n_grad_evals_np,
         )
 
+        self._check_adapter_health(
+            iteration=iteration,
+            ss_np=np.asarray(ss_np),
+            acc_np=np.asarray(acc_np),
+            adjustment_stats=adjustment_stats,
+        )
+
+    def _check_adapter_health(
+        self,
+        iteration: int,
+        ss_np: np.ndarray,
+        acc_np: np.ndarray,
+        adjustment_stats: "dict[str, np.ndarray] | None",
+    ) -> None:
+        """Emit WARNINGs when adapter diagnostics indicate a dying move.
+
+        Reads the same arrays the h5 logger just wrote (``(n_runs, n_moves)``
+        layout) and applies two cheap heuristics:
+
+          * first-hit floor — set membership so each move warns at most once;
+          * stall guard — fixed-length deque of bool flags per move, warning
+            when every entry is ``True`` and the cooldown counter has elapsed.
+
+        ``adjustment_stats == None`` is the non-``full_auto`` case (no
+        bisection ever ran).  Floor / bracket info is absent, so we silently
+        return — there's nothing to diagnose.
+        """
+        if adjustment_stats is None:
+            return
+        floor_hits = adjustment_stats.get("floor_hits")
+        if floor_hits is None:
+            return
+        floor_hits = np.asarray(floor_hits)  # (n_runs, n_moves) int32
+        bracket_detected = adjustment_stats.get("bracket_detected")
+        bracket_detected = (
+            np.asarray(bracket_detected)
+            if bracket_detected is not None
+            else np.zeros_like(floor_hits, dtype=bool)
+        )
+        move_names = self._adaptation_logger.move_names
+        n_runs, n_moves = floor_hits.shape
+
+        for m in range(n_moves):
+            name = move_names[m]
+            floor_runs = int((floor_hits[:, m] > 0).sum())
+            bracketed_runs = int(bracket_detected[:, m].sum())
+            mean_acc = float(acc_np[:, m].mean())
+            mean_ss = float(ss_np[:, m].mean())
+
+            if floor_runs > 0 and m not in self._floor_warned:
+                logger.warning(
+                    "[adapt] iter=%d move=%s hit step-size floor on %d/%d "
+                    "replicas (ss=%.2e, mean trial acc=%.3f). Further "
+                    "shrinking is a no-op; if acc stays ~0 the move is "
+                    "functionally dead.",
+                    iteration, name, floor_runs, n_runs, mean_ss, mean_acc,
+                )
+                self._floor_warned.add(m)
+
+            is_pathological = (
+                mean_acc < 0.01
+                and floor_runs > 0
+                and bracketed_runs == 0
+            )
+            self._stall_history[m].append(is_pathological)
+            if self._stall_cooldown[m] > 0:
+                self._stall_cooldown[m] -= 1
+                continue
+            hist = self._stall_history[m]
+            if len(hist) == hist.maxlen and all(hist):
+                logger.warning(
+                    "[adapt] iter=%d move=%s STALLED: mean trial acc<0.01, "
+                    "ss=%.2e at floor on %d/%d replicas, bracket never "
+                    "detected across last %d adjustment events. This move's "
+                    "DOFs are effectively frozen; subsequent dead points are "
+                    "correlated clones in this DOF.",
+                    iteration, name, mean_ss, floor_runs, n_runs,
+                    self._STALL_HISTORY_LEN,
+                )
+                self._stall_cooldown[m] = self._STALL_SUPPRESS_EVENTS
+
     def on_finish(self, ns_state: Any) -> None:
         self._adaptation_logger.close()
 
@@ -605,25 +757,385 @@ class AccRatesCallback:
         self._logger.close()
 
 
-class EnergyCheckCallback:
-    """Warns if energy is not decreasing as expected.
+class MaxNeighborsCallback:
+    """Writes per-iteration neighbor-bucket diagnostics to HDF5.
 
-    ndim-agnostic: reduces batched ``info["emax"]`` to a scalar via ``max``
-    before comparing to the previous iteration.
+    Captures the full per-walker ``max_neighbor_count`` distribution at
+    each iteration, alongside the current bucket size and the overflow
+    flag — enough to plot the per-iteration distribution of neighbor
+    counts vs the current bucket boundary, and to diagnose bucket
+    growth/shrink dynamics.
+
+    Reads directly off the post-step ``ns_state``: no info-dict keys
+    are required.  For sharded runs, the redundant leading-G axis on
+    info is collapsed upstream by ``_run_loop``, but the population
+    leaves are already gathered to ``(K, ...)`` via
+    ``_gather_sharded_ns_state``.
+
+    Args:
+        logger_obj: A ready-to-use ``MaxNeighborsLogger`` instance.
+        interval: Fire every ``interval`` iterations.  Default ``1``.
+    """
+
+    def __init__(self, logger_obj: Any, interval: int = 1) -> None:
+        self._logger = logger_obj
+        self._interval = max(1, int(interval))
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        if iteration % self._interval != 0:
+            return
+        pop = ns_state.population
+        counts = jnp.asarray(pop.max_neighbor_count)
+        # ``max_neighbors`` is a static int shared across every replica/walker
+        # in this run.  Same value across the population, so pass the scalar
+        # and let the logger broadcast to ``(n_runs,)``.
+        bucket_scalar = int(pop.max_neighbors)
+        # ``overflow`` is per-walker (shape ``(*B, n_walkers)``).  The
+        # logger stores a per-run flag, so reduce across walkers via
+        # ``any`` after flattening the batch prefix.
+        of = jnp.asarray(pop.overflow)
+
+        batcher = info.get("_batcher")
+        if batcher is not None:
+            counts = batcher.flatten(counts)
+            of = batcher.flatten(of)
+        else:
+            if counts.ndim == 1:
+                counts = counts[None, :]
+
+        of_per_run = jnp.any(of, axis=-1) if of.ndim > 0 else of
+
+        self._logger.write_entry(
+            iteration=iteration,
+            max_neighbor_count=np.asarray(counts, dtype=np.int32),
+            bucket_size=np.int32(bucket_scalar),
+            overflow=np.asarray(of_per_run, dtype=np.bool_),
+        )
+
+    def on_finish(self, ns_state: Any) -> None:
+        self._logger.close()
+
+
+class RECallback:
+    """Writes per-fire inter-RE swap counts to HDF5.
+
+    Reads ``info["inter_re_stats"]`` (populated by ``run_loop`` when
+    the manager fires) and forwards the per-pair counts to an
+    :class:`~jaxrens.io.re_stats_log.RELogger`.  Skips iterations on
+    which the manager did not fire (info key absent or
+    ``n_attempted_per_pair`` is empty / sums to zero) — the resulting
+    file's iteration index is therefore the authoritative record of
+    when the manager actually did work.
+
+    Args:
+        logger_obj: A ready-to-use ``RELogger`` instance.
+    """
+
+    def __init__(self, logger_obj: Any) -> None:
+        self._logger = logger_obj
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        re_stats = info.get("inter_re_stats")
+        if re_stats is None:
+            return
+        n_att = re_stats.get("n_attempted_per_pair")
+        if n_att is None:
+            return
+        n_att_arr = np.asarray(n_att, dtype=np.int32)
+        if n_att_arr.size == 0 or int(n_att_arr.sum()) == 0:
+            # Manager didn't fire this iteration (or fired with no
+            # valid pairs).  Skip — keeps the file iteration-indexed
+            # by actual fires only.
+            return
+        n_acc_arr = np.asarray(
+            re_stats["n_accepted_per_pair"], dtype=np.int32
+        )
+        self._logger.write_entry(
+            iteration=iteration,
+            n_accepted_per_pair=n_acc_arr,
+            n_attempted_per_pair=n_att_arr,
+        )
+
+    def on_finish(self, ns_state: Any) -> None:
+        self._logger.close()
+
+
+class EnergyCheckCallback:
+    """Warns if any replica's Emax fails to decrease between iterations.
+
+    Compares ``info["emax"]`` element-wise against the previous iteration; a
+    global ``max``-reduction would let one descending replica mask another
+    replica's non-monotonic contour (the failure mode that previously hid
+    `https://github.com/.../pressure-rens-writeback-bug`).  Works for any
+    batched shape — scalars (``SingleRun``), 1-D ``(R,)`` (``VmapRuns``),
+    2-D ``(G, P)`` (``PmapVmapRuns``).
     """
 
     def __init__(self):
-        self._prev_emax = float("inf")
+        self._prev_emax: np.ndarray | None = None
 
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
-        emax_raw = info.get("emax", 0)
-        emax_arr = jnp.asarray(emax_raw)
-        emax = float(emax_arr if emax_arr.ndim == 0 else jnp.max(emax_arr))
-        if emax > self._prev_emax and iteration > 0:
-            logger.warning(
-                "iter=%d: Emax increased (%.6f > %.6f)", iteration, emax, self._prev_emax
+        emax_arr = np.asarray(info.get("emax", 0.0), dtype=np.float64)
+
+        if iteration > 0 and self._prev_emax is not None:
+            offenders = emax_arr > self._prev_emax
+            if bool(np.any(offenders)):
+                # Build per-replica diagnostic for the offending indices.
+                idxs = np.argwhere(offenders)
+                deltas = (emax_arr - self._prev_emax)[offenders]
+                # Report up to 4 worst, sorted by delta descending.
+                order = np.argsort(-deltas)
+                def _fmt_idx(coords: np.ndarray) -> str:
+                    parts = tuple(int(c) for c in coords)
+                    return str(parts[0]) if len(parts) == 1 else (
+                        ",".join(str(p) for p in parts)
+                    )
+
+                worst = [
+                    (_fmt_idx(idxs[k]), float(deltas[k]))
+                    for k in order[:4]
+                ]
+                summary = ", ".join(
+                    f"replica[{i}]: Δ=+{d:.4g}" for i, d in worst
+                )
+                logger.warning(
+                    "iter=%d: Emax non-monotonic on %d replica(s) (worst: %s)",
+                    iteration, int(offenders.sum()), summary,
+                )
+
+        self._prev_emax = emax_arr
+
+    def on_finish(self, ns_state: Any) -> None:
+        pass
+
+
+def _min_pair_distance_pbc(positions: jnp.ndarray, cell: jnp.ndarray) -> jnp.ndarray:
+    """Minimum interatomic distance under PBC, vmapped over (n_runs, K).
+
+    ``positions``: ``(n_runs, K, N, 3)``.  ``cell``: ``(n_runs, K, 3, 3)``.
+    Returns ``(n_runs, K)`` minimum pair distance per walker, using the
+    minimum-image convention.
+    """
+    def _one(p, c):
+        cell_inv = jnp.linalg.inv(c)
+        frac = p @ cell_inv
+        diff_frac = frac[:, None, :] - frac[None, :, :]
+        diff_frac = diff_frac - jnp.round(diff_frac)
+        diff = diff_frac @ c
+        d2 = jnp.sum(diff ** 2, axis=-1)
+        n = p.shape[0]
+        d2 = jnp.where(jnp.eye(n, dtype=bool), jnp.inf, d2)
+        return jnp.sqrt(jnp.min(d2))
+    return jax.vmap(jax.vmap(_one))(positions, cell)
+
+
+def _min_pair_distance_open(positions: jnp.ndarray) -> jnp.ndarray:
+    """All-pairs minimum distance (no PBC), vmapped over (n_runs, K).
+
+    ``positions``: ``(n_runs, K, N, 3)``.  Returns ``(n_runs, K)``.
+    """
+    def _one(p):
+        diff = p[:, None, :] - p[None, :, :]
+        d2 = jnp.sum(diff ** 2, axis=-1)
+        n = p.shape[0]
+        d2 = jnp.where(jnp.eye(n, dtype=bool), jnp.inf, d2)
+        return jnp.sqrt(jnp.min(d2))
+    return jax.vmap(jax.vmap(_one))(positions)
+
+
+class CollisionCheckCallback:
+    """Periodically scans walkers for unphysically close atom pairs.
+
+    Computes the minimum interatomic distance per walker using the
+    minimum-image convention when ``population.cell`` is present, and
+    plain all-pairs otherwise.  When any walker falls below
+    ``threshold``, a warning is logged identifying the worst-offender
+    replicas + walkers and their minimum pair distance.
+
+    Diagnostic only — never feeds back into the run.  Works for
+    SingleRun, VmapRuns, and PmapVmapRuns shape conventions via
+    ``info["_batcher"]``.
+
+    Args:
+        threshold: Pair distance below which a warning fires.  Backend
+            length units (typically Å).
+        interval: Fire every ``interval`` iterations.  Default 100 —
+            this is a diagnostic, not a per-iter signal.
+        max_offenders: Cap on the number of (run, walker) entries
+            included in the warning message.  Default 4.
+    """
+
+    def __init__(
+        self,
+        threshold: float,
+        interval: int = 100,
+        max_offenders: int = 4,
+    ) -> None:
+        self._threshold = float(threshold)
+        self._interval = max(1, int(interval))
+        self._max_offenders = max(1, int(max_offenders))
+        self._jit_pbc = jax.jit(_min_pair_distance_pbc)
+        self._jit_open = jax.jit(_min_pair_distance_open)
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        if iteration % self._interval != 0:
+            return
+        pop = ns_state.population
+        positions = jnp.asarray(pop.positions)
+        cell = pop.cell
+
+        batcher = info.get("_batcher")
+        if batcher is not None:
+            positions_flat = batcher.flatten(positions)
+            cell_flat = batcher.flatten(cell) if cell is not None else None
+        else:
+            positions_flat = positions[None, ...] if positions.ndim == 3 else positions
+            if cell is not None:
+                cell_flat = cell[None, ...] if cell.ndim == 3 else cell
+            else:
+                cell_flat = None
+
+        if cell_flat is not None:
+            mins = self._jit_pbc(positions_flat, jnp.asarray(cell_flat))
+        else:
+            mins = self._jit_open(positions_flat)
+        mins_np = np.asarray(mins)
+
+        offenders = mins_np < self._threshold
+        if not bool(np.any(offenders)):
+            return
+
+        idxs = np.argwhere(offenders)
+        offending_d = mins_np[offenders]
+        order = np.argsort(offending_d)
+        worst = [
+            (int(idxs[k, 0]), int(idxs[k, 1]), float(offending_d[k]))
+            for k in order[: self._max_offenders]
+        ]
+        summary = ", ".join(
+            f"run[{r}].walker[{w}]: d_min={d:.4g}" for r, w, d in worst
+        )
+        logger.warning(
+            "iter=%d: %d walker(s) have atom pairs below %.4g "
+            "(worst: %s)",
+            iteration,
+            int(offenders.sum()),
+            self._threshold,
+            summary,
+        )
+
+    def on_finish(self, ns_state: Any) -> None:
+        pass
+
+
+class TemperatureCallback:
+    """Finite-difference temperature estimator (Baldock et al., PRE 96, 043311, 2017).
+
+    Maintains a per-replica FIFO of the last ``lag`` ``info["emax"]`` values and
+    reports ``T = 1 / (k_B * beta)`` with
+    ``beta = (L - 1) * log_alpha / (E_last - E_first)`` and
+    ``log_alpha = log((n_live + 1 - n_cull) / (n_live + 1))``.
+
+    Diagnostic only — never feeds back into the run. Works for SingleRun,
+    VmapRuns, and PmapVmapRuns shape conventions via ``info["_batcher"]``.
+
+    Returns NaN when the deque is shorter than 2 samples or when
+    ``E_last == E_first`` (avoids ``ZeroDivisionError``); downstream
+    aggregation uses ``np.nan{min,max,median}``.
+
+    Args:
+        n_live: Number of live walkers (from ``NSConfig.n_live``).
+        n_cull: Number of culled walkers per iteration (from ``NSConfig.n_cull``).
+        lag: Length of the Emax FIFO (window size for the finite difference).
+        interval: Emit a log line every ``interval`` iterations.
+        kB: Boltzmann constant in the backend's energy units.  Default
+            ``8.6173324e-5`` eV/K (ASE convention).  Set ``1.0`` for
+            reduced-unit backends (LJ, harmonic).
+    """
+
+    def __init__(
+        self,
+        n_live: int,
+        n_cull: int = 1,
+        lag: int = 100,
+        interval: int = 100,
+        kB: float = 8.6173324e-5,
+    ) -> None:
+        self._lag = int(lag)
+        self._interval = max(1, int(interval))
+        self._kB = float(kB)
+        self._log_alpha = float(
+            np.log((n_live + 1 - n_cull) / (n_live + 1))
+        )
+        self._histories: list[collections.deque] | None = None
+
+    def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
+        batcher = (start_info or {}).get("_batcher") if start_info else None
+        n_runs = batcher.n_runs if batcher is not None else 1
+        self._histories = [
+            collections.deque(maxlen=self._lag) for _ in range(n_runs)
+        ]
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        if self._histories is None:
+            # on_start was not called (legacy/test caller) — lazy-init from info.
+            batcher = info.get("_batcher")
+            n_runs = batcher.n_runs if batcher is not None else 1
+            self._histories = [
+                collections.deque(maxlen=self._lag) for _ in range(n_runs)
+            ]
+
+        emax_arr = jnp.asarray(info.get("emax", 0.0))
+        batcher = info.get("_batcher")
+        if batcher is not None:
+            flat = batcher.flatten(emax_arr)
+        elif emax_arr.ndim == 0:
+            flat = emax_arr[None]
+        else:
+            flat = emax_arr
+        flat_np = np.asarray(flat).reshape(-1)
+
+        if flat_np.shape[0] != len(self._histories):
+            # Resize the per-replica list if the run topology changed since
+            # on_start (e.g. tests that swap batchers mid-run).
+            self._histories = [
+                collections.deque(maxlen=self._lag)
+                for _ in range(flat_np.shape[0])
+            ]
+
+        for k, e in enumerate(flat_np):
+            self._histories[k].append(float(e))
+
+        if iteration % self._interval != 0:
+            return
+
+        T = np.array(
+            [self._compute_T(h) for h in self._histories], dtype=np.float64
+        )
+        # All replicas still warming up — emit a pending line instead of
+        # letting nanmin/nanmax fire All-NaN RuntimeWarnings.
+        if np.all(np.isnan(T)):
+            logger.info("iter=%d  T_est=pending (deque < 2)", iteration)
+            return
+        if T.size == 1:
+            logger.info("iter=%d  T_est=%.3f K", iteration, float(T[0]))
+        else:
+            logger.info(
+                "iter=%d  T_est=[%.3f..%.3f] K  median=%.3f",
+                iteration,
+                float(np.nanmin(T)),
+                float(np.nanmax(T)),
+                float(np.nanmedian(T)),
             )
-        self._prev_emax = emax
+
+    def _compute_T(self, history: collections.deque) -> float:
+        if len(history) < 2:
+            return float("nan")
+        dE = history[-1] - history[0]
+        if dE == 0.0:
+            return float("nan")
+        beta = (len(history) - 1) * self._log_alpha / dE
+        return 1.0 / (self._kB * beta)
 
     def on_finish(self, ns_state: Any) -> None:
         pass
@@ -733,45 +1245,33 @@ class TrajectoryCallback:
         self.snapshot_interval = snapshot_interval
 
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        # The dead walker is surfaced by ``ns_step`` as a single
+        # ``WalkerState`` pytree under ``info["dead_walker"]`` (positions,
+        # types, energy, cell).  Energy is also exposed as ``info["emax"]``
+        # for consumers that only need the scalar.
+        dead_ws = info["dead_walker"]
+        dead_cell = dead_ws.cell
+
         if iteration % self.traj_interval == 0:
-            # Latest culled walker: read directly from info (set by ns_step).
-            # No need to look it up in any history buffer.
-            worst_idx = int(info.get("worst_idx", 0))
-            if isinstance(ns_state, NSState):
-                dead_walker = {
-                    "positions": info["dead_position"],
-                    "types": ns_state.population.types[0],
-                    "energy": float(info.get("emax", 0)),
-                }
-                cell = ns_state.population.cell[worst_idx]
-                if jnp.any(cell != 0):
-                    dead_walker["box"] = cell
-            else:
-                # Dict-fallback path for non-NSState callers.  Latest dead point
-                # comes from info if available, else falls back to the legacy
-                # state["dead_positions"][n_dead-1] read.
-                if "dead_position" in info:
-                    pos_latest = info["dead_position"]
-                else:
-                    n_dead_local = int(ns_state.get("n_dead", 0))
-                    pos_latest = ns_state["dead_positions"][n_dead_local - 1]
-                dead_walker = {
-                    "positions": pos_latest,
-                    "types": ns_state["types"][0],
-                    "energy": float(info.get("emax", 0)),
-                }
-                if ns_state.get("cells") is not None:
-                    dead_walker["box"] = ns_state["cells"][worst_idx]
+            dead_walker = {
+                "positions": dead_ws.positions,
+                "types": dead_ws.types,
+                "energy": float(info.get("emax", 0)),
+            }
+            if jnp.any(dead_cell != 0):
+                dead_walker["box"] = dead_cell
             self.writer.write_dead_point(iteration, dead_walker, float(info["emax"]))
 
         if self.energy_logger is not None:
             # Write the culled-walker energy and volume so postprocess can
             # reconstruct the dead-point trace from this single file.
-            dead_v = info.get("dead_volume", 0.0)
+            # Volume is derived from the dead walker's cell (det) — no
+            # separate ``dead_volume`` field needed in ``info``.
+            dead_v = float(jnp.abs(jnp.linalg.det(dead_cell)))
             self.energy_logger.write_entry(
                 iteration,
                 float(info.get("emax", 0)),
-                volume=float(np.asarray(dead_v)),
+                volume=dead_v,
             )
 
         if self.snapshot_interval and iteration > 0 and iteration % self.snapshot_interval == 0:
@@ -841,10 +1341,8 @@ class BatchedTrajectoryCallback:
             )
 
         pop = ns_state.population
-        types = flatten(pop.types)
-        cells = flatten(pop.cell)
 
-        # info["emax"] is (*shape_prefix,) when batched; flatten via the
+        # ``info["emax"]`` is (*shape_prefix,) when batched; flatten via the
         # batcher (or by ravel for the legacy fallback).
         emax_arr = jnp.asarray(info.get("emax", 0.0))
         if batcher is not None:
@@ -853,21 +1351,23 @@ class BatchedTrajectoryCallback:
             emax_flat = (
                 emax_arr.reshape(-1) if emax_arr.ndim >= 1 else emax_arr[None]
             )
-        # Latest culled position per replica — sourced from info, shape
-        # ``(*shape_prefix, n_atoms, 3)``; flatten leading dims for indexing.
-        latest_pos = np.asarray(info["dead_position"])
-        latest_pos_flat = np.asarray(flatten(latest_pos))
-        # For SingleRun (n_batch_axes=0 effectively but we set min 1), the
-        # batched callback shouldn't be used; assume we always have a batch.
+
+        # Dead walker is a single ``WalkerState`` pytree from ns_step.
+        # Flatten each leaf over the replica axis once; per-replica slicing
+        # then uses simple integer indexing on each leaf.
+        dead_ws = info["dead_walker"]
+        dead_pos_flat = np.asarray(flatten(dead_ws.positions))
+        dead_types_flat = np.asarray(flatten(dead_ws.types))
+        dead_cell_flat = np.asarray(flatten(dead_ws.cell))
 
         if iteration % self.traj_interval == 0:
             for r in range(n_runs):
+                cell_r = dead_cell_flat[r]
                 dead_walker = {
-                    "positions": latest_pos_flat[r],
-                    "types": types[r, 0] if types.ndim >= 2 else types[0],
+                    "positions": dead_pos_flat[r],
+                    "types": dead_types_flat[r],
                     "energy": float(emax_flat[r]),
                 }
-                cell_r = cells[r, 0] if cells.ndim >= 3 else cells[0]
                 if jnp.any(cell_r != 0):
                     dead_walker["box"] = cell_r
                 self.writers[r].write_dead_point(
@@ -875,17 +1375,13 @@ class BatchedTrajectoryCallback:
                 )
 
         if self.energy_loggers is not None:
-            # Per-replica volume of the culled walker, sourced from info.
-            dv_arr = np.asarray(info.get("dead_volume", 0.0))
-            dv_flat = (
-                dv_arr.reshape(-1) if dv_arr.ndim >= 1
-                else np.broadcast_to(dv_arr, (n_runs,))
-            )
+            # Per-replica volume derived from the dead walker's own cell.
             for r in range(n_runs):
+                vol = float(np.abs(np.linalg.det(dead_cell_flat[r])))
                 self.energy_loggers[r].write_entry(
                     iteration,
                     float(emax_flat[r]),
-                    volume=float(dv_flat[r]),
+                    volume=vol,
                 )
 
         if (
@@ -893,16 +1389,19 @@ class BatchedTrajectoryCallback:
             and iteration > 0
             and iteration % self.snapshot_interval == 0
         ):
+            # Live-walker snapshot — separate from the dead-point write
+            # path; needs the full per-replica live population, not the
+            # culled walker.
             positions_flat = flatten(pop.positions)
             energies_flat = flatten(pop.energy)
+            types_flat = flatten(pop.types)
+            cells_flat = flatten(pop.cell)
             for r in range(n_runs):
-                # Live-walker snapshot only.  Dead-point history lives on
-                # disk via the per-iteration writers above.
                 snap = {
                     "positions": positions_flat[r],
-                    "types": types[r] if types.ndim >= 2 else types,
+                    "types": types_flat[r] if types_flat.ndim >= 2 else types_flat,
                     "energies": energies_flat[r],
-                    "cells": cells[r] if cells.ndim >= 3 else cells,
+                    "cells": cells_flat[r] if cells_flat.ndim >= 3 else cells_flat,
                     "iteration": iteration,
                     "n_dead": iteration,
                 }

@@ -115,16 +115,20 @@ class PressureRENSSwap(SwapKernel):
     ``propose`` is identity — the positions/cell/energy pair is passed
     through unchanged as the swap candidate (no morphing, no backend call).
 
-    ``accept`` checks enthalpies:
-        H_A_in_j = E_A + P_j * V_A < Emax_j
-        H_B_in_i = E_B + P_i * V_B < Emax_i
+    The stored energy convention follows ``EnsembleBackend``: each walker's
+    ``state.energy`` is the *enthalpy at the run's own pressure*,
+    ``H_self = U + P_self · V``.  ``accept`` undoes the self-PV term before
+    re-basing at the partner's pressure::
+
+        H_A_in_j = (E_A - P_i · V_A) + P_j · V_A < Emax_j
+        H_B_in_i = (E_B - P_j · V_B) + P_i · V_B < Emax_i
+
+    matching the legacy ``jaxnest`` ``create_perform_pressure_swap``.
 
     For simple energy-based RE (``volumes``/``pressures`` not provided in
     the proposed dict or set to ``None``), falls back to direct energy
     comparison:
         E_A < Emax_j AND E_B < Emax_i
-
-    Equivalent to the legacy :func:`perform_swap` function.
     """
 
     def propose(
@@ -174,7 +178,19 @@ class PressureRENSSwap(SwapKernel):
     ) -> jnp.ndarray:
         """Enthalpy-based acceptance check (or simple energy check without pressure).
 
-        Replicates the logic of the legacy :func:`perform_swap` function.
+        ``proposed['energy_a']`` and ``proposed['energy_b']`` are interpreted as
+        the *stored* enthalpies at each run's own pressure
+        (``H_self = U + P_self · V``), matching what ``EnsembleBackend`` writes
+        into ``state.energy``.  To compare against the receiving run's Emax we
+        re-base the enthalpy at the partner's pressure::
+
+            H_A_at_B = (E_A - P_A · V_A) + P_B · V_A
+            H_B_at_A = (E_B - P_B · V_B) + P_A · V_B
+
+        which matches the legacy ``jaxnest`` ``perform_pressure_swap`` convention
+        (subtract self's PV to recover U, then add partner's PV).  When neither
+        side has a pressure key the check degenerates to a plain energy
+        comparison — useful for the no-pressure shim path and tests.
 
         Args:
             proposed: Dict with keys ``'energy_a'``, ``'energy_b'``, and
@@ -203,10 +219,14 @@ class PressureRENSSwap(SwapKernel):
         if use_pressure:
             v_a = _get_volume(proposed["cell_a"])
             v_b = _get_volume(proposed["cell_b"])
-            # Enthalpy of A evaluated at B's pressure (run_b's constraint)
-            h_a_in_b = e_a + p_b * v_a
-            # Enthalpy of B evaluated at A's pressure (run_a's constraint)
-            h_b_in_a = e_b + p_a * v_b
+            # Stored e_a, e_b are enthalpies at self's pressure (EnsembleBackend
+            # adds P_self·V).  Recover U by subtracting self's PV, then re-add
+            # at the partner's pressure to get the enthalpy under the receiving
+            # run's constraint.
+            u_a = e_a - p_a * v_a
+            u_b = e_b - p_b * v_b
+            h_a_in_b = u_a + p_b * v_a
+            h_b_in_a = u_b + p_a * v_b
             accepted = (h_a_in_b < emax_b) & (h_b_in_a < emax_a)
         else:
             accepted = (e_a < emax_b) & (e_b < emax_a)
@@ -263,15 +283,24 @@ def perform_swap(
         :class:`PressureRENSSwap` and call its :meth:`~PressureRENSSwap.accept`
         method directly.
 
-    For pressure RE, the acceptance checks enthalpies:
-      H_A_in_j = E_A + P_j * V_A < Emax_j
-      H_B_in_i = E_B + P_i * V_B < Emax_i
+    Interface convention (legacy ``jaxnest``-style): ``energies_pair`` are
+    interpreted as **raw potential energies** *U* (not enthalpies).  Production
+    callers that already have ``state.energy = U + P_self · V`` (the
+    ``EnsembleBackend`` convention) should call ``PressureRENSSwap.accept``
+    directly instead of going through this shim — the kernel expects stored
+    enthalpies on that path.
+
+    For pressure RE, the shim converts U → H_self = U + P_self · V before
+    delegating, so the kernel's enthalpy math reduces to the standard rule::
+
+        H_A_in_j = U_A + P_j · V_A < Emax_j
+        H_B_in_i = U_B + P_i · V_B < Emax_i
 
     For simple RE (no pressure):
       E_A < Emax_j AND E_B < Emax_i
 
     Args:
-        energies_pair: (2,) energies of the two walkers.
+        energies_pair: (2,) **raw** potential energies of the two walkers.
         emax_pair: (2,) Emax constraints of the two runs.
         volumes_pair: (2,) or None, volumes for pressure RE.
         pressures_pair: (2,) or None, pressures for pressure RE.
@@ -279,13 +308,12 @@ def perform_swap(
     Returns:
         accepted: bool scalar.
     """
-    # Build the proposed / ensemble_params dicts that PressureRENSSwap.accept expects.
-    proposed: dict[str, Any] = {
-        "energy_a": energies_pair[0],
-        "energy_b": energies_pair[1],
-    }
-
     if volumes_pair is not None and pressures_pair is not None:
+        # Convert raw U → H_self = U + P_self · V so the kernel sees the same
+        # input shape that production state.energy has.
+        h_self_a = energies_pair[0] + pressures_pair[0] * volumes_pair[0]
+        h_self_b = energies_pair[1] + pressures_pair[1] * volumes_pair[1]
+
         # Fake cell matrices whose determinant equals the supplied volumes.
         # _get_volume calls jnp.linalg.det, so we need actual (3,3) matrices.
         # Use a diagonal matrix: det(diag(cbrt(V), cbrt(V), cbrt(V))) = V.
@@ -293,11 +321,19 @@ def perform_swap(
             side = jnp.cbrt(v)
             return jnp.diag(jnp.array([side, side, side]))
 
-        proposed["cell_a"] = _volume_to_cell(volumes_pair[0])
-        proposed["cell_b"] = _volume_to_cell(volumes_pair[1])
+        proposed: dict[str, Any] = {
+            "energy_a": h_self_a,
+            "energy_b": h_self_b,
+            "cell_a": _volume_to_cell(volumes_pair[0]),
+            "cell_b": _volume_to_cell(volumes_pair[1]),
+        }
         ensemble_params_a: dict[str, Any] = {"pressure": pressures_pair[0]}
         ensemble_params_b: dict[str, Any] = {"pressure": pressures_pair[1]}
     else:
+        proposed = {
+            "energy_a": energies_pair[0],
+            "energy_b": energies_pair[1],
+        }
         ensemble_params_a = {}
         ensemble_params_b = {}
 
@@ -383,6 +419,8 @@ def replica_exchange_step(
     n_odd = odd_pairs.shape[0]
     max_pairs = max(n_even, n_odd) if (n_even > 0 or n_odd > 0) else 0
 
+    n_pairs = max(n_runs - 1, 0)
+
     if max_pairs == 0:
         # No swaps possible (n_runs < 2)
         return (
@@ -390,7 +428,12 @@ def replica_exchange_step(
             all_types,
             all_energies,
             all_cells,
-            {"n_accepted": jnp.array(0), "n_attempted": jnp.array(0)},
+            {
+                "n_accepted": jnp.array(0),
+                "n_attempted": jnp.array(0),
+                "n_accepted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
+                "n_attempted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
+            },
         )
 
     # Pad pairs arrays to max_pairs with dummy pair (0, 0) and mask
@@ -414,7 +457,7 @@ def replica_exchange_step(
 
     def _do_one_phase(carry, phase_input):
         """Process one phase (even or odd) of swap attempts."""
-        positions, types, energies, cells, n_acc, n_att, key = carry
+        positions, types, energies, cells, acc_per_pair, att_per_pair, key = carry
         pairs, mask, phase_key = phase_input
 
         # Generate random walker indices for all pairs
@@ -422,7 +465,7 @@ def replica_exchange_step(
 
         def _attempt_one_swap(carry_inner, swap_input):
             """Attempt a single swap between a pair of runs."""
-            pos, typ, ene, bxs, acc_count = carry_inner
+            pos, typ, ene, bxs, acc_per_pair_in = carry_inner
             pair, valid, swap_key = swap_input
 
             k1, k2 = jax.random.split(swap_key)
@@ -470,9 +513,32 @@ def replica_exchange_step(
             new_pos = pos.at[run_i, wi].set(jnp.where(do_swap, pos_j, pos_i))
             new_pos = new_pos.at[run_j, wj].set(jnp.where(do_swap, pos_i, pos_j))
 
-            # Swap energies
-            new_ene = ene.at[run_i, wi].set(jnp.where(do_swap, e_j, e_i))
-            new_ene = new_ene.at[run_j, wj].set(jnp.where(do_swap, e_i, e_j))
+            # Post-swap stored energies must reflect the *destination* run's
+            # ensemble parameters: walker A (from run i) moves to run j, so its
+            # new stored energy is its enthalpy at P_j; symmetrically for B.
+            # Without this re-base the next ns_step sees a stale H_self that no
+            # longer matches the home pressure — visible as non-monotonic dead-
+            # point energies and a drifting NS contour.  Mirrors legacy
+            # jaxnest_dev/replica_exchange.py:159-163.
+            if pressures is not None and bxs is not None:
+                p_i = pressures[run_i]
+                p_j = pressures[run_j]
+                v_i = _get_volume(bxs[run_i, wi])
+                v_j = _get_volume(bxs[run_j, wj])
+                u_i = e_i - p_i * v_i  # recover raw U from stored H_self
+                u_j = e_j - p_j * v_j
+                new_e_into_run_i = u_j + p_i * v_j  # walker B in its new home (run i)
+                new_e_into_run_j = u_i + p_j * v_i  # walker A in its new home (run j)
+            else:
+                new_e_into_run_i = e_j
+                new_e_into_run_j = e_i
+
+            new_ene = ene.at[run_i, wi].set(
+                jnp.where(do_swap, new_e_into_run_i, e_i)
+            )
+            new_ene = new_ene.at[run_j, wj].set(
+                jnp.where(do_swap, new_e_into_run_j, e_j)
+            )
 
             # Swap types if per-walker
             if types_are_per_walker:
@@ -496,37 +562,47 @@ def replica_exchange_step(
             else:
                 new_bxs = bxs
 
-            new_acc = acc_count + valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
+            # Per-pair scatter-add: pair_id = min(run_i, run_j) since
+            # pairs are always (k, k+1).  Even/odd phases write to
+            # disjoint pair_ids; padding entries have valid=False so
+            # contribute zero.
+            pair_id = jnp.minimum(run_i, run_j)
+            delta = valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
+            new_acc_per_pair = acc_per_pair_in.at[pair_id].add(delta)
 
-            return (new_pos, new_typ, new_ene, new_bxs, new_acc), None
+            return (new_pos, new_typ, new_ene, new_bxs, new_acc_per_pair), None
 
         scan_inputs = (pairs, mask, pair_keys)
-        (positions, types, energies, cells, n_acc), _ = jax.lax.scan(
+        (positions, types, energies, cells, acc_per_pair), _ = jax.lax.scan(
             _attempt_one_swap,
-            (positions, types, energies, cells, n_acc),
+            (positions, types, energies, cells, acc_per_pair),
             scan_inputs,
         )
-        n_att = n_att + jnp.sum(mask.astype(jnp.int32))
+        # Per-pair attempted: scatter the phase mask by pair_id.  No
+        # collisions within a phase (each pair_id appears at most once
+        # in the unpadded slice; padded entries have mask=0).
+        pair_ids_phase = jnp.minimum(pairs[:, 0], pairs[:, 1])
+        att_per_pair = att_per_pair.at[pair_ids_phase].add(mask.astype(jnp.int32))
 
-        return (positions, types, energies, cells, n_acc, n_att, key), None
+        return (positions, types, energies, cells, acc_per_pair, att_per_pair, key), None
 
     # Run n_swap_cycles, each with even + odd phase
     def _do_one_cycle(carry, cycle_key):
-        positions, types, energies, cells, n_acc, n_att = carry
+        positions, types, energies, cells, acc_per_pair, att_per_pair = carry
         even_key, odd_key = jax.random.split(cycle_key)
 
         # Even phase
-        (positions, types, energies, cells, n_acc, n_att, _), _ = _do_one_phase(
-            (positions, types, energies, cells, n_acc, n_att, even_key),
+        (positions, types, energies, cells, acc_per_pair, att_per_pair, _), _ = _do_one_phase(
+            (positions, types, energies, cells, acc_per_pair, att_per_pair, even_key),
             (all_pairs[0], all_masks[0], even_key),
         )
         # Odd phase
-        (positions, types, energies, cells, n_acc, n_att, _), _ = _do_one_phase(
-            (positions, types, energies, cells, n_acc, n_att, odd_key),
+        (positions, types, energies, cells, acc_per_pair, att_per_pair, _), _ = _do_one_phase(
+            (positions, types, energies, cells, acc_per_pair, att_per_pair, odd_key),
             (all_pairs[1], all_masks[1], odd_key),
         )
 
-        return (positions, types, energies, cells, n_acc, n_att), None
+        return (positions, types, energies, cells, acc_per_pair, att_per_pair), None
 
     cycle_keys = jax.random.split(rng_key, n_swap_cycles)
     init_carry = (
@@ -534,16 +610,18 @@ def replica_exchange_step(
         types_broadcastable,
         all_energies,
         all_cells,
-        jnp.array(0, dtype=jnp.int32),
-        jnp.array(0, dtype=jnp.int32),
+        jnp.zeros(n_pairs, dtype=jnp.int32),
+        jnp.zeros(n_pairs, dtype=jnp.int32),
     )
-    (new_pos, new_types, new_ene, new_cells, total_acc, total_att), _ = jax.lax.scan(
+    (new_pos, new_types, new_ene, new_cells, acc_per_pair, att_per_pair), _ = jax.lax.scan(
         _do_one_cycle, init_carry, cycle_keys
     )
 
     swap_info = {
-        "n_accepted": total_acc,
-        "n_attempted": total_att,
+        "n_accepted": jnp.sum(acc_per_pair),
+        "n_attempted": jnp.sum(att_per_pair),
+        "n_accepted_per_pair": acc_per_pair,
+        "n_attempted_per_pair": att_per_pair,
     }
 
     return new_pos, new_types, new_ene, new_cells, swap_info
@@ -563,9 +641,11 @@ class XRENSSwap(SwapKernel):
     - Replica A receives walker from B; its types are morphed to ``target_a``.
     - Replica B receives walker from A; its types are morphed to ``target_b``.
     - Each morphed config's energy is re-evaluated under the new types via
-      the backend.
-    - Enthalpy check (E + P·V, or pure energy if no pressure) against each
-      replica's emax decides acceptance.
+      the backend, threading the receiving run's ``ensemble_params`` (so the
+      returned energy is the *enthalpy at the receiving run's pressure*,
+      matching the ``EnsembleBackend`` convention for stored state.energy).
+    - Acceptance is a direct ``E_new_a < Emax_a`` / ``E_new_b < Emax_b`` check
+      — no further PV terms are added inside ``accept``.
 
     Each swap makes exactly 2 energy evaluations, 0 gradient evaluations.
 
@@ -640,18 +720,30 @@ class XRENSSwap(SwapKernel):
             key_b, state_a["types"], target_b, self.n_species
         )
 
-        # Re-evaluate energies under morphed types.
+        # Re-evaluate energies under morphed types, threading each receiving
+        # run's ensemble_params so the returned scalar is the enthalpy at the
+        # receiving run's pressure (matches EnsembleBackend stored convention;
+        # see PressureRENSSwap.accept docstring).  Strip non-backend keys
+        # ('target_composition') before forwarding.
+        backend_params_a = {
+            k: v for k, v in ensemble_params_a.items() if k != "target_composition"
+        } or None
+        backend_params_b = {
+            k: v for k, v in ensemble_params_b.items() if k != "target_composition"
+        } or None
         e_a_new, _, _ = backend(
             state_b["positions"],
             morphed_types_for_a,
             state_b["cell"],
             0,  # max_neighbors
+            ensemble_params=backend_params_a,
         )
         e_b_new, _, _ = backend(
             state_a["positions"],
             morphed_types_for_b,
             state_a["cell"],
             0,
+            ensemble_params=backend_params_b,
         )
 
         proposed = {
@@ -674,26 +766,28 @@ class XRENSSwap(SwapKernel):
         ensemble_params_a: Any,
         ensemble_params_b: Any,
     ) -> jnp.ndarray:
-        """Enthalpy-based acceptance on the morphed + re-evaluated energies.
+        """Direct enthalpy threshold check on the morphed + re-evaluated energies.
 
-        Delegates to :class:`PressureRENSSwap` acceptance logic: the proposed
-        dict already contains the re-evaluated post-morph energies so the
-        math is identical to pressure-RENS once energies are set.
+        ``propose`` already threaded each receiving run's ensemble_params into
+        the backend call, so ``proposed['energy_a']`` and
+        ``proposed['energy_b']`` are already the enthalpies (or raw energies,
+        if no ensemble correction) at the destination run's pressure.  The
+        acceptance criterion is therefore a plain threshold comparison::
+
+            E_A_new < Emax_A  AND  E_B_new < Emax_B
 
         Args:
             proposed: Dict from :meth:`propose` with keys ``'energy_a'``,
-                ``'energy_b'``, ``'cell_a'``, ``'cell_b'``.
+                ``'energy_b'``.
             emax_a: Emax scalar for run A.
             emax_b: Emax scalar for run B.
-            ensemble_params_a: Dict with optional key ``'pressure'``.
-            ensemble_params_b: Dict with optional key ``'pressure'``.
+            ensemble_params_a: Unused; accepted for API uniformity.
+            ensemble_params_b: Unused; accepted for API uniformity.
 
         Returns:
             Boolean scalar: ``True`` iff the swap is accepted.
         """
-        return _PRESSURE_RENS_SWAP_INSTANCE.accept(
-            proposed, emax_a, emax_b, ensemble_params_a, ensemble_params_b
-        )
+        return (proposed["energy_a"] < emax_a) & (proposed["energy_b"] < emax_b)
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +851,7 @@ def xrens_replica_exchange_step(
     n_even = even_pairs.shape[0]
     n_odd = odd_pairs.shape[0]
     max_pairs = max(n_even, n_odd) if (n_even > 0 or n_odd > 0) else 0
+    n_pairs = max(n_runs - 1, 0)
 
     if max_pairs == 0:
         return (
@@ -768,6 +863,8 @@ def xrens_replica_exchange_step(
                 "n_accepted": jnp.array(0),
                 "n_attempted": jnp.array(0),
                 "n_energy_evals": jnp.array(0),
+                "n_accepted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
+                "n_attempted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
             },
         )
 
@@ -786,13 +883,13 @@ def xrens_replica_exchange_step(
 
     def _do_one_phase(carry, phase_input):
         """Process one phase of XRENS swap attempts."""
-        positions, types, energies, cells, n_acc, n_att, n_evals_total, key = carry
+        positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, key = carry
         pairs, mask, phase_key = phase_input
 
         pair_keys = jax.random.split(phase_key, max_pairs)
 
         def _attempt_one_xrens_swap(carry_inner, swap_input):
-            pos, typ, ene, bxs, acc_count, eval_count = carry_inner
+            pos, typ, ene, bxs, acc_per_pair_in, eval_count = carry_inner
             pair, valid, swap_key = swap_input
 
             k1, k2, morph_key = jax.random.split(swap_key, 3)
@@ -877,34 +974,39 @@ def xrens_replica_exchange_step(
             else:
                 new_bxs = bxs
 
-            new_acc = acc_count + valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
+            # Per-pair scatter-add (see replica_exchange_step for the
+            # convention rationale).
+            pair_id = jnp.minimum(run_i, run_j)
+            delta = valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
+            new_acc_per_pair = acc_per_pair_in.at[pair_id].add(delta)
             # We always call propose (2 evals) when valid, regardless of acceptance.
             new_eval_count = eval_count + valid.astype(jnp.int32) * n_e
 
-            return (new_pos, new_typ, new_ene, new_bxs, new_acc, new_eval_count), None
+            return (new_pos, new_typ, new_ene, new_bxs, new_acc_per_pair, new_eval_count), None
 
         scan_inputs = (pairs, mask, pair_keys)
-        (positions, types, energies, cells, n_acc, n_evals_total), _ = jax.lax.scan(
+        (positions, types, energies, cells, acc_per_pair, n_evals_total), _ = jax.lax.scan(
             _attempt_one_xrens_swap,
-            (positions, types, energies, cells, n_acc, n_evals_total),
+            (positions, types, energies, cells, acc_per_pair, n_evals_total),
             scan_inputs,
         )
-        n_att = n_att + jnp.sum(mask.astype(jnp.int32))
-        return (positions, types, energies, cells, n_acc, n_att, n_evals_total, key), None
+        pair_ids_phase = jnp.minimum(pairs[:, 0], pairs[:, 1])
+        att_per_pair = att_per_pair.at[pair_ids_phase].add(mask.astype(jnp.int32))
+        return (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, key), None
 
     def _do_one_cycle(carry, cycle_key):
-        positions, types, energies, cells, n_acc, n_att, n_evals_total = carry
+        positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total = carry
         even_key, odd_key = jax.random.split(cycle_key)
 
-        (positions, types, energies, cells, n_acc, n_att, n_evals_total, _), _ = _do_one_phase(
-            (positions, types, energies, cells, n_acc, n_att, n_evals_total, even_key),
+        (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, _), _ = _do_one_phase(
+            (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, even_key),
             (all_pairs[0], all_masks[0], even_key),
         )
-        (positions, types, energies, cells, n_acc, n_att, n_evals_total, _), _ = _do_one_phase(
-            (positions, types, energies, cells, n_acc, n_att, n_evals_total, odd_key),
+        (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, _), _ = _do_one_phase(
+            (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, odd_key),
             (all_pairs[1], all_masks[1], odd_key),
         )
-        return (positions, types, energies, cells, n_acc, n_att, n_evals_total), None
+        return (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total), None
 
     cycle_keys = jax.random.split(rng_key, n_swap_cycles)
     init_carry = (
@@ -912,18 +1014,20 @@ def xrens_replica_exchange_step(
         all_types,
         all_energies,
         all_cells,
-        jnp.array(0, dtype=jnp.int32),
-        jnp.array(0, dtype=jnp.int32),
+        jnp.zeros(n_pairs, dtype=jnp.int32),
+        jnp.zeros(n_pairs, dtype=jnp.int32),
         jnp.array(0, dtype=jnp.int32),
     )
-    (new_pos, new_types, new_ene, new_cells, total_acc, total_att, total_evals), _ = (
+    (new_pos, new_types, new_ene, new_cells, acc_per_pair, att_per_pair, total_evals), _ = (
         jax.lax.scan(_do_one_cycle, init_carry, cycle_keys)
     )
 
     swap_info = {
-        "n_accepted": total_acc,
-        "n_attempted": total_att,
+        "n_accepted": jnp.sum(acc_per_pair),
+        "n_attempted": jnp.sum(att_per_pair),
         "n_energy_evals": total_evals,
+        "n_accepted_per_pair": acc_per_pair,
+        "n_attempted_per_pair": att_per_pair,
     }
     return new_pos, new_types, new_ene, new_cells, swap_info
 
@@ -941,31 +1045,34 @@ class SemiGrandSwap(SwapKernel):
     adopts μ_B and replica B adopts μ_A.  Positions, cells, and types are
     **never** changed — only the μ assignment moves.
 
-    **Sign convention (matching legacy jaxnest
-    ``create_perform_semi_grand_swap`` at
-    ``jaxns-devAS/src/jaxnest/replica_exchange.py:195-249``):**
+    **Sign convention (consistent with ``EnsembleBackend``):**
 
-    The stored ``state.energy`` is the raw potential energy *U* (not the
-    grand-canonical energy Ω).  The grand-canonical energy under chemical
-    potential μ and species count array N is::
+    The stored ``state.energy`` is the grand-canonical energy at the run's own
+    chemical potential, ``Ω_self = U - μ_self · N`` (matching the
+    ``H = H - μ · N`` line in ``backends/ensemble.py``).  Under the swap,
+    replica A adopts μ_B and replica B adopts μ_A.  To obtain the new
+    grand-canonical energy at the *partner's* μ we first recover U from the
+    stored Ω, then re-subtract the partner's μN term::
 
-        Ω = U - μ · N
+        Ω_A_new = U_A - μ_B · N_A
+                = (state.energy_A + μ_A · N_A) - μ_B · N_A
+
+        Ω_B_new = U_B - μ_A · N_B
+                = (state.energy_B + μ_B · N_B) - μ_A · N_B
 
     where ``N[s] = number of atoms of species s`` (i.e.
     ``jnp.bincount(types, length=n_species)``).
-
-    Under the swap, replica A (with Emax_A) receives μ_B::
-
-        Ω_A_new = U_A - μ_B · N_A
-
-    and replica B (with Emax_B) receives μ_A::
-
-        Ω_B_new = U_B - μ_A · N_B
 
     The swap is accepted iff both ``Ω_A_new < Emax_A`` and
     ``Ω_B_new < Emax_B``.
 
     Zero backend calls are made.  No morphing, no position change.
+
+    .. note::
+        This matches the legacy ``jaxnest`` ``create_perform_semi_grand_swap``
+        (subtract self μN to recover U, then re-add partner μN) up to the sign
+        flip introduced by ``EnsembleBackend`` storing ``Ω = U - μN`` instead
+        of the legacy ``E_stored = U + μN``.
 
     Args:
         n_species: Static Python int; number of distinct species labels.
@@ -998,7 +1105,8 @@ class SemiGrandSwap(SwapKernel):
 
         Args:
             state_a: Dict with keys ``'positions'``, ``'cell'``, ``'types'``,
-                ``'energy'`` (raw potential energy U_A).
+                ``'energy'`` (stored grand-canonical energy
+                ``Ω_self_A = U_A - μ_A · N_A`` from ``EnsembleBackend``).
             state_b: Same structure for replica B.
             ensemble_params_a: Dict with key ``'chemical_potentials'`` — float
                 array of shape ``(n_species,)``.
@@ -1010,8 +1118,10 @@ class SemiGrandSwap(SwapKernel):
             ``(proposed, 0, 0)`` where ``proposed`` is a dict with keys
             ``{'positions_a', 'cell_a', 'types_a', 'energy_a',
                'positions_b', 'cell_b', 'types_b', 'energy_b'}``.
-            ``energy_a`` = ``U_A - μ_B · N_A``.
-            ``energy_b`` = ``U_B - μ_A · N_B``.
+            ``energy_a`` = ``state_a.energy + μ_A · N_A - μ_B · N_A``
+            (= ``U_A - μ_B · N_A``).
+            ``energy_b`` = ``state_b.energy + μ_B · N_B - μ_A · N_B``
+            (= ``U_B - μ_A · N_B``).
 
         Raises:
             ValueError: If ``'chemical_potentials'`` is absent from either
@@ -1048,11 +1158,11 @@ class SemiGrandSwap(SwapKernel):
         N_A = jnp.bincount(types_a, length=n_species)  # (n_species,)
         N_B = jnp.bincount(types_b, length=n_species)  # (n_species,)
 
-        # Grand-canonical energy under the *swapped* chemical potential.
-        # Replica A adopts μ_B: Ω_A_new = U_A - μ_B · N_A
-        # Replica B adopts μ_A: Ω_B_new = U_B - μ_A · N_B
-        omega_a = state_a["energy"] - jnp.dot(mu_b, N_A)
-        omega_b = state_b["energy"] - jnp.dot(mu_a, N_B)
+        # Stored state.energy = Ω_self = U - μ_self·N (EnsembleBackend
+        # convention).  Recover U by adding μ_self·N back, then subtract the
+        # partner's μ·N to get the post-swap grand-canonical energy.
+        omega_a = state_a["energy"] + jnp.dot(mu_a, N_A) - jnp.dot(mu_b, N_A)
+        omega_b = state_b["energy"] + jnp.dot(mu_b, N_B) - jnp.dot(mu_a, N_B)
 
         proposed = {
             "positions_a": state_a.get("positions"),
@@ -1161,6 +1271,7 @@ def semi_grand_replica_exchange_step(
     n_even = even_pairs.shape[0]
     n_odd = odd_pairs.shape[0]
     max_pairs = max(n_even, n_odd) if (n_even > 0 or n_odd > 0) else 0
+    n_pairs = max(n_runs - 1, 0)
 
     if max_pairs == 0:
         return (
@@ -1172,6 +1283,8 @@ def semi_grand_replica_exchange_step(
                 "n_accepted": jnp.array(0),
                 "n_attempted": jnp.array(0),
                 "n_energy_evals": jnp.array(0),
+                "n_accepted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
+                "n_attempted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
             },
         )
 
@@ -1190,13 +1303,13 @@ def semi_grand_replica_exchange_step(
 
     def _do_one_phase(carry, phase_input):
         """Process one phase of semi-grand swap attempts."""
-        positions, types, energies, cells, n_acc, n_att = carry
+        positions, types, energies, cells, acc_per_pair, att_per_pair = carry
         pairs, mask, phase_key = phase_input
 
         pair_keys = jax.random.split(phase_key, max_pairs)
 
         def _attempt_one_sg_swap(carry_inner, swap_input):
-            pos, typ, ene, bxs, acc_count = carry_inner
+            pos, typ, ene, bxs, acc_per_pair_in = carry_inner
             pair, valid, swap_key = swap_input
 
             k1, k2 = jax.random.split(swap_key)
@@ -1247,32 +1360,37 @@ def semi_grand_replica_exchange_step(
                 jnp.where(do_swap, proposed["energy_b"], ene[run_j, wj])
             )
 
-            new_acc = acc_count + valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
+            # Per-pair scatter-add (see replica_exchange_step for the
+            # convention rationale).
+            pair_id = jnp.minimum(run_i, run_j)
+            delta = valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
+            new_acc_per_pair = acc_per_pair_in.at[pair_id].add(delta)
 
-            return (pos, typ, new_ene, bxs, new_acc), None
+            return (pos, typ, new_ene, bxs, new_acc_per_pair), None
 
         scan_inputs = (pairs, mask, pair_keys)
-        (positions, types, energies, cells, n_acc), _ = jax.lax.scan(
+        (positions, types, energies, cells, acc_per_pair), _ = jax.lax.scan(
             _attempt_one_sg_swap,
-            (positions, types, energies, cells, n_acc),
+            (positions, types, energies, cells, acc_per_pair),
             scan_inputs,
         )
-        n_att = n_att + jnp.sum(mask.astype(jnp.int32))
-        return (positions, types, energies, cells, n_acc, n_att), None
+        pair_ids_phase = jnp.minimum(pairs[:, 0], pairs[:, 1])
+        att_per_pair = att_per_pair.at[pair_ids_phase].add(mask.astype(jnp.int32))
+        return (positions, types, energies, cells, acc_per_pair, att_per_pair), None
 
     def _do_one_cycle(carry, cycle_key):
-        positions, types, energies, cells, n_acc, n_att = carry
+        positions, types, energies, cells, acc_per_pair, att_per_pair = carry
         even_key, odd_key = jax.random.split(cycle_key)
 
-        (positions, types, energies, cells, n_acc, n_att), _ = _do_one_phase(
-            (positions, types, energies, cells, n_acc, n_att),
+        (positions, types, energies, cells, acc_per_pair, att_per_pair), _ = _do_one_phase(
+            (positions, types, energies, cells, acc_per_pair, att_per_pair),
             (all_pairs[0], all_masks[0], even_key),
         )
-        (positions, types, energies, cells, n_acc, n_att), _ = _do_one_phase(
-            (positions, types, energies, cells, n_acc, n_att),
+        (positions, types, energies, cells, acc_per_pair, att_per_pair), _ = _do_one_phase(
+            (positions, types, energies, cells, acc_per_pair, att_per_pair),
             (all_pairs[1], all_masks[1], odd_key),
         )
-        return (positions, types, energies, cells, n_acc, n_att), None
+        return (positions, types, energies, cells, acc_per_pair, att_per_pair), None
 
     cycle_keys = jax.random.split(rng_key, n_swap_cycles)
     init_carry = (
@@ -1280,16 +1398,18 @@ def semi_grand_replica_exchange_step(
         all_types,
         all_energies,
         all_cells,
-        jnp.array(0, dtype=jnp.int32),
-        jnp.array(0, dtype=jnp.int32),
+        jnp.zeros(n_pairs, dtype=jnp.int32),
+        jnp.zeros(n_pairs, dtype=jnp.int32),
     )
-    (new_pos, new_types, new_ene, new_cells, total_acc, total_att), _ = jax.lax.scan(
+    (new_pos, new_types, new_ene, new_cells, acc_per_pair, att_per_pair), _ = jax.lax.scan(
         _do_one_cycle, init_carry, cycle_keys
     )
 
     swap_info = {
-        "n_accepted": total_acc,
-        "n_attempted": total_att,
+        "n_accepted": jnp.sum(acc_per_pair),
+        "n_attempted": jnp.sum(att_per_pair),
         "n_energy_evals": jnp.array(0, dtype=jnp.int32),
+        "n_accepted_per_pair": acc_per_pair,
+        "n_attempted_per_pair": att_per_pair,
     }
     return new_pos, new_types, new_ene, new_cells, swap_info

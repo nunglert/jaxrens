@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RunSpec(BaseModel):
@@ -28,3 +28,16 @@ class RunSpec(BaseModel):
     n_cull: int = 1
     seed: int = 42
     pressure: Optional[float] = None
+    shard_n_gpu: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Shard the n_live walker population across this many GPUs.  "
+            "When > 1 and the config implies a single logical run (no "
+            "pressure / composition / chemical-potential list, no inter_re), "
+            "the resolver builds a ShardedSingleRun batcher and the CLI "
+            "dispatches to run_sharded_from_config.  "
+            "n_live must be divisible by shard_n_gpu.  Default 1 → "
+            "behaviour identical to today's single-GPU single run."
+        ),
+    )

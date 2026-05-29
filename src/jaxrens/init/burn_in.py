@@ -14,26 +14,29 @@ The ``batcher`` argument routes the run-axis dispatch:
 
 Parallelism axes:
     walker_batch_size: chunk the walker vmap via lax.map(batch_size=N).
-    run_batch_size: chunk the run vmap via lax.map(batch_size=M).  Only
-        applies to ``VmapRuns``; ignored for SingleRun and PmapVmapRuns.
 """
 
 from __future__ import annotations
 
+import logging
 import warnings
 from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
 
-from jaxrens.sampling.adaptation.stepsize_handler import adjust_step_size
+from jaxrens.sampling.adaptation.manager import build_adapt_step
 from jaxrens.sampling.batch_descriptor import (
     BatchDescriptor,
+    ShardedSingleRun,
     SingleRun,
     VmapRuns,
 )
+from jaxrens.sampling.bucket_manager import BucketManager
 from jaxrens.state.ns import NSState
 from jaxrens.utils.padding import pad_to_multiple
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -65,8 +68,25 @@ def _one_walk(
     Returns:
         (new_ns_state, last_accepted) where last_accepted is (n_walkers, walklength).
     """
+    # Fires once per cache miss; subsequent walks with identical shapes /
+    # static fields reuse the compiled binary and stay silent.  A second
+    # entry after iter-N indicates the burn-in bucket changed (overflow
+    # retry).
+    logger.info(
+        "burnin _one_walk tracing: pop_shape=%s  max_neighbors=%d  "
+        "walklength=%d  walker_batch_size=%s",
+        ns_state.population.positions.shape,
+        int(ns_state.population.max_neighbors),
+        int(walklength),
+        walker_batch_size,
+    )
     population = ns_state.population
-    n_walkers = ns_state.n_walkers
+    # Use the leading dim of the local population, not ``ns_state.n_walkers``.
+    # ``n_walkers`` is a static field that holds the GLOBAL count (matters for
+    # ShardedSingleRun: per-shard local count is ``K // G`` while
+    # ``ns_state.n_walkers == K``).  All other batchers run with local ==
+    # global so the two agree.
+    n_walkers = population.energy.shape[0]
 
     walker_keys = jax.random.split(key, n_walkers)
     # chain_keys: (n_walkers, walklength)
@@ -108,105 +128,6 @@ def _one_walk(
     return ns_state.set(population=new_population), accepted
 
 
-def _apply_adaptation(
-    ns_state: NSState,
-    emax: jnp.ndarray,
-    key: jax.Array,
-    per_move_fns: list[Callable],
-    adaptation_policies: tuple,
-    current_step_sizes: jnp.ndarray,
-    adjust_n_samples: int,
-    adjust_max_rounds: int,
-    jit_adjust_fns: list[Callable],
-    batcher: BatchDescriptor,
-    run_batch_size: int | None = None,
-) -> tuple[NSState, jnp.ndarray]:
-    """Update step sizes for all move types.
-
-    Routing is descriptor-driven via ``batcher``:
-
-    * ``SingleRun`` — direct call (no vmap).
-    * ``VmapRuns`` — ``jax.vmap`` over the run axis (or
-      ``jax.lax.map(batch_size=run_batch_size)`` when set).
-    * ``PmapVmapRuns`` — ``jax.pmap(jax.vmap(...))`` over G × P.
-
-    Args:
-        ns_state: Current NSState whose population has shape
-            ``(*shape_prefix, n_walkers, ...)``.
-        emax: ``(*shape_prefix,)``-shaped energy ceiling (scalar for SingleRun).
-        key: PRNG key.
-        per_move_fns: Per-move step functions.
-        adaptation_policies: Tuple of ResolvedAdaptationPolicy.
-        current_step_sizes: ``(*shape_prefix, n_move_types)``.
-        adjust_n_samples: Trial walker count per adaptation round.
-        adjust_max_rounds: Max bisection rounds.
-        jit_adjust_fns: Pre-JIT'd adjust functions, one per move.  These should
-            already close over ``trial_batch_size`` (set in :func:`initial_walk`)
-            so each per-run call internally chunks its trial vmap.
-        batcher: ``BatchDescriptor`` selecting the run-axis dispatch.
-        run_batch_size: Optional chunk size for the run-axis vmap.  Only
-            consumed when ``batcher`` is ``VmapRuns``; ignored otherwise.
-            ``jax.lax.map(..., batch_size=run_batch_size)`` replaces the full
-            vmap, bounding peak memory.
-
-    Returns:
-        (new_ns_state, new_step_sizes)
-    """
-    population = ns_state.population
-    n_walkers = population.step_sizes.shape[batcher.walker_axis]
-
-    use_chunked_vmap = (
-        run_batch_size is not None and isinstance(batcher, VmapRuns)
-    )
-
-    for move_idx, policy in enumerate(adaptation_policies):
-        key, key_adj = jax.random.split(key)
-
-        def adjust_one_replica(
-            pop, ss, e, k,
-            _move_idx=move_idx,
-            _policy=policy,
-        ):
-            new_ss, *_ = jit_adjust_fns[_move_idx](
-                pop,
-                per_move_fns[_move_idx],
-                ss,
-                e,
-                k,
-                adjust_n_samples,
-                _policy.min_rate,
-                _policy.max_rate,
-                _policy.adjust_factor,
-                _policy.step_size_max,
-                adjust_max_rounds,
-            )
-            return new_ss
-
-        ss_move = current_step_sizes[..., move_idx]
-
-        if not batcher.is_batched:
-            new_ss = adjust_one_replica(population, ss_move, emax, key_adj)
-        else:
-            run_keys = jax.random.split(key_adj, batcher.n_runs).reshape(
-                batcher.shape_prefix
-            )
-            if use_chunked_vmap:
-                new_ss = jax.lax.map(
-                    lambda x: adjust_one_replica(x[0], x[1], x[2], x[3]),
-                    (population, ss_move, emax, run_keys),
-                    batch_size=run_batch_size,
-                )
-            else:
-                wrapped = batcher.wrap_for_batch(adjust_one_replica)
-                new_ss = wrapped(population, ss_move, emax, run_keys)
-
-        current_step_sizes = current_step_sizes.at[..., move_idx].set(new_ss)
-
-    new_ss_pop = batcher.broadcast_step_sizes(current_step_sizes, n_walkers)
-    new_population = population.set(step_sizes=new_ss_pop)
-    return ns_state.set(population=new_population), current_step_sizes
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -225,11 +146,14 @@ def initial_walk(
     batcher: BatchDescriptor | None = None,
     batched: bool | None = None,  # deprecated; pass ``batcher`` instead
     walker_batch_size: int | None = None,
-    run_batch_size: int | None = None,
     per_move_fns: list[Callable] | None = None,
     adaptation_policies: tuple | None = None,
+    move_names: tuple[str, ...] | None = None,
     adjust_n_samples: int = 50,
     adjust_max_rounds: int = 15,
+    max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
+    max_neighbors_offset: int = 5,
+    max_neighbors_shrink_dwell: int = 0,
 ) -> NSState:
     """Run fixed-Emax MCMC to decorrelate walkers from their initialization.
 
@@ -240,9 +164,6 @@ def initial_walk(
         walker_batch_size=None: vmap over all walkers simultaneously (fastest).
         walker_batch_size=N: chunk via lax.map(batch_size=N). Any positive
             int; non-divisors are handled internally by padding.
-        run_batch_size=None: vmap over all runs simultaneously (VmapRuns only).
-        run_batch_size=M: chunk via lax.map(batch_size=M). Must divide n_runs.
-            Ignored for SingleRun and PmapVmapRuns.
 
     Args:
         key: JAX PRNG key.
@@ -266,21 +187,26 @@ def initial_walk(
             ``batcher`` instead.
         walker_batch_size: Chunk size for walker vmap. None = full vmap.
             Any positive int; non-divisors are handled internally by padding.
-        run_batch_size: Chunk size for run vmap (VmapRuns only). None =
-            full vmap over runs. Must divide n_runs evenly.
         per_move_fns: Per-move step functions (third return of build_mwg).
             Required for step-size adaptation; None disables it.
         adaptation_policies: Tuple of ResolvedAdaptationPolicy, one per move.
             Required when per_move_fns is not None.
         adjust_n_samples: Number of trial walkers per adaptation round.
         adjust_max_rounds: Max bisection rounds per adaptation call.
+        max_neighbors_list: Bucket ladder for neighbor-overflow retries.
+            On overflow after a walk the next entry in this ladder is
+            selected via ``_pick_next_bucket`` and the walk is retried.
+            Mirrors the NS-loop parameter of the same name.
+        max_neighbors_offset: Headroom added to the observed peak when
+            picking the next bucket.  Mirrors the NS-loop parameter.
+        max_neighbors_shrink_dwell: Hysteresis dwell window for downsizing
+            the bucket — see :class:`~jaxrens.sampling.bucket_manager.BucketManager`.
+            ``0`` (default) disables shrinking, preserving the existing
+            growth-only behaviour.  Mirrors the NS-loop parameter.
 
     Returns:
         New NSState with live walkers advanced. Same pytree shape as input.
         Dead-point arrays, log_evidence, iteration, n_dead are unchanged.
-
-    Raises:
-        ValueError: If run_batch_size does not evenly divide n_runs.
     """
     if batched is not None:
         warnings.warn(
@@ -304,18 +230,7 @@ def initial_walk(
     if n_walks == 0:
         return ns_state
 
-    # --- Validate chunking parameters ---
     n_walkers = int(ns_state.population.energy.shape[batcher.walker_axis])
-    if (
-        isinstance(batcher, VmapRuns)
-        and run_batch_size is not None
-        and batcher.n_runs % run_batch_size != 0
-    ):
-        raise ValueError(
-            f"run_batch_size={run_batch_size} does not evenly divide "
-            f"n_runs={batcher.n_runs}. "
-            f"Choose a divisor of {batcher.n_runs}."
-        )
 
     # --- Compute fixed Emax (per replica) ---
     population = ns_state.population
@@ -330,86 +245,123 @@ def initial_walk(
     )
 
     if use_adaptation:
-        n_moves = len(per_move_fns)
-        # Close over walker_batch_size as trial_batch_size: when set, the inner
-        # trial vmap inside adjust_step_size becomes a chunked-vmap so peak
-        # memory tracks the chunk rather than adjust_n_samples.  The closed-over
-        # value is captured at JIT-trace time, so different walker_batch_size
-        # values produce distinct compilation traces (correct cache behaviour).
-        if walker_batch_size is None:
-            jit_adjust_fns = [
-                jax.jit(adjust_step_size, static_argnums=(1, 5, 6, 7, 8, 9, 10))
-                for _ in range(n_moves)
-            ]
-        else:
-            def _make_adjust_fn(_trial_chunk=walker_batch_size):
-                def _wrapped(*args):
-                    return adjust_step_size(*args, trial_batch_size=_trial_chunk)
-                return jax.jit(_wrapped, static_argnums=(1, 5, 6, 7, 8, 9, 10))
-            jit_adjust_fns = [_make_adjust_fn() for _ in range(n_moves)]
-        current_step_sizes = batcher.extract_step_sizes(population)
+        # ``build_adapt_step`` only reads ``name``/``min_rate``/
+        # ``max_rate``/``step_size_max`` from each move descriptor.
+        # Burn-in receives ``ResolvedAdaptationPolicy`` (no ``name``);
+        # construct a real :class:`MoveKernel` with a no-op
+        # ``build_kernel`` (the builder never calls it — only reads the
+        # four rate/cap fields).  ``MoveKernel`` is a frozen dataclass
+        # with strict beartype-checked typing on its sequence
+        # consumers, so a real instance is required.  Per-move
+        # ``adjust_factor`` collapses to a single value (the builder's
+        # contract) — burn-in adopts the first policy's factor,
+        # mirroring how the NS-loop adapt step is constructed in
+        # ``cli/run.py``.
+        from jaxrens.sampling.move_kernel import MoveKernel
+
+        def _noop_build_kernel(*_args, **_kwargs):  # pragma: no cover
+            raise RuntimeError(
+                "burn-in's MoveKernel shim build_kernel was invoked — "
+                "build_adapt_step should only read static fields."
+            )
+
+        # Use caller-supplied move names when available so the adapt-tracing
+        # log shows ``move=random_walk`` etc. instead of ``move=move_0``.
+        # Falls back to positional names for back-compat with direct callers
+        # (tests / scripts) that don't have descriptors handy.
+        if move_names is not None and len(move_names) != len(adaptation_policies):
+            raise ValueError(
+                f"initial_walk: len(move_names)={len(move_names)} does not "
+                f"match len(adaptation_policies)={len(adaptation_policies)}."
+            )
+        descs = [
+            MoveKernel(
+                name=(move_names[i] if move_names is not None else f"move_{i}"),
+                build_kernel=_noop_build_kernel,
+                min_rate=p.min_rate,
+                max_rate=p.max_rate,
+                step_size_max=p.step_size_max,
+            )
+            for i, p in enumerate(adaptation_policies)
+        ]
+        adjust_factor = float(adaptation_policies[0].adjust_factor)
+        # Propagate burn-in's ``walker_batch_size`` to the adapt step as
+        # ``trial_batch_size`` — same memory motivation (chunk the per-
+        # round trial vmap).  Zero-overhead when ``None``.
+        adapt_step = build_adapt_step(
+            move_descriptors=descs,
+            per_move_fns=per_move_fns,
+            batcher=batcher,
+            adjust_n_samples=adjust_n_samples,
+            adjust_factor=adjust_factor,
+            adjust_max_rounds=adjust_max_rounds,
+            adjust_interval=adjust_interval,
+            trial_batch_size=walker_batch_size,
+        )
     else:
-        jit_adjust_fns = None
-        current_step_sizes = None
+        adapt_step = None
 
     # --- Build one-walk function via the descriptor ---
-    # Per-replica callable; ``wrap_for_batch`` adds the right jit/vmap/pmap
-    # composition for the chosen descriptor.  ``run_batch_size`` (chunked
-    # vmap along the run axis) is only meaningful for ``VmapRuns`` — for
-    # SingleRun there is no run axis, and for PmapVmapRuns the replicas are
-    # already split by GPU.  The chunked path is left explicit below.
+    # ``wrap_for_batch`` adds the right jit / vmap / pmap composition for
+    # the chosen descriptor (identity for SingleRun, vmap for VmapRuns,
+    # pmap-of-vmap for PmapVmapRuns).
     def _per_replica(k, run_state, run_emax):
         return _one_walk(
             k, run_state, step_fn, walklength, run_emax, walker_batch_size,
         )
 
-    use_chunked_run_vmap = (
-        run_batch_size is not None and isinstance(batcher, VmapRuns)
-    )
-    if use_chunked_run_vmap:
-        def _chunked_walk(key_in, batched_state, batched_emax):
-            run_keys = jax.random.split(key_in, batcher.n_runs)
-            return jax.lax.map(
-                lambda x: _per_replica(x[0], x[1], x[2]),
-                (run_keys, batched_state, batched_emax),
-                batch_size=run_batch_size,
-            )
-        jit_one_walk = jax.jit(_chunked_walk)
-    else:
-        jit_one_walk = batcher.wrap_for_batch(_per_replica)
+    jit_one_walk = batcher.wrap_for_batch(_per_replica)
 
-    # --- Outer walk loop ---
-    for walk_i in range(n_walks):
-        if use_adaptation and walk_i > 0 and walk_i % adjust_interval == 0:
+    # Bucket-ladder manager shared with ``_run_loop``.  Growth always
+    # active; shrink path opt-in via ``shrink_dwell > 0``.
+    bucket_mgr = BucketManager(
+        ladder=max_neighbors_list,
+        offset=max_neighbors_offset,
+        shrink_dwell=max_neighbors_shrink_dwell,
+    )
+
+    # --- Outer walk loop (while-loop so overflow retries don't advance walk_i) ---
+    walk_i = 0
+    while walk_i < n_walks:
+        if adapt_step is not None and walk_i % adjust_interval == 0:
             key, key_adapt = jax.random.split(key)
-            ns_state, current_step_sizes = _apply_adaptation(
-                ns_state=ns_state,
-                emax=emax,
-                key=key_adapt,
-                per_move_fns=per_move_fns,
-                adaptation_policies=adaptation_policies,
-                current_step_sizes=current_step_sizes,
-                adjust_n_samples=adjust_n_samples,
-                adjust_max_rounds=adjust_max_rounds,
-                jit_adjust_fns=jit_adjust_fns,
-                batcher=batcher,
-                run_batch_size=run_batch_size,
+            # adapt_step requires a shape-prefix-shaped key; burn-in
+            # carries a scalar so promote here.  Sharded: BROADCAST
+            # (identical per shard — required for lax.psum coherence).
+            # Other batched: SPLIT (independent per replica).
+            if isinstance(batcher, ShardedSingleRun):
+                key_adapt = jnp.broadcast_to(
+                    key_adapt, (batcher.n_gpu,) + key_adapt.shape,
+                )
+            elif batcher.is_batched:
+                key_adapt = jax.random.split(
+                    key_adapt, batcher.n_runs,
+                ).reshape(batcher.shape_prefix)
+            ns_state, _diag, _new_key = adapt_step(
+                ns_state, emax, key_adapt,
             )
 
         key, sub = jax.random.split(key)
 
-        if not batcher.is_batched:
-            # SingleRun: scalar key flows straight through to ``_per_replica``.
-            ns_state, _ = jit_one_walk(sub, ns_state, emax)
-        elif use_chunked_run_vmap:
-            # Chunked path consumes the scalar key and splits internally.
-            ns_state, _ = jit_one_walk(sub, ns_state, emax)
-        else:
-            # Batched path (vmap or pmap-vmap): split into per-replica keys
-            # before invoking the wrapped callable.
-            run_keys = jax.random.split(sub, batcher.n_runs).reshape(
-                batcher.shape_prefix
-            )
-            ns_state, _ = jit_one_walk(run_keys, ns_state, emax)
+        # ``distinct_keys`` returns shape_prefix-shaped INDEPENDENT keys
+        # (scalar for SingleRun) on the right mesh per batcher.  Each
+        # replica/shard walks its own walkers.
+        walk_keys = batcher.distinct_keys(sub)
+        new_ns_state, _ = jit_one_walk(walk_keys, ns_state, emax)
+
+        # Bucket overflow → grow and retry the same walk.  JAX re-traces
+        # ``jit_one_walk`` automatically because ``max_neighbors`` is a
+        # static field on the MCState pytree.  Counter ``walk_i`` is not
+        # advanced.
+        ns_state, retry = bucket_mgr.grow_if_overflow(
+            ns_state, new_ns_state,
+            label="burn-in walk", iteration=walk_i,
+        )
+        if retry:
+            continue
+
+        # Optional shrink path — no-op when ``shrink_dwell == 0``.
+        ns_state = bucket_mgr.maybe_shrink(ns_state, iteration=walk_i)
+        walk_i += 1
 
     return ns_state

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
 import jax.numpy as jnp
 import numpy as np
 

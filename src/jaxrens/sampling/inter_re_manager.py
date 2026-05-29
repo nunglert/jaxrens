@@ -11,18 +11,21 @@ The manager is descriptor-aware:
   same swap decisions), then re-shards by slicing the device's own offset.
   For ``n_gpu=1`` the all_gather is a no-op (zero extra cost).
 
-Design mirrors ``AdaptationManager``: built once at construction time, JIT'd
-swap step cached; ``_run_loop`` calls ``fires(i)`` / ``apply(state, key)`` at
-each iteration.
+Design: built once at construction time, JIT'd swap step cached; ``_run_loop``
+calls ``fires(i)`` / ``apply(state, key)`` at each iteration.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, TypedDict
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jaxtyping import Array, Key
+
+logger = logging.getLogger(__name__)
 
 from jaxrens.sampling.batch_descriptor import (
     BatchDescriptor,
@@ -43,13 +46,23 @@ from jaxrens.state.ns import NSState
 
 
 class SwapStats(TypedDict):
-    """Public return type of ``InterREManager.apply``'s stats dict."""
+    """Public return type of ``InterREManager.apply``'s stats dict.
+
+    The aggregate fields (``n_swap_pairs_attempted``,
+    ``n_swap_pairs_accepted``, ``acceptance_rate``) are sums over all
+    pairs and all swap cycles in the fire.  The per-pair arrays carry
+    the same totals broken down by pair_id (``min(left, right)`` of
+    the (k, k+1) pair).  Always shape ``(n_runs - 1,)`` int32; when
+    ``n_runs < 2`` the arrays are length-zero.
+    """
 
     n_swap_pairs_attempted: int
     n_swap_pairs_accepted: int
     acceptance_rate: float
     n_energy_evals: int
     n_grad_evals: int
+    n_accepted_per_pair: np.ndarray
+    n_attempted_per_pair: np.ndarray
 
 
 _EMPTY_STATS: SwapStats = {
@@ -58,6 +71,8 @@ _EMPTY_STATS: SwapStats = {
     "acceptance_rate": 0.0,
     "n_energy_evals": 0,
     "n_grad_evals": 0,
+    "n_accepted_per_pair": np.zeros(0, dtype=np.int32),
+    "n_attempted_per_pair": np.zeros(0, dtype=np.int32),
 }
 
 
@@ -73,7 +88,7 @@ class InterREManager:
         batcher: ``BatchDescriptor`` controlling the execution mode.
         backend: Energy backend (unused for ``PressureRENSSwap`` but part of
             the general API for future kernels such as ``XRENSSwap``).
-        every: Fire a swap pass every this many NS iterations.  0 → never fire.
+        re_interval: Fire a swap pass every this many NS iterations.  0 → never fire.
         n_swap_cycles: Number of even+odd swap phases per fire.
     """
 
@@ -82,13 +97,13 @@ class InterREManager:
         swap_kernel: SwapKernel,
         batcher: BatchDescriptor,
         backend: Any,
-        every: int = 1,
+        re_interval: int = 1,
         n_swap_cycles: int = 1,
     ) -> None:
         self._swap_kernel = swap_kernel
         self._batcher = batcher
         self._backend = backend
-        self._every = every
+        self._re_interval = re_interval
         self._n_swap_cycles = n_swap_cycles
 
         # Kernel flavor flags (mutually exclusive).
@@ -110,8 +125,8 @@ class InterREManager:
     def fires(self, iteration: int) -> bool:
         """Return True iff a swap pass should fire on this iteration.
 
-        Rules: every > 0 AND iteration > 0 AND iteration % every == 0.
-        Iteration 0 is skipped to match ``AdaptationManager.fires`` convention.
+        Rules: re_interval > 0 AND iteration > 0 AND iteration % re_interval == 0.
+        Iteration 0 is skipped to match the adapt-step firing convention.
 
         Args:
             iteration: Current NS iteration index (Python int).
@@ -119,16 +134,16 @@ class InterREManager:
         Returns:
             True when a swap should be attempted.
         """
-        return self._every > 0 and iteration > 0 and iteration % self._every == 0
+        return self._re_interval > 0 and iteration > 0 and iteration % self._re_interval == 0
 
     @property
     def is_active(self) -> bool:
         """True iff this manager will actually do work.
 
         ``SingleRun`` descriptors return False (no batched population to swap).
-        ``VmapRuns`` / ``PmapVmapRuns`` return True when ``every > 0``.
+        ``VmapRuns`` / ``PmapVmapRuns`` return True when ``re_interval > 0``.
         """
-        return self._batcher.is_batched and self._every > 0
+        return self._batcher.is_batched and self._re_interval > 0
 
     def apply(
         self, ns_state: NSState, rng_key: Key[Array, ""]
@@ -138,6 +153,12 @@ class InterREManager:
         For ``SingleRun``: returns state unchanged with zero stats.
         For ``VmapRuns``: operates on ``(n_runs, K, ...)`` population directly.
         For ``PmapVmapRuns``: all_gathers across the pmap axis, swaps, re-shards.
+
+        The swap-acceptance constraint is read off ``ns_state.emax`` — the
+        per-replica NS contour the most recent ``ns_step`` culled at.
+        This is algorithm state set by ``ns_step``, not a value re-derived
+        from ``pop.energy``: recomputing here would be strictly tighter
+        post-MCMC and would reject otherwise-legal swaps.
 
         Args:
             ns_state: Current ``NSState`` (single, vmapped, or pmap-vmapped).
@@ -209,6 +230,12 @@ class InterREManager:
             # XRENS path: requires composition_targets and backend.
             def _xrens_swap_fn(rng_key, positions, types, energies, cells,
                                emax, pressures, composition_targets):
+                # Cache-miss tracing log (fires only on first trace per signature).
+                logger.info(
+                    "inter_re tracing: flavor=xrens  pop_shape=%s  "
+                    "n_swap_cycles=%d",
+                    positions.shape, int(n_swap_cycles),
+                )
                 return xrens_replica_exchange_step(
                     rng_key=rng_key,
                     all_positions=positions,
@@ -227,6 +254,11 @@ class InterREManager:
             # Semi-grand path: requires chemical_potentials; zero backend calls.
             def _sg_swap_fn(rng_key, positions, types, energies, cells,
                             emax, pressures, chemical_potentials):
+                logger.info(
+                    "inter_re tracing: flavor=semi_grand  pop_shape=%s  "
+                    "n_swap_cycles=%d",
+                    positions.shape, int(n_swap_cycles),
+                )
                 return semi_grand_replica_exchange_step(
                     rng_key=rng_key,
                     all_positions=positions,
@@ -242,6 +274,11 @@ class InterREManager:
             jit_vmap = jax.jit(_sg_swap_fn)
         else:
             def _swap_fn(rng_key, positions, types, energies, cells, emax, pressures):
+                logger.info(
+                    "inter_re tracing: flavor=pressure  pop_shape=%s  "
+                    "n_swap_cycles=%d",
+                    positions.shape, int(n_swap_cycles),
+                )
                 return replica_exchange_step(
                     rng_key=rng_key,
                     all_positions=positions,
@@ -436,6 +473,10 @@ class InterREManager:
         For VmapRuns the population has shape ``(n_runs, K, ...)``.
         For PmapVmapRuns the population has shape ``(G, P, K, ...)``.
 
+        ``emax`` is read off ``ns_state.emax`` — the per-replica NS
+        contour set by the most recent ``ns_step``.  Not re-derived from
+        ``pop.energy`` (which would be strictly tighter post-MCMC).
+
         Returns:
             Tuple of JAX arrays:
             ``(positions, types, energies, cells, emax, pressures,
@@ -445,14 +486,12 @@ class InterREManager:
             ``SemiGrandSwap`` mode is active.
         """
         pop = ns_state.population
+        emax = ns_state.emax        # (*shape_prefix,)
 
         positions = pop.positions   # (*shape_prefix, K, n_atoms, 3)
         types = pop.types           # varies
         energies = pop.energy       # (*shape_prefix, K)
         cells = pop.cell            # (*shape_prefix, K, 3, 3)
-
-        # Per-replica Emax via the descriptor's walker-axis reduction.
-        emax = self._batcher.reduce_emax(energies)
 
         # Pressures, composition_targets, chemical_potentials: extract from
         # ensemble_params.  After vmapping init_ns, per-replica scalar values
@@ -606,10 +645,15 @@ class InterREManager:
 
         # All devices ran the same swap (same RNG + same data after all_gather),
         # so device 0's swap_info is representative.
-        stats = self._build_stats({
+        device0_info: dict[str, Any] = {
             "n_accepted": swap_info_sharded["n_accepted"][0],
             "n_attempted": swap_info_sharded["n_attempted"][0],
-        })
+            "n_accepted_per_pair": swap_info_sharded["n_accepted_per_pair"][0],
+            "n_attempted_per_pair": swap_info_sharded["n_attempted_per_pair"][0],
+        }
+        if "n_energy_evals" in swap_info_sharded:
+            device0_info["n_energy_evals"] = swap_info_sharded["n_energy_evals"][0]
+        stats = self._build_stats(device0_info)
         return new_ns_state, stats
 
     @staticmethod
@@ -629,10 +673,25 @@ class InterREManager:
         n_acc = int(jnp.asarray(swap_info["n_accepted"]))
         rate = n_acc / max(n_att, 1)
         n_evals = int(jnp.asarray(swap_info["n_energy_evals"])) if "n_energy_evals" in swap_info else 0
+        # Per-pair arrays — host-side numpy copies for downstream
+        # logging.  Always present in swap_info post-2026-05 kernel
+        # extension; defensively zero-filled for legacy callers.
+        n_acc_pp = swap_info.get("n_accepted_per_pair")
+        n_att_pp = swap_info.get("n_attempted_per_pair")
+        n_acc_pp = (
+            np.asarray(n_acc_pp, dtype=np.int32)
+            if n_acc_pp is not None else np.zeros(0, dtype=np.int32)
+        )
+        n_att_pp = (
+            np.asarray(n_att_pp, dtype=np.int32)
+            if n_att_pp is not None else np.zeros(0, dtype=np.int32)
+        )
         return {
             "n_swap_pairs_attempted": n_att,
             "n_swap_pairs_accepted": n_acc,
             "acceptance_rate": rate,
             "n_energy_evals": n_evals,
             "n_grad_evals": 0,
+            "n_accepted_per_pair": n_acc_pp,
+            "n_attempted_per_pair": n_att_pp,
         }

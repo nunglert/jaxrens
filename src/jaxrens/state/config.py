@@ -41,6 +41,22 @@ class BackendConfig:
     max_neighbors_list: list[int] = field(default_factory=lambda: [30, 35, 40, 45, 50])
     max_neighbors_offset: int = 5
 
+    # Hysteresis-gated bucket shrinking (opt-in).  When ``shrink_dwell == 0``
+    # (default), the outer NS loop never downsizes the bucket: behaviour is
+    # byte-identical to before this feature was added.  When > 0, the bucket
+    # is stepped one entry down after ``shrink_dwell`` consecutive iterations
+    # where ``observed_max + offset <= next_smaller_entry``.  Temporal
+    # hysteresis comes from ``shrink_dwell``; the ``offset`` slack already
+    # plays the role of post-shrink safety margin.
+    max_neighbors_shrink_dwell: int = 0
+
+    # Soft-core repulsion wrapper kwargs.  ``None`` disables.  When set,
+    # the runtime wraps ``base_backend`` with ``SoftCoreBackend`` before
+    # any ``EnsembleBackend`` wrap.  Expected keys: ``a0``, ``b0``,
+    # ``d0``, ``r_core_cut``, ``r_core_switch``.  See
+    # ``jaxrens.backends.softcore`` and the ``SoftCoreSpec`` schema.
+    softcore_repulsion: dict | None = None
+
 
 @dataclass(frozen=True)
 class OutputConfig:
@@ -54,11 +70,65 @@ class OutputConfig:
     out_file_prefix: str = "ns"
     working_dir: Path = field(default_factory=lambda: Path("."))
     log_level: str = "info"  # "info" | "debug"
+
+    # Common write-buffer flush cadence for the per-iter trace loggers
+    # (``acc_rates``, ``max_neighbors``, ``re_stats``).  A flush fires once
+    # the NS iteration index has advanced by ``flush_interval`` since the
+    # previous flush.  Scaled by ``RootSpec.interval_units`` in the resolver
+    # exactly like every other ``*_interval`` field — set ``per_walker`` in
+    # the YAML to specify the value in walker-sweeps instead of raw iters.
+    # Decoupled from per-callback firing intervals so tight logging cadences
+    # don't force per-iter I/O.  Does NOT affect the adaptation log, which
+    # flushes on every event for crash durability.
+    flush_interval: int = 1000
+
     # Per-iter chain acceptance logging.  ``True`` registers an
     # ``AccRatesCallback`` writing ``<prefix>.acc_rates.h5`` every
     # ``acc_rates_interval`` iterations.  Decoupled from full_auto.
     save_acc_rates: bool = False
     acc_rates_interval: int = 1
+
+    # Per-iter neighbor-bucket diagnostic log.  When ``True`` registers a
+    # ``MaxNeighborsCallback`` writing ``<prefix>.max_neighbors.h5`` every
+    # ``max_neighbors_interval`` iterations.  Captures the full per-walker
+    # ``max_neighbor_count`` distribution plus the current bucket and
+    # overflow flag — useful for diagnosing bucket oscillations and for
+    # tuning ``max_neighbors_list`` / ``shrink_dwell``.  Default-off; no I/O
+    # overhead unless enabled.
+    save_max_neighbors: bool = False
+    max_neighbors_interval: int = 1
+
+    # Per-fire inter-RE swap log; cadence is upstream
+    # ``inter_re.re_interval``.  No-op when ``inter_re`` is not configured.
+    save_re_stats: bool = False
+
+    # Finite-difference temperature estimator (Baldock et al. 2017).
+    # ``temperature_lag`` is the length of the Emax FIFO used for the
+    # finite difference; ``None`` disables the callback entirely.
+    # Both ``temperature_lag`` and ``temperature_interval`` are scaled by
+    # ``RootSpec.interval_units`` (``per_walker`` → multiply by ``n_live``)
+    # in the resolver before reaching this runtime dataclass.
+    # ``temperature_kB`` defaults to eV/K (ASE convention) — set ``1.0``
+    # for reduced-unit backends (LJ, harmonic).
+    temperature_lag: int | None = 100
+    temperature_interval: int = 100
+    temperature_kB: float = 8.6173324e-5
+
+    # Pairwise-distance "collision" check.  When ``collision_check_threshold``
+    # is set (non-None and > 0), a ``CollisionCheckCallback`` fires every
+    # ``collision_check_interval`` iterations: it computes the minimum
+    # interatomic distance per walker (minimum-image convention if cells are
+    # present, all-pairs otherwise) and emits a logging warning when any
+    # walker has atoms closer than the threshold.  Diagnostic only — never
+    # feeds back into the run.  Default-off (no overhead unless enabled).
+    collision_check_threshold: float | None = None
+    collision_check_interval: int = 100
+
+    # Whether ``ExtxyzTrajectoryWriter`` wraps dead-point atom positions into
+    # the (correct, dead-walker-own) cell before writing.  Default False
+    # keeps absolute Cartesians so off-the-shelf viewers don't show
+    # boundary-wrap artifacts; set True if you want all atoms inside ``[0,L)``.
+    wrap_atoms: bool = False
 
 
 @dataclass(frozen=True)
@@ -74,7 +144,7 @@ class InterREConfig:
             proposal), ``"xrens"`` (composition-morphing), or
             ``"semi_grand"`` (chemical-potential assignment swap, zero backend
             calls).
-        every: Fire a swap pass every this many NS iterations (1 = every iter).
+        re_interval: Fire a swap pass every this many NS iterations (1 = every iter).
         n_swap_cycles: Number of even+odd swap phases per fire.
         composition_targets: XRENS-only — per-run target compositions,
             shape ``(n_runs, n_species)``.  ``None`` for other flavors.
@@ -84,7 +154,7 @@ class InterREConfig:
     """
 
     flavor: str = "pressure"
-    every: int = 1
+    re_interval: int = 1
     n_swap_cycles: int = 1
     # XRENS-only: per-run target compositions, shape (n_runs, n_species).
     # Required when flavor == "xrens"; each row must sum to n_atoms and

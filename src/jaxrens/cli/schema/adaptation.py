@@ -4,7 +4,7 @@
 ``defaults + per_move`` overlay.  ``resolve_for(key)`` returns the effective
 policy for a named move: per-move fields that are None fall through to
 defaults, and defaults fields that are None fall through to the hardcoded
-library values that ``MoveKernel`` and ``adjust_step_size`` use today.
+library values that ``MoveKernel`` and ``build_adapt_step`` use today.
 """
 
 from __future__ import annotations
@@ -89,6 +89,7 @@ class AdaptationSpec(BaseModel):
     adjust_interval: int | float = 0
     adjust_n_samples: int = 50
     adjust_max_rounds: int = 15
+    trial_batch_size: int | None = None
     defaults: AdaptationPolicy = Field(default_factory=AdaptationPolicy)
     per_move: dict[str, AdaptationPolicy] = Field(default_factory=dict)
 

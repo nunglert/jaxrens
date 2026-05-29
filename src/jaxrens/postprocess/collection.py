@@ -8,11 +8,91 @@ functions so there is no duplicated matplotlib logic here.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Callable, Iterator
 
 import numpy as np
 
 from jaxrens.postprocess.monitor import Monitor
+
+
+def _observable_volume(monitor: Monitor, T: np.ndarray, **kwargs) -> np.ndarray:
+    if not hasattr(monitor, "volume_trace"):
+        raise AttributeError(
+            f"Monitor {monitor.label!r} has no volume_trace; "
+            "the 'volume' heatmap needs a multi-run NPT collection built via "
+            "MonitorCollection.from_multi_run_directory."
+        )
+    return monitor.expectation(monitor.volume_trace, T, **kwargs)
+
+
+_OBSERVABLE_DISPATCH: dict[str, Callable[..., np.ndarray]] = {
+    "heat_capacity": lambda m, T, **k: m.heat_capacity(T, **k),
+    "free_energy": lambda m, T, **k: m.free_energy(T, **k),
+    "log_partition_function": lambda m, T, **k: m.partition_function(T, **k),
+    "log_Z": lambda m, T, **k: m.partition_function(T, **k),
+    "volume": _observable_volume,
+}
+
+
+def _discover_config(path: Path) -> Path | None:
+    """Find a ``config.yaml`` next to the run output.
+
+    Looks first in ``path`` itself (rare — the working dir), then in
+    ``path.parent`` (the standard layout where ``output/`` is a sibling
+    of ``config.yaml``).
+    """
+    for candidate in (path / "config.yaml", path.parent / "config.yaml"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _load_yaml(config_path: Path) -> dict[str, Any]:
+    import yaml
+    with open(config_path) as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def _prefix_from_config(cfg: dict[str, Any]) -> str | None:
+    """Return ``output.out_file_prefix`` from a parsed config, or None."""
+    output = cfg.get("output") or {}
+    prefix = output.get("out_file_prefix")
+    return str(prefix) if prefix is not None else None
+
+
+def _labels_and_metadata_from_config(
+    cfg: dict[str, Any], n_total: int,
+) -> tuple[list[str] | None, list[dict[str, Any]]]:
+    """Derive overlay labels and per-replica metadata from a config dict.
+
+    Currently understands the ``ensemble`` section: for an NPT cohort
+    with a pressure list whose length matches ``n_total`` we emit
+    ``"P=… GPa"`` (or eV/Å³) labels and attach ``pressure_gpa`` /
+    ``pressure_eva3`` to each monitor.  Returns ``(None, [{}, …])`` when
+    nothing useful can be derived — callers fall back to ``runNN``.
+    """
+    empty_meta: list[dict[str, Any]] = [{} for _ in range(n_total)]
+    ensemble = cfg.get("ensemble") or {}
+    if ensemble.get("type") != "npt":
+        return None, empty_meta
+
+    pressure = ensemble.get("pressure")
+    if pressure is None:
+        return None, empty_meta
+    if isinstance(pressure, (int, float)):
+        pressure = [pressure]
+    pressure = list(pressure)
+    if len(pressure) != n_total:
+        return None, empty_meta
+
+    units = ensemble.get("pressure_units", "eva3")
+    if units == "gpa":
+        labels = [f"P={p:>5.2f} GPa" for p in pressure]
+        metadata = [{"pressure_gpa": float(p)} for p in pressure]
+    else:
+        labels = [f"P={p:.4g} eV/Å³" for p in pressure]
+        metadata = [{"pressure_eva3": float(p)} for p in pressure]
+    return labels, metadata
 
 
 class MonitorCollection:
@@ -24,6 +104,12 @@ class MonitorCollection:
 
     def __init__(self, monitors: list[Monitor]) -> None:
         self._monitors: list[Monitor] = list(monitors)
+        # Shared adaptation trace across the cohort (populated by
+        # ``from_multi_run_directory`` when the ``.adaptation.h5`` file is
+        # present).  Stays ``None`` for collections built by hand or by
+        # ``from_directories``; the per-replica ``Monitor.adaptation_trace``
+        # remains the per-replica record in those cases.
+        self.adaptation_trace = None
 
     # ------------------------------------------------------------------
     # Constructors
@@ -62,9 +148,10 @@ class MonitorCollection:
         cls,
         path: Path | str,
         *,
-        prefix: str = "ns",
+        prefix: str | None = None,
         prefer_final: bool = True,
         labels: list[str] | None = None,
+        config: Path | str | None = None,
     ) -> "MonitorCollection":
         """Build a collection from a single multi-run output directory.
 
@@ -87,15 +174,31 @@ class MonitorCollection:
         For single-run checkpoints (no batch axis) this delegates to
         ``Monitor.from_directory`` and returns a one-element collection.
 
+        Config auto-discovery: when ``config`` is ``None`` the constructor
+        looks for ``config.yaml`` in ``path`` and then in ``path.parent``
+        (the standard ``experiment_dir/output/`` layout).  A found config
+        supplies the run prefix (``output.out_file_prefix``) and — for an
+        NPT pressure sweep whose pressure-list length matches the replica
+        count — per-replica labels and ``pressure_gpa`` / ``pressure_eva3``
+        attributes attached to each Monitor.  Pass ``prefix=`` / ``labels=``
+        explicitly to override the inferred values, or hand a specific
+        path via ``config=`` to skip auto-discovery.  When no config is
+        found we fall back to ``prefix='ns'`` and ``runNN`` labels.
+
         Args:
             path: Directory produced by ``jaxrens run`` on a multi-run config.
-            prefix: File prefix matching ``output.out_file_prefix``.
+            prefix: File prefix matching ``output.out_file_prefix``.  If
+                ``None`` (default), inferred from the config when present;
+                otherwise falls back to ``"ns"``.
             prefer_final: Prefer ``<prefix>.final.checkpoint.h5`` over the
                 periodic ``<prefix>.checkpoint.h5``; falls back further to
                 ``<prefix>.initial.checkpoint.h5`` when the run is still in
                 flight.  Zero-byte files (mid-write) are skipped.
-            labels: Per-replica display labels, length ``n_total``.  Defaults
-                to ``f"run{i:02d}"``.
+            labels: Per-replica display labels, length ``n_total``.  If
+                ``None``, inferred from the config (e.g. NPT pressures);
+                otherwise falls back to ``f"run{i:02d}"``.
+            config: Explicit path to the run's YAML config.  When ``None``,
+                auto-discovery looks in ``path`` then ``path.parent``.
 
         Returns:
             Populated ``MonitorCollection``.
@@ -114,6 +217,21 @@ class MonitorCollection:
         from jaxrens.io.energy_log import EnergyLogger
 
         path = Path(path)
+
+        # Resolve config: explicit path > auto-discovery > none.
+        cfg: dict[str, Any] = {}
+        if config is not None:
+            cfg_path = Path(config)
+            if not cfg_path.is_file():
+                raise FileNotFoundError(f"config not found: {cfg_path}")
+            cfg = _load_yaml(cfg_path)
+        else:
+            auto = _discover_config(path)
+            if auto is not None:
+                cfg = _load_yaml(auto)
+
+        if prefix is None:
+            prefix = _prefix_from_config(cfg) or "ns"
 
         # Resolve checkpoint: skip 0-byte stubs from mid-write periodic saves.
         candidates: list[Path] = []
@@ -180,6 +298,12 @@ class MonitorCollection:
                 f"{ckpt_path.name}; expected 1, 2, or 3 dims."
             )
 
+        # Derive labels + per-replica metadata from config when caller did
+        # not supply explicit labels.  ``metadata`` is always n_total long.
+        inferred_labels, metadata = _labels_and_metadata_from_config(cfg, n_total)
+        if labels is None and inferred_labels is not None:
+            labels = inferred_labels
+
         if labels is not None and len(labels) != n_total:
             raise ValueError(
                 f"len(labels)={len(labels)} does not match n_total={n_total} "
@@ -214,9 +338,25 @@ class MonitorCollection:
             )
             # Bare cell volume series, stashed for separate <V>(T) analysis.
             m.volume_trace = np.asarray(elog.volumes, dtype=np.float64)
+            # Attach per-replica metadata from the config (e.g. pressure_gpa).
+            for k, v in metadata[i].items():
+                setattr(m, k, v)
             monitors.append(m)
 
-        return cls(monitors)
+        coll = cls(monitors)
+
+        # Pick up the cohort-wide adaptation log if the run wrote one.
+        # Multi-run NS produces a single ``<prefix>.adaptation.h5`` with
+        # arrays of shape ``(n_entries, n_runs, n_moves)`` — one row per
+        # replica along the second axis.  We stash the full trace on the
+        # collection so ``plot_step_sizes`` / ``plot_acceptance_rates``
+        # can render mean±std across replicas or per-replica overlays.
+        adaptation_path = path / f"{prefix}.adaptation.h5"
+        if adaptation_path.exists():
+            from jaxrens.io.adaptation_log import AdaptationLogger
+            coll.adaptation_trace = AdaptationLogger.read(adaptation_path)
+
+        return coll
 
     # ------------------------------------------------------------------
     # Mutation
@@ -360,40 +500,169 @@ class MonitorCollection:
         return ax
 
     def plot_step_sizes(self, *, ax=None, per_run: bool = False, **kwargs):
-        """Overlay step-size traces for all monitors that have adaptation data.
+        """Plot per-move step-size adaptation trace for the cohort.
 
-        Monitors without ``adaptation_trace`` are silently skipped.
+        Uses the collection-level ``self.adaptation_trace`` populated by
+        ``from_multi_run_directory`` (one shared ``.adaptation.h5`` for the
+        whole cohort, indexed along an ``n_runs`` axis).  Falls back to
+        per-monitor traces when the cohort-level trace is unavailable
+        (e.g. collections built via ``from_directories``).
 
         Args:
             ax:      Existing axes.  Created if None.
-            per_run: Passed through to :func:`~jaxrens.postprocess.plotting.plot_step_sizes`.
-            **kwargs: Forwarded to each ``plot_step_sizes`` call.
+            per_run: When True, draws one line per (move, replica)
+                combination; when False, draws mean ± std across replicas.
+            **kwargs: Forwarded to the underlying plotting function.
 
         Returns:
             The Axes object.
         """
         from jaxrens.postprocess.plotting import plot_step_sizes
 
+        if self.adaptation_trace is not None:
+            return plot_step_sizes(
+                self.adaptation_trace, ax=ax, per_run=per_run, **kwargs,
+            )
         for monitor in self._monitors:
             if monitor.adaptation_trace is not None:
                 ax = plot_step_sizes(monitor, ax=ax, per_run=per_run, **kwargs)
         return ax
 
-    def plot_acceptance_rates(self, *, ax=None, per_run: bool = False, **kwargs):
-        """Overlay acceptance-rate traces for all monitors that have adaptation data.
+    def plot_heatmap(
+        self,
+        T: np.ndarray,
+        observable: str | Callable[..., np.ndarray] = "heat_capacity",
+        *,
+        ax=None,
+        cmap: str = "viridis",
+        fmt: str = "PT",
+        vmin: float | None = None,
+        vmax: float | None = None,
+        do_colorbar: bool = True,
+        cbar_label: str | None = None,
+        T_label: str = "T",
+        P_label: str | None = None,
+        pressure_attr: str = "auto",
+        **obs_kwargs,
+    ):
+        """Render a pressure-temperature heatmap of an observable.
 
-        Monitors without ``adaptation_trace`` are silently skipped.
+        Each monitor in the collection contributes one row of the
+        ``(n_P, n_T)`` grid.  Pressure values are taken from the
+        ``pressure_gpa`` or ``pressure_eva3`` attribute set by
+        ``from_multi_run_directory`` when a config is found; when neither is
+        present we fall back to ordinal replica indices (the heatmap then
+        functions purely as a 2D overlay).  Monitors are sorted by pressure
+        before plotting so ``pcolormesh`` sees a monotonic axis.
+
+        Args:
+            T: Temperature grid, shape ``(n_T,)``.  Passed to each monitor's
+                observable method.
+            observable: One of ``"heat_capacity"``, ``"free_energy"``,
+                ``"log_partition_function"``/``"log_Z"``, ``"volume"``, or a
+                callable ``(monitor, T, **obs_kwargs) -> array (n_T,)``.
+            ax: Existing axes to plot into.  Created if None.
+            cmap, fmt, vmin, vmax, do_colorbar, cbar_label, T_label, P_label:
+                Forwarded to :func:`~jaxrens.postprocess.plotting.plot_heatmap`.
+                ``P_label`` defaults to a unit-aware string when
+                ``pressure_attr`` is resolved to a named field.
+            pressure_attr: ``"auto"`` (default) prefers ``pressure_gpa`` then
+                ``pressure_eva3`` then ordinal indices; pass an explicit
+                attribute name to force a choice, or ``"index"`` for replica
+                indices.
+            **obs_kwargs: Forwarded to the observable function
+                (e.g. ``k_B=8.617e-5``).
+
+        Returns:
+            The Axes object.
+        """
+        from jaxrens.postprocess.plotting import plot_heatmap
+
+        if not self._monitors:
+            raise ValueError("Cannot plot a heatmap from an empty collection")
+
+        # Resolve pressure-axis source.
+        if pressure_attr == "auto":
+            if hasattr(self._monitors[0], "pressure_gpa"):
+                pressure_attr = "pressure_gpa"
+            elif hasattr(self._monitors[0], "pressure_eva3"):
+                pressure_attr = "pressure_eva3"
+            else:
+                pressure_attr = "index"
+
+        if pressure_attr == "index":
+            pressures = np.arange(len(self._monitors), dtype=float)
+            P_label_resolved = P_label or "replica index"
+        else:
+            try:
+                pressures = np.array(
+                    [getattr(m, pressure_attr) for m in self._monitors],
+                    dtype=float,
+                )
+            except AttributeError as exc:
+                raise AttributeError(
+                    f"Not every monitor carries {pressure_attr!r}; "
+                    "pass pressure_attr='index' or build the collection via "
+                    "from_multi_run_directory with a config that declares an "
+                    "NPT pressure list."
+                ) from exc
+            P_label_resolved = P_label or (
+                "P [GPa]" if pressure_attr == "pressure_gpa"
+                else r"P [eV/Å³]" if pressure_attr == "pressure_eva3"
+                else pressure_attr
+            )
+
+        # Resolve observable function.
+        if isinstance(observable, str):
+            try:
+                fn = _OBSERVABLE_DISPATCH[observable]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Unknown observable {observable!r}; valid choices: "
+                    f"{sorted(_OBSERVABLE_DISPATCH)}"
+                ) from exc
+            cbar_label_resolved = cbar_label or observable
+        else:
+            fn = observable
+            cbar_label_resolved = cbar_label
+
+        # Compute observable per monitor, in pressure-sorted order.
+        T_arr = np.asarray(T, dtype=np.float64)
+        order = np.argsort(pressures)
+        pressures_sorted = pressures[order]
+        Z = np.empty((len(self._monitors), T_arr.shape[0]), dtype=np.float64)
+        for row, idx in enumerate(order):
+            Z[row] = np.asarray(fn(self._monitors[idx], T_arr, **obs_kwargs))
+
+        return plot_heatmap(
+            T_arr, pressures_sorted, Z,
+            ax=ax, cmap=cmap, fmt=fmt, vmin=vmin, vmax=vmax,
+            do_colorbar=do_colorbar, cbar_label=cbar_label_resolved,
+            T_label=T_label, P_label=P_label_resolved,
+        )
+
+    def plot_acceptance_rates(self, *, ax=None, per_run: bool = False, **kwargs):
+        """Plot per-move acceptance-rate trace for the cohort.
+
+        Uses the cohort-wide ``self.adaptation_trace`` (set by
+        ``from_multi_run_directory``) when present, falling back to
+        per-monitor traces otherwise.
 
         Args:
             ax:      Existing axes.  Created if None.
-            per_run: Passed through to :func:`~jaxrens.postprocess.plotting.plot_acceptance_rates`.
-            **kwargs: Forwarded to each ``plot_acceptance_rates`` call.
+            per_run: When True, one line per (move, replica); when False,
+                mean ± std across replicas.
+            **kwargs: Forwarded to the underlying plotting function.
 
         Returns:
             The Axes object.
         """
         from jaxrens.postprocess.plotting import plot_acceptance_rates
 
+        if self.adaptation_trace is not None:
+            return plot_acceptance_rates(
+                self.adaptation_trace, ax=ax, per_run=per_run, **kwargs,
+            )
         for monitor in self._monitors:
             if monitor.adaptation_trace is not None:
                 ax = plot_acceptance_rates(monitor, ax=ax, per_run=per_run, **kwargs)
