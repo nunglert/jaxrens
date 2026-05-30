@@ -9,6 +9,7 @@ from typing import Any, NamedTuple, Protocol
 import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from jaxrens.types import Box, Params, Positions, Types
 
@@ -40,9 +41,14 @@ class MoveInfo(NamedTuple):
     accepted: jnp.ndarray  # bool scalar
     log_likelihood: jnp.ndarray  # float scalar
     n_evaluations: int
-    reject_reason: jnp.ndarray = jnp.int32(0)
-    move_idx: jnp.ndarray = jnp.int32(0)
-    n_grad_evaluations: int = jnp.int32(0)
+    # NumPy (not jnp) scalars: a ``jnp.int32(0)`` default would execute a JAX
+    # op at class-definition (import) time, forcing JAX to bring up a backend
+    # — including a CUDA probe that errors on GPU-less nodes — even for
+    # import-only consumers like ``jaxrens dump-schema``.  ``np.int32(0)``
+    # carries the same int32 dtype without touching a device.
+    reject_reason: jnp.ndarray = np.int32(0)
+    move_idx: jnp.ndarray = np.int32(0)
+    n_grad_evaluations: int = np.int32(0)
 
 
 class StepFn(Protocol):

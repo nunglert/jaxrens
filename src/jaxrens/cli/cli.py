@@ -397,6 +397,13 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 
 def _cmd_dump_schema(args: argparse.Namespace) -> int:
+    # dump-schema only serialises pydantic models — it imports JAX-bound
+    # modules transitively but executes no JAX op, so silence _jax_init's
+    # CPU/TMPDIR runtime checks.  Must be set before the schema import below.
+    import os
+
+    os.environ["JAXRENS_SKIP_RUNTIME_CHECKS"] = "1"
+
     from jaxrens.cli.schema import RootSpec
 
     schema = RootSpec.model_json_schema()

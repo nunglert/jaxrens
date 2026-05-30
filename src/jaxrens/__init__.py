@@ -5,9 +5,10 @@ JAX is NOT imported at package import time.  Heavy symbols
 ``__getattr__`` so cheap consumers — postprocessing, ``jaxrens
 plot``, the pydantic config schemas — pay no JAX startup cost.
 
-The ``jax_enable_x64=False`` pin still runs before any JAX op:
-every JAX-using subpackage / module imports :mod:`jaxrens._jax_init`
-at the top of its ``__init__.py``.
+The float32 precision config still runs before any JAX op: every
+JAX-using subpackage / module imports :mod:`jaxrens._jax_init` at the
+top of its ``__init__.py`` (float32 by default; opt into 64-bit with
+``JAX_ENABLE_X64``).
 """
 
 from __future__ import annotations
@@ -15,9 +16,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 __version__ = "0.1.0"
-
-import os as _os
-import tempfile as _tempfile
 
 # Static analysers (pyright/pylance, mypy) can't introspect a module-level
 # ``__getattr__``.  Re-export the same symbols here under ``TYPE_CHECKING``
@@ -47,20 +45,6 @@ if TYPE_CHECKING:
         OutputConfig,
     )
     from jaxrens.state.mc_state import MCState, make_mc_state_class
-
-# TMPDIR sanity check — JAX writes compilation artifacts there; bail early
-# with a clear message rather than letting JAX raise a JaxRuntimeError later.
-_jax_tmpdir = _os.environ.get("TMPDIR", "/tmp")
-try:
-    with _tempfile.NamedTemporaryFile(dir=_jax_tmpdir, delete=True):
-        pass
-except OSError as _e:
-    raise RuntimeError(
-        f"jaxrens: {_jax_tmpdir!r} is not writable ({_e}). "
-        f"JAX writes compilation artifacts there and will fail with a "
-        f"confusing JaxRuntimeError later. "
-        f"Set $TMPDIR to a writable directory before importing jaxrens."
-    ) from _e
 
 # (name -> (module_path, attr, needs_jax_pin)).  ``needs_jax_pin`` flags
 # the JAX-using exports — accessing one of those names triggers an
