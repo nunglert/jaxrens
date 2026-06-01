@@ -57,15 +57,6 @@ from jaxrens.cli.schema.backend import LJBackendSpec
 
 logger = logging.getLogger(__name__)
 
-# Output fields that are accepted by OutputSpec but not yet consumed by the
-# runtime callback layer.
-_DEFERRED_OUTPUT_FIELDS: tuple[str, ...] = (
-    "snapshot_time",
-    "snapshot_clean",
-    "write_traj_db",
-    "write_walkers_db",
-)
-
 
 # ---------------------------------------------------------------------------
 # Interval-unit scaling (RootSpec.interval_units = "absolute" | "per_walker")
@@ -857,34 +848,6 @@ def _null_energy_fn(
 
 
 # ---------------------------------------------------------------------------
-# Warning helper for deferred output fields
-# ---------------------------------------------------------------------------
-
-def _warn_unused_output_fields(output_schema: Any) -> None:
-    """Emit warnings for deferred ``OutputSpec`` fields that are non-default.
-
-    Args:
-        output_schema: An ``OutputSpec`` instance.
-    """
-    deferred_defaults: dict[str, Any] = {
-        "snapshot_time": None,
-        "snapshot_clean": False,
-        "write_traj_db": False,
-        "write_walkers_db": False,
-    }
-    for field_name, default in deferred_defaults.items():
-        value = getattr(output_schema, field_name, default)
-        if value != default:
-            logger.warning(
-                "output.%s=%r is set but not yet consumed by the runtime — "
-                "this field is a deferred placeholder.  The value will be "
-                "ignored until runtime support is added.",
-                field_name,
-                value,
-            )
-
-
-# ---------------------------------------------------------------------------
 # ResolvedConfig (unified single-/multi-replica)
 # ---------------------------------------------------------------------------
 
@@ -1040,9 +1003,8 @@ def _resolve_single_replica(
         collision_check_threshold=root.output.collision_check_threshold,
         collision_check_interval=int(root.output.collision_check_interval),
         wrap_atoms=bool(root.output.wrap_atoms),
+        snapshot_clean=bool(root.output.snapshot_clean),
     )
-
-    _warn_unused_output_fields(root.output)
 
     # Build termination criteria.  ``IterationTermination`` is only added
     # when the user explicitly set ``run.max_iterations`` — when ``None``
@@ -1550,8 +1512,8 @@ def _resolve_multi_replica(
         collision_check_threshold=root.output.collision_check_threshold,
         collision_check_interval=int(root.output.collision_check_interval),
         wrap_atoms=bool(root.output.wrap_atoms),
+        snapshot_clean=bool(root.output.snapshot_clean),
     )
-    _warn_unused_output_fields(root.output)
 
     # Same termination logic as the single-run path: default to PriorMass
     # only; append IterationTermination only when max_iterations is set.

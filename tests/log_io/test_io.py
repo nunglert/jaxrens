@@ -16,6 +16,7 @@ from jaxrens.io.formats import (
 from jaxrens.io.checkpoint import save_checkpoint, load_checkpoint
 from jaxrens.io.energy_log import EnergyLogger, EnergyLog
 from jaxrens.io.trajectory import (
+    ExtxyzTrajectoryWriter,
     NullTrajectoryWriter,
     H5TrajectoryWriter,
     create_trajectory_writer,
@@ -366,3 +367,53 @@ class TestTrajectoryWriters:
     def test_create_unknown_raises(self, tmp_path, symbol_map):
         with pytest.raises(ValueError):
             create_trajectory_writer("zarr", tmp_path / "z", symbol_map)
+
+
+class TestSnapshotClean:
+    """``ExtxyzTrajectoryWriter`` walker-snapshot retention."""
+
+    @staticmethod
+    def _snap(i):
+        # One walker, one atom: positions (1, 1, 3), per-walker types (1, 1).
+        return {
+            "positions": np.array([[[float(i), 0.0, 0.0]]]),
+            "types": np.array([[0]]),
+            "energies": np.array([float(-i)]),
+            "cells": None,
+        }
+
+    def _snap_files(self, tmp_path):
+        return sorted(tmp_path.glob("*.snap.*.extxyz"))
+
+    def test_clean_keeps_only_latest(self, tmp_path, symbol_map):
+        writer = ExtxyzTrajectoryWriter(
+            tmp_path / "ns.traj.extxyz", symbol_map, clean_snapshots=True
+        )
+        for i in (10, 20, 30):
+            writer.write_walker_snapshot(i, self._snap(i))
+            # After each write the new snapshot exists; once past the first,
+            # the previous one must be gone — never more than one on disk.
+            files = self._snap_files(tmp_path)
+            assert len(files) == 1
+            assert files[0].name.endswith(f".snap.{i}.extxyz")
+
+    def test_no_clean_accumulates(self, tmp_path, symbol_map):
+        writer = ExtxyzTrajectoryWriter(
+            tmp_path / "ns.traj.extxyz", symbol_map, clean_snapshots=False
+        )
+        for i in (10, 20, 30):
+            writer.write_walker_snapshot(i, self._snap(i))
+        assert len(self._snap_files(tmp_path)) == 3
+
+    def test_clean_survives_missing_previous(self, tmp_path, symbol_map):
+        """A previous snapshot deleted out-of-band must not crash the writer."""
+        writer = ExtxyzTrajectoryWriter(
+            tmp_path / "ns.traj.extxyz", symbol_map, clean_snapshots=True
+        )
+        writer.write_walker_snapshot(10, self._snap(10))
+        (tmp_path / "ns.traj.snap.10.extxyz").unlink()
+        # Should warn-and-continue, leaving the new snapshot in place.
+        writer.write_walker_snapshot(20, self._snap(20))
+        files = self._snap_files(tmp_path)
+        assert len(files) == 1
+        assert files[0].name.endswith(".snap.20.extxyz")

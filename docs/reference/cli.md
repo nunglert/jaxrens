@@ -97,7 +97,7 @@ Every YAML config has ten top-level sections. Not all are required
 | `init` | starting walkers (species / config file / restart) | optional |
 | `cell` | cell-shape / volume constraints | optional |
 
-For the full schema, see the JSON dump (`jaxrens dump-schema`).
-The schema pages in the API reference will render each pydantic
-model's fields, types, and validators in the follow-up
-documentation PR.
+For the full schema — every field of every section, with its type,
+default, and constraints — see the {doc}`config`. For a
+machine-readable version (e.g. editor autocomplete), use the JSON dump
+(`jaxrens dump-schema`).

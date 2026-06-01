@@ -1,10 +1,11 @@
 API reference
 =============
 
-The public surface of ``jaxrens`` — everything importable from the
-top-level package.  Each symbol is linked to its own page with the
-full docstring; the CLI subcommands are documented separately at
-:doc:`cli`.
+The public surface of ``jaxrens``, organised by subpackage.  Each symbol
+is linked to its own page with the full docstring; import symbols from
+their subpackage, e.g. ``from jaxrens.sampling.nested_sampling import
+run_ns``.  The CLI subcommands are documented separately at :doc:`cli`.
+Every allowed YAML configuration parameter is documented at :doc:`config`.
 
 An interactive overview of the package layout — subpackages and
 modules sized by lines of code — sets the stage:
@@ -31,60 +32,31 @@ modules sized by lines of code — sets the stage:
 
 .. currentmodule:: jaxrens
 
-High-level entry points
------------------------
+.. note::
 
-.. autosummary::
-   :toctree: api/
-   :nosignatures:
+   The curated **top-level API** (``from jaxrens import run_ns``,
+   ``jaxrens.free_energy``, …) is currently **disabled** — see the
+   commented lazy-export block in ``src/jaxrens/__init__.py``.  Import
+   public symbols from their subpackage instead (browse the
+   :ref:`Subpackages <subpackages>` tree below).  When it was enabled, the
+   top of this page listed these symbols grouped by theme:
 
-   run_ns
-   run_from_config
-   init_ns
-   ns_step
-   build_mwg
-   load_backend
+   * *High-level entry points:* ``run_ns``, ``run_from_config``,
+     ``init_ns``, ``ns_step``, ``build_mwg``, ``load_backend``
+   * *State and configuration:* ``MoveKernel``, ``MCState``,
+     ``make_mc_state_class``, ``NSConfig``, ``MoveConfig``,
+     ``BackendConfig``, ``OutputConfig``
+   * *Backend interfaces:* ``EnergyBackend``, ``EnsembleBackend``,
+     ``make_ensemble_params``
+   * *Post-processing:* ``calc_log_weights``, ``calc_log_weights_live``,
+     ``log_evidence``, ``partition_function``, ``heat_capacity``,
+     ``expectation``, ``free_energy``
 
-State and configuration
------------------------
+   To reinstate, uncomment the lazy-export block in
+   ``src/jaxrens/__init__.py`` and restore the four ``autosummary``
+   sections here (recoverable from git history).
 
-.. autosummary::
-   :toctree: api/
-   :nosignatures:
-
-   MoveKernel
-   MCState
-   make_mc_state_class
-   NSConfig
-   MoveConfig
-   BackendConfig
-   OutputConfig
-
-Backend interfaces
-------------------
-
-.. autosummary::
-   :toctree: api/
-   :nosignatures:
-
-   EnergyBackend
-   EnsembleBackend
-   make_ensemble_params
-
-Post-processing
----------------
-
-.. autosummary::
-   :toctree: api/
-   :nosignatures:
-
-   calc_log_weights
-   calc_log_weights_live
-   log_evidence
-   partition_function
-   heat_capacity
-   expectation
-   free_energy
+.. _subpackages:
 
 Subpackages
 -----------

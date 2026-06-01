@@ -780,38 +780,24 @@ class TestCellResolve:
 # ---------------------------------------------------------------------------
 
 class TestExtendedOutputResolve:
-    def test_deferred_fields_emit_warnings(self, caplog):
-        import logging
-        from jaxrens.cli.resolve import _warn_unused_output_fields
-        from jaxrens.cli.schema.output import OutputSpec
-        schema = OutputSpec(
-            format="none",
-            write_traj_db=True,
-            write_walkers_db=True,
-        )
-        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            _warn_unused_output_fields(schema)
-        warned = [r.message for r in caplog.records]
-        assert any("write_traj_db" in m for m in warned)
-        assert any("write_walkers_db" in m for m in warned)
-
-    def test_default_output_no_warnings(self, caplog):
-        import logging
-        from jaxrens.cli.resolve import _warn_unused_output_fields
-        from jaxrens.cli.schema.output import OutputSpec
-        schema = OutputSpec(format="none")
-        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            _warn_unused_output_fields(schema)
-        assert len(caplog.records) == 0
-
-    def test_resolve_warns_for_deferred_output_fields(self, caplog):
+    def test_snapshot_clean_is_wired_through(self, caplog):
+        """``snapshot_clean`` is consumed by the runtime: setting it must NOT
+        emit a deferred-field warning and must land on
+        ``ResolvedConfig.output.snapshot_clean``.
+        """
         import logging
         d = _minimal_dict()
-        d["output"]["write_traj_db"] = True
+        d["output"]["snapshot_clean"] = True
         root = RootSpec.model_validate(d)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            resolve(root)
-        assert any("write_traj_db" in r.message for r in caplog.records)
+            resolved = resolve(root)
+        assert not any("snapshot_clean" in r.message for r in caplog.records)
+        assert resolved.output.snapshot_clean is True
+
+    def test_snapshot_clean_defaults_false(self):
+        d = _minimal_dict()
+        resolved = resolve(RootSpec.model_validate(d))
+        assert resolved.output.snapshot_clean is False
 
     def test_wrap_atoms_is_wired_no_longer_deferred(self, caplog):
         """``wrap_atoms`` was previously a deferred field that only warned.

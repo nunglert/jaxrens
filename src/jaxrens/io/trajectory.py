@@ -25,11 +25,18 @@ class ExtxyzTrajectoryWriter:
         wrap: bool = True,
         mode: str = "w",
         restart_iteration: int = 0,
+        clean_snapshots: bool = False,
     ):
         self.path = Path(path)
         self.symbol_map = symbol_map
         self.wrap = wrap
         self._mode = mode
+        self.clean_snapshots = clean_snapshots
+        # Path of the most recently written walker snapshot.  When
+        # ``clean_snapshots`` is set we delete it as soon as the *next*
+        # snapshot is safely on disk (so the directory keeps at most one
+        # walker snapshot, but a complete one always exists).
+        self._prev_snapshot_path: Path | None = None
         # First write of a run with mode="w" must overwrite any leftover
         # file; subsequent writes within the same run must append so frames
         # accumulate instead of replacing each other.
@@ -79,6 +86,26 @@ class ExtxyzTrajectoryWriter:
 
         ase_write(str(snapshot_path), atoms_list)
 
+        # snapshot_clean: now that the new snapshot is fully on disk, drop
+        # the previous one (the "second last") so the output directory
+        # doesn't accumulate one walker dump per interval.  Deleting only
+        # after the new write guarantees at least one complete snapshot
+        # always exists, even if the run crashes mid-write.
+        if (
+            self.clean_snapshots
+            and self._prev_snapshot_path is not None
+            and self._prev_snapshot_path != snapshot_path
+        ):
+            try:
+                self._prev_snapshot_path.unlink()
+            except OSError as exc:
+                logger.warning(
+                    "snapshot_clean: could not delete previous snapshot %s: %s",
+                    self._prev_snapshot_path,
+                    exc,
+                )
+        self._prev_snapshot_path = snapshot_path
+
     def close(self) -> None:
         pass
 
@@ -92,7 +119,12 @@ class H5TrajectoryWriter:
         symbol_map: dict[int, str],
         mode: str = "w",
         restart_iteration: int = 0,
+        clean_snapshots: bool = False,
     ):
+        # ``clean_snapshots`` is accepted for signature parity with
+        # ``ExtxyzTrajectoryWriter`` but is a no-op here: H5 snapshots are
+        # groups inside the single trajectory file, so deleting a group
+        # would not reclaim disk space without repacking.
         import h5py
 
         self.path = Path(path)

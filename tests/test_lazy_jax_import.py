@@ -71,30 +71,36 @@ def test_cli_dispatcher_module_does_not_import_jax():
     assert r.returncode == 0, r.stderr
 
 
-def test_jax_free_root_reexport_does_not_import_jax():
-    # Postprocess re-exports (``expectation``, ``heat_capacity``, ...) are
-    # flagged ``needs_pin=False`` and resolve into ``postprocess.thermodynamics``,
-    # whose parent ``postprocess/__init__.py`` is JAX-free.  The full
-    # ``from jaxrens import ...`` path must stay JAX-free.
-    #
-    # (Pydantic config re-exports like ``NSConfig`` are also ``needs_pin=False``
-    # but their parent ``state/__init__.py`` already loads JAX-using siblings,
-    # so they pay the JAX cost transitively — not a leak of the lazy refactor.)
-    r = _python_check(
-        "from jaxrens import expectation; "
-        "import sys; "
-        "assert 'jax' not in sys.modules, sorted(m for m in sys.modules if 'jax' in m)"
-    )
-    assert r.returncode == 0, r.stderr
-
-
-def test_lazy_root_export_applies_x64_pin():
-    r = _python_check(
-        "from jaxrens import run_ns; "
-        "import jax; "
-        "assert jax.config.read('jax_enable_x64') is False"
-    )
-    assert r.returncode == 0, r.stderr
+# The curated top-level API (``from jaxrens import expectation`` /
+# ``from jaxrens import run_ns``) is currently DISABLED in
+# ``src/jaxrens/__init__.py`` (lazy PEP 562 ``__getattr__`` commented out), so
+# these two tests are commented out too.  Reinstate them together with that
+# block.
+#
+# def test_jax_free_root_reexport_does_not_import_jax():
+#     # Postprocess re-exports (``expectation``, ``heat_capacity``, ...) are
+#     # flagged ``needs_pin=False`` and resolve into ``postprocess.thermodynamics``,
+#     # whose parent ``postprocess/__init__.py`` is JAX-free.  The full
+#     # ``from jaxrens import ...`` path must stay JAX-free.
+#     #
+#     # (Pydantic config re-exports like ``NSConfig`` are also ``needs_pin=False``
+#     # but their parent ``state/__init__.py`` already loads JAX-using siblings,
+#     # so they pay the JAX cost transitively — not a leak of the lazy refactor.)
+#     r = _python_check(
+#         "from jaxrens import expectation; "
+#         "import sys; "
+#         "assert 'jax' not in sys.modules, sorted(m for m in sys.modules if 'jax' in m)"
+#     )
+#     assert r.returncode == 0, r.stderr
+#
+#
+# def test_lazy_root_export_applies_x64_pin():
+#     r = _python_check(
+#         "from jaxrens import run_ns; "
+#         "import jax; "
+#         "assert jax.config.read('jax_enable_x64') is False"
+#     )
+#     assert r.returncode == 0, r.stderr
 
 
 def test_direct_submodule_import_applies_x64_pin():

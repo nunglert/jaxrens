@@ -130,6 +130,14 @@ class OutputConfig:
     # boundary-wrap artifacts; set True if you want all atoms inside ``[0,L)``.
     wrap_atoms: bool = False
 
+    # When True, ``ExtxyzTrajectoryWriter`` deletes the previous walker
+    # snapshot right after the next one is written, keeping at most one
+    # ``*.snap.<iter>.extxyz`` file on disk.  Walker snapshots are a crash-
+    # inspection convenience; cleaning them stops the output directory from
+    # growing one dump per ``snapshot_interval``.  No-op for the h5/none
+    # writers.
+    snapshot_clean: bool = False
+
 
 @dataclass(frozen=True)
 class InterREConfig:

@@ -368,6 +368,7 @@ def run_from_config(
         output_config.format, traj_path, symbol_map, mode=writer_mode,
         restart_iteration=restart_iteration,
         wrap=output_config.wrap_atoms,
+        clean_snapshots=output_config.snapshot_clean,
     )
     energy_logger = EnergyLogger(
         working_dir / f"{output_config.out_file_prefix}.energies",
@@ -845,6 +846,7 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
                 resolved.output.format, traj_path, symbol_map, mode=writer_mode,
                 restart_iteration=restart_iteration,
                 wrap=resolved.output.wrap_atoms,
+                clean_snapshots=resolved.output.snapshot_clean,
             )
         )
         energy_path = working_dir / f"{resolved.output.out_file_prefix}.run{r:02d}.energies"
@@ -1222,6 +1224,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
         resolved.output.format, traj_path, symbol_map, mode=writer_mode,
         restart_iteration=restart_iteration,
         wrap=resolved.output.wrap_atoms,
+        clean_snapshots=resolved.output.snapshot_clean,
     )
     energy_path = (
         working_dir / f"{resolved.output.out_file_prefix}.energies"

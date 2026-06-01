@@ -900,35 +900,36 @@ class TestCellSpec:
 # ---------------------------------------------------------------------------
 
 class TestExtendedOutputSpec:
-    """Tests for the extended OutputSpec with deferred fields (Part C)."""
+    """Tests for the extended OutputSpec optional fields (Part C)."""
 
-    def test_deferred_fields_have_correct_defaults(self):
+    def test_optional_fields_have_correct_defaults(self):
         from jaxrens.cli.schema.output import OutputSpec
         schema = OutputSpec()
-        assert schema.snapshot_time is None
         assert schema.snapshot_clean is False
         assert schema.wrap_atoms is False
-        assert schema.write_traj_db is False
-        assert schema.write_walkers_db is False
         # save_acc_rates was promoted out of deferred into a real field.
         assert schema.save_acc_rates is False
         assert schema.acc_rates_interval == 1
 
-    def test_deferred_fields_accept_non_defaults(self):
+    def test_optional_fields_accept_non_defaults(self):
         from jaxrens.cli.schema.output import OutputSpec
         schema = OutputSpec(
             format="none",
-            snapshot_time=60.0,
             snapshot_clean=True,
             wrap_atoms=True,
-            write_traj_db=True,
-            write_walkers_db=True,
         )
-        assert schema.snapshot_time == pytest.approx(60.0)
         assert schema.snapshot_clean is True
         assert schema.wrap_atoms is True
-        assert schema.write_traj_db is True
-        assert schema.write_walkers_db is True
+
+    def test_removed_fields_rejected(self):
+        """``snapshot_time`` / ``write_traj_db`` / ``write_walkers_db`` were
+        removed; ``extra='forbid'`` must now reject them."""
+        from pydantic import ValidationError
+
+        from jaxrens.cli.schema.output import OutputSpec
+        for key in ("snapshot_time", "write_traj_db", "write_walkers_db"):
+            with pytest.raises(ValidationError):
+                OutputSpec(**{key: 1})
 
     def test_save_acc_rates_accept_non_defaults(self):
         from jaxrens.cli.schema.output import OutputSpec
@@ -941,14 +942,14 @@ class TestExtendedOutputSpec:
         schema = OutputSpec(
             format="none",
             wrap_atoms=True,
-            snapshot_time=30.0,
+            snapshot_clean=True,
         )
         dumped = schema.model_dump(mode="json")
         import yaml as _yaml
         reloaded = _yaml.safe_load(_yaml.safe_dump(dumped))
         schema2 = OutputSpec.model_validate(reloaded)
         assert schema2.wrap_atoms is True
-        assert schema2.snapshot_time == pytest.approx(30.0)
+        assert schema2.snapshot_clean is True
 
 
 # ---------------------------------------------------------------------------

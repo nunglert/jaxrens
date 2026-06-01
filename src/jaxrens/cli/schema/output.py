@@ -1,15 +1,4 @@
-"""Pydantic schema for the [output] section of a jaxrens YAML config.
-
-DEFERRED fields — accepted and validated but not yet consumed by the runtime.
-Users who set these will see a ``logging.warning`` from the resolver:
-
-  - ``snapshot_time``: time-based snapshot interval (runtime has only
-    iteration-based snapshots today).
-  - ``snapshot_clean``: delete older snapshots on write.
-  - ``wrap_atoms``: wrap atom positions into the cell on output.
-  - ``write_traj_db``: write a trajectory database (no DB writer exists yet).
-  - ``write_walkers_db``: write a walker database (no walker DB writer exists).
-"""
+"""Pydantic schema for the [output] section of a jaxrens YAML config."""
 
 from __future__ import annotations
 
@@ -126,9 +115,13 @@ class OutputSpec(BaseModel):
         ),
     )
 
-    # -- Deferred fields (see module docstring) --
-    snapshot_time: float | None = None
-    snapshot_clean: bool = False
+    # Whether ``ExtxyzTrajectoryWriter`` wraps dead-point atom positions into
+    # the dead walker's own cell before writing.  Default False keeps absolute
+    # Cartesians so off-the-shelf viewers don't show boundary-wrap artifacts.
     wrap_atoms: bool = False
-    write_traj_db: bool = False
-    write_walkers_db: bool = False
+
+    # When True, only the most recent walker snapshot (``*.snap.<iter>.extxyz``)
+    # is kept: the previous one is deleted as soon as the next is written.
+    # Walker snapshots are a crash-inspection convenience, so this stops the
+    # output directory from growing one dump per ``snapshot_interval``.
+    snapshot_clean: bool = False
