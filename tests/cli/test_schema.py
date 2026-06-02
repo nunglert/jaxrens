@@ -905,7 +905,7 @@ class TestExtendedOutputSpec:
     def test_optional_fields_have_correct_defaults(self):
         from jaxrens.cli.schema.output import OutputSpec
         schema = OutputSpec()
-        assert schema.snapshot_clean is False
+        assert schema.snapshot_clean is True
         assert schema.wrap_atoms is False
         # save_acc_rates was promoted out of deferred into a real field.
         assert schema.save_acc_rates is False

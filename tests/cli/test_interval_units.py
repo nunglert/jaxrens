@@ -113,25 +113,25 @@ class TestApplyIntervalUnits:
         assert out.inter_re.re_interval == 50
         assert out.termination[0].max_iterations == 40
 
-    def test_per_walker_scales_temperature_lag_and_interval(self):
-        """``temperature_lag`` / ``temperature_interval`` scale with n_live."""
+    def test_per_walker_scales_temperature_lag_interval_and_interval(self):
+        """``temperature_lag_interval`` / ``temperature_interval`` scale with n_live."""
         d = _full_interval_dict(n_live=500)
         d["interval_units"] = "per_walker"
-        d["output"]["temperature_lag"] = 0.5      # 0.5 walker-sweeps → 250 iters
+        d["output"]["temperature_lag_interval"] = 0.5      # 0.5 walker-sweeps → 250 iters
         d["output"]["temperature_interval"] = 0.2  # → 100 iters
         root = RootSpec.model_validate(d)
         out = _apply_interval_units(root)
-        assert out.output.temperature_lag == 250
+        assert out.output.temperature_lag_interval == 250
         assert out.output.temperature_interval == 100
 
-    def test_temperature_lag_none_passes_through(self):
-        """``temperature_lag: null`` survives scaling — disables the callback."""
+    def test_temperature_lag_interval_none_passes_through(self):
+        """``temperature_lag_interval: null`` survives scaling — disables the callback."""
         d = _full_interval_dict(n_live=10)
         d["interval_units"] = "per_walker"
-        d["output"]["temperature_lag"] = None
+        d["output"]["temperature_lag_interval"] = None
         root = RootSpec.model_validate(d)
         out = _apply_interval_units(root)
-        assert out.output.temperature_lag is None
+        assert out.output.temperature_lag_interval is None
 
     def test_per_walker_accepts_floats(self):
         d = _full_interval_dict(n_live=500)

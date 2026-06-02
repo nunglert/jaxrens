@@ -230,7 +230,15 @@ def _scalarize_sharded_info(info: dict[str, Any]) -> dict[str, Any]:
         try:
             arr = jnp.asarray(v)
         except (TypeError, ValueError):
-            out[k] = v
+            # Non-array leaf that is itself a pytree — notably
+            # ``dead_walker`` (a ``WalkerState``).  ``jnp.asarray`` can't
+            # collapse it directly, so map the ``[0]`` collapse over its
+            # array leaves; otherwise the redundant leading-G axis survives
+            # and SingleRun-shaped consumers (TrajectoryCallback ->
+            # walker_to_ase_atoms) see G replicated walkers instead of one.
+            out[k] = jax.tree_util.tree_map(
+                lambda a: a[0] if getattr(a, "ndim", 0) > 0 else a, v
+            )
             continue
         out[k] = arr[0] if arr.ndim > 0 else arr
     return out

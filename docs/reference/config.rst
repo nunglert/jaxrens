@@ -20,6 +20,14 @@ Root document
    :model-show-json: true
    :field-show-constraints: true
 
+.. note::
+
+   ``interval_units`` rescales every iteration-counted field at once
+   (``per_walker`` counts in walker-sweeps of ``run.n_live`` iterations
+   instead of raw iterations).  See the "Interval-unit scaling" section
+   of :doc:`../user/concepts/schema_resolve` for the motivation, a YAML
+   example, and the full list of affected fields.
+
 
 Run settings
 ------------

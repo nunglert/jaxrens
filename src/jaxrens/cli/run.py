@@ -329,11 +329,11 @@ def run_from_config(
         EnergyCheckCallback(),
     ]
 
-    if output_config.temperature_lag is not None:
+    if output_config.temperature_lag_interval is not None:
         callbacks.append(TemperatureCallback(
             n_live=ns_config.n_live,
             n_cull=ns_config.n_cull,
-            lag=output_config.temperature_lag,
+            lag=output_config.temperature_lag_interval,
             interval=output_config.temperature_interval,
             kB=output_config.temperature_kB,
         ))
@@ -802,11 +802,11 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
         EnergyCheckCallback(),
     ]
 
-    if resolved.output.temperature_lag is not None:
+    if resolved.output.temperature_lag_interval is not None:
         callbacks.append(TemperatureCallback(
             n_live=ns.n_live,
             n_cull=ns.n_cull,
-            lag=resolved.output.temperature_lag,
+            lag=resolved.output.temperature_lag_interval,
             interval=resolved.output.temperature_interval,
             kB=resolved.output.temperature_kB,
         ))
@@ -1184,11 +1184,11 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
         EnergyCheckCallback(),
     ]
 
-    if resolved.output.temperature_lag is not None:
+    if resolved.output.temperature_lag_interval is not None:
         callbacks.append(TemperatureCallback(
             n_live=ns.n_live,
             n_cull=ns.n_cull,
-            lag=resolved.output.temperature_lag,
+            lag=resolved.output.temperature_lag_interval,
             interval=resolved.output.temperature_interval,
             kB=resolved.output.temperature_kB,
         ))

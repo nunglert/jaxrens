@@ -76,7 +76,7 @@ _OUTPUT_INTERVAL_FIELDS: tuple[str, ...] = (
     "traj_interval",
     "snapshot_interval",
     "checkpoint_interval",
-    "temperature_lag",
+    "temperature_lag_interval",
     "temperature_interval",
     "acc_rates_interval",
     "max_neighbors_interval",

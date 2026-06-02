@@ -119,7 +119,7 @@ class TestRun:
         )
         output_config = OutputConfig(
             format="none", working_dir=tmp_path, info_interval=999,
-            temperature_lag=None,
+            temperature_lag_interval=None,
         )
         key = jax.random.key(1)
         positions = jax.random.uniform(key, (12, 1, 3), minval=-3.0, maxval=3.0)
@@ -141,7 +141,7 @@ class TestRun:
         backend_config = BackendConfig(backend_type="harmonic")
         output_config = OutputConfig(
             format="none", working_dir=tmp_path, info_interval=999,
-            temperature_lag=None,
+            temperature_lag_interval=None,
         )
         key = jax.random.key(2)
         positions = jax.random.uniform(key, (12, 1, 3), minval=-3.0, maxval=3.0)
@@ -163,7 +163,7 @@ class TestRun:
         output_config = OutputConfig(
             format="extxyz", working_dir=tmp_path, info_interval=999,
             traj_interval=1, snapshot_interval=999,
-            temperature_lag=None,
+            temperature_lag_interval=None,
         )
         key = jax.random.key(3)
         positions = jax.random.uniform(key, (12, 1, 3), minval=-3.0, maxval=3.0)
@@ -194,7 +194,7 @@ class TestRun:
         output_config = OutputConfig(
             format="none", working_dir=tmp_path, info_interval=999,
             save_acc_rates=True, save_max_neighbors=True,
-            temperature_lag=None,
+            temperature_lag_interval=None,
         )
         # Real MoveKernel; adaptation logger needs ``name`` per descriptor.
         descriptors = [MoveKernel(

@@ -794,10 +794,10 @@ class TestExtendedOutputResolve:
         assert not any("snapshot_clean" in r.message for r in caplog.records)
         assert resolved.output.snapshot_clean is True
 
-    def test_snapshot_clean_defaults_false(self):
+    def test_snapshot_clean_defaults_true(self):
         d = _minimal_dict()
         resolved = resolve(RootSpec.model_validate(d))
-        assert resolved.output.snapshot_clean is False
+        assert resolved.output.snapshot_clean is True
 
     def test_wrap_atoms_is_wired_no_longer_deferred(self, caplog):
         """``wrap_atoms`` was previously a deferred field that only warned.

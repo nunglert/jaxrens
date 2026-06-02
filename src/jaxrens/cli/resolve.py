@@ -87,7 +87,7 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
 
     The scaled fields:
         output.{info,traj,snapshot,checkpoint}_interval
-        output.{temperature_lag,temperature_interval}
+        output.{temperature_lag_interval,temperature_interval}
         output.{acc_rates_interval,max_neighbors_interval}
         output.collision_check_interval
         output.flush_interval
@@ -105,7 +105,7 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
             "traj_interval",
             "snapshot_interval",
             "checkpoint_interval",
-            "temperature_lag",
+            "temperature_lag_interval",
             "temperature_interval",
             "acc_rates_interval",
             "max_neighbors_interval",
@@ -997,7 +997,7 @@ def _resolve_single_replica(
         save_max_neighbors=root.output.save_max_neighbors,
         max_neighbors_interval=int(root.output.max_neighbors_interval),
         save_re_stats=root.output.save_re_stats,
-        temperature_lag=root.output.temperature_lag,
+        temperature_lag_interval=root.output.temperature_lag_interval,
         temperature_interval=int(root.output.temperature_interval),
         temperature_kB=float(root.output.temperature_kB),
         collision_check_threshold=root.output.collision_check_threshold,
@@ -1506,7 +1506,7 @@ def _resolve_multi_replica(
         save_max_neighbors=root.output.save_max_neighbors,
         max_neighbors_interval=int(root.output.max_neighbors_interval),
         save_re_stats=root.output.save_re_stats,
-        temperature_lag=root.output.temperature_lag,
+        temperature_lag_interval=root.output.temperature_lag_interval,
         temperature_interval=int(root.output.temperature_interval),
         temperature_kB=float(root.output.temperature_kB),
         collision_check_threshold=root.output.collision_check_threshold,

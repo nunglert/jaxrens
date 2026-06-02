@@ -361,15 +361,63 @@ its batcher is `SingleRun()` and there is no replica axis.
 
 ### Interval-unit scaling
 
-`root.interval_units = "per_walker"` lets users express iteration
-counts in walker-sweeps (1 sweep = `n_live` iterations). The resolver
-calls `_apply_interval_units(root)` at the top of `resolve()` to
-multiply the eight affected fields by `n_live`. The CLI already does
-the same call earlier — in `_cmd_run`, right after
-`_load_and_validate` — and flips `root.interval_units` to
-`"absolute"`. The resolver's second pass therefore becomes idempotent
-(factor=1, identical re-rounding). Direct callers of `resolve` (tests,
-scripts) that bypass the CLI still get correct scaling automatically.
+Every "do this every N iterations" knob in the config — how often to
+write a frame, flush the log, check termination, attempt a replica
+swap, re-tune the step size — is counted in NS iterations by default.
+But a single NS iteration replaces just `n_cull` of the `n_live`
+walkers, so the *natural* cadence for most of these is one **walker
+sweep** (`n_live` iterations — roughly "every walker touched once"),
+not one iteration. The catch is that a sweep is `n_live` iterations,
+so an interval tuned for `n_live=500` is off by 4× at `n_live=2000`.
+
+`interval_units` removes that coupling. It is a single top-level key
+with two modes:
+
+- **`absolute`** (default) — interval fields are raw NS iteration
+  counts. What you write is what the runtime sees.
+- **`per_walker`** — interval fields are walker-sweeps. The resolver
+  multiplies each by `run.n_live`, so the *same* YAML keeps the same
+  physical cadence no matter what `n_live` you run at.
+
+```yaml
+run:
+  n_live: 1000
+interval_units: per_walker   # everything below is in sweeps now
+output:
+  info_interval: 1           # → log every 1000 iterations
+  traj_interval: 10          # → dump a frame every 10 sweeps = 10 000 iters
+  snapshot_interval: 0.001   # → 0.001 × 1000 = every 1 iteration
+```
+
+The resolver applies this in `_apply_interval_units(root)`, which
+scales these fields (and leaves an unset `None`, e.g. an omitted
+`run.max_iterations`, untouched):
+
+| Section | Fields |
+|---|---|
+| `output` | `info`, `traj`, `snapshot`, `checkpoint`, `flush`, `temperature_lag`, `temperature`, `acc_rates`, `max_neighbors`, `collision_check` `_interval` |
+| `run` | `max_iterations` |
+| `termination` | `max_iterations` of any `iteration` criterion |
+| `inter_re` | `re_interval` |
+| `adaptation` | `adjust_interval` |
+
+Two practical notes:
+
+- **Rounding.** Each scaled value is rounded to the nearest int and
+  clamped to `>= 1`, so a fractional sweep like `snapshot_interval:
+  0.001` resolves to a real iteration count and never collapses to 0.
+  This is why the interval fields accept `int | float` in the schema.
+- **Restart.** Because the unit only changes *how the YAML is read*,
+  a restart config may switch `interval_units` freely — the restart
+  validator scales both sides to absolute iterations before comparing
+  (see {doc}`restart`).
+
+Implementation detail: the CLI calls `_apply_interval_units` early —
+in `_cmd_run`, right after `_load_and_validate` — and then flips
+`root.interval_units` to `"absolute"`. The resolver's own call at the
+top of `resolve()` therefore becomes a no-op second pass (factor=1).
+Direct callers of `resolve` (tests, scripts) that bypass the CLI still
+get correct scaling automatically.
 
 ### The four init modes (reference)
 

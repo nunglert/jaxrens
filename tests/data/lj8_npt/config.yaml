@@ -1,0 +1,77 @@
+# Tiny LJ NPT NS example used by tests/postprocess/test_monitor.py::TestSmokeRealRun.
+# Single-run NPT NS on 8 Ar-like LJ atoms; sized to finish quickly and produce
+# committed reference artefacts under ./output/ that exercise the full
+# postprocessing stack (Monitor.from_directory, heat_capacity, energy/iteration
+# trace).  Keep it cheap — these artefacts are tracked in git.
+
+run:
+  n_live: 32
+  max_iterations: 200
+  n_mcmc_steps: 10
+  n_extra: 0
+  seed: 42
+
+backend:
+  type: lj
+  epsilon: 1.0
+  sigma: 1.0
+  cutoff: 2.5
+  periodic: true
+
+ensemble:
+  type: npt
+  pressure: 0.1
+  pressure_units: eva3
+
+moves:
+  - type: galilean
+    n_reflect: 4
+    step_size: 0.1
+    weight: 2.0
+  - type: volume
+    step_size: 0.2
+    weight: 1.0
+
+termination:
+  - type: iteration
+    max_iterations: 200
+
+adaptation:
+  full_auto: true
+  adjust_interval: 20
+  defaults:
+    min_rate: 0.3
+    max_rate: 0.5
+    adjust_factor: 1.5
+    step_size_max: 0.5
+
+init:
+  start_species: "18 8"
+  random_initialise_pos: true
+  pos_randomization_mode: grid
+  grid_distance: 1.0
+  random_initialise_cell: true
+  start_energy_ceiling_per_atom: 100.0
+  initial_walk:
+    n_walks: 1
+    walklength: 5
+    adjust_interval: 1
+    emax_offset_per_atom: 1.0
+
+cell:
+  max_volume_per_atom: 30.0
+  min_volume_per_atom: 1.5
+  min_aspect_ratio: 0.6
+  flat_V_prior: false
+
+output:
+  format: extxyz
+  working_dir: ./output
+  out_file_prefix: lj8_npt
+  info_interval: 50
+  traj_interval: 50
+  # Disable periodic snapshot writes — only the .energies, .traj.extxyz,
+  # and final checkpoint are needed for postprocessing.
+  snapshot_interval: 100000
+  checkpoint_interval: 100000
+  log_level: info

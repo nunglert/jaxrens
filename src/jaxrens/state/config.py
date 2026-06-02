@@ -103,14 +103,14 @@ class OutputConfig:
     save_re_stats: bool = False
 
     # Finite-difference temperature estimator (Baldock et al. 2017).
-    # ``temperature_lag`` is the length of the Emax FIFO used for the
+    # ``temperature_lag_interval`` is the length of the Emax FIFO used for the
     # finite difference; ``None`` disables the callback entirely.
-    # Both ``temperature_lag`` and ``temperature_interval`` are scaled by
+    # Both ``temperature_lag_interval`` and ``temperature_interval`` are scaled by
     # ``RootSpec.interval_units`` (``per_walker`` → multiply by ``n_live``)
     # in the resolver before reaching this runtime dataclass.
     # ``temperature_kB`` defaults to eV/K (ASE convention) — set ``1.0``
     # for reduced-unit backends (LJ, harmonic).
-    temperature_lag: int | None = 100
+    temperature_lag_interval: int | None = 100
     temperature_interval: int = 100
     temperature_kB: float = 8.6173324e-5
 
@@ -136,7 +136,7 @@ class OutputConfig:
     # inspection convenience; cleaning them stops the output directory from
     # growing one dump per ``snapshot_interval``.  No-op for the h5/none
     # writers.
-    snapshot_clean: bool = False
+    snapshot_clean: bool = True
 
 
 @dataclass(frozen=True)

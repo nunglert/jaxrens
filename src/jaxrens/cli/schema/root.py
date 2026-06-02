@@ -47,15 +47,25 @@ class RootSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    # ``interval_units`` controls how the resolver interprets every
-    # iteration-counted field downstream:
-    #   * ``"absolute"`` (default): values are absolute NS iteration counts.
-    #   * ``"per_walker"``: values are walker-sweeps (1 sweep = ``n_live`` iters);
-    #     the resolver multiplies by ``run.n_live`` before constructing runtime
-    #     dataclasses.  Affected fields: ``output.{info,traj,snapshot,checkpoint}_interval``,
-    #     ``run.max_iterations``, ``termination[iteration].max_iterations``,
-    #     ``inter_re.re_interval``, ``adaptation.adjust_interval``.
-    interval_units: Literal["absolute", "per_walker"] = "absolute"
+    interval_units: Literal["absolute", "per_walker"] = Field(
+        default="absolute",
+        description=(
+            "How the resolver interprets every iteration-counted field. "
+            "``absolute`` (default): values are raw NS iteration counts. "
+            "``per_walker``: values are walker-sweeps, where one sweep equals "
+            "``run.n_live`` iterations; the resolver multiplies each affected "
+            "field by ``n_live`` before building the runtime dataclasses, so "
+            "an interval expressed in sweeps stays comparable across configs "
+            "with different ``n_live``. Affected fields: "
+            "``output.{info,traj,snapshot,checkpoint,flush}_interval``, "
+            "``output.{temperature_lag,temperature,acc_rates,max_neighbors,"
+            "collision_check}_interval``, ``run.max_iterations``, "
+            "``termination[iteration].max_iterations``, "
+            "``inter_re.re_interval``, and ``adaptation.adjust_interval``. "
+            "Scaled values are rounded to the nearest int and clamped to "
+            ">= 1, so a fractional sweep like ``0.001`` never collapses to 0."
+        ),
+    )
     run: RunSpec
     moves: list[MoveSpec]
     backend: BackendSpec

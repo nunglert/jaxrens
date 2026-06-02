@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+logger = logging.getLogger(__name__)
 
 
 class OutputSpec(BaseModel):
@@ -80,13 +83,13 @@ class OutputSpec(BaseModel):
     save_re_stats: bool = False
 
     # Finite-difference temperature estimator (Baldock et al. 2017).
-    # ``temperature_lag`` is the length of the Emax FIFO used for the
+    # ``temperature_lag_interval`` is the length of the Emax FIFO used for the
     # finite difference; ``None`` disables the callback entirely.
-    # Both ``temperature_lag`` and ``temperature_interval`` honour
+    # Both ``temperature_lag_interval`` and ``temperature_interval`` honour
     # ``interval_units`` (``per_walker`` scales by ``n_live``).
     # ``temperature_kB`` defaults to eV/K (ASE convention) — set ``1.0``
     # for reduced-unit backends (LJ, harmonic).
-    temperature_lag: int | float | None = 100
+    temperature_lag_interval: int | float | None = 100
     temperature_interval: int | float = 100
     temperature_kB: float = 8.6173324e-5
 
@@ -120,8 +123,36 @@ class OutputSpec(BaseModel):
     # Cartesians so off-the-shelf viewers don't show boundary-wrap artifacts.
     wrap_atoms: bool = False
 
-    # When True, only the most recent walker snapshot (``*.snap.<iter>.extxyz``)
-    # is kept: the previous one is deleted as soon as the next is written.
-    # Walker snapshots are a crash-inspection convenience, so this stops the
-    # output directory from growing one dump per ``snapshot_interval``.
-    snapshot_clean: bool = False
+    # When True (default), only the most recent walker snapshot
+    # (``*.snap.<iter>.extxyz``) is kept: the previous one is deleted as soon
+    # as the next is written.  Walker snapshots are a crash-inspection
+    # convenience, so this stops the output directory from growing one dump per
+    # ``snapshot_interval``.  Set False to retain every snapshot.
+    snapshot_clean: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_temperature_lag(cls, data: Any) -> Any:
+        """Map the deprecated ``temperature_lag`` key onto its new name.
+
+        ``temperature_lag`` was renamed to ``temperature_lag_interval`` for
+        naming consistency with the other ``*_interval`` fields.  Configs
+        written against the old name still load (with a deprecation warning)
+        instead of being rejected by ``extra='forbid'``.
+        """
+        if not isinstance(data, dict) or "temperature_lag" not in data:
+            return data
+        data = dict(data)
+        legacy = data.pop("temperature_lag")
+        if "temperature_lag_interval" in data:
+            raise ValueError(
+                "output: set either 'temperature_lag' (deprecated) or "
+                "'temperature_lag_interval', not both."
+            )
+        logger.warning(
+            "output.temperature_lag is deprecated; use temperature_lag_interval. "
+            "Mapping the provided value (%r) onto temperature_lag_interval.",
+            legacy,
+        )
+        data["temperature_lag_interval"] = legacy
+        return data

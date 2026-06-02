@@ -29,6 +29,7 @@ from jaxrens.sampling.moves.replica_exchange import PressureRENSSwap, SemiGrandS
 from jaxrens.sampling.run_loop import (
     _bump_cumulative_counters,
     _dispatch_callbacks,
+    _gather_sharded_ns_state,
     _inject_cumulative_into_info,
     _pack_adjustment_info,
     _pick_next_bucket,
@@ -2030,9 +2031,15 @@ def run_ns_sharded(
         final_iter, final_log_z,
     )
 
+    # Finish callbacks (notably the final checkpoint) must see the gathered
+    # ``(K, ...)`` single-run layout — same as the periodic checkpoints
+    # written through ``_run_loop`` and the flat layout a sharded restart
+    # re-loads.  The raw ``ns_state`` still carries the redundant leading
+    # ``(G, ...)`` shard axis, so gather before dispatching.
+    ns_state_finished = _gather_sharded_ns_state(ns_state)
     for cb in callbacks:
         if hasattr(cb, "on_finish"):
-            cb.on_finish(ns_state)
+            cb.on_finish(ns_state_finished)
 
     pop = ns_state.population
     return {

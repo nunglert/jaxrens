@@ -1,0 +1,112 @@
+interval_units: absolute
+run:
+  n_live: 32
+  max_iterations: 200
+  convergence_threshold: 0.1
+  n_mcmc_steps: 10
+  n_extra: 0
+  n_cull: 1
+  seed: 42
+  pressure: null
+  shard_n_gpu: 1
+moves:
+- step_size: 0.1
+  weight: 2.0
+  adaptation_warmup: 100
+  target_acceptance: 0.5
+  name: null
+  type: gmc
+  n_reflect: 4
+- step_size: 0.2
+  weight: 1.0
+  adaptation_warmup: 100
+  target_acceptance: 0.5
+  name: null
+  type: volume
+backend:
+  periodic: true
+  softcore_repulsion: null
+  max_neighbors_list:
+  - 30
+  - 35
+  - 40
+  - 45
+  - 50
+  max_neighbors_offset: 5
+  max_neighbors_shrink_dwell: 0
+  type: lj
+  epsilon: 1.0
+  sigma: 1.0
+  cutoff: 2.5
+  supercell_trafo:
+  - 1
+  - 1
+  - 1
+output:
+  format: extxyz
+  traj_interval: 50
+  snapshot_interval: 100000
+  checkpoint_interval: 100000
+  info_interval: 50
+  out_file_prefix: lj8_npt
+  working_dir: output
+  log_level: info
+  flush_interval: 1000
+  save_acc_rates: false
+  acc_rates_interval: 1
+  save_max_neighbors: false
+  max_neighbors_interval: 1
+  save_re_stats: false
+  temperature_lag_interval: 100
+  temperature_interval: 100
+  temperature_kB: 8.6173324e-05
+  collision_check_threshold: null
+  collision_check_interval: 100
+  wrap_atoms: false
+  snapshot_clean: true
+termination:
+- type: iteration
+  max_iterations: 200
+adaptation:
+  full_auto: true
+  adjust_interval: 20
+  adjust_n_samples: 50
+  adjust_max_rounds: 15
+  trial_batch_size: null
+  defaults:
+    min_rate: 0.3
+    max_rate: 0.5
+    adjust_factor: 1.5
+    step_size_max: 0.5
+  per_move: {}
+ensemble:
+  type: npt
+  pressure: 0.1
+  pressure_units: eva3
+init:
+  start_species: 18 8
+  start_config_file: null
+  start_walker_set: null
+  restart_file: null
+  start_energy_ceiling_per_atom: 100.0
+  random_initialise_pos: true
+  random_initialise_cell: true
+  pos_randomization_mode: grid
+  grid_distance: 1.0
+  init_distance_criterion: 1.0
+  random_init_max_n_tries: 100
+  pos_autoscale_cells: false
+  initial_walk:
+    n_walks: 1
+    walklength: 5
+    adjust_interval: 1
+    emax_offset_per_atom: 1.0
+    only: null
+    write_initial_walkers: false
+    walker_batch_size: null
+cell:
+  max_volume_per_atom: 30.0
+  min_volume_per_atom: 1.5
+  min_aspect_ratio: 0.6
+  flat_V_prior: false
+inter_re: null

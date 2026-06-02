@@ -353,3 +353,177 @@ def test_neuralil_multi_gpu_pipeline(tmp_path: Path) -> None:
 
     saved_positions = np.asarray(state["positions"])
     assert saved_positions.shape == (n_gpu, 2, 4, 8, 3)
+
+
+# ---------------------------------------------------------------------------
+# Sharded single-run variant — ONE NS run whose live population is sharded
+# across all local GPUs (ShardedSingleRun / run_sharded_from_config).  This is
+# a different code path from the pmap-vmap multi-run tests above: there is a
+# single pressure, a single set of output files, and the dead-point /
+# snapshot writers run on a per-iteration WalkerState gathered off the mesh.
+# ---------------------------------------------------------------------------
+
+
+_NEURALIL_SHARDED_CONFIG_YAML = """
+run:
+  n_live: 8                 # divisible by 2 and 4 local GPUs
+  max_iterations: 5
+  n_mcmc_steps: 2
+  n_extra: 0
+  seed: 42
+  shard_n_gpu: PLACEHOLDER  # set to the local device count at runtime
+
+backend:
+  type: neuralil
+  checkpoint_path: PLACEHOLDER
+  periodic: true
+  max_neighbors_list: [30, 50, 80]
+  max_neighbors_offset: 4
+
+# Single pressure → still a single NS run; sharding distributes its live
+# population across GPUs (a pressure LIST would route to the multi-run path
+# and the resolver rejects combining it with shard_n_gpu).
+ensemble:
+  type: npt
+  pressure: 0.0
+  pressure_units: gpa
+
+moves:
+  - type: galilean
+    n_reflect: 2
+    step_size: 0.05
+    weight: 1.0
+  - type: volume
+    step_size: 0.05
+    weight: 1.0
+
+termination:
+  - type: iteration
+    max_iterations: 5
+
+adaptation:
+  full_auto: true
+  adjust_interval: 100
+  defaults:
+    min_rate: 0.3
+    max_rate: 0.5
+    adjust_factor: 1.5
+    step_size_max: 0.3
+
+init:
+  start_species: "1 8"
+  random_initialise_pos: true
+  pos_randomization_mode: grid
+  grid_distance: 1.5
+  start_energy_ceiling_per_atom: 100.0
+  random_initialise_cell: false
+  initial_walk:
+    n_walks: 1
+    walklength: 2
+    adjust_interval: 1
+    emax_offset_per_atom: 1.0
+
+cell:
+  max_volume_per_atom: 200.0
+  min_volume_per_atom: 50.0
+  min_aspect_ratio: 0.5
+  flat_V_prior: false
+
+output:
+  format: extxyz
+  working_dir: PLACEHOLDER
+  out_file_prefix: neuralil_sharded
+  info_interval: 1
+  traj_interval: 1          # write a dead point every iteration
+  snapshot_interval: 100
+  checkpoint_interval: 100
+  log_level: info
+"""
+
+
+@pytest.mark.multi_gpu
+@pytest.mark.neuralil
+@pytest.mark.gpu
+@pytest.mark.heavy
+def test_neuralil_sharded_multi_gpu_pipeline(tmp_path: Path) -> None:
+    """Single NeuralIL NPT NS run sharded across all local GPUs.
+
+    Exercises the ``ShardedSingleRun`` path end-to-end through
+    ``run_sharded_from_config``:
+
+    * Resolver routes ``run.shard_n_gpu > 1`` to ``ShardedSingleRun(n_gpu)``.
+    * ``init_ns_sharded`` shards the K=8 population to ``(G, K/G, ...)``.
+    * The NS loop runs ``ns_step_sharded`` (galilean ``value_and_grad`` +
+      volume moves) with the cross-shard ``lax.psum`` invariants.
+    * **The per-iteration dead point is gathered off the mesh and written**
+      via the single-run ``TrajectoryCallback`` — this is the path that
+      regressed when ``info["dead_walker"]`` kept its leading shard axis, so
+      the trajectory-frame assertions below are the regression guard.
+    * Streamed I/O is single-run-shaped: one ``.energies`` and one
+      ``.traj.extxyz`` (no ``.runNN`` suffix), plus a gathered checkpoint.
+    """
+    pytest.importorskip("neuralil")
+
+    from jaxrens.cli.resolve import resolve
+    from jaxrens.cli.run import run_sharded_from_config
+    from jaxrens.cli.schema import RootSpec
+    from jaxrens.sampling.batch_descriptor import ShardedSingleRun
+
+    n_gpu = multi_gpu_n_devices()
+
+    raw = yaml.safe_load(_NEURALIL_SHARDED_CONFIG_YAML)
+    raw["backend"]["checkpoint_path"] = str(_MODEL_PKL)
+    raw["output"]["working_dir"] = str(tmp_path / "out")
+    raw["run"]["shard_n_gpu"] = n_gpu
+
+    root = RootSpec.model_validate(raw)
+    resolved = resolve(root)
+
+    assert isinstance(resolved.batcher, ShardedSingleRun), (
+        "shard_n_gpu > 1 with a single pressure should route through the "
+        "sharded single-run dispatcher."
+    )
+    assert resolved.batcher.n_gpu == n_gpu
+
+    run_sharded_from_config(resolved)
+
+    # ---- On-disk artefacts: single-run-shaped (no per-replica suffix) -------
+    out = tmp_path / "out"
+    from jaxrens.io.energy_log import EnergyLogger
+
+    energies_path = out / "neuralil_sharded.energies"
+    traj_path = out / "neuralil_sharded.traj.extxyz"
+    assert energies_path.exists(), f"missing energy log: {energies_path}"
+    assert traj_path.exists(), f"missing trajectory: {traj_path}"
+
+    log = EnergyLogger.read(energies_path)
+    assert log.energies.shape == (5,), (
+        f"expected 5 dead-point energies, got {log.energies.shape}"
+    )
+
+    # Dead-point trajectory: one frame per iteration, each the full 8-atom
+    # gathered walker.  Before the sharded dead_walker fix this write crashed
+    # (the WalkerState reached the writer with a leading shard axis), so these
+    # assertions guard that regression.
+    from ase.io import read as ase_read
+
+    frames = ase_read(str(traj_path), index=":")
+    assert len(frames) == 5, f"expected 5 trajectory frames, got {len(frames)}"
+    for fr in frames:
+        assert len(fr) == 8, f"expected 8 atoms per frame, got {len(fr)}"
+
+    # ---- Final checkpoint: gathered to single-run (K, ...) shapes -----------
+    final_ckpt = out / "neuralil_sharded.final.checkpoint.h5"
+    assert final_ckpt.exists(), f"missing final checkpoint: {final_ckpt}"
+
+    from jaxrens.io.checkpoint import load_checkpoint
+
+    state = load_checkpoint(final_ckpt)
+    log_z = np.asarray(state["log_evidence"])
+    assert log_z.size == 1, f"expected scalar log_evidence, got shape {log_z.shape}"
+    assert np.all(np.isfinite(log_z)), f"log_evidence not finite: {log_z}"
+
+    saved_positions = np.asarray(state["positions"])
+    assert saved_positions.shape == (8, 8, 3), (
+        f"expected gathered (K=8, n_atoms=8, 3), got {saved_positions.shape}"
+    )
