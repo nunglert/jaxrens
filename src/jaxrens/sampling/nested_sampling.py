@@ -543,9 +543,15 @@ def ns_step_sharded(
        potentials (same RNG → same global index on every shard).
     2. Random-survivor cloning indexes globally — the chain seed is
        identical on every shard.
-    3. The MCMC chains (``vmap(run_one_chain)``) execute identically
-       on every shard ("wasted compute" — explicit cost of sharded
-       single-run vs. independent-run sharding; gain is memory).
+    3. The MCMC chains are DISTRIBUTED across shards: each device walks
+       only its ``ceil(n_walk / G)`` slice of the (clone + n_extra)
+       chains, then the small final walker states + per-move counters
+       are ``lax.all_gather``-ed back.  This divides the model-eval work
+       (the dominant per-step cost) G ways, so a sharded run is both a
+       memory win (population storage is split) and a walk speedup of up
+       to G× when ``n_walk >= G``.  Chain ``i`` always consumes
+       ``chain_keys[i]`` regardless of which shard runs it, so the walk
+       is bit-identical to the single-device result.
     4. Writing the new walkers happens via a global ``.at[].set(...)``
        on the gathered population, then reshape-and-slice back to the
        local shard.
@@ -649,9 +655,37 @@ def ns_step_sharded(
     n_walk = 1 + n_extra
     walk_batch = jax.tree.map(lambda x: x[walk_indices], pop_global)
 
-    # 6. Run MCMC chains identically on every shard (same seed, same RNG).
+    # 6. Run the MCMC chains, DISTRIBUTED across shards.
+    #
+    # The clone + n_extra survivor walks are independent, so each shard walks 
+    # only its ~n_walk/G slice and the small
+    # final walker states + per-chain counters are all_gathered back.
+    # Chain i always consumes chain_keys[i] regardless of which shard runs
+    # it, so the result is identical to the single-device walk (same seed
+    # -> same sequence); only the model-eval work is divided G ways.
+    n_gpu = n_walkers_global // K_per_gpu
     chain_keys = jax.random.split(key_mcmc, n_walk)
     all_mcmc_keys = jax.vmap(lambda k: jax.random.split(k, n_mcmc_steps))(chain_keys)
+
+    # Pad the chain set up to a multiple of G so every shard gets an
+    # equal, statically-shaped slice (pmap requires identical per-device
+    # shapes).  ``pad_idx`` wraps around (mod n_walk) so it is safe even
+    # when n_walk < G; the padding chains are walked but discarded after
+    # the gather (only n_padded - n_walk < G of them — a bounded tail).
+    n_per_shard = -(-n_walk // n_gpu)        # ceil(n_walk / G)
+    n_padded = n_per_shard * n_gpu
+    pad_idx = jnp.arange(n_padded) % n_walk
+    walk_batch_p = jax.tree.map(lambda x: x[pad_idx], walk_batch)
+    all_mcmc_keys_p = all_mcmc_keys[pad_idx]
+
+    my_shard = jax.lax.axis_index("shard")
+
+    def _take_my_chains(x):
+        # (n_padded, ...) -> this shard's contiguous (n_per_shard, ...) block.
+        return x.reshape((n_gpu, n_per_shard) + x.shape[1:])[my_shard]
+
+    local_batch = jax.tree.map(_take_my_chains, walk_batch_p)
+    local_keys = _take_my_chains(all_mcmc_keys_p)
 
     def run_one_chain(walker, chain_keys):
         # Same body as ns_step.run_one_chain — see ns_step for the
@@ -692,19 +726,34 @@ def ns_step_sharded(
             jnp.sum(n_grad_evals_arr, axis=0),
         )
 
-    finals, acc_counts, chain_n_acc, chain_n_prop, chain_rr, chain_n_evals, chain_n_grad_evals = jax.vmap(
-        run_one_chain
-    )(walk_batch, all_mcmc_keys)
+    (
+        local_finals, local_acc, local_n_acc, local_n_prop, local_rr,
+        local_n_evals, local_n_grad,
+    ) = jax.vmap(run_one_chain)(local_batch, local_keys)
+
+    # Gather every per-chain result to the full (padded) chain set on every
+    # shard, then drop the wrap-around padding rows.  These arrays are small
+    # (final walker states + per-move counters), so the gather is cheap
+    # relative to the model evals we just distributed.
+    def _gather_chains(x):
+        g = jax.lax.all_gather(x, axis_name="shard")     # (G, n_per_shard, ...)
+        return g.reshape((n_padded,) + x.shape[1:])[:n_walk]
+
+    finals = jax.tree.map(_gather_chains, local_finals)
+    acc_counts = _gather_chains(local_acc)
+    chain_n_acc = _gather_chains(local_n_acc)
+    chain_n_prop = _gather_chains(local_n_prop)
+    chain_rr = _gather_chains(local_rr)
+    chain_n_evals = _gather_chains(local_n_evals)
+    chain_n_grad_evals = _gather_chains(local_n_grad)
 
     # 7. Scatter walked walkers back into the global pop, then reshape
     # to (G, K_per_gpu, ...) and take this shard's slice.  This works
-    # because every shard wrote the same updates; each slice differs
-    # only in *which* of the (G, K_per_gpu) rows it owns.
+    # because every shard now holds the same gathered updates; each slice
+    # differs only in *which* of the (G, K_per_gpu) rows it owns.
     new_pop_global = jax.tree.map(
         lambda x, w: x.at[walk_indices].set(w), pop_global, finals,
     )
-
-    my_shard = jax.lax.axis_index("shard")
 
     def _slice_my_shard(x):
         return x.reshape((-1, K_per_gpu) + x.shape[1:])[my_shard]

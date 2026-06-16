@@ -78,16 +78,22 @@ def _make_harmonic_problem(seed: int, n_walkers: int):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("n_extra", [0, 4])
 @pytest.mark.parametrize(
     "n_gpu", [1, pytest.param(2, marks=pytest.mark.multi_gpu)],
 )
-def test_run_ns_sharded_matches_single_run(n_gpu):
+def test_run_ns_sharded_matches_single_run(n_gpu, n_extra):
     """Sharded run reproduces the SingleRun reference exactly.
 
     Uses a small harmonic problem (K=8, n_atoms=1) and runs 3 NS
     iterations from the same seed.  All shards make the same global
     decisions (same RNG broadcast), so the result is bit-exact at
     G=1 and effectively bit-exact at G=2 on this toy problem.
+
+    ``n_extra > 0`` is the case that exercises the cross-shard chain
+    distribution: the ``1 + n_extra`` walked chains are split across
+    devices (here 5 chains over 2 shards, padded to 3 each), gathered,
+    and must still match the single-device walk.
     """
     if n_gpu > 1 and 8 % n_gpu != 0:
         pytest.skip("n_walkers must divide n_gpu")
@@ -107,7 +113,7 @@ def test_run_ns_sharded_matches_single_run(n_gpu):
         n_walkers=8,
         max_iterations=n_iter,
         n_mcmc_steps=4,
-        n_extra=0,
+        n_extra=n_extra,
         move_descriptors=setup["descriptors"],
         termination_criteria=[IterationTermination(n_iter)],
     )
@@ -124,7 +130,7 @@ def test_run_ns_sharded_matches_single_run(n_gpu):
         n_walkers=8,
         max_iterations=n_iter,
         n_mcmc_steps=4,
-        n_extra=0,
+        n_extra=n_extra,
         move_descriptors=setup["descriptors"],
         termination_criteria=[IterationTermination(n_iter)],
     )
