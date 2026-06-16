@@ -77,20 +77,22 @@ class TestPerSpeciesReducesToScalar:
         scalar_be = create_lj(epsilon=1.0, sigma=1.0)
         table_be = create_lj(epsilon=[1.0], sigma=[1.0])
 
-        e_scalar, _, _ = scalar_be(pos, types, cell).legacy()
-        e_table, _, _ = table_be(pos, types, cell).legacy()
+        e_scalar = scalar_be(pos, types, cell).energy
+        e_table = table_be(pos, types, cell).energy
         assert jnp.allclose(e_scalar, e_table, atol=1e-6, rtol=1e-6)
 
     def test_two_equal_entries_match_scalar(self):
         pos = _two_atom_positions(r=1.5)
-        types = jnp.array([1, 0], dtype=jnp.int32)  # mixed types but same params
+        types = jnp.array(
+            [1, 0], dtype=jnp.int32
+        )  # mixed types but same params
         cell = _no_cell()
 
         scalar_be = create_lj(epsilon=0.7, sigma=0.9)
         table_be = create_lj(epsilon=[0.7, 0.7], sigma=[0.9, 0.9])
 
-        e_scalar, _, _ = scalar_be(pos, types, cell).legacy()
-        e_table, _, _ = table_be(pos, types, cell).legacy()
+        e_scalar = scalar_be(pos, types, cell).energy
+        e_table = table_be(pos, types, cell).energy
         assert jnp.allclose(e_scalar, e_table, atol=1e-6, rtol=1e-6)
 
 
@@ -109,13 +111,19 @@ class TestCompositionDependence:
         cell = _no_cell()
         be = create_lj(epsilon=[1.0, 0.5], sigma=[1.0, 1.2])
 
-        e_AA, _, _ = be(pos, jnp.array([0, 0], dtype=jnp.int32), cell).legacy()
-        e_BB, _, _ = be(pos, jnp.array([1, 1], dtype=jnp.int32), cell).legacy()
-        e_AB, _, _ = be(pos, jnp.array([0, 1], dtype=jnp.int32), cell).legacy()
+        e_AA = be(pos, jnp.array([0, 0], dtype=jnp.int32), cell).energy
+        e_BB = be(pos, jnp.array([1, 1], dtype=jnp.int32), cell).energy
+        e_AB = be(pos, jnp.array([0, 1], dtype=jnp.int32), cell).energy
 
-        assert not jnp.allclose(e_AA, e_BB), "AA and BB pair energies must differ"
-        assert not jnp.allclose(e_AA, e_AB), "AA and AB pair energies must differ"
-        assert not jnp.allclose(e_BB, e_AB), "BB and AB pair energies must differ"
+        assert not jnp.allclose(
+            e_AA, e_BB
+        ), "AA and BB pair energies must differ"
+        assert not jnp.allclose(
+            e_AA, e_AB
+        ), "AA and AB pair energies must differ"
+        assert not jnp.allclose(
+            e_BB, e_AB
+        ), "BB and AB pair energies must differ"
 
     def test_lorentz_berthelot_mixing_value(self):
         """Cross-species pair energy follows ε_ij=√(ε_i·ε_j), σ_ij=(σ_i+σ_j)/2."""
@@ -126,14 +134,14 @@ class TestCompositionDependence:
         pos = _two_atom_positions(r=r)
         cell = _no_cell()
         be = create_lj(epsilon=[eps_a, eps_b], sigma=[sig_a, sig_b])
-        e_AB, _, _ = be(pos, jnp.array([0, 1], dtype=jnp.int32), cell).legacy()
+        e_AB = be(pos, jnp.array([0, 1], dtype=jnp.int32), cell).energy
 
         eps_ij = float(jnp.sqrt(eps_a * eps_b))
         sig_ij = 0.5 * (sig_a + sig_b)
         expected = 4.0 * eps_ij * ((sig_ij / r) ** 12 - (sig_ij / r) ** 6)
-        assert jnp.allclose(e_AB, expected, atol=1e-5, rtol=1e-5), (
-            f"got {float(e_AB):.6f}, expected {expected:.6f}"
-        )
+        assert jnp.allclose(
+            e_AB, expected, atol=1e-5, rtol=1e-5
+        ), f"got {float(e_AB):.6f}, expected {expected:.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +188,7 @@ class TestScalarRegression:
         be = create_lj(epsilon=eps, sigma=sig)
         pos = _two_atom_positions(r=r)
         cell = _no_cell()
-        e, _, _ = be(pos, jnp.array([0, 0], dtype=jnp.int32), cell).legacy()
+        e = be(pos, jnp.array([0, 0], dtype=jnp.int32), cell).energy
         expected = 4.0 * eps * ((sig / r) ** 12 - (sig / r) ** 6)
         assert jnp.allclose(e, expected, atol=1e-5, rtol=1e-5)
 
@@ -221,11 +229,11 @@ def _brute_force_pair_energy(
                 if i == j and np.all(off == 0):
                     continue
                 dr_kij = dr_mic + off @ cell
-                r2 = float((dr_kij ** 2).sum())
-                if cutoff is not None and r2 >= cutoff ** 2:
+                r2 = float((dr_kij**2).sum())
+                if cutoff is not None and r2 >= cutoff**2:
                     continue
-                sig_r6 = (sigma ** 2 / r2) ** 3
-                pair = 4.0 * epsilon * (sig_r6 ** 2 - sig_r6)
+                sig_r6 = (sigma**2 / r2) ** 3
+                pair = 4.0 * epsilon * (sig_r6**2 - sig_r6)
                 energy += 0.5 * pair
     return energy
 
@@ -234,35 +242,47 @@ class TestTriclinicMIC:
     def test_sheared_cell_matches_brute_force(self):
         # 8-atom random configuration in a sheared cell.
         key = jax.random.PRNGKey(0)
-        cell = jnp.array([
-            [5.0, 0.5, 0.0],
-            [0.6, 5.0, 0.3],
-            [0.2, 0.4, 5.0],
-        ])
-        positions = jax.random.uniform(
-            key, (8, 3), minval=-1.0, maxval=6.0
+        cell = jnp.array(
+            [
+                [5.0, 0.5, 0.0],
+                [0.6, 5.0, 0.3],
+                [0.2, 0.4, 5.0],
+            ]
         )
+        positions = jax.random.uniform(key, (8, 3), minval=-1.0, maxval=6.0)
 
         be = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5)
-        e, _, _ = be(positions, jnp.zeros(8, dtype=jnp.int32), cell).legacy()
+        e = be(positions, jnp.zeros(8, dtype=jnp.int32), cell).energy
         ref = _brute_force_pair_energy(
-            positions, cell, 1.0, 1.0, 2.5, (1, 1, 1),
+            positions,
+            cell,
+            1.0,
+            1.0,
+            2.5,
+            (1, 1, 1),
         )
         assert jnp.allclose(e, ref, atol=1e-4, rtol=1e-4), (e, ref)
 
     def test_diagonal_cell_unchanged(self):
         # MIC-safe cubic cell: triclinic MIC and the previous diag-only MIC
         # must give the same energy.
-        positions = jnp.array([
-            [0.0, 0.0, 0.0],
-            [1.2, 0.0, 0.0],
-            [0.0, 1.5, 0.0],
-        ])
+        positions = jnp.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.2, 0.0, 0.0],
+                [0.0, 1.5, 0.0],
+            ]
+        )
         cell = jnp.diag(jnp.array([10.0, 10.0, 10.0]))
         be = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5)
-        e, _, _ = be(positions, jnp.zeros(3, dtype=jnp.int32), cell).legacy()
+        e = be(positions, jnp.zeros(3, dtype=jnp.int32), cell).energy
         ref = _brute_force_pair_energy(
-            positions, cell, 1.0, 1.0, 2.5, (1, 1, 1),
+            positions,
+            cell,
+            1.0,
+            1.0,
+            2.5,
+            (1, 1, 1),
         )
         assert jnp.allclose(e, ref, atol=1e-5, rtol=1e-5)
 
@@ -276,38 +296,56 @@ class TestSupercellTrafo:
     def test_default_is_mic_only(self):
         # Spacious cubic cell: (1,1,1) and (2,2,2) must agree because every
         # extra image is beyond the cutoff.
-        positions = jnp.array([
-            [0.0, 0.0, 0.0],
-            [1.4, 0.0, 0.0],
-            [0.0, 1.4, 0.0],
-        ])
+        positions = jnp.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.4, 0.0, 0.0],
+                [0.0, 1.4, 0.0],
+            ]
+        )
         cell = jnp.diag(jnp.array([10.0, 10.0, 10.0]))
-        be_a = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5,
-                         supercell_trafo=(1, 1, 1))
-        be_b = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5,
-                         supercell_trafo=(2, 2, 2))
-        e_a, _, _ = be_a(positions, jnp.zeros(3, dtype=jnp.int32), cell).legacy()
-        e_b, _, _ = be_b(positions, jnp.zeros(3, dtype=jnp.int32), cell).legacy()
+        be_a = create_lj(
+            epsilon=1.0, sigma=1.0, cutoff=2.5, supercell_trafo=(1, 1, 1)
+        )
+        be_b = create_lj(
+            epsilon=1.0, sigma=1.0, cutoff=2.5, supercell_trafo=(2, 2, 2)
+        )
+        e_a = be_a(positions, jnp.zeros(3, dtype=jnp.int32), cell).energy
+        e_b = be_b(positions, jnp.zeros(3, dtype=jnp.int32), cell).energy
         assert jnp.allclose(e_a, e_b, atol=1e-5, rtol=1e-5)
 
     def test_tight_cell_picks_up_images(self):
         # Cell side 3.55 σ < 2 σ * cutoff/σ = 5 — needs (2,2,2) to be correct.
-        positions = jnp.array([
-            [0.0, 0.0, 0.0],
-            [1.2, 0.0, 0.0],
-        ])
+        positions = jnp.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.2, 0.0, 0.0],
+            ]
+        )
         cell = jnp.diag(jnp.array([3.55, 3.55, 3.55]))
-        be_mic = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5,
-                           supercell_trafo=(1, 1, 1))
-        be_sc = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5,
-                          supercell_trafo=(2, 2, 2))
-        e_mic, _, _ = be_mic(positions, jnp.zeros(2, dtype=jnp.int32), cell).legacy()
-        e_sc, _, _ = be_sc(positions, jnp.zeros(2, dtype=jnp.int32), cell).legacy()
+        be_mic = create_lj(
+            epsilon=1.0, sigma=1.0, cutoff=2.5, supercell_trafo=(1, 1, 1)
+        )
+        be_sc = create_lj(
+            epsilon=1.0, sigma=1.0, cutoff=2.5, supercell_trafo=(2, 2, 2)
+        )
+        e_mic = be_mic(positions, jnp.zeros(2, dtype=jnp.int32), cell).energy
+        e_sc = be_sc(positions, jnp.zeros(2, dtype=jnp.int32), cell).energy
         ref_mic = _brute_force_pair_energy(
-            positions, cell, 1.0, 1.0, 2.5, (1, 1, 1),
+            positions,
+            cell,
+            1.0,
+            1.0,
+            2.5,
+            (1, 1, 1),
         )
         ref_sc = _brute_force_pair_energy(
-            positions, cell, 1.0, 1.0, 2.5, (2, 2, 2),
+            positions,
+            cell,
+            1.0,
+            1.0,
+            2.5,
+            (2, 2, 2),
         )
         assert jnp.allclose(e_mic, ref_mic, atol=1e-4, rtol=1e-4)
         assert jnp.allclose(e_sc, ref_sc, atol=1e-4, rtol=1e-4)
@@ -315,15 +353,21 @@ class TestSupercellTrafo:
         assert not jnp.allclose(e_mic, e_sc, atol=1e-3, rtol=1e-3)
 
     def test_jit_compatibility(self):
-        be = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5,
-                       supercell_trafo=(2, 2, 2))
+        be = create_lj(
+            epsilon=1.0, sigma=1.0, cutoff=2.5, supercell_trafo=(2, 2, 2)
+        )
+
         @jax.jit
         def energy_fn(pos, sp, c):
-            e, _, _ = be(pos, sp, c).legacy()
+            e = be(pos, sp, c).energy
             return e
+
         pos = jnp.array([[0.0, 0.0, 0.0], [1.2, 0.0, 0.0]])
-        e = energy_fn(pos, jnp.zeros(2, dtype=jnp.int32),
-                      jnp.diag(jnp.array([4.0, 4.0, 4.0])))
+        e = energy_fn(
+            pos,
+            jnp.zeros(2, dtype=jnp.int32),
+            jnp.diag(jnp.array([4.0, 4.0, 4.0])),
+        )
         assert jnp.isfinite(e)
 
     def test_invalid_supercell_trafo_raises(self):
@@ -353,7 +397,12 @@ class TestStartupCutoffWarning:
                 "pressure_units": "eva3",
             },
             "moves": [
-                {"type": "gmc", "n_reflect": 4, "step_size": 0.1, "weight": 1.0},
+                {
+                    "type": "gmc",
+                    "n_reflect": 4,
+                    "step_size": 0.1,
+                    "weight": 1.0,
+                },
             ],
             "init": {
                 "start_species": "18 8",
@@ -362,7 +411,9 @@ class TestStartupCutoffWarning:
                 "grid_distance": 1.0,
                 "random_initialise_cell": True,
                 "initial_walk": {
-                    "n_walks": 1, "walklength": 1, "adjust_interval": 1,
+                    "n_walks": 1,
+                    "walklength": 1,
+                    "adjust_interval": 1,
                     "emax_offset_per_atom": 1.0,
                 },
             },
@@ -409,7 +460,9 @@ class TestStartupCutoffWarning:
         with caplog.at_level("WARNING", logger="jaxrens.cli.resolve"):
             resolve(root)
         msgs = [r.getMessage() for r in caplog.records]
-        assert not any("LJ cutoff vs cell-prior bounds" in m for m in msgs), msgs
+        assert not any(
+            "LJ cutoff vs cell-prior bounds" in m for m in msgs
+        ), msgs
 
     def test_no_warning_without_cutoff(self, caplog):
         from jaxrens.cli.resolve import resolve
@@ -427,4 +480,6 @@ class TestStartupCutoffWarning:
         with caplog.at_level("WARNING", logger="jaxrens.cli.resolve"):
             resolve(root)
         msgs = [r.getMessage() for r in caplog.records]
-        assert not any("LJ cutoff vs cell-prior bounds" in m for m in msgs), msgs
+        assert not any(
+            "LJ cutoff vs cell-prior bounds" in m for m in msgs
+        ), msgs

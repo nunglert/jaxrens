@@ -37,10 +37,18 @@ def build_kernel(backend: Any):
         new_positions = state.positions + dpos
 
         # Evaluate energy at proposed position
-        new_energy, count, overflow = backend(
-            new_positions, state.types, state.cell, state.max_neighbors,
+        result = backend(
+            new_positions,
+            state.types,
+            state.cell,
+            state.max_neighbors,
             ensemble_params=state.ensemble_params,
-        ).legacy()
+        )
+        new_energy, count, overflow = (
+            result.energy,
+            result.max_neighbor_count,
+            result.overflow,
+        )
 
         # Accept if energy below constraint (NS rejection sampling)
         accepted = new_energy < likelihood_constraint

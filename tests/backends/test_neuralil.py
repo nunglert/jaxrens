@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jaxrens.backends.neuralil import is_available, _NEURALIL_IMPORT_ERROR
+from jaxrens.backends.neuralil import _NEURALIL_IMPORT_ERROR, is_available
 
 neuralil_required = pytest.mark.skipif(
     not is_available(),
@@ -79,7 +79,8 @@ class TestNeuralILBackend:
         cell = jnp.array(reference["cell"])
         max_neighbors = int(reference["max_neighbors"])
 
-        energy, count, overflow = backend(positions, species, cell, max_neighbors).legacy()
+        _r = backend(positions, species, cell, max_neighbors)
+        energy, count, overflow = _r.energy, _r.max_neighbor_count, _r.overflow
 
         assert jnp.isfinite(energy), f"Energy is not finite: {energy}"
         assert not overflow, f"Overflow with max_neighbors={max_neighbors}"
@@ -91,18 +92,18 @@ class TestNeuralILBackend:
         max_neighbors = int(reference["max_neighbors"])
         ref_energy = float(reference["energy"])
 
-        energy, _, _ = backend(positions, species, cell, max_neighbors).legacy()
+        energy = backend(positions, species, cell, max_neighbors).energy
 
-        assert abs(float(energy) - ref_energy) < 1e-3, (
-            f"Energy mismatch: {float(energy):.6f} vs ref {ref_energy:.6f}"
-        )
+        assert (
+            abs(float(energy) - ref_energy) < 1e-3
+        ), f"Energy mismatch: {float(energy):.6f} vs ref {ref_energy:.6f}"
 
     def test_overflow_with_tiny_budget(self, backend, reference):
         positions = jnp.array(reference["positions"])
         species = jnp.array(reference["types"], dtype=jnp.int32)
         cell = jnp.array(reference["cell"])
 
-        _, _, overflow = backend(positions, species, cell, max_neighbors=1).legacy()
+        overflow = backend(positions, species, cell, max_neighbors=1).overflow
         assert overflow, "Should overflow with max_neighbors=1"
 
     def test_max_neighbors_for(self, backend, reference):
@@ -123,7 +124,9 @@ class TestNeuralILBackend:
         # energy compile — so passing the real cell/positions should
         # produce the same count the backend reports internally.
         n_from_method = int(backend.max_neighbors_for(positions, cell))
-        _, n_from_call, _ = backend(positions, species, cell, max_neighbors=64).legacy()
+        n_from_call = backend(
+            positions, species, cell, max_neighbors=64
+        ).max_neighbor_count
         assert n_from_method == int(n_from_call), (
             f"max_neighbors_for={n_from_method} disagrees with the count "
             f"the backend reports during __call__={int(n_from_call)}"
@@ -141,7 +144,8 @@ class TestNeuralILBackend:
         stacked_cells = jnp.stack([cell, cell], axis=0)
 
         counts = jax.vmap(backend.max_neighbors_for)(
-            stacked_positions, stacked_cells,
+            stacked_positions,
+            stacked_cells,
         )
         assert counts.shape == (2,)
         assert int(counts[0]) == int(counts[1])  # identical inputs
@@ -168,9 +172,14 @@ class TestNeuralILNSStep:
             supercell_trafo=(1, 1, 1),
         )
 
-        init_fn, step_fn, _ = build_mwg(backend, [
-            MoveKernel("random_walk", random_walk.build_kernel, step_size=0.01),
-        ])
+        init_fn, step_fn, _ = build_mwg(
+            backend,
+            [
+                MoveKernel(
+                    "random_walk", random_walk.build_kernel, step_size=0.01
+                ),
+            ],
+        )
 
         # Use 3 walkers with slightly different positions
         n_walkers = 3
@@ -181,7 +190,9 @@ class TestNeuralILNSStep:
         key = jax.random.key(0)
         positions = jnp.tile(base_pos[None, :, :], (n_walkers, 1, 1))
         key, noise_key = jax.random.split(key)
-        positions = positions + 0.01 * jax.random.normal(noise_key, positions.shape)
+        positions = positions + 0.01 * jax.random.normal(
+            noise_key, positions.shape
+        )
 
         cells = jnp.tile(cell[None, :, :], (n_walkers, 1, 1))
 
@@ -190,8 +201,12 @@ class TestNeuralILNSStep:
         )(positions)
 
         state = init_ns(
-            init_fn, positions, species, energies,
-            cells=cells, rng_key=key,
+            init_fn,
+            positions,
+            species,
+            energies,
+            cells=cells,
+            rng_key=key,
         )
         state = state.set(
             population=state.population.set(max_neighbors=max_neighbors),

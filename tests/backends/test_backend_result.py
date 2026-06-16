@@ -10,7 +10,6 @@ import pytest
 
 from jaxrens.backends.base import BackendResult, eval_energy_and_forces
 
-
 # ---------------------------------------------------------------------------
 # Fake backends
 # ---------------------------------------------------------------------------
@@ -21,7 +20,9 @@ class EnergyOnlyBackend:
 
     r_cutoff = 4.5
 
-    def __call__(self, positions, species, cell, max_neighbors, ensemble_params=None):
+    def __call__(
+        self, positions, species, cell, max_neighbors, ensemble_params=None
+    ):
         # control fields take the sentinel defaults (no neighbor list)
         return BackendResult(energy=(positions**2).sum())
 
@@ -31,15 +32,25 @@ class NativeForceBackend:
 
     r_cutoff = 4.5
 
-    def __call__(self, positions, species, cell, max_neighbors, ensemble_params=None):
+    def __call__(
+        self, positions, species, cell, max_neighbors, ensemble_params=None
+    ):
         return BackendResult(
             energy=(positions**2).sum(),
             max_neighbor_count=jnp.asarray(3, jnp.int32),
             overflow=jnp.asarray(False),
         )
 
-    def energy_and_forces(self, positions, species, cell, max_neighbors, ensemble_params=None):
-        res = self(positions, species, cell, max_neighbors, ensemble_params=ensemble_params)
+    def energy_and_forces(
+        self, positions, species, cell, max_neighbors, ensemble_params=None
+    ):
+        res = self(
+            positions,
+            species,
+            cell,
+            max_neighbors,
+            ensemble_params=ensemble_params,
+        )
         # intentionally NOT -dE/dx, to prove the native path is used verbatim
         return res._replace(forces=jnp.full_like(positions, 7.0))
 
@@ -90,7 +101,9 @@ class TestBackendResultPytree:
             max_neighbor_count=jnp.asarray(7),
             overflow=jnp.asarray(True),
         )
-        assert jax.tree_util.tree_structure(sentinel) == jax.tree_util.tree_structure(filled)
+        assert jax.tree_util.tree_structure(
+            sentinel
+        ) == jax.tree_util.tree_structure(filled)
 
     def test_replace_forwards_other_fields(self):
         # the wrapper pattern: modify energy, pass everything else through
@@ -103,15 +116,6 @@ class TestBackendResultPytree:
         assert wrapped.energy == 11.0
         assert wrapped.max_neighbor_count == 5
         assert jnp.array_equal(wrapped.forces, base.forces)
-
-    def test_legacy_tuple(self):
-        r = BackendResult(
-            energy=jnp.array(3.0),
-            max_neighbor_count=jnp.asarray(4),
-            overflow=jnp.asarray(False),
-        )
-        e, count, overflow = r.legacy()
-        assert (float(e), int(count), bool(overflow)) == (3.0, 4, False)
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +177,13 @@ class TestEvalEnergyAndForces:
     def test_jit_and_vmap(self, species, cell):
         b = EnergyOnlyBackend()
         batch = jnp.arange(2 * 3 * 3, dtype=jnp.float32).reshape(2, 3, 3)
-        fn = jax.jit(jax.vmap(lambda p: eval_energy_and_forces(b, p, species, cell, 10).forces))
+        fn = jax.jit(
+            jax.vmap(
+                lambda p: eval_energy_and_forces(
+                    b, p, species, cell, 10
+                ).forces
+            )
+        )
         forces = fn(batch)
         assert forces.shape == (2, 3, 3)
         assert jnp.allclose(forces, -2.0 * batch)

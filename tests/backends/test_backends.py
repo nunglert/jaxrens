@@ -7,10 +7,13 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from jaxrens.backends.toy import create_harmonic, create_double_well, create_gaussian_mixture
 from jaxrens.backends.lj import create_lj
 from jaxrens.backends.loader import load_backend
-
+from jaxrens.backends.toy import (
+    create_double_well,
+    create_gaussian_mixture,
+    create_harmonic,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -65,8 +68,10 @@ class TestHarmonic:
 
     def test_grad(self, positions_3, types_3):
         backend = create_harmonic(k=1.0)
+
         def energy_fn(pos):
             return backend(pos, types_3, jnp.zeros((3, 3)), 0)[0]
+
         grad_fn = jax.grad(energy_fn)
         forces = grad_fn(positions_3)
         assert jnp.allclose(forces, positions_3)  # dE/dx = k*x = x for k=1
@@ -85,7 +90,9 @@ class TestDoubleWell:
     def test_minima_at_sqrt_b(self, types_3):
         backend = create_double_well(a=1.0, b=1.0)
         # Minimum at x = +-1, y=z=0
-        pos_min = jnp.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        pos_min = jnp.array(
+            [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+        )
         e = backend(pos_min, types_3, jnp.zeros((3, 3)), 0)[0]
         assert jnp.allclose(e, 0.0, atol=1e-6)
 
@@ -104,9 +111,7 @@ class TestDoubleWell:
 
 class TestGaussianMixture:
     def test_energy_at_center(self, types_3):
-        backend = create_gaussian_mixture(
-            centers=[[0.0, 0.0, 0.0]], sigma=1.0
-        )
+        backend = create_gaussian_mixture(centers=[[0.0, 0.0, 0.0]], sigma=1.0)
         # Single atom at center of single Gaussian
         pos = jnp.zeros((1, 3))
         types = jnp.array([0])
@@ -121,7 +126,9 @@ class TestGaussianMixture:
         assert e.shape == ()
 
     def test_two_modes_lower_than_one(self, types_3):
-        backend1 = create_gaussian_mixture(centers=[[0.0, 0.0, 0.0]], sigma=1.0)
+        backend1 = create_gaussian_mixture(
+            centers=[[0.0, 0.0, 0.0]], sigma=1.0
+        )
         backend2 = create_gaussian_mixture(
             centers=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], sigma=1.0
         )
@@ -183,8 +190,10 @@ class TestLJ:
 
     def test_grad(self, positions_3, types_3):
         backend = create_lj()
+
         def energy_fn(pos):
             return backend(pos, types_3, jnp.zeros((3, 3)), 0)[0]
+
         grad_fn = jax.grad(energy_fn)
         forces = grad_fn(positions_3)
         assert forces.shape == positions_3.shape
@@ -201,7 +210,9 @@ class TestLJ:
     def test_cutoff(self, positions_3, types_3):
         backend_no_cut = create_lj(cutoff=None)
         backend_cut = create_lj(cutoff=0.5)
-        e_no_cut = backend_no_cut(positions_3, types_3, jnp.zeros((3, 3)), 0)[0]
+        e_no_cut = backend_no_cut(positions_3, types_3, jnp.zeros((3, 3)), 0)[
+            0
+        ]
         e_cut = backend_cut(positions_3, types_3, jnp.zeros((3, 3)), 0)[0]
         # With cutoff=0.5, all pairs (distance >= 1.0) are beyond cutoff
         assert jnp.allclose(e_cut, 0.0, atol=1e-5)
@@ -242,16 +253,17 @@ class TestLoader:
 # Backend callable test (moved from test_schema.py::TestBuildBackend)
 # ---------------------------------------------------------------------------
 
+
 class TestHarmonicBackendCallable:
     """Moved from test_schema.py::TestBuildBackend::test_harmonic_backend_callable."""
 
     def test_harmonic_backend_callable(self):
         from jaxrens.cli.schema.backend import HarmonicBackendSpec
+
         spec = HarmonicBackendSpec(k=1.0)
         backend = spec.build_backend()
         positions = jnp.zeros((1, 3))
         types = jnp.zeros((1,), dtype=jnp.int32)
         cell = jnp.zeros((3, 3))
-        energy, _, _ = backend(positions, types, cell, 0).legacy()
+        energy = backend(positions, types, cell, 0).energy
         assert jnp.isfinite(energy)
-

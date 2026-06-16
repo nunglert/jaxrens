@@ -39,11 +39,14 @@ def build_kernel(
         ensemble_params = state.ensemble_params
 
         def energy_with_aux(pos):
-            e, count, overflow = backend(
-                pos, state.types, state.cell, max_neighbors,
+            res = backend(
+                pos,
+                state.types,
+                state.cell,
+                max_neighbors,
                 ensemble_params=ensemble_params,
-            ).legacy()
-            return e, (count, overflow)
+            )
+            return res.energy, (res.max_neighbor_count, res.overflow)
 
         # Leapfrog integration via lax.scan
         def leapfrog_step(carry, _):
@@ -71,18 +74,36 @@ def build_kernel(
             return (pos, mom, acc_count, acc_overflow), None
 
         init_carry = (
-            state.positions, momentum,
-            state.max_neighbor_count, state.overflow,
+            state.positions,
+            momentum,
+            state.max_neighbor_count,
+            state.overflow,
         )
-        (new_positions, new_momentum, acc_count, acc_overflow), _ = jax.lax.scan(
-            leapfrog_step, init_carry, None, length=n_leapfrog,
+        (
+            new_positions,
+            new_momentum,
+            acc_count,
+            acc_overflow,
+        ), _ = jax.lax.scan(
+            leapfrog_step,
+            init_carry,
+            None,
+            length=n_leapfrog,
         )
 
         # Evaluate energy at proposed position
-        new_energy, count, overflow = backend(
-            new_positions, state.types, state.cell, max_neighbors,
+        result = backend(
+            new_positions,
+            state.types,
+            state.cell,
+            max_neighbors,
             ensemble_params=ensemble_params,
-        ).legacy()
+        )
+        new_energy, count, overflow = (
+            result.energy,
+            result.max_neighbor_count,
+            result.overflow,
+        )
         acc_count = jnp.maximum(acc_count, count)
         acc_overflow = acc_overflow | overflow
 

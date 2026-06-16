@@ -103,20 +103,31 @@ def build_kernel(
             if use_forces:
                 # Energy + forces via autodiff through backend
                 def energy_fn(p):
-                    e, count, overflow = backend(
-                        p, state.types, state.cell, max_neighbors,
+                    res = backend(
+                        p,
+                        state.types,
+                        state.cell,
+                        max_neighbors,
                         ensemble_params=ensemble_params,
-                    ).legacy()
-                    return e, (count, overflow)
+                    )
+                    return res.energy, (res.max_neighbor_count, res.overflow)
 
                 (new_energy, (count, overflow)), grad = jax.value_and_grad(
                     energy_fn, has_aux=True
                 )(new_pos)
             else:
-                new_energy, count, overflow = backend(
-                    new_pos, state.types, state.cell, max_neighbors,
+                result = backend(
+                    new_pos,
+                    state.types,
+                    state.cell,
+                    max_neighbors,
                     ensemble_params=ensemble_params,
-                ).legacy()
+                )
+                new_energy, count, overflow = (
+                    result.energy,
+                    result.max_neighbor_count,
+                    result.overflow,
+                )
                 grad = None
 
             # Accumulate overflow tracking
@@ -135,7 +146,9 @@ def build_kernel(
             if use_forces:
                 grad_norm = jnp.sqrt(jnp.sum(grad**2))
                 f_hat = grad / jnp.maximum(grad_norm, 1e-10)
-                reflected_dir = direction - 2.0 * jnp.sum(f_hat * direction) * f_hat
+                reflected_dir = (
+                    direction - 2.0 * jnp.sum(f_hat * direction) * f_hat
+                )
             else:
                 reflected_dir = _random_direction(step_key, direction.shape)
 
@@ -147,16 +160,29 @@ def build_kernel(
             pos_out = new_pos
             energy_out = new_energy
 
-            return (pos_out, direction_out, energy_out, acc_count, acc_overflow), None
+            return (
+                pos_out,
+                direction_out,
+                energy_out,
+                acc_count,
+                acc_overflow,
+            ), None
 
         reflect_keys = jax.random.split(key_reflect, n_reflect)
         init_carry = (
-            state.positions, direction, state.energy,
-            state.max_neighbor_count, state.overflow,
+            state.positions,
+            direction,
+            state.energy,
+            state.max_neighbor_count,
+            state.overflow,
         )
-        (final_pos, final_dir, final_energy, acc_count, acc_overflow), _ = (
-            jax.lax.scan(reflect_step, init_carry, reflect_keys)
-        )
+        (
+            final_pos,
+            final_dir,
+            final_energy,
+            acc_count,
+            acc_overflow,
+        ), _ = jax.lax.scan(reflect_step, init_carry, reflect_keys)
 
         # Accept if final energy < Emax
         accepted = final_energy < likelihood_constraint

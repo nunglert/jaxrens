@@ -41,10 +41,18 @@ def build_morph_kernel(backend: Any, n_species: int):
         new_type = candidate + (candidate >= current_type).astype(jnp.int32)
 
         new_types = state.types.at[atom_idx].set(new_type)
-        new_energy, count, overflow = backend(
-            state.positions, new_types, state.cell, state.max_neighbors,
+        result = backend(
+            state.positions,
+            new_types,
+            state.cell,
+            state.max_neighbors,
             ensemble_params=state.ensemble_params,
-        ).legacy()
+        )
+        new_energy, count, overflow = (
+            result.energy,
+            result.max_neighbor_count,
+            result.overflow,
+        )
 
         accepted = new_energy < likelihood_constraint
 
@@ -82,10 +90,18 @@ def build_shift_kernel(backend: Any):
         shift = state.step_size * jax.random.normal(rng_key, (3,))
         new_positions = state.positions + shift[None, :]
 
-        new_energy, count, overflow = backend(
-            new_positions, state.types, state.cell, state.max_neighbors,
+        result = backend(
+            new_positions,
+            state.types,
+            state.cell,
+            state.max_neighbors,
             ensemble_params=state.ensemble_params,
-        ).legacy()
+        )
+        new_energy, count, overflow = (
+            result.energy,
+            result.max_neighbor_count,
+            result.overflow,
+        )
         accepted = new_energy < likelihood_constraint
 
         new_state = state.set(

@@ -39,17 +39,22 @@ def build_kernel(backend: Any):
         displacement = state.step_size * jax.random.normal(key_disp, (3,))
         new_positions = state.positions.at[atom_idx].add(displacement)
 
-        new_energy, count, overflow = backend(
-            new_positions, state.types, state.cell, state.max_neighbors,
+        result = backend(
+            new_positions,
+            state.types,
+            state.cell,
+            state.max_neighbors,
             ensemble_params=state.ensemble_params,
-        ).legacy()
-        accepted = new_energy < likelihood_constraint
+        )
+        accepted = result.energy < likelihood_constraint
 
         new_state = state.set(
             positions=jnp.where(accepted, new_positions, state.positions),
-            energy=jnp.where(accepted, new_energy, state.energy),
-            max_neighbor_count=jnp.maximum(state.max_neighbor_count, count),
-            overflow=state.overflow | overflow,
+            energy=jnp.where(accepted, result.energy, state.energy),
+            max_neighbor_count=jnp.maximum(
+                state.max_neighbor_count, result.max_neighbor_count
+            ),
+            overflow=state.overflow | result.overflow,
         )
 
         info = MoveInfo(
@@ -88,28 +93,43 @@ def build_sweep_kernel(backend: Any, n_atoms: int):
             displacement = state.step_size * jax.random.normal(key, (3,))
             new_positions = positions.at[idx].add(displacement)
 
-            new_energy, count, overflow = backend(
-                new_positions, state.types, state.cell, max_neighbors,
+            result = backend(
+                new_positions,
+                state.types,
+                state.cell,
+                max_neighbors,
                 ensemble_params=ensemble_params,
-            ).legacy()
-            accepted = new_energy < likelihood_constraint
+            )
+            accepted = result.energy < likelihood_constraint
 
             out_positions = jnp.where(accepted, new_positions, positions)
-            out_energy = jnp.where(accepted, new_energy, energy)
-            acc_count = jnp.maximum(acc_count, count)
-            acc_overflow = acc_overflow | overflow
+            out_energy = jnp.where(accepted, result.energy, energy)
+            acc_count = jnp.maximum(acc_count, result.max_neighbor_count)
+            acc_overflow = acc_overflow | result.overflow
 
-            return (out_positions, out_energy, n_accepted + accepted.astype(jnp.int32),
-                    acc_count, acc_overflow), None
+            return (
+                out_positions,
+                out_energy,
+                n_accepted + accepted.astype(jnp.int32),
+                acc_count,
+                acc_overflow,
+            ), None
 
         atom_indices = jnp.arange(n_atoms)
         init_carry = (
-            state.positions, state.energy, jnp.int32(0),
-            state.max_neighbor_count, state.overflow,
+            state.positions,
+            state.energy,
+            jnp.int32(0),
+            state.max_neighbor_count,
+            state.overflow,
         )
-        (final_positions, final_energy, n_accepted, acc_count, acc_overflow), _ = (
-            jax.lax.scan(sweep_one, init_carry, (keys, atom_indices))
-        )
+        (
+            final_positions,
+            final_energy,
+            n_accepted,
+            acc_count,
+            acc_overflow,
+        ), _ = jax.lax.scan(sweep_one, init_carry, (keys, atom_indices))
 
         new_state = state.set(
             positions=final_positions,
@@ -152,19 +172,24 @@ def build_swap_kernel(backend: Any):
         type_b = state.types[idx_b]
         new_types = state.types.at[idx_a].set(type_b).at[idx_b].set(type_a)
 
-        new_energy, count, overflow = backend(
-            state.positions, new_types, state.cell, state.max_neighbors,
+        result = backend(
+            state.positions,
+            new_types,
+            state.cell,
+            state.max_neighbors,
             ensemble_params=state.ensemble_params,
-        ).legacy()
+        )
 
         different_species = type_a != type_b
-        accepted = (new_energy < likelihood_constraint) & different_species
+        accepted = (result.energy < likelihood_constraint) & different_species
 
         new_state = state.set(
             types=jnp.where(accepted, new_types, state.types),
-            energy=jnp.where(accepted, new_energy, state.energy),
-            max_neighbor_count=jnp.maximum(state.max_neighbor_count, count),
-            overflow=state.overflow | overflow,
+            energy=jnp.where(accepted, result.energy, state.energy),
+            max_neighbor_count=jnp.maximum(
+                state.max_neighbor_count, result.max_neighbor_count
+            ),
+            overflow=state.overflow | result.overflow,
         )
 
         info = MoveInfo(

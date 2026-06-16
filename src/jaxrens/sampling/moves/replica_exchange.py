@@ -38,7 +38,6 @@ import jax.numpy as jnp
 
 from jaxrens.sampling.morph import morph_types_to_composition
 
-
 # ---------------------------------------------------------------------------
 # SwapKernel abstraction
 # ---------------------------------------------------------------------------
@@ -206,8 +205,16 @@ class PressureRENSSwap(SwapKernel):
         e_a = proposed["energy_a"]
         e_b = proposed["energy_b"]
 
-        p_a = ensemble_params_a.get("pressure") if isinstance(ensemble_params_a, dict) else None
-        p_b = ensemble_params_b.get("pressure") if isinstance(ensemble_params_b, dict) else None
+        p_a = (
+            ensemble_params_a.get("pressure")
+            if isinstance(ensemble_params_a, dict)
+            else None
+        )
+        p_b = (
+            ensemble_params_b.get("pressure")
+            if isinstance(ensemble_params_b, dict)
+            else None
+        )
 
         use_pressure = (
             p_a is not None
@@ -439,7 +446,9 @@ def replica_exchange_step(
     # Pad pairs arrays to max_pairs with dummy pair (0, 0) and mask
     def _pad_pairs(pairs, n_valid, max_len):
         if pairs.shape[0] < max_len:
-            padding = jnp.zeros((max_len - pairs.shape[0], 2), dtype=pairs.dtype)
+            padding = jnp.zeros(
+                (max_len - pairs.shape[0], 2), dtype=pairs.dtype
+            )
             pairs = jnp.concatenate([pairs, padding], axis=0)
         mask = jnp.arange(max_len) < n_valid
         return pairs, mask
@@ -457,7 +466,15 @@ def replica_exchange_step(
 
     def _do_one_phase(carry, phase_input):
         """Process one phase (even or odd) of swap attempts."""
-        positions, types, energies, cells, acc_per_pair, att_per_pair, key = carry
+        (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+            key,
+        ) = carry
         pairs, mask, phase_key = phase_input
 
         # Generate random walker indices for all pairs
@@ -502,7 +519,9 @@ def replica_exchange_step(
                 ens_a = {}
                 ens_b = {}
 
-            accepted = swap_kernel.accept(proposed, emax_a, emax_b, ens_a, ens_b)
+            accepted = swap_kernel.accept(
+                proposed, emax_a, emax_b, ens_a, ens_b
+            )
 
             # Only actually swap if valid (not padding) and accepted
             do_swap = accepted & valid
@@ -511,7 +530,9 @@ def replica_exchange_step(
             pos_i = pos[run_i, wi]
             pos_j = pos[run_j, wj]
             new_pos = pos.at[run_i, wi].set(jnp.where(do_swap, pos_j, pos_i))
-            new_pos = new_pos.at[run_j, wj].set(jnp.where(do_swap, pos_i, pos_j))
+            new_pos = new_pos.at[run_j, wj].set(
+                jnp.where(do_swap, pos_i, pos_j)
+            )
 
             # Post-swap stored energies must reflect the *destination* run's
             # ensemble parameters: walker A (from run i) moves to run j, so its
@@ -527,8 +548,12 @@ def replica_exchange_step(
                 v_j = _get_volume(bxs[run_j, wj])
                 u_i = e_i - p_i * v_i  # recover raw U from stored H_self
                 u_j = e_j - p_j * v_j
-                new_e_into_run_i = u_j + p_i * v_j  # walker B in its new home (run i)
-                new_e_into_run_j = u_i + p_j * v_i  # walker A in its new home (run j)
+                new_e_into_run_i = (
+                    u_j + p_i * v_j
+                )  # walker B in its new home (run i)
+                new_e_into_run_j = (
+                    u_i + p_j * v_i
+                )  # walker A in its new home (run j)
             else:
                 new_e_into_run_i = e_j
                 new_e_into_run_j = e_i
@@ -544,9 +569,7 @@ def replica_exchange_step(
             if types_are_per_walker:
                 t_i = typ[run_i, wi]
                 t_j = typ[run_j, wj]
-                new_typ = typ.at[run_i, wi].set(
-                    jnp.where(do_swap, t_j, t_i)
-                )
+                new_typ = typ.at[run_i, wi].set(jnp.where(do_swap, t_j, t_i))
                 new_typ = new_typ.at[run_j, wj].set(
                     jnp.where(do_swap, t_i, t_j)
                 )
@@ -558,7 +581,9 @@ def replica_exchange_step(
                 b_i = bxs[run_i, wi]
                 b_j = bxs[run_j, wj]
                 new_bxs = bxs.at[run_i, wi].set(jnp.where(do_swap, b_j, b_i))
-                new_bxs = new_bxs.at[run_j, wj].set(jnp.where(do_swap, b_i, b_j))
+                new_bxs = new_bxs.at[run_j, wj].set(
+                    jnp.where(do_swap, b_i, b_j)
+                )
             else:
                 new_bxs = bxs
 
@@ -582,9 +607,19 @@ def replica_exchange_step(
         # collisions within a phase (each pair_id appears at most once
         # in the unpadded slice; padded entries have mask=0).
         pair_ids_phase = jnp.minimum(pairs[:, 0], pairs[:, 1])
-        att_per_pair = att_per_pair.at[pair_ids_phase].add(mask.astype(jnp.int32))
+        att_per_pair = att_per_pair.at[pair_ids_phase].add(
+            mask.astype(jnp.int32)
+        )
 
-        return (positions, types, energies, cells, acc_per_pair, att_per_pair, key), None
+        return (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+            key,
+        ), None
 
     # Run n_swap_cycles, each with even + odd phase
     def _do_one_cycle(carry, cycle_key):
@@ -592,17 +627,56 @@ def replica_exchange_step(
         even_key, odd_key = jax.random.split(cycle_key)
 
         # Even phase
-        (positions, types, energies, cells, acc_per_pair, att_per_pair, _), _ = _do_one_phase(
-            (positions, types, energies, cells, acc_per_pair, att_per_pair, even_key),
+        (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+            _,
+        ), _ = _do_one_phase(
+            (
+                positions,
+                types,
+                energies,
+                cells,
+                acc_per_pair,
+                att_per_pair,
+                even_key,
+            ),
             (all_pairs[0], all_masks[0], even_key),
         )
         # Odd phase
-        (positions, types, energies, cells, acc_per_pair, att_per_pair, _), _ = _do_one_phase(
-            (positions, types, energies, cells, acc_per_pair, att_per_pair, odd_key),
+        (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+            _,
+        ), _ = _do_one_phase(
+            (
+                positions,
+                types,
+                energies,
+                cells,
+                acc_per_pair,
+                att_per_pair,
+                odd_key,
+            ),
             (all_pairs[1], all_masks[1], odd_key),
         )
 
-        return (positions, types, energies, cells, acc_per_pair, att_per_pair), None
+        return (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+        ), None
 
     cycle_keys = jax.random.split(rng_key, n_swap_cycles)
     init_carry = (
@@ -613,9 +687,14 @@ def replica_exchange_step(
         jnp.zeros(n_pairs, dtype=jnp.int32),
         jnp.zeros(n_pairs, dtype=jnp.int32),
     )
-    (new_pos, new_types, new_ene, new_cells, acc_per_pair, att_per_pair), _ = jax.lax.scan(
-        _do_one_cycle, init_carry, cycle_keys
-    )
+    (
+        new_pos,
+        new_types,
+        new_ene,
+        new_cells,
+        acc_per_pair,
+        att_per_pair,
+    ), _ = jax.lax.scan(_do_one_cycle, init_carry, cycle_keys)
 
     swap_info = {
         "n_accepted": jnp.sum(acc_per_pair),
@@ -693,21 +772,31 @@ class XRENSSwap(SwapKernel):
             ValueError: If ``target_composition`` is missing from either
                 ensemble_params dict.
         """
-        if not isinstance(ensemble_params_a, dict) or "target_composition" not in ensemble_params_a:
+        if (
+            not isinstance(ensemble_params_a, dict)
+            or "target_composition" not in ensemble_params_a
+        ):
             raise ValueError(
                 "XRENSSwap.propose: ensemble_params_a must contain "
                 "'target_composition' (int array of shape (n_species,)). "
                 f"Got keys: {list(ensemble_params_a.keys()) if isinstance(ensemble_params_a, dict) else type(ensemble_params_a)}"
             )
-        if not isinstance(ensemble_params_b, dict) or "target_composition" not in ensemble_params_b:
+        if (
+            not isinstance(ensemble_params_b, dict)
+            or "target_composition" not in ensemble_params_b
+        ):
             raise ValueError(
                 "XRENSSwap.propose: ensemble_params_b must contain "
                 "'target_composition' (int array of shape (n_species,)). "
                 f"Got keys: {list(ensemble_params_b.keys()) if isinstance(ensemble_params_b, dict) else type(ensemble_params_b)}"
             )
 
-        target_a = jnp.asarray(ensemble_params_a["target_composition"], dtype=jnp.int32)
-        target_b = jnp.asarray(ensemble_params_b["target_composition"], dtype=jnp.int32)
+        target_a = jnp.asarray(
+            ensemble_params_a["target_composition"], dtype=jnp.int32
+        )
+        target_b = jnp.asarray(
+            ensemble_params_b["target_composition"], dtype=jnp.int32
+        )
 
         key_a, key_b = jax.random.split(rng_key)
 
@@ -726,25 +815,29 @@ class XRENSSwap(SwapKernel):
         # see PressureRENSSwap.accept docstring).  Strip non-backend keys
         # ('target_composition') before forwarding.
         backend_params_a = {
-            k: v for k, v in ensemble_params_a.items() if k != "target_composition"
+            k: v
+            for k, v in ensemble_params_a.items()
+            if k != "target_composition"
         } or None
         backend_params_b = {
-            k: v for k, v in ensemble_params_b.items() if k != "target_composition"
+            k: v
+            for k, v in ensemble_params_b.items()
+            if k != "target_composition"
         } or None
-        e_a_new, _, _ = backend(
+        e_a_new = backend(
             state_b["positions"],
             morphed_types_for_a,
             state_b["cell"],
             0,  # max_neighbors
             ensemble_params=backend_params_a,
-        ).legacy()
-        e_b_new, _, _ = backend(
+        ).energy
+        e_b_new = backend(
             state_a["positions"],
             morphed_types_for_b,
             state_a["cell"],
             0,
             ensemble_params=backend_params_b,
-        ).legacy()
+        ).energy
 
         proposed = {
             "positions_a": state_b["positions"],
@@ -787,7 +880,9 @@ class XRENSSwap(SwapKernel):
         Returns:
             Boolean scalar: ``True`` iff the swap is accepted.
         """
-        return (proposed["energy_a"] < emax_a) & (proposed["energy_b"] < emax_b)
+        return (proposed["energy_a"] < emax_a) & (
+            proposed["energy_b"] < emax_b
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -846,7 +941,7 @@ def xrens_replica_exchange_step(
 
     # Pre-compute swap pairs for both phases.
     even_pairs = get_swap_pairs(n_runs, 0)  # (n_even, 2)
-    odd_pairs = get_swap_pairs(n_runs, 1)   # (n_odd, 2)
+    odd_pairs = get_swap_pairs(n_runs, 1)  # (n_odd, 2)
 
     n_even = even_pairs.shape[0]
     n_odd = odd_pairs.shape[0]
@@ -870,7 +965,9 @@ def xrens_replica_exchange_step(
 
     def _pad_pairs(pairs, n_valid, max_len):
         if pairs.shape[0] < max_len:
-            padding = jnp.zeros((max_len - pairs.shape[0], 2), dtype=pairs.dtype)
+            padding = jnp.zeros(
+                (max_len - pairs.shape[0], 2), dtype=pairs.dtype
+            )
             pairs = jnp.concatenate([pairs, padding], axis=0)
         mask = jnp.arange(max_len) < n_valid
         return pairs, mask
@@ -883,7 +980,16 @@ def xrens_replica_exchange_step(
 
     def _do_one_phase(carry, phase_input):
         """Process one phase of XRENS swap attempts."""
-        positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, key = carry
+        (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+            n_evals_total,
+            key,
+        ) = carry
         pairs, mask, phase_key = phase_input
 
         pair_keys = jax.random.split(phase_key, max_pairs)
@@ -934,7 +1040,9 @@ def xrens_replica_exchange_step(
             emax_i = all_emax[run_i]
             emax_j = all_emax[run_j]
 
-            accepted = xrens_kernel.accept(proposed, emax_i, emax_j, ens_i, ens_j)
+            accepted = xrens_kernel.accept(
+                proposed, emax_i, emax_j, ens_i, ens_j
+            )
 
             # Only apply if valid (not padding) and accepted.
             do_swap = accepted & valid
@@ -982,31 +1090,108 @@ def xrens_replica_exchange_step(
             # We always call propose (2 evals) when valid, regardless of acceptance.
             new_eval_count = eval_count + valid.astype(jnp.int32) * n_e
 
-            return (new_pos, new_typ, new_ene, new_bxs, new_acc_per_pair, new_eval_count), None
+            return (
+                new_pos,
+                new_typ,
+                new_ene,
+                new_bxs,
+                new_acc_per_pair,
+                new_eval_count,
+            ), None
 
         scan_inputs = (pairs, mask, pair_keys)
-        (positions, types, energies, cells, acc_per_pair, n_evals_total), _ = jax.lax.scan(
+        (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            n_evals_total,
+        ), _ = jax.lax.scan(
             _attempt_one_xrens_swap,
             (positions, types, energies, cells, acc_per_pair, n_evals_total),
             scan_inputs,
         )
         pair_ids_phase = jnp.minimum(pairs[:, 0], pairs[:, 1])
-        att_per_pair = att_per_pair.at[pair_ids_phase].add(mask.astype(jnp.int32))
-        return (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, key), None
+        att_per_pair = att_per_pair.at[pair_ids_phase].add(
+            mask.astype(jnp.int32)
+        )
+        return (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+            n_evals_total,
+            key,
+        ), None
 
     def _do_one_cycle(carry, cycle_key):
-        positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total = carry
+        (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+            n_evals_total,
+        ) = carry
         even_key, odd_key = jax.random.split(cycle_key)
 
-        (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, _), _ = _do_one_phase(
-            (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, even_key),
+        (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+            n_evals_total,
+            _,
+        ), _ = _do_one_phase(
+            (
+                positions,
+                types,
+                energies,
+                cells,
+                acc_per_pair,
+                att_per_pair,
+                n_evals_total,
+                even_key,
+            ),
             (all_pairs[0], all_masks[0], even_key),
         )
-        (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, _), _ = _do_one_phase(
-            (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total, odd_key),
+        (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+            n_evals_total,
+            _,
+        ), _ = _do_one_phase(
+            (
+                positions,
+                types,
+                energies,
+                cells,
+                acc_per_pair,
+                att_per_pair,
+                n_evals_total,
+                odd_key,
+            ),
             (all_pairs[1], all_masks[1], odd_key),
         )
-        return (positions, types, energies, cells, acc_per_pair, att_per_pair, n_evals_total), None
+        return (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+            n_evals_total,
+        ), None
 
     cycle_keys = jax.random.split(rng_key, n_swap_cycles)
     init_carry = (
@@ -1018,9 +1203,15 @@ def xrens_replica_exchange_step(
         jnp.zeros(n_pairs, dtype=jnp.int32),
         jnp.array(0, dtype=jnp.int32),
     )
-    (new_pos, new_types, new_ene, new_cells, acc_per_pair, att_per_pair, total_evals), _ = (
-        jax.lax.scan(_do_one_cycle, init_carry, cycle_keys)
-    )
+    (
+        new_pos,
+        new_types,
+        new_ene,
+        new_cells,
+        acc_per_pair,
+        att_per_pair,
+        total_evals,
+    ), _ = jax.lax.scan(_do_one_cycle, init_carry, cycle_keys)
 
     swap_info = {
         "n_accepted": jnp.sum(acc_per_pair),
@@ -1127,21 +1318,31 @@ class SemiGrandSwap(SwapKernel):
             ValueError: If ``'chemical_potentials'`` is absent from either
                 ensemble_params dict.
         """
-        if not isinstance(ensemble_params_a, dict) or "chemical_potentials" not in ensemble_params_a:
+        if (
+            not isinstance(ensemble_params_a, dict)
+            or "chemical_potentials" not in ensemble_params_a
+        ):
             raise ValueError(
                 "SemiGrandSwap.propose: ensemble_params_a must contain "
                 "'chemical_potentials' (float array of shape (n_species,)). "
                 f"Got keys: {list(ensemble_params_a.keys()) if isinstance(ensemble_params_a, dict) else type(ensemble_params_a)}"
             )
-        if not isinstance(ensemble_params_b, dict) or "chemical_potentials" not in ensemble_params_b:
+        if (
+            not isinstance(ensemble_params_b, dict)
+            or "chemical_potentials" not in ensemble_params_b
+        ):
             raise ValueError(
                 "SemiGrandSwap.propose: ensemble_params_b must contain "
                 "'chemical_potentials' (float array of shape (n_species,)). "
                 f"Got keys: {list(ensemble_params_b.keys()) if isinstance(ensemble_params_b, dict) else type(ensemble_params_b)}"
             )
 
-        mu_a = jnp.asarray(ensemble_params_a["chemical_potentials"], dtype=jnp.float32)
-        mu_b = jnp.asarray(ensemble_params_b["chemical_potentials"], dtype=jnp.float32)
+        mu_a = jnp.asarray(
+            ensemble_params_a["chemical_potentials"], dtype=jnp.float32
+        )
+        mu_b = jnp.asarray(
+            ensemble_params_b["chemical_potentials"], dtype=jnp.float32
+        )
 
         n_species = self.n_species
         if mu_a.shape != (n_species,) or mu_b.shape != (n_species,):
@@ -1168,11 +1369,11 @@ class SemiGrandSwap(SwapKernel):
             "positions_a": state_a.get("positions"),
             "cell_a": state_a.get("cell"),
             "types_a": types_a,
-            "energy_a": omega_a,   # grand-canonical energy under new μ
+            "energy_a": omega_a,  # grand-canonical energy under new μ
             "positions_b": state_b.get("positions"),
             "cell_b": state_b.get("cell"),
             "types_b": types_b,
-            "energy_b": omega_b,   # grand-canonical energy under new μ
+            "energy_b": omega_b,  # grand-canonical energy under new μ
         }
         return proposed, 0, 0
 
@@ -1203,7 +1404,9 @@ class SemiGrandSwap(SwapKernel):
         Returns:
             Boolean scalar: ``True`` iff the swap is accepted.
         """
-        return (proposed["energy_a"] < emax_a) & (proposed["energy_b"] < emax_b)
+        return (proposed["energy_a"] < emax_a) & (
+            proposed["energy_b"] < emax_b
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1290,7 +1493,9 @@ def semi_grand_replica_exchange_step(
 
     def _pad_pairs(pairs, n_valid, max_len):
         if pairs.shape[0] < max_len:
-            padding = jnp.zeros((max_len - pairs.shape[0], 2), dtype=pairs.dtype)
+            padding = jnp.zeros(
+                (max_len - pairs.shape[0], 2), dtype=pairs.dtype
+            )
             pairs = jnp.concatenate([pairs, padding], axis=0)
         mask = jnp.arange(max_len) < n_valid
         return pairs, mask
@@ -1334,8 +1539,12 @@ def semi_grand_replica_exchange_step(
                 "cell": cell_j,
             }
 
-            ens_i: dict[str, Any] = {"chemical_potentials": chemical_potentials[run_i]}
-            ens_j: dict[str, Any] = {"chemical_potentials": chemical_potentials[run_j]}
+            ens_i: dict[str, Any] = {
+                "chemical_potentials": chemical_potentials[run_i]
+            }
+            ens_j: dict[str, Any] = {
+                "chemical_potentials": chemical_potentials[run_j]
+            }
 
             proposed, _, _ = semi_grand_kernel.propose(
                 state_i, state_j, ens_i, ens_j, swap_key, None
@@ -1344,7 +1553,9 @@ def semi_grand_replica_exchange_step(
             emax_i = all_emax[run_i]
             emax_j = all_emax[run_j]
 
-            accepted = semi_grand_kernel.accept(proposed, emax_i, emax_j, ens_i, ens_j)
+            accepted = semi_grand_kernel.accept(
+                proposed, emax_i, emax_j, ens_i, ens_j
+            )
             do_swap = accepted & valid
 
             # Positions, cells, types are unchanged; only energies update
@@ -1375,22 +1586,52 @@ def semi_grand_replica_exchange_step(
             scan_inputs,
         )
         pair_ids_phase = jnp.minimum(pairs[:, 0], pairs[:, 1])
-        att_per_pair = att_per_pair.at[pair_ids_phase].add(mask.astype(jnp.int32))
-        return (positions, types, energies, cells, acc_per_pair, att_per_pair), None
+        att_per_pair = att_per_pair.at[pair_ids_phase].add(
+            mask.astype(jnp.int32)
+        )
+        return (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+        ), None
 
     def _do_one_cycle(carry, cycle_key):
         positions, types, energies, cells, acc_per_pair, att_per_pair = carry
         even_key, odd_key = jax.random.split(cycle_key)
 
-        (positions, types, energies, cells, acc_per_pair, att_per_pair), _ = _do_one_phase(
+        (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+        ), _ = _do_one_phase(
             (positions, types, energies, cells, acc_per_pair, att_per_pair),
             (all_pairs[0], all_masks[0], even_key),
         )
-        (positions, types, energies, cells, acc_per_pair, att_per_pair), _ = _do_one_phase(
+        (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+        ), _ = _do_one_phase(
             (positions, types, energies, cells, acc_per_pair, att_per_pair),
             (all_pairs[1], all_masks[1], odd_key),
         )
-        return (positions, types, energies, cells, acc_per_pair, att_per_pair), None
+        return (
+            positions,
+            types,
+            energies,
+            cells,
+            acc_per_pair,
+            att_per_pair,
+        ), None
 
     cycle_keys = jax.random.split(rng_key, n_swap_cycles)
     init_carry = (
@@ -1401,9 +1642,14 @@ def semi_grand_replica_exchange_step(
         jnp.zeros(n_pairs, dtype=jnp.int32),
         jnp.zeros(n_pairs, dtype=jnp.int32),
     )
-    (new_pos, new_types, new_ene, new_cells, acc_per_pair, att_per_pair), _ = jax.lax.scan(
-        _do_one_cycle, init_carry, cycle_keys
-    )
+    (
+        new_pos,
+        new_types,
+        new_ene,
+        new_cells,
+        acc_per_pair,
+        att_per_pair,
+    ), _ = jax.lax.scan(_do_one_cycle, init_carry, cycle_keys)
 
     swap_info = {
         "n_accepted": jnp.sum(acc_per_pair),

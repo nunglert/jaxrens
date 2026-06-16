@@ -65,15 +65,6 @@ class BackendResult(NamedTuple):
     energy_members: Float[Array, "*B n_ens"] | None = None
     forces_members: Float[Array, "*B n_ens N 3"] | None = None
 
-    def legacy(self) -> tuple[Float[Array, "*B"], Int[Array, "*B"], Bool[Array, "*B"]]:
-        """Return the historical ``(energy, max_neighbor_count, overflow)`` tuple.
-
-        Transitional shim so consumers can be migrated one at a time while
-        producers already return :class:`BackendResult`. Removed once every
-        call site reads the named fields directly.
-        """
-        return self.energy, self.max_neighbor_count, self.overflow
-
 
 def eval_energy_and_forces(
     backend: "EnergyBackend",
@@ -94,18 +85,26 @@ def eval_energy_and_forces(
     native = getattr(backend, "energy_and_forces", None)
     if native is not None:
         return native(
-            positions, species, cell, max_neighbors,
+            positions,
+            species,
+            cell,
+            max_neighbors,
             ensemble_params=ensemble_params,
         )
 
     def energy_of(pos: jnp.ndarray) -> tuple[jnp.ndarray, BackendResult]:
         res = backend(
-            pos, species, cell, max_neighbors,
+            pos,
+            species,
+            cell,
+            max_neighbors,
             ensemble_params=ensemble_params,
         )
         return res.energy, res
 
-    (energy, res), grad = jax.value_and_grad(energy_of, has_aux=True)(positions)
+    (energy, res), grad = jax.value_and_grad(energy_of, has_aux=True)(
+        positions
+    )
     return res._replace(energy=energy, forces=-grad)
 
 

@@ -16,25 +16,23 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jaxrens.backends.toy import create_harmonic
 from jaxrens.backends.ensemble import EnsembleBackend
+from jaxrens.backends.toy import create_harmonic
+from jaxrens.postprocess.thermodynamics import partition_function
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
-from jaxrens.sampling.nested_sampling import (
-    init_ns,
-    ns_step,
-    run_ns,
-)
-from jaxrens.postprocess.thermodynamics import partition_function
+from jaxrens.sampling.nested_sampling import init_ns, ns_step, run_ns
 from jaxrens.utils.cell import get_volume
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _make_periodic_setup(n_walkers=20, n_atoms=2, cell_size=5.0, seed=0, pressure=None):
+
+def _make_periodic_setup(
+    n_walkers=20, n_atoms=2, cell_size=5.0, seed=0, pressure=None
+):
     """Create a periodic harmonic system with cells."""
     base_backend = create_harmonic(k=1.0)
     if pressure:
@@ -42,9 +40,12 @@ def _make_periodic_setup(n_walkers=20, n_atoms=2, cell_size=5.0, seed=0, pressur
     else:
         backend = base_backend
 
-    init_fn, step_fn, _ = build_mwg(backend, [
-        MoveKernel("random_walk", random_walk.build_kernel),
-    ])
+    init_fn, step_fn, _ = build_mwg(
+        backend,
+        [
+            MoveKernel("random_walk", random_walk.build_kernel),
+        ],
+    )
 
     key = jax.random.key(seed)
     key, init_key = jax.random.split(key)
@@ -55,9 +56,9 @@ def _make_periodic_setup(n_walkers=20, n_atoms=2, cell_size=5.0, seed=0, pressur
     cells = jnp.tile(cell_size * jnp.eye(3), (n_walkers, 1, 1))
 
     # Compute energies through the backend (includes PV if NPT)
-    energies = jax.vmap(
-        lambda pos, cell: backend(pos, types, cell, 0)[0]
-    )(positions, cells)
+    energies = jax.vmap(lambda pos, cell: backend(pos, types, cell, 0)[0])(
+        positions, cells
+    )
 
     return {
         "backend": backend,
@@ -86,6 +87,7 @@ def periodic_setup_npt():
 # EnsembleBackend correctness
 # ---------------------------------------------------------------------------
 
+
 class TestEnsembleBackend:
     def test_no_pressure_returns_raw_energy(self):
         base = create_harmonic(k=1.0)
@@ -93,8 +95,8 @@ class TestEnsembleBackend:
         pos = jnp.array([[1.0, 0.0, 0.0]])
         types = jnp.array([0])
         cell = 5.0 * jnp.eye(3)
-        e_raw, _, _ = base(pos, types, cell, 0).legacy()
-        e_ens, _, _ = backend(pos, types, cell, 0).legacy()
+        e_raw = base(pos, types, cell, 0).energy
+        e_ens = backend(pos, types, cell, 0).energy
         assert jnp.allclose(e_raw, e_ens)
 
     def test_finite_pressure_adds_pv(self):
@@ -103,8 +105,8 @@ class TestEnsembleBackend:
         pos = jnp.array([[1.0, 0.0, 0.0]])
         types = jnp.array([0])
         cell = 5.0 * jnp.eye(3)
-        e_raw, _, _ = base(pos, types, cell, 0).legacy()
-        e_ens, _, _ = backend(pos, types, cell, 0).legacy()
+        e_raw = base(pos, types, cell, 0).energy
+        e_ens = backend(pos, types, cell, 0).energy
         V = 5.0**3
         assert jnp.allclose(e_ens, e_raw + 0.01 * V, atol=1e-4)
 
@@ -115,8 +117,8 @@ class TestEnsembleBackend:
         types = jnp.array([0])
         cell_a = 4.0 * jnp.eye(3)
         cell_b = 6.0 * jnp.eye(3)
-        e_a, _, _ = backend(pos, types, cell_a, 0).legacy()
-        e_b, _, _ = backend(pos, types, cell_b, 0).legacy()
+        e_a = backend(pos, types, cell_a, 0).energy
+        e_b = backend(pos, types, cell_b, 0).energy
         # Different volumes → different PV → different energies
         assert float(e_b) > float(e_a)
 
@@ -124,6 +126,7 @@ class TestEnsembleBackend:
 # ---------------------------------------------------------------------------
 # ns_step with pressure
 # ---------------------------------------------------------------------------
+
 
 class TestNSStepDeadWalker:
     """``info['dead_walker']`` is a ``WalkerState`` pytree (positions /
@@ -136,8 +139,11 @@ class TestNSStepDeadWalker:
         s = periodic_setup_npt
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=s["cells"], rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=s["cells"],
+            rng_key=s["key"],
         )
         _, info = ns_step(state, s["step_fn"], n_mcmc_steps=5)
 
@@ -150,14 +156,18 @@ class TestNSStepDeadWalker:
         assert dw.energy.shape == ()
 
     def test_dead_walker_volume_from_cell_matches_fixture(
-        self, periodic_setup_npt,
+        self,
+        periodic_setup_npt,
     ):
         """Volume must derive correctly from ``dead_walker.cell``."""
         s = periodic_setup_npt
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=s["cells"], rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=s["cells"],
+            rng_key=s["key"],
         )
         _, info = ns_step(state, s["step_fn"], n_mcmc_steps=5)
         vol = float(jnp.abs(jnp.linalg.det(info["dead_walker"].cell)))
@@ -170,8 +180,11 @@ class TestNSStepDeadWalker:
         s = periodic_setup_npt
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=s["cells"], rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=s["cells"],
+            rng_key=s["key"],
         )
         _, info = ns_step(state, s["step_fn"], n_mcmc_steps=5)
 
@@ -187,15 +200,22 @@ class TestNSStepDeadWalker:
 # run_ns with pressure
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.heavy
 class TestRunNSPressure:
     def test_nvt_no_volumes(self, periodic_setup):
         s = periodic_setup
         result = run_ns(
-            s["positions"], s["types"], s["energies"],
-            cells=s["cells"], init_fn=s["init_fn"], step_fn=s["step_fn"],
-            rng_key=s["key"], max_iterations=30,
-            n_mcmc_steps=5, initial_step_size=0.3,
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=s["cells"],
+            init_fn=s["init_fn"],
+            step_fn=s["step_fn"],
+            rng_key=s["key"],
+            max_iterations=30,
+            n_mcmc_steps=5,
+            initial_step_size=0.3,
         )
         # Dead-point history (incl. dead_volumes) is no longer returned in the
         # result dict — it is persisted to disk by callbacks.  For an NVT run
@@ -205,11 +225,18 @@ class TestRunNSPressure:
     def test_npt_converges(self, periodic_setup_npt):
         s = periodic_setup_npt
         from jaxrens.backends.ensemble import make_ensemble_params
+
         result = run_ns(
-            s["positions"], s["types"], s["energies"],
-            cells=s["cells"], init_fn=s["init_fn"], step_fn=s["step_fn"],
-            rng_key=s["key"], max_iterations=100,
-            n_mcmc_steps=5, initial_step_size=0.3,
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=s["cells"],
+            init_fn=s["init_fn"],
+            step_fn=s["step_fn"],
+            rng_key=s["key"],
+            max_iterations=100,
+            n_mcmc_steps=5,
+            initial_step_size=0.3,
             ensemble_params=make_ensemble_params(pressure=0.01),
         )
         assert jnp.isfinite(result["log_evidence"])
@@ -219,6 +246,7 @@ class TestRunNSPressure:
 # ---------------------------------------------------------------------------
 # Post-processing with volumes
 # ---------------------------------------------------------------------------
+
 
 class TestPartitionFunctionWithVolumes:
     def test_pv_changes_partition_function(self):
@@ -231,8 +259,12 @@ class TestPartitionFunctionWithVolumes:
         dead_vols = jnp.full(100, 1.25)
         live_vols = jnp.full(20, 1.25)
         log_Z_npt = partition_function(
-            1.0, dead_E, live_E, n_live=n_live,
-            dead_volumes=dead_vols, live_volumes=live_vols,
+            1.0,
+            dead_E,
+            live_E,
+            n_live=n_live,
+            dead_volumes=dead_vols,
+            live_volumes=live_vols,
         )
 
         assert not jnp.allclose(log_Z_nvt, log_Z_npt)
@@ -245,8 +277,12 @@ class TestPartitionFunctionWithVolumes:
 
         log_Z_base = partition_function(1.0, dead_E, live_E, n_live=n_live)
         log_Z_zero = partition_function(
-            1.0, dead_E, live_E, n_live=n_live,
-            dead_volumes=jnp.zeros(100), live_volumes=jnp.zeros(20),
+            1.0,
+            dead_E,
+            live_E,
+            n_live=n_live,
+            dead_volumes=jnp.zeros(100),
+            live_volumes=jnp.zeros(20),
         )
 
         assert jnp.allclose(log_Z_base, log_Z_zero, atol=1e-5)
@@ -256,10 +292,11 @@ class TestPartitionFunctionWithVolumes:
 # Config parsing
 # ---------------------------------------------------------------------------
 
+
 class TestConfigPressure:
     def test_pressure_parsed_from_input(self, tmp_path):
-        from jaxrens.cli.parser import parse_input_file
         from jaxrens.cli.migrate import migrate_ns_inp
+        from jaxrens.cli.parser import parse_input_file
 
         inp = tmp_path / "ns.inp"
         inp.write_text("n_walkers = 100\npressure = 0.05\n")
@@ -268,8 +305,8 @@ class TestConfigPressure:
         assert result["config"]["ensemble"]["pressure"] == pytest.approx(0.05)
 
     def test_no_pressure_in_input(self, tmp_path):
-        from jaxrens.cli.parser import parse_input_file
         from jaxrens.cli.migrate import migrate_ns_inp
+        from jaxrens.cli.parser import parse_input_file
 
         inp = tmp_path / "ns.inp"
         inp.write_text("n_walkers = 100\n")

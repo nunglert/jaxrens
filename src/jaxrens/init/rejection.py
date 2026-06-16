@@ -13,12 +13,15 @@ from typing import Callable, Literal
 import jax
 import jax.numpy as jnp
 
-from jaxrens.init.positions import grid_positions_in_cell, uniform_positions_in_cell
-
+from jaxrens.init.positions import (
+    grid_positions_in_cell,
+    uniform_positions_in_cell,
+)
 
 # ---------------------------------------------------------------------------
 # Minimum-image pair-distance check
 # ---------------------------------------------------------------------------
+
 
 @jax.jit
 def _check_min_distance(
@@ -46,13 +49,13 @@ def _check_min_distance(
     diff_frac = diff_frac - jnp.round(diff_frac)
     diff_cart = diff_frac @ cell
 
-    dist_sq = jnp.sum(diff_cart ** 2, axis=-1)
+    dist_sq = jnp.sum(diff_cart**2, axis=-1)
 
     n = positions.shape[0]
     i_idx, j_idx = jnp.tril_indices(n, k=-1)
     pair_dist_sq = dist_sq[i_idx, j_idx]
 
-    return jnp.any(pair_dist_sq < min_distance ** 2)
+    return jnp.any(pair_dist_sq < min_distance**2)
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +83,7 @@ def _inner_check(
     but repeated calls with the same backend reuse the compiled trace.
     Scalars are dynamic to avoid retracing on minor parameter changes.
     """
-    energy, _count, _overflow = energy_fn(positions, types, cell, 0).legacy()
+    energy = energy_fn(positions, types, cell, 0).energy
 
     too_close = _check_min_distance(positions, cell, min_distance)
 
@@ -102,6 +105,7 @@ def _inner_check(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def rejection_sample_positions(
     key: jax.Array,
@@ -155,7 +159,9 @@ def rejection_sample_positions(
             positions = uniform_positions_in_cell(subkey, cell, n_atoms)
         else:
             try:
-                positions = grid_positions_in_cell(subkey, cell, n_atoms, grid_distance)
+                positions = grid_positions_in_cell(
+                    subkey, cell, n_atoms, grid_distance
+                )
             except ValueError as exc:
                 raise ValueError(
                     f"grid_positions_in_cell failed during rejection sampling: {exc}"
