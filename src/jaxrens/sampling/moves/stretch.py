@@ -61,7 +61,7 @@ def build_kernel(
         new_energy, count, overflow = backend(
             new_positions, state.types, new_cell, state.max_neighbors,
             ensemble_params=state.ensemble_params,
-        )
+        ).legacy()
 
         cell_valid = check_cell_shape(
             new_cell, n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect

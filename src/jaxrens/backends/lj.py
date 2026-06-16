@@ -31,6 +31,7 @@ from typing import Any, Sequence
 import jax.numpy as jnp
 
 from jaxrens.backends._graph_neighbors import _make_image_offsets
+from jaxrens.backends.base import BackendResult
 
 
 _ScalarOrSeq = float | Sequence[float] | jnp.ndarray
@@ -123,7 +124,7 @@ class LJBackend:
         cell: jnp.ndarray,
         max_neighbors: int = 0,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> tuple[jnp.ndarray, int, bool]:
+    ) -> BackendResult:
         n_atoms = positions.shape[0]
 
         # Non-periodic systems: cell is all zeros. Substitute a huge cube so
@@ -184,7 +185,7 @@ class LJBackend:
 
         # Each (i, j, k) and its mirror (j, i, -k) both contribute — divide by 2.
         energy = 0.5 * jnp.sum(pair_energy)
-        return energy, 0, False
+        return BackendResult(energy=energy)
 
 
 def create_lj(

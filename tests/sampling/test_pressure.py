@@ -93,8 +93,8 @@ class TestEnsembleBackend:
         pos = jnp.array([[1.0, 0.0, 0.0]])
         types = jnp.array([0])
         cell = 5.0 * jnp.eye(3)
-        e_raw, _, _ = base(pos, types, cell, 0)
-        e_ens, _, _ = backend(pos, types, cell, 0)
+        e_raw, _, _ = base(pos, types, cell, 0).legacy()
+        e_ens, _, _ = backend(pos, types, cell, 0).legacy()
         assert jnp.allclose(e_raw, e_ens)
 
     def test_finite_pressure_adds_pv(self):
@@ -103,8 +103,8 @@ class TestEnsembleBackend:
         pos = jnp.array([[1.0, 0.0, 0.0]])
         types = jnp.array([0])
         cell = 5.0 * jnp.eye(3)
-        e_raw, _, _ = base(pos, types, cell, 0)
-        e_ens, _, _ = backend(pos, types, cell, 0)
+        e_raw, _, _ = base(pos, types, cell, 0).legacy()
+        e_ens, _, _ = backend(pos, types, cell, 0).legacy()
         V = 5.0**3
         assert jnp.allclose(e_ens, e_raw + 0.01 * V, atol=1e-4)
 
@@ -115,8 +115,8 @@ class TestEnsembleBackend:
         types = jnp.array([0])
         cell_a = 4.0 * jnp.eye(3)
         cell_b = 6.0 * jnp.eye(3)
-        e_a, _, _ = backend(pos, types, cell_a, 0)
-        e_b, _, _ = backend(pos, types, cell_b, 0)
+        e_a, _, _ = backend(pos, types, cell_a, 0).legacy()
+        e_b, _, _ = backend(pos, types, cell_b, 0).legacy()
         # Different volumes → different PV → different energies
         assert float(e_b) > float(e_a)
 

@@ -737,14 +737,14 @@ class XRENSSwap(SwapKernel):
             state_b["cell"],
             0,  # max_neighbors
             ensemble_params=backend_params_a,
-        )
+        ).legacy()
         e_b_new, _, _ = backend(
             state_a["positions"],
             morphed_types_for_b,
             state_a["cell"],
             0,
             ensemble_params=backend_params_b,
-        )
+        ).legacy()
 
         proposed = {
             "positions_a": state_b["positions"],

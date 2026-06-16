@@ -126,7 +126,7 @@ def test_si_dimer_energy_negative_and_finite():
     )
     species = jnp.zeros(2, dtype=jnp.int32)
     cell = jnp.zeros((3, 3), dtype=jnp.float32)  # ignored in free space
-    e, n, overflow = b(positions, species, cell)
+    e, n, overflow = b(positions, species, cell).legacy()
     assert jnp.isfinite(e)
     assert float(e) < 0.0
     assert int(n) == 0
@@ -147,7 +147,7 @@ def test_si_diamond_energy_finite():
     positions = _si_diamond_positions()
     species = jnp.zeros(8, dtype=jnp.int32)
     cell = SI_LATTICE_CONST * jnp.eye(3, dtype=jnp.float32)
-    e, n, overflow = b(positions, species, cell, max_neighbors=0)
+    e, n, overflow = b(positions, species, cell, max_neighbors=0).legacy()
     assert jnp.isfinite(e)
     e_per_atom = float(e) / 8.0
     assert -4.7 < e_per_atom < -4.5, (
@@ -194,7 +194,7 @@ def test_jit_compiles_and_no_retrace_across_cells():
     @jax.jit
     def jitted_energy(pos, cell):
         trace_counter["n"] += 1
-        e, _, _ = b(pos, species, cell)
+        e, _, _ = b(pos, species, cell).legacy()
         return e
 
     e1 = jitted_energy(positions, SI_LATTICE_CONST * jnp.eye(3))
@@ -228,7 +228,7 @@ def test_vmap_over_walker_axis():
     positions_K = base[None] + noise  # (K=4, N=8, 3)
 
     def one_call(pos):
-        e, _, _ = b(pos, species, cell)
+        e, _, _ = b(pos, species, cell).legacy()
         return e
 
     energies = jax.vmap(one_call)(positions_K)
@@ -249,7 +249,7 @@ def test_value_and_grad_finite():
     cell = SI_LATTICE_CONST * jnp.eye(3, dtype=jnp.float32)
 
     def total_e(pos):
-        e, _, _ = b(pos, species, cell)
+        e, _, _ = b(pos, species, cell).legacy()
         return e
 
     e, grad = jax.value_and_grad(total_e)(positions)

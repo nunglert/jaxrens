@@ -252,6 +252,6 @@ class TestHarmonicBackendCallable:
         positions = jnp.zeros((1, 3))
         types = jnp.zeros((1,), dtype=jnp.int32)
         cell = jnp.zeros((3, 3))
-        energy, _, _ = backend(positions, types, cell, 0)
+        energy, _, _ = backend(positions, types, cell, 0).legacy()
         assert jnp.isfinite(energy)
 

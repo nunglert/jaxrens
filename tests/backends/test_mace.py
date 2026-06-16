@@ -172,7 +172,7 @@ class TestMACEBackend:
         cell = jnp.array(reference["cell"])
         ref_energy = float(reference["jax_energy"])
 
-        energy, count, overflow = backend(positions, species, cell, max_neighbors=100)
+        energy, count, overflow = backend(positions, species, cell, max_neighbors=100).legacy()
 
         assert not overflow, "Overflow with max_neighbors=100"
         assert jnp.isfinite(energy), "Energy is not finite"
@@ -186,7 +186,7 @@ class TestMACEBackend:
         cell = jnp.array(reference["cell"])
 
         jit_backend = jax.jit(backend, static_argnums=(3,))
-        energy, count, overflow = jit_backend(positions, species, cell, 100)
+        energy, count, overflow = jit_backend(positions, species, cell, 100).legacy()
 
         assert jnp.isfinite(energy)
         assert not overflow
@@ -197,7 +197,7 @@ class TestMACEBackend:
         cell = jnp.array(reference["cell"])
 
         def energy_fn(pos):
-            e, _, _ = backend(pos, species, cell, 100)
+            e, _, _ = backend(pos, species, cell, 100).legacy()
             return e
 
         forces = -jax.grad(energy_fn)(positions)
@@ -209,7 +209,7 @@ class TestMACEBackend:
         species = jnp.array(reference["species"], dtype=jnp.int32)
         cell = jnp.array(reference["cell"])
 
-        _, _, overflow = backend(positions, species, cell, max_neighbors=1)
+        _, _, overflow = backend(positions, species, cell, max_neighbors=1).legacy()
         assert overflow, "Should overflow with max_neighbors=1"
 
 

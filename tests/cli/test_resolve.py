@@ -424,7 +424,7 @@ class TestResolveEnergyBackend:
         positions = jnp.zeros((1, 3))
         types = jnp.zeros((1,), dtype=jnp.int32)
         cell = jnp.zeros((3, 3))
-        energy, _, _ = resolved.base_backend(positions, types, cell, 0)
+        energy, _, _ = resolved.base_backend(positions, types, cell, 0).legacy()
         assert jnp.isfinite(energy)
 
     def test_resolve_base_backend_lj(self):
@@ -1244,7 +1244,9 @@ class _FakeZTableBackend:
 
     def __call__(self, positions, species, cell, max_neighbors, ensemble_params=None):
         import jax.numpy as jnp
-        return jnp.float32(0.0), jnp.int32(0), jnp.bool_(False)
+
+        from jaxrens.backends.base import BackendResult
+        return BackendResult(energy=jnp.float32(0.0))
 
 
 class TestBackendAwareSpeciesMapping:
@@ -1343,7 +1345,13 @@ class _BucketRecordingBackend:
     def __call__(self, positions, species, cell, max_neighbors, ensemble_params=None):
         import jax.numpy as jnp
         self.calls.append(int(max_neighbors))
-        return jnp.float32(0.0), jnp.int32(int(max_neighbors)), jnp.bool_(False)
+
+        from jaxrens.backends.base import BackendResult
+        return BackendResult(
+            energy=jnp.float32(0.0),
+            max_neighbor_count=jnp.int32(int(max_neighbors)),
+            overflow=jnp.bool_(False),
+        )
 
 
 class TestFinaliseInitialBucketChoice:

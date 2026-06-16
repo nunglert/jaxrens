@@ -44,7 +44,7 @@ def build_morph_kernel(backend: Any, n_species: int):
         new_energy, count, overflow = backend(
             state.positions, new_types, state.cell, state.max_neighbors,
             ensemble_params=state.ensemble_params,
-        )
+        ).legacy()
 
         accepted = new_energy < likelihood_constraint
 
@@ -85,7 +85,7 @@ def build_shift_kernel(backend: Any):
         new_energy, count, overflow = backend(
             new_positions, state.types, state.cell, state.max_neighbors,
             ensemble_params=state.ensemble_params,
-        )
+        ).legacy()
         accepted = new_energy < likelihood_constraint
 
         new_state = state.set(

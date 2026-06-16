@@ -106,7 +106,7 @@ def build_kernel(
                     e, count, overflow = backend(
                         p, state.types, state.cell, max_neighbors,
                         ensemble_params=ensemble_params,
-                    )
+                    ).legacy()
                     return e, (count, overflow)
 
                 (new_energy, (count, overflow)), grad = jax.value_and_grad(
@@ -116,7 +116,7 @@ def build_kernel(
                 new_energy, count, overflow = backend(
                     new_pos, state.types, state.cell, max_neighbors,
                     ensemble_params=ensemble_params,
-                )
+                ).legacy()
                 grad = None
 
             # Accumulate overflow tracking

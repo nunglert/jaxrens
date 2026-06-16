@@ -170,8 +170,8 @@ class TestSoftCoreBackendWrapper:
         species = _species(2)
         cell = _cell()
 
-        E_base, _, _ = base(positions, species, cell, 0)
-        E_wrapped, _, _ = wrapped(positions, species, cell, 0)
+        E_base, _, _ = base(positions, species, cell, 0).legacy()
+        E_wrapped, _, _ = wrapped(positions, species, cell, 0).legacy()
         assert float(E_wrapped) == pytest.approx(float(E_base), rel=1e-6)
 
     def test_close_contact_penalty(self):
@@ -182,7 +182,7 @@ class TestSoftCoreBackendWrapper:
         species = _species(2)
         cell = _cell()
 
-        E_wrapped, _, _ = wrapped(positions, species, cell, 0)
+        E_wrapped, _, _ = wrapped(positions, species, cell, 0).legacy()
         # phi(0.3) = exp(-2 * (0.3 - 3.0)) = exp(5.4) ≈ 221
         expected = D0 * np.exp(-2.0 * A0 * (0.3 - B0))
         assert float(E_wrapped) == pytest.approx(expected, rel=1e-4)
@@ -197,7 +197,7 @@ class TestSoftCoreBackendWrapper:
         pos = jnp.array(
             [[0.08, 0.0, 0.0], [3.92, 0.0, 0.0]], dtype=jnp.float32,
         )
-        E, _, _ = wrapped(pos, species, cell, 0)
+        E, _, _ = wrapped(pos, species, cell, 0).legacy()
         expected = D0 * np.exp(-2.0 * A0 * (0.16 - B0))
         assert float(E) == pytest.approx(expected, rel=1e-3)
 
@@ -210,7 +210,7 @@ class TestSoftCoreBackendWrapper:
         cell = _cell()
 
         def go(pos):
-            E, _, _ = wrapped(pos, species, cell, 0)
+            E, _, _ = wrapped(pos, species, cell, 0).legacy()
             return E
 
         E_eager = float(go(positions))
@@ -229,13 +229,13 @@ class TestSoftCoreBackendWrapper:
         )
 
         def one(pos):
-            E, _, _ = wrapped(pos, species, cell, 0)
+            E, _, _ = wrapped(pos, species, cell, 0).legacy()
             return E
 
         Es = jax.vmap(one)(batch)
         assert Es.shape == (3,)
         # The r=2.0 case should equal the base alone
-        E_base_far, _, _ = base(batch[2], species, cell, 0)
+        E_base_far, _, _ = base(batch[2], species, cell, 0).legacy()
         assert float(Es[2]) == pytest.approx(float(E_base_far), rel=1e-5)
 
     def test_attr_forwarding(self):
@@ -260,7 +260,7 @@ class TestSoftCoreBackendWrapper:
         species = _species(2)
         cell = _cell()
 
-        E, _, _ = stacked(positions, species, cell, 0)
+        E, _, _ = stacked(positions, species, cell, 0).legacy()
 
         # Reconstruct expected.
         E_U = 0.5 * 1.0 * float(jnp.sum(positions**2))

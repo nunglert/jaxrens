@@ -80,7 +80,7 @@ def _inner_check(
     but repeated calls with the same backend reuse the compiled trace.
     Scalars are dynamic to avoid retracing on minor parameter changes.
     """
-    energy, _count, _overflow = energy_fn(positions, types, cell, 0)
+    energy, _count, _overflow = energy_fn(positions, types, cell, 0).legacy()
 
     too_close = _check_min_distance(positions, cell, min_distance)
 

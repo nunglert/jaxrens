@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from jaxrens.backends.base import BackendResult
 from jaxrens.sampling.moves.replica_exchange import XRENSSwap, xrens_replica_exchange_step
 from jaxrens.state.config import InterREConfig
 
@@ -48,10 +49,10 @@ class SpeciesHarmonicBackend:
         cell: jnp.ndarray,
         max_neighbors: int = 0,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> tuple[jnp.ndarray, int, bool]:
+    ) -> BackendResult:
         weights = self.species_weights[types]  # (n_atoms,)
         energy = jnp.sum(weights * 0.5 * jnp.sum(positions ** 2, axis=-1))
-        return energy, 0, False
+        return BackendResult(energy=energy)
 
 
 # ---------------------------------------------------------------------------
@@ -94,8 +95,8 @@ class TestXRENSProposeMorphedTypes:
         pos_a = jax.random.normal(k1, (n_atoms, 3)) * 0.1
         pos_b = jax.random.normal(k2, (n_atoms, 3)) * 0.1
 
-        e_a, _, _ = backend(pos_a, types_a, jnp.zeros((3, 3)))
-        e_b, _, _ = backend(pos_b, types_b, jnp.zeros((3, 3)))
+        e_a, _, _ = backend(pos_a, types_a, jnp.zeros((3, 3))).legacy()
+        e_b, _, _ = backend(pos_b, types_b, jnp.zeros((3, 3))).legacy()
 
         state_a = _make_state(pos_a, types_a, e_a)
         state_b = _make_state(pos_b, types_b, e_b)
@@ -155,8 +156,8 @@ class TestXRENSProposeMorphedTypes:
         pos_b = jax.random.normal(k2, (4, 3))
         types_a = jnp.zeros(4, dtype=jnp.int32)
         types_b = jnp.ones(4, dtype=jnp.int32)
-        e_a, _, _ = backend(pos_a, types_a, jnp.zeros((3, 3)))
-        e_b, _, _ = backend(pos_b, types_b, jnp.zeros((3, 3)))
+        e_a, _, _ = backend(pos_a, types_a, jnp.zeros((3, 3))).legacy()
+        e_b, _, _ = backend(pos_b, types_b, jnp.zeros((3, 3))).legacy()
 
         state_a = _make_state(pos_a, types_a, e_a)
         state_b = _make_state(pos_b, types_b, e_b)
@@ -332,7 +333,7 @@ class TestNSpeciesMismatch:
         types_a = jnp.array([0, 1, 2, 0, 1, 2], dtype=jnp.int32)
         types_b = jnp.array([0, 0, 0, 1, 1, 1], dtype=jnp.int32)
         pos = jax.random.normal(key, (n_atoms, 3)) * 0.1
-        e, _, _ = backend(pos, types_a, jnp.zeros((3, 3)))
+        e, _, _ = backend(pos, types_a, jnp.zeros((3, 3))).legacy()
 
         state_a = _make_state(pos, types_a, e)
         state_b = _make_state(pos, types_b, e)

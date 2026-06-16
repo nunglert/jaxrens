@@ -42,7 +42,7 @@ def build_kernel(backend: Any):
         new_energy, count, overflow = backend(
             new_positions, state.types, state.cell, state.max_neighbors,
             ensemble_params=state.ensemble_params,
-        )
+        ).legacy()
         accepted = new_energy < likelihood_constraint
 
         new_state = state.set(
@@ -91,7 +91,7 @@ def build_sweep_kernel(backend: Any, n_atoms: int):
             new_energy, count, overflow = backend(
                 new_positions, state.types, state.cell, max_neighbors,
                 ensemble_params=ensemble_params,
-            )
+            ).legacy()
             accepted = new_energy < likelihood_constraint
 
             out_positions = jnp.where(accepted, new_positions, positions)
@@ -155,7 +155,7 @@ def build_swap_kernel(backend: Any):
         new_energy, count, overflow = backend(
             state.positions, new_types, state.cell, state.max_neighbors,
             ensemble_params=state.ensemble_params,
-        )
+        ).legacy()
 
         different_species = type_a != type_b
         accepted = (new_energy < likelihood_constraint) & different_species

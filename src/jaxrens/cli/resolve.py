@@ -25,7 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jaxrens.backends.base import EnergyBackend
+from jaxrens.backends.base import BackendResult, EnergyBackend
 from jaxrens.sampling.batch_descriptor import BatchDescriptor, PmapVmapRuns, SingleRun
 from jaxrens.cli.schema.adaptation import AdaptationSpec, ResolvedAdaptationPolicy
 from jaxrens.cli.schema.cell import CellSpec
@@ -842,9 +842,9 @@ def _null_energy_fn(
     types: jnp.ndarray,
     cell: jnp.ndarray,
     max_neighbors: int,
-) -> tuple[jnp.ndarray, int, bool]:
+) -> BackendResult:
     """Placeholder energy function returning zero, for grid-mode without a backend."""
-    return jnp.float32(0.0), 0, False
+    return BackendResult(energy=jnp.float32(0.0))
 
 
 # ---------------------------------------------------------------------------

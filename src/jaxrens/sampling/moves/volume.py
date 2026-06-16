@@ -63,7 +63,7 @@ def build_kernel(
         new_energy, count, overflow = backend(
             new_positions, state.types, new_cell, state.max_neighbors,
             ensemble_params=state.ensemble_params,
-        )
+        ).legacy()
 
         # Check cell shape validity
         cell_valid = check_cell_shape(

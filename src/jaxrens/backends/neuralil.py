@@ -29,6 +29,8 @@ from typing import Any, Sequence
 import jax
 import jax.numpy as jnp
 
+from jaxrens.backends.base import BackendResult
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -275,7 +277,7 @@ class NeuralILBackend:
         cell: jnp.ndarray,
         max_neighbors: int = 50,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> tuple[jnp.ndarray, int, bool]:
+    ) -> BackendResult:
         # Non-periodic: use large dummy cell
         safe_cell = jnp.where(
             jnp.trace(cell) == 0, 1000.0 * jnp.eye(3), cell,
@@ -307,7 +309,11 @@ class NeuralILBackend:
         )
         overflow = actual_max_neighbors > max_neighbors
 
-        return energy, actual_max_neighbors, overflow
+        return BackendResult(
+            energy=energy,
+            max_neighbor_count=actual_max_neighbors,
+            overflow=overflow,
+        )
 
     def max_neighbors_for(
         self,

@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from jaxrens.backends.base import BackendResult
 from jaxrens.init.rejection import _check_min_distance, rejection_sample_positions
 
 
@@ -24,7 +25,7 @@ class _HarmonicBackend:
 
     def __call__(self, positions, species, cell, max_neighbors, ensemble_params=None):
         energy = 0.5 * jnp.sum(positions ** 2)
-        return energy, 0, False
+        return BackendResult(energy=energy)
 
 
 _BACKEND = _HarmonicBackend()

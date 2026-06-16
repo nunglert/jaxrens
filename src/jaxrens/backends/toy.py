@@ -10,6 +10,8 @@ from typing import Any
 
 import jax.numpy as jnp
 
+from jaxrens.backends.base import BackendResult
+
 
 class HarmonicBackend:
     """Harmonic potential: E = 0.5 * k * sum(positions^2).
@@ -29,9 +31,9 @@ class HarmonicBackend:
         cell: jnp.ndarray,
         max_neighbors: int = 0,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> tuple[jnp.ndarray, int, bool]:
+    ) -> BackendResult:
         energy = 0.5 * self.k * jnp.sum(positions**2)
-        return energy, 0, False
+        return BackendResult(energy=energy)
 
 
 class DoubleWellBackend:
@@ -52,11 +54,11 @@ class DoubleWellBackend:
         cell: jnp.ndarray,
         max_neighbors: int = 0,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> tuple[jnp.ndarray, int, bool]:
+    ) -> BackendResult:
         x = positions[:, 0]
         yz = positions[:, 1:]
         energy = jnp.sum(self.a * (x**2 - self.b) ** 2) + 0.5 * jnp.sum(yz**2)
-        return energy, 0, False
+        return BackendResult(energy=energy)
 
 
 class GaussianMixtureBackend:
@@ -84,7 +86,7 @@ class GaussianMixtureBackend:
         cell: jnp.ndarray,
         max_neighbors: int = 0,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> tuple[jnp.ndarray, int, bool]:
+    ) -> BackendResult:
         com = jnp.mean(positions, axis=0)
         diff = com[None, :] - self.centers
         dist_sq = jnp.sum(diff**2, axis=-1)
@@ -94,7 +96,7 @@ class GaussianMixtureBackend:
             - 1.5 * jnp.log(2.0 * jnp.pi * self.sigma**2)
         )
         energy = -_logsumexp(log_components)
-        return energy, 0, False
+        return BackendResult(energy=energy)
 
 
 def _logsumexp(x: jnp.ndarray) -> jnp.ndarray:

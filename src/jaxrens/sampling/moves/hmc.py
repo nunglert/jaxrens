@@ -42,7 +42,7 @@ def build_kernel(
             e, count, overflow = backend(
                 pos, state.types, state.cell, max_neighbors,
                 ensemble_params=ensemble_params,
-            )
+            ).legacy()
             return e, (count, overflow)
 
         # Leapfrog integration via lax.scan
@@ -82,7 +82,7 @@ def build_kernel(
         new_energy, count, overflow = backend(
             new_positions, state.types, state.cell, max_neighbors,
             ensemble_params=ensemble_params,
-        )
+        ).legacy()
         acc_count = jnp.maximum(acc_count, count)
         acc_overflow = acc_overflow | overflow
 

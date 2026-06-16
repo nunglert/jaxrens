@@ -6,8 +6,8 @@ The wrapped backend satisfies the same EnergyBackend protocol.
 Usage:
     base = HarmonicBackend(k=1.0)
     backend = EnsembleBackend(base, pressure=0.01)
-    H, count, overflow = backend(positions, species, cell, max_neighbors)
-    # H = U + P*V
+    result = backend(positions, species, cell, max_neighbors)
+    # result.energy = U + P*V
 
 For per-run vmap with different pressures, pass ensemble_params:
     backend(pos, species, cell, mn, ensemble_params={"pressure": 0.02})
@@ -19,6 +19,7 @@ from typing import Any
 
 import jax.numpy as jnp
 
+from jaxrens.backends.base import BackendResult
 from jaxrens.utils.cell import get_volume
 
 
@@ -56,15 +57,16 @@ class EnsembleBackend:
         cell: jnp.ndarray,
         max_neighbors: int,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> tuple[jnp.ndarray, int, bool]:
+    ) -> BackendResult:
         """Compute ensemble-corrected energy.
 
         Calls the base backend for the raw potential U, then adds
-        ensemble terms (PV, μN).
+        ensemble terms (PV, μN). Control/diagnostic fields pass through.
         """
-        U, count, overflow = self.base(
+        res = self.base(
             positions, species, cell, max_neighbors,
         )
+        U = res.energy
 
         # Use per-run params if provided, else closured defaults
         pressure = self.pressure
@@ -82,7 +84,7 @@ class EnsembleBackend:
                 counts = counts.at[species].add(1)
                 H = H - jnp.dot(mu, counts.astype(jnp.float32))
 
-        return H, count, overflow
+        return res._replace(energy=H)
 
     def __getattr__(self, name: str) -> Any:
         # Called only when normal lookup fails, so this does not shadow

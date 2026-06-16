@@ -303,7 +303,7 @@ def run_from_config(
         def eval_one(pos):
             e, _, _ = backend(pos, initial_types,
                              initial_cells[0] if initial_cells is not None else jnp.zeros((3, 3)),
-                             0)
+                             0).legacy()
             return e
         initial_energies = jax.vmap(eval_one)(initial_positions)
 

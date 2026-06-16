@@ -51,6 +51,7 @@ from jaxrens.backends._graph_neighbors import (
     _make_image_offsets,
     _supercell_edges,
 )
+from jaxrens.backends.base import BackendResult
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +175,7 @@ class NequixBackend:
         cell: jnp.ndarray,
         max_neighbors: int = 50,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> tuple[jnp.ndarray, int, bool]:
+    ) -> BackendResult:
         n_atoms = positions.shape[0]
         max_edges = n_atoms * max_neighbors
 
@@ -205,7 +206,11 @@ class NequixBackend:
             n_atoms,
         )
 
-        return energy, true_max_per_atom, overflow
+        return BackendResult(
+            energy=energy,
+            max_neighbor_count=true_max_per_atom,
+            overflow=overflow,
+        )
 
 
 # ---------------------------------------------------------------------------

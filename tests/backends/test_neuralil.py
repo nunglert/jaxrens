@@ -79,7 +79,7 @@ class TestNeuralILBackend:
         cell = jnp.array(reference["cell"])
         max_neighbors = int(reference["max_neighbors"])
 
-        energy, count, overflow = backend(positions, species, cell, max_neighbors)
+        energy, count, overflow = backend(positions, species, cell, max_neighbors).legacy()
 
         assert jnp.isfinite(energy), f"Energy is not finite: {energy}"
         assert not overflow, f"Overflow with max_neighbors={max_neighbors}"
@@ -91,7 +91,7 @@ class TestNeuralILBackend:
         max_neighbors = int(reference["max_neighbors"])
         ref_energy = float(reference["energy"])
 
-        energy, _, _ = backend(positions, species, cell, max_neighbors)
+        energy, _, _ = backend(positions, species, cell, max_neighbors).legacy()
 
         assert abs(float(energy) - ref_energy) < 1e-3, (
             f"Energy mismatch: {float(energy):.6f} vs ref {ref_energy:.6f}"
@@ -102,7 +102,7 @@ class TestNeuralILBackend:
         species = jnp.array(reference["types"], dtype=jnp.int32)
         cell = jnp.array(reference["cell"])
 
-        _, _, overflow = backend(positions, species, cell, max_neighbors=1)
+        _, _, overflow = backend(positions, species, cell, max_neighbors=1).legacy()
         assert overflow, "Should overflow with max_neighbors=1"
 
     def test_max_neighbors_for(self, backend, reference):
@@ -123,7 +123,7 @@ class TestNeuralILBackend:
         # energy compile — so passing the real cell/positions should
         # produce the same count the backend reports internally.
         n_from_method = int(backend.max_neighbors_for(positions, cell))
-        _, n_from_call, _ = backend(positions, species, cell, max_neighbors=64)
+        _, n_from_call, _ = backend(positions, species, cell, max_neighbors=64).legacy()
         assert n_from_method == int(n_from_call), (
             f"max_neighbors_for={n_from_method} disagrees with the count "
             f"the backend reports during __call__={int(n_from_call)}"

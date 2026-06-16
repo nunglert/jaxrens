@@ -19,6 +19,7 @@ from jaxrens.utils.cell import (
     check_cell_shape,
     transform_positions,
 )
+from jaxrens.backends.base import BackendResult
 from jaxrens.backends.lj import create_lj
 
 
@@ -72,7 +73,7 @@ class _CellEnergyBackend:
     def __call__(self, positions, species, cell, max_neighbors=0,
                  ensemble_params=None):
         energy = jnp.sum(positions**2)
-        return energy, 0, False
+        return BackendResult(energy=energy)
 
 
 cell_energy_backend = _CellEnergyBackend()
@@ -628,7 +629,11 @@ class _OverflowingBackend:
     def __call__(self, positions, species, cell, max_neighbors=0,
                  ensemble_params=None):
         energy = jnp.sum(positions**2)
-        return energy, jnp.int32(self._count), jnp.bool_(True)
+        return BackendResult(
+            energy=energy,
+            max_neighbor_count=jnp.int32(self._count),
+            overflow=jnp.bool_(True),
+        )
 
 
 _OVERFLOWING_BACKEND = _OverflowingBackend(count=999)

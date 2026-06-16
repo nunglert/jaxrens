@@ -77,8 +77,8 @@ class TestPerSpeciesReducesToScalar:
         scalar_be = create_lj(epsilon=1.0, sigma=1.0)
         table_be = create_lj(epsilon=[1.0], sigma=[1.0])
 
-        e_scalar, _, _ = scalar_be(pos, types, cell)
-        e_table, _, _ = table_be(pos, types, cell)
+        e_scalar, _, _ = scalar_be(pos, types, cell).legacy()
+        e_table, _, _ = table_be(pos, types, cell).legacy()
         assert jnp.allclose(e_scalar, e_table, atol=1e-6, rtol=1e-6)
 
     def test_two_equal_entries_match_scalar(self):
@@ -89,8 +89,8 @@ class TestPerSpeciesReducesToScalar:
         scalar_be = create_lj(epsilon=0.7, sigma=0.9)
         table_be = create_lj(epsilon=[0.7, 0.7], sigma=[0.9, 0.9])
 
-        e_scalar, _, _ = scalar_be(pos, types, cell)
-        e_table, _, _ = table_be(pos, types, cell)
+        e_scalar, _, _ = scalar_be(pos, types, cell).legacy()
+        e_table, _, _ = table_be(pos, types, cell).legacy()
         assert jnp.allclose(e_scalar, e_table, atol=1e-6, rtol=1e-6)
 
 
@@ -109,9 +109,9 @@ class TestCompositionDependence:
         cell = _no_cell()
         be = create_lj(epsilon=[1.0, 0.5], sigma=[1.0, 1.2])
 
-        e_AA, _, _ = be(pos, jnp.array([0, 0], dtype=jnp.int32), cell)
-        e_BB, _, _ = be(pos, jnp.array([1, 1], dtype=jnp.int32), cell)
-        e_AB, _, _ = be(pos, jnp.array([0, 1], dtype=jnp.int32), cell)
+        e_AA, _, _ = be(pos, jnp.array([0, 0], dtype=jnp.int32), cell).legacy()
+        e_BB, _, _ = be(pos, jnp.array([1, 1], dtype=jnp.int32), cell).legacy()
+        e_AB, _, _ = be(pos, jnp.array([0, 1], dtype=jnp.int32), cell).legacy()
 
         assert not jnp.allclose(e_AA, e_BB), "AA and BB pair energies must differ"
         assert not jnp.allclose(e_AA, e_AB), "AA and AB pair energies must differ"
@@ -126,7 +126,7 @@ class TestCompositionDependence:
         pos = _two_atom_positions(r=r)
         cell = _no_cell()
         be = create_lj(epsilon=[eps_a, eps_b], sigma=[sig_a, sig_b])
-        e_AB, _, _ = be(pos, jnp.array([0, 1], dtype=jnp.int32), cell)
+        e_AB, _, _ = be(pos, jnp.array([0, 1], dtype=jnp.int32), cell).legacy()
 
         eps_ij = float(jnp.sqrt(eps_a * eps_b))
         sig_ij = 0.5 * (sig_a + sig_b)
@@ -180,7 +180,7 @@ class TestScalarRegression:
         be = create_lj(epsilon=eps, sigma=sig)
         pos = _two_atom_positions(r=r)
         cell = _no_cell()
-        e, _, _ = be(pos, jnp.array([0, 0], dtype=jnp.int32), cell)
+        e, _, _ = be(pos, jnp.array([0, 0], dtype=jnp.int32), cell).legacy()
         expected = 4.0 * eps * ((sig / r) ** 12 - (sig / r) ** 6)
         assert jnp.allclose(e, expected, atol=1e-5, rtol=1e-5)
 
@@ -244,7 +244,7 @@ class TestTriclinicMIC:
         )
 
         be = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5)
-        e, _, _ = be(positions, jnp.zeros(8, dtype=jnp.int32), cell)
+        e, _, _ = be(positions, jnp.zeros(8, dtype=jnp.int32), cell).legacy()
         ref = _brute_force_pair_energy(
             positions, cell, 1.0, 1.0, 2.5, (1, 1, 1),
         )
@@ -260,7 +260,7 @@ class TestTriclinicMIC:
         ])
         cell = jnp.diag(jnp.array([10.0, 10.0, 10.0]))
         be = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5)
-        e, _, _ = be(positions, jnp.zeros(3, dtype=jnp.int32), cell)
+        e, _, _ = be(positions, jnp.zeros(3, dtype=jnp.int32), cell).legacy()
         ref = _brute_force_pair_energy(
             positions, cell, 1.0, 1.0, 2.5, (1, 1, 1),
         )
@@ -286,8 +286,8 @@ class TestSupercellTrafo:
                          supercell_trafo=(1, 1, 1))
         be_b = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5,
                          supercell_trafo=(2, 2, 2))
-        e_a, _, _ = be_a(positions, jnp.zeros(3, dtype=jnp.int32), cell)
-        e_b, _, _ = be_b(positions, jnp.zeros(3, dtype=jnp.int32), cell)
+        e_a, _, _ = be_a(positions, jnp.zeros(3, dtype=jnp.int32), cell).legacy()
+        e_b, _, _ = be_b(positions, jnp.zeros(3, dtype=jnp.int32), cell).legacy()
         assert jnp.allclose(e_a, e_b, atol=1e-5, rtol=1e-5)
 
     def test_tight_cell_picks_up_images(self):
@@ -301,8 +301,8 @@ class TestSupercellTrafo:
                            supercell_trafo=(1, 1, 1))
         be_sc = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5,
                           supercell_trafo=(2, 2, 2))
-        e_mic, _, _ = be_mic(positions, jnp.zeros(2, dtype=jnp.int32), cell)
-        e_sc, _, _ = be_sc(positions, jnp.zeros(2, dtype=jnp.int32), cell)
+        e_mic, _, _ = be_mic(positions, jnp.zeros(2, dtype=jnp.int32), cell).legacy()
+        e_sc, _, _ = be_sc(positions, jnp.zeros(2, dtype=jnp.int32), cell).legacy()
         ref_mic = _brute_force_pair_energy(
             positions, cell, 1.0, 1.0, 2.5, (1, 1, 1),
         )
@@ -319,7 +319,7 @@ class TestSupercellTrafo:
                        supercell_trafo=(2, 2, 2))
         @jax.jit
         def energy_fn(pos, sp, c):
-            e, _, _ = be(pos, sp, c)
+            e, _, _ = be(pos, sp, c).legacy()
             return e
         pos = jnp.array([[0.0, 0.0, 0.0], [1.2, 0.0, 0.0]])
         e = energy_fn(pos, jnp.zeros(2, dtype=jnp.int32),
