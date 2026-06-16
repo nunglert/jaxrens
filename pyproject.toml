@@ -36,6 +36,7 @@ dev = [
     "pytest-cov>=5.0",
     "pytest-timeout>=2.3",
     "beartype>=0.18",
+    "pre-commit",
 ]
 docs = [
     "sphinx>=8.1",
