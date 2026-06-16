@@ -13,6 +13,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from jaxrens.backends.base import eval_energy_and_forces
 from jaxrens.base import MoveInfo
 
 
@@ -38,38 +39,37 @@ def build_kernel(
         max_neighbors = state.max_neighbors
         ensemble_params = state.ensemble_params
 
-        def energy_with_aux(pos):
-            res = backend(
+        def eval_forces(pos):
+            # Backend uses its native force path when available, else autodiff.
+            return eval_energy_and_forces(
+                backend,
                 pos,
                 state.types,
                 state.cell,
                 max_neighbors,
                 ensemble_params=ensemble_params,
             )
-            return res.energy, (res.max_neighbor_count, res.overflow)
 
-        # Leapfrog integration via lax.scan
+        # Leapfrog integration via lax.scan. The potential gradient is
+        # ``-forces``, so each half-step momentum kick ``p -= step * dU/dq``
+        # is written as ``p += step * forces``.
         def leapfrog_step(carry, _):
             pos, mom, acc_count, acc_overflow = carry
 
-            # Half-step momentum (using forces from autodiff)
-            (_, (count, overflow)), grad = jax.value_and_grad(
-                energy_with_aux, has_aux=True
-            )(pos)
-            acc_count = jnp.maximum(acc_count, count)
-            acc_overflow = acc_overflow | overflow
-            mom = mom - 0.5 * state.step_size * grad
+            # Half-step momentum
+            res = eval_forces(pos)
+            acc_count = jnp.maximum(acc_count, res.max_neighbor_count)
+            acc_overflow = acc_overflow | res.overflow
+            mom = mom + 0.5 * state.step_size * res.forces
 
             # Full-step position
             pos = pos + state.step_size * mom
 
             # Half-step momentum
-            (_, (count, overflow)), grad = jax.value_and_grad(
-                energy_with_aux, has_aux=True
-            )(pos)
-            acc_count = jnp.maximum(acc_count, count)
-            acc_overflow = acc_overflow | overflow
-            mom = mom - 0.5 * state.step_size * grad
+            res = eval_forces(pos)
+            acc_count = jnp.maximum(acc_count, res.max_neighbor_count)
+            acc_overflow = acc_overflow | res.overflow
+            mom = mom + 0.5 * state.step_size * res.forces
 
             return (pos, mom, acc_count, acc_overflow), None
 

@@ -131,7 +131,7 @@ def rejection_sample_positions(
         types: (n_atoms,) int32 type indices.
         n_atoms: Number of atoms.
         energy_fn: Callable (positions, types, cell, max_neighbors) ->
-            (energy, count, overflow).  Should already have backend kwargs bound.
+            BackendResult.  Should already have backend kwargs bound.
         start_energy_ceiling: Absolute energy ceiling for the whole configuration.
         min_distance: Minimum allowed interatomic distance under PBC.
         max_tries: Maximum number of draw attempts before raising RuntimeError.
