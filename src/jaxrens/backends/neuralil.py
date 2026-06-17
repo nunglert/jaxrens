@@ -57,10 +57,7 @@ except ImportError as exc:
     _NEURALIL_IMPORT_ERROR = str(exc)
 
 try:
-    from neuralil.softcore.model import (
-        SoftCoreNeuralIL,
-        SoftCorePlainEnsemble,
-    )
+    from neuralil.softcore.model import SoftCoreNeuralIL, SoftCorePlainEnsemble
 
     _SOFTCORE_AVAILABLE = True
 except ImportError:
@@ -161,7 +158,10 @@ def _build_dynamics_model(
         )
 
     descriptor_gen = PowerSpectrumGenerator(
-        n_max, r_cutoff, n_types, supercell_trafo,
+        n_max,
+        r_cutoff,
+        n_types,
+        supercell_trafo,
     )
     core_model = ResNetCore(core_widths)
 
@@ -170,22 +170,31 @@ def _build_dynamics_model(
         if softcore_kwargs is not None:
             sc_kwargs.update(softcore_kwargs)
         individual = SoftCoreNeuralIL(
-            n_types, embed_d, r_cutoff,
-            descriptor_gen, descriptor_gen.process_some_data,
+            n_types,
+            embed_d,
+            r_cutoff,
+            descriptor_gen,
+            descriptor_gen.process_some_data,
             core_model,
             **sc_kwargs,
         )
     elif has_morse:
         individual = NeuralILwithMorse(
-            n_types, embed_d, r_cutoff,
-            descriptor_gen, descriptor_gen.process_some_data,
+            n_types,
+            embed_d,
+            r_cutoff,
+            descriptor_gen,
+            descriptor_gen.process_some_data,
             core_model,
             morse_type=morse_type,
         )
     else:
         individual = NeuralIL(
-            n_types, embed_d, r_cutoff,
-            descriptor_gen, descriptor_gen.process_some_data,
+            n_types,
+            embed_d,
+            r_cutoff,
+            descriptor_gen,
+            descriptor_gen.process_some_data,
             core_model,
         )
 
@@ -270,6 +279,45 @@ class NeuralILBackend:
 
         return tuple(_Z[s] for s in self.sorted_elements)
 
+    @staticmethod
+    def _safe_cell(cell: jnp.ndarray) -> jnp.ndarray:
+        """Substitute a large dummy cell for non-periodic (zero-trace) inputs."""
+        return jnp.where(jnp.trace(cell) == 0, 1000.0 * jnp.eye(3), cell)
+
+    def _apply_energy_shift(
+        self, energy: jnp.ndarray, species: jnp.ndarray
+    ) -> jnp.ndarray:
+        """Re-add the per-atom baseline that training subtracted from targets.
+        This will become important for grand-canonical formulations.
+
+        A constant per-atom shift; it does not affect forces.
+        """
+        if self.energy_shift_per_atom == 0.0:
+            return energy
+        n_real = (species >= 0).sum()
+        return energy + self.energy_shift_per_atom * n_real
+
+    def _neighbor_diagnostics(
+        self,
+        positions: jnp.ndarray,
+        species: jnp.ndarray,
+        safe_cell: jnp.ndarray,
+        max_neighbors: int,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Actual max neighbor count + overflow flag for the bucket manager."""
+        sc_a, sc_b, sc_c = self.supercell_trafo
+        actual_max_neighbors = _get_max_number_of_neighbors(
+            positions,
+            species,
+            self.r_cutoff,
+            safe_cell,
+            sc_a,
+            sc_b,
+            sc_c,
+        )
+        overflow = actual_max_neighbors > max_neighbors
+        return actual_max_neighbors, overflow
+
     def __call__(
         self,
         positions: jnp.ndarray,
@@ -278,10 +326,7 @@ class NeuralILBackend:
         max_neighbors: int = 50,
         ensemble_params: dict[str, Any] | None = None,
     ) -> BackendResult:
-        # Non-periodic: use large dummy cell
-        safe_cell = jnp.where(
-            jnp.trace(cell) == 0, 1000.0 * jnp.eye(3), cell,
-        )
+        safe_cell = self._safe_cell(cell)
 
         # Compute energy. max_neighbors is a static-at-trace int that flows
         # down into PSG._process_center as a buffer-shape arg. For an
@@ -296,24 +341,151 @@ class NeuralILBackend:
             method=self._dynamics_model.calc_potential_energy,
         )
         energy = energy_out.mean() if self.is_ensemble else energy_out
+        energy = self._apply_energy_shift(energy, species)
 
-        # Re-add the per-atom baseline that training subtracted from targets.
-        if self.energy_shift_per_atom != 0.0:
-            n_real = (species >= 0).sum()
-            energy = energy + self.energy_shift_per_atom * n_real
-
-        # Check actual neighbor count for overflow detection
-        sc_a, sc_b, sc_c = self.supercell_trafo
-        actual_max_neighbors = _get_max_number_of_neighbors(
-            positions, species, self.r_cutoff, safe_cell, sc_a, sc_b, sc_c,
+        actual_max_neighbors, overflow = self._neighbor_diagnostics(
+            positions, species, safe_cell, max_neighbors
         )
-        overflow = actual_max_neighbors > max_neighbors
 
         return BackendResult(
             energy=energy,
             max_neighbor_count=actual_max_neighbors,
             overflow=overflow,
         )
+
+    def energy_and_forces(
+        self,
+        positions: jnp.ndarray,
+        species: jnp.ndarray,
+        cell: jnp.ndarray,
+        max_neighbors: int = 50,
+        ensemble_params: dict[str, Any] | None = None,
+    ) -> BackendResult:
+        """Native energy + forces via NeuralIL's ``calc_potential_energy_and_forces``.
+
+        Every dynamics-model variant (single / Morse / soft-core / ensemble)
+        exposes ``calc_potential_energy_and_forces``, returning ``(energy,
+        forces)`` with ``forces = -dE/dx``. The soft-core and Morse terms are
+        included because the differentiated ``calc_potential_energy`` runs
+        through the same (overridden) ``calc_atomic_energies`` as ``__call__``.
+
+        For an ensemble the model returns per-member energies ``(n_ensemble,)``
+        and forces ``(n_ensemble, N, 3)``; both are reduced by mean to match the
+        committee prediction used in ``__call__``. The per-atom energy shift is a
+        constant and is added to the energy only — it does not affect forces.
+        """
+        safe_cell = self._safe_cell(cell)
+
+        energy_out, forces_out = self._dynamics_model.apply(
+            self.model_params,
+            positions,
+            species,
+            safe_cell,
+            max_neighbors,
+            method=self._dynamics_model.calc_potential_energy_and_forces,
+        )
+        if self.is_ensemble:
+            energy = energy_out.mean()
+            forces = forces_out.mean(axis=0)
+        else:
+            energy = energy_out
+            forces = forces_out
+        energy = self._apply_energy_shift(energy, species)
+
+        actual_max_neighbors, overflow = self._neighbor_diagnostics(
+            positions, species, safe_cell, max_neighbors
+        )
+
+        return BackendResult(
+            energy=energy,
+            forces=forces,
+            max_neighbor_count=actual_max_neighbors,
+            overflow=overflow,
+        )
+
+    def members(
+        self,
+        positions: jnp.ndarray,
+        species: jnp.ndarray,
+        cell: jnp.ndarray,
+        max_neighbors: int = 50,
+        ensemble_params: dict[str, Any] | None = None,
+    ) -> BackendResult:
+        """Per-committee-member energies and forces (for uncertainty).
+
+        Like :meth:`energy_and_forces` but **keeps the per-ensemble-member
+        axis**: populates the reserved ``energy_members`` ``(M,)`` and
+        ``forces_members`` ``(M, N, 3)`` slots, in addition to the reduced
+        ``energy`` / ``forces`` committee means and the control fields.
+
+        For a single (non-ensemble) model ``M = 1`` (a leading axis is added)
+        so the ``(M, …)`` shape contract holds uniformly and the committee
+        spread is exactly zero. The per-atom energy shift is added to every
+        member, preserving the invariant ``energy == energy_members.mean()``
+        (the shift is constant across members, so it does not affect the std).
+        """
+        safe_cell = self._safe_cell(cell)
+
+        energy_out, forces_out = self._dynamics_model.apply(
+            self.model_params,
+            positions,
+            species,
+            safe_cell,
+            max_neighbors,
+            method=self._dynamics_model.calc_potential_energy_and_forces,
+        )
+        if self.is_ensemble:
+            energy_members = energy_out  # (M,)
+            forces_members = forces_out  # (M, N, 3)
+        else:
+            energy_members = energy_out[jnp.newaxis]  # (1,)
+            forces_members = forces_out[jnp.newaxis]  # (1, N, 3)
+
+        # Shift each member equally (constant → no effect on std), keeping
+        # energy == energy_members.mean().
+        energy_members = self._apply_energy_shift(energy_members, species)
+        energy = energy_members.mean()
+        forces = forces_members.mean(axis=0)
+
+        actual_max_neighbors, overflow = self._neighbor_diagnostics(
+            positions, species, safe_cell, max_neighbors
+        )
+
+        return BackendResult(
+            energy=energy,
+            forces=forces,
+            max_neighbor_count=actual_max_neighbors,
+            overflow=overflow,
+            energy_members=energy_members,
+            forces_members=forces_members,
+        )
+
+    def energy_members(
+        self,
+        positions: jnp.ndarray,
+        species: jnp.ndarray,
+        cell: jnp.ndarray,
+        max_neighbors: int = 50,
+        ensemble_params: dict[str, Any] | None = None,
+    ) -> jnp.ndarray:
+        """Per-committee-member total energies, shape ``(M,)`` — no forces.
+
+        The cheap path for energy-only uncertainty: skips the force jacobian
+        that :meth:`members` computes. Single (non-ensemble) model → ``(1,)``.
+        The per-atom shift is added to every member (constant; irrelevant to
+        the committee std, kept for absolute-scale consistency).
+        """
+        safe_cell = self._safe_cell(cell)
+        energy_out = self._dynamics_model.apply(
+            self.model_params,
+            positions,
+            species,
+            safe_cell,
+            max_neighbors,
+            method=self._dynamics_model.calc_potential_energy,
+        )
+        members = energy_out if self.is_ensemble else energy_out[jnp.newaxis]
+        return self._apply_energy_shift(members, species)
 
     def max_neighbors_for(
         self,
@@ -337,11 +509,19 @@ class NeuralILBackend:
         """
         sc_a, sc_b, sc_c = self.supercell_trafo
         safe_cell = jnp.where(
-            jnp.trace(cell) == 0, 1000.0 * jnp.eye(3), cell,
+            jnp.trace(cell) == 0,
+            1000.0 * jnp.eye(3),
+            cell,
         )
         species = jnp.zeros(positions.shape[0], dtype=jnp.int32)
         return _get_max_number_of_neighbors(
-            positions, species, self.r_cutoff, safe_cell, sc_a, sc_b, sc_c,
+            positions,
+            species,
+            self.r_cutoff,
+            safe_cell,
+            sc_a,
+            sc_b,
+            sc_c,
         )
 
 
@@ -440,9 +620,15 @@ def create_neuralil(
         "NeuralIL backend created: r_cut=%.2f, elements=%s, supercell=%s, "
         "ensemble=%s, n_ensemble=%d, morse=%s, morse_type=%s, "
         "softcore=%s, softcore_kwargs=%s, energy_shift_per_atom=%g",
-        model_info.r_cut, model_info.sorted_elements, supercell_trafo,
-        is_ensemble, n_ensemble, has_morse, morse_type,
-        use_softcore, final_softcore_kwargs,
+        model_info.r_cut,
+        model_info.sorted_elements,
+        supercell_trafo,
+        is_ensemble,
+        n_ensemble,
+        has_morse,
+        morse_type,
+        use_softcore,
+        final_softcore_kwargs,
         energy_shift_per_atom,
     )
 

@@ -108,6 +108,64 @@ def eval_energy_and_forces(
     return res._replace(energy=energy, forces=-grad)
 
 
+def committee_uncertainty(
+    result: BackendResult,
+) -> tuple[jnp.ndarray, jnp.ndarray | None] | None:
+    """Committee (ensemble) uncertainty from a :class:`BackendResult`'s members.
+
+    Reduces the per-member slots populated by a committee backend's ``members``
+    method into uncertainty estimates:
+
+    - ``energy_std``: population standard deviation of the ``M`` member energies.
+    - ``force_std_per_atom``: per-atom RMS deviation of the force vector across
+      the committee, ``σ_i = sqrt(Σ_components Var_members(f[:, i, :]))``, shape
+      ``(N,)``. ``None`` when ``forces_members`` is unpopulated (energy-only).
+
+    Returns ``None`` when ``energy_members`` is absent (the backend is not a
+    committee). A single-member committee (``M = 1``) yields ``energy_std == 0``
+    and all-zero ``force_std_per_atom``.
+    """
+    if result.energy_members is None:
+        return None
+
+    energy_std = result.energy_members.std()
+
+    if result.forces_members is None:
+        force_std_per_atom = None
+    else:
+        force_var = result.forces_members.var(axis=0)  # (N, 3)
+        force_std_per_atom = jnp.sqrt(force_var.sum(axis=-1))  # (N,)
+
+    return energy_std, force_std_per_atom
+
+
+def get_committee_backend(backend: Any) -> Any | None:
+    """Unwrap wrapper backends to the underlying ensemble committee, if any.
+
+    Walks the ``.base`` chain (e.g. ``EnsembleBackend`` → ``SoftCoreBackend`` →
+    the committee backend) and returns the **innermost** backend that is a
+    committee — ``is_ensemble`` True and exposing a ``members`` method (for
+    committee uncertainty). The innermost is taken deliberately: wrapper
+    backends (e.g. ``EnsembleBackend``) forward attribute access to their base
+    via ``__getattr__``, so every wrapper *looks* committee-like; the real
+    committee is the deepest such backend (the one whose ``members`` is its own,
+    evaluated without the wrappers' per-run / soft-core machinery). Returns
+    ``None`` when no committee is present (single model / non-NN backend), so
+    callers can warn and skip uncertainty work.
+    """
+    seen: set[int] = set()
+    current = backend
+    committee = None
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "is_ensemble", False) and hasattr(
+            current, "members"
+        ):
+            committee = current
+        current = getattr(current, "base", None)
+    return committee
+
+
 @runtime_checkable
 class EnergyBackend(Protocol):
     """Protocol that all energy backends must satisfy.

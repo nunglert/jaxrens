@@ -38,7 +38,9 @@ class BackendConfig:
     cutoff: float | None = None
 
     # NeuralIL-specific
-    max_neighbors_list: list[int] = field(default_factory=lambda: [30, 35, 40, 45, 50])
+    max_neighbors_list: list[int] = field(
+        default_factory=lambda: [30, 35, 40, 45, 50]
+    )
     max_neighbors_offset: int = 5
 
     # Hysteresis-gated bucket shrinking (opt-in).  When ``shrink_dwell == 0``
@@ -137,6 +139,16 @@ class OutputConfig:
     # growing one dump per ``snapshot_interval``.  No-op for the h5/none
     # writers.
     snapshot_clean: bool = True
+
+    # Post-hoc committee-uncertainty annotation (Phase 4 / active learning).
+    # When ``write_uncertainty`` is True and the backend is an NN committee
+    # (ensemble), a post-run step annotates the written trajectory with
+    # per-frame ``ns_energy_std`` (and, when ``write_force_uncertainty``,
+    # per-atom ``ns_force_std``).  No effect on the sampling run itself; a
+    # non-committee backend just emits a warning and skips.
+    write_uncertainty: bool = False
+    write_force_uncertainty: bool = True
+    uncertainty_in_place: bool = False
 
 
 @dataclass(frozen=True)

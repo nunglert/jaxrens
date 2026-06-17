@@ -130,6 +130,17 @@ class OutputSpec(BaseModel):
     # ``snapshot_interval``.  Set False to retain every snapshot.
     snapshot_clean: bool = True
 
+    # Post-hoc committee-uncertainty annotation (Phase 4 / active learning).
+    # When ``write_uncertainty`` is True and the backend is an NN committee
+    # (ensemble), a post-run step annotates the written trajectory with
+    # per-frame ``ns_energy_std`` (+ per-atom ``ns_force_std`` when
+    # ``write_force_uncertainty``).  No effect on the run itself; a
+    # non-committee backend warns and skips.  The annotation can also be run
+    # standalone later via the ``annotate-uncertainty`` CLI subcommand.
+    write_uncertainty: bool = False
+    write_force_uncertainty: bool = True
+    uncertainty_in_place: bool = False
+
     @model_validator(mode="before")
     @classmethod
     def _accept_legacy_temperature_lag(cls, data: Any) -> Any:

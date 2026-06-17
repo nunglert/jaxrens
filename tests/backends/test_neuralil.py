@@ -153,6 +153,117 @@ class TestNeuralILBackend:
 
 
 @neuralil_required
+class TestNeuralILForces:
+    """Native ``energy_and_forces`` agrees with the autodiff fallback.
+
+    NeuralIL forces are the exact gradient of the energy, so the native
+    path (``calc_potential_energy_and_forces``) must reproduce ``-dE/dx``
+    obtained by differentiating ``__call__``.
+    """
+
+    @pytest.fixture
+    def backend(self):
+        from jaxrens.backends.neuralil import create_neuralil
+
+        return create_neuralil(
+            pickle_file=str(FIXTURE_DIR / "model.pkl"),
+            supercell_trafo=(1, 1, 1),
+        )
+
+    @pytest.fixture
+    def config(self):
+        ref = np.load(FIXTURE_DIR / "reference.npz", allow_pickle=True)
+        return (
+            jnp.array(ref["positions"]),
+            jnp.array(ref["types"], dtype=jnp.int32),
+            jnp.array(ref["cell"]),
+            int(ref["max_neighbors"]),
+        )
+
+    def test_native_forces_shape_and_finite(self, backend, config):
+        positions, species, cell, mn = config
+        res = backend.energy_and_forces(positions, species, cell, mn)
+        assert res.forces is not None
+        assert res.forces.shape == positions.shape
+        assert jnp.all(jnp.isfinite(res.forces))
+
+    def test_energy_matches_call(self, backend, config):
+        positions, species, cell, mn = config
+        e_call = backend(positions, species, cell, mn).energy
+        e_force = backend.energy_and_forces(
+            positions, species, cell, mn
+        ).energy
+        assert abs(float(e_call) - float(e_force)) < 1e-5
+
+    def test_native_forces_match_autodiff(self, backend, config):
+        positions, species, cell, mn = config
+
+        def energy_of(pos):
+            return backend(pos, species, cell, mn).energy
+
+        autodiff_forces = -jax.grad(energy_of)(positions)
+        native_forces = backend.energy_and_forces(
+            positions, species, cell, mn
+        ).forces
+
+        # Mathematically identical (-dE/dx); the gap is float32 + GPU
+        # non-determinism through the deep descriptor model (~1e-4 here).
+        np.testing.assert_allclose(
+            np.asarray(native_forces),
+            np.asarray(autodiff_forces),
+            atol=2e-3,
+            rtol=0.0,
+        )
+
+    def test_eval_energy_and_forces_dispatches_native(self, backend, config):
+        """``eval_energy_and_forces`` must route to the backend's native
+        method, not the autodiff fallback.
+
+        Native-vs-native differs only by GPU non-determinism (~1e-7), while
+        the autodiff fallback differs by ~1e-4, so a 1e-5 tolerance confirms
+        the dispatch took the native path.
+        """
+        from jaxrens.backends.base import eval_energy_and_forces
+
+        positions, species, cell, mn = config
+        res = eval_energy_and_forces(backend, positions, species, cell, mn)
+        native = backend.energy_and_forces(positions, species, cell, mn)
+        np.testing.assert_allclose(
+            np.asarray(res.forces),
+            np.asarray(native.forces),
+            atol=1e-5,
+            rtol=0.0,
+        )
+
+    def test_members_keeps_per_member_axis(self, backend, config):
+        """``members()`` keeps the ``(M, …)`` axis; reduced fields are the
+        committee means; ``committee_uncertainty`` returns finite σ."""
+        from jaxrens.backends.base import committee_uncertainty
+
+        positions, species, cell, mn = config
+        n_atoms = positions.shape[0]
+        m = backend.n_ensemble
+        res = backend.members(positions, species, cell, mn)
+
+        assert res.energy_members is not None
+        assert res.forces_members is not None
+        assert res.energy_members.shape == (m,)
+        assert res.forces_members.shape == (m, n_atoms, 3)
+        # Reduced fields are the member means.
+        assert abs(float(res.energy) - float(res.energy_members.mean())) < 1e-5
+        np.testing.assert_allclose(
+            np.asarray(res.forces),
+            np.asarray(res.forces_members.mean(axis=0)),
+            atol=1e-5,
+        )
+
+        e_std, f_std = committee_uncertainty(res)
+        assert float(e_std) >= 0.0
+        assert f_std.shape == (n_atoms,)
+        assert float(jnp.min(f_std)) >= 0.0
+
+
+@neuralil_required
 class TestNeuralILNSStep:
     """Test ns_step with the NeuralIL backend under JIT."""
 
