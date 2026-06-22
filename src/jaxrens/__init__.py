@@ -17,10 +17,18 @@ top of its ``__init__.py`` (float32 by default; opt into 64-bit with
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
+
 # Used only by the disabled top-level-API block below; uncomment to reinstate.
 # from typing import TYPE_CHECKING
 
-__version__ = "0.1.0"
+
+try:
+    # Single source of truth is the git tag (via setuptools-scm); report the
+    # installed package version.
+    __version__ = version("jaxrens")
+except PackageNotFoundError:  # running from a source tree with no install
+    __version__ = "0.0.0+unknown"
 
 # ===========================================================================
 # Curated top-level public API (lazy PEP 562 re-exports) — DISABLED.

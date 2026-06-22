@@ -1,10 +1,11 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=68.0", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "jaxrens"
-version = "0.1.0"
+# Version is derived from git tags by setuptools-scm (see [tool.setuptools_scm]).
+dynamic = ["version"]
 description = "JAX-based nested sampling for atomistic systems"
 readme = "README.md"
 license = "MIT"
@@ -60,6 +61,13 @@ jaxrens = "jaxrens.cli.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Version comes from git tags (e.g. ``v0.1.0`` -> ``0.1.0``); commits past a
+# tag get a dev version like ``0.1.1.dev3+g<sha>``. ``fallback_version`` keeps
+# installs working where git history/tags are unavailable (e.g. the .git-less
+# Docker CI build context or a shallow clone) instead of erroring.
+[tool.setuptools_scm]
+fallback_version = "0.0.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

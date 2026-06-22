@@ -28,6 +28,7 @@ reference/notation
 :hidden:
 
 dev/install
+dev/contributing
 ```
 
 # jaxrens documentation
