@@ -24,6 +24,7 @@ from jaxrens.backends._graph_neighbors import (
     _neighbor_mask,
     _supercell_edges,
 )
+from jaxrens.backends.base import BackendResult
 
 # Re-export the edge-finding helpers under the `mace` namespace for
 # backwards-compat with existing tests (`tests/test_mace.py` imports
@@ -193,7 +194,7 @@ class MACEBackend:
         cell: jnp.ndarray,
         max_neighbors: int = 50,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> tuple[jnp.ndarray, int, bool]:
+    ) -> BackendResult:
         n_atoms = positions.shape[0]
         max_edges = n_atoms * max_neighbors
 
@@ -219,7 +220,11 @@ class MACEBackend:
         out = model._energy_fn(data)
         energy = out["energy"][0]  # scalar energy for the real graph
 
-        return energy, true_max_per_atom, overflow
+        return BackendResult(
+            energy=energy,
+            max_neighbor_count=true_max_per_atom,
+            overflow=overflow,
+        )
 
     def max_neighbors_for(
         self,

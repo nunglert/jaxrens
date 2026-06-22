@@ -12,10 +12,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.base import MoveInfo
-from jaxrens.utils.cell import (
-    check_cell_shape,
-    transform_positions,
-)
+from jaxrens.utils.cell import check_cell_shape, transform_positions
 
 
 def _build_shear_cell(cell, shear_idx, rv1, rv2):
@@ -48,7 +45,9 @@ def _build_shear_cell(cell, shear_idx, rv1, rv2):
         v2_norm = v2_perp / jnp.linalg.norm(v2_perp)
         return cell.at[2].set(cell[2] + rv1 * v1_norm + rv2 * v2_norm)
 
-    return jax.lax.switch(shear_idx, [shear_0, shear_1, shear_2], (cell, rv1, rv2))
+    return jax.lax.switch(
+        shear_idx, [shear_0, shear_1, shear_2], (cell, rv1, rv2)
+    )
 
 
 def build_kernel(
@@ -79,11 +78,21 @@ def build_kernel(
         rv1, rv2 = rvs[0], rvs[1]
 
         new_cell = _build_shear_cell(state.cell, shear_idx, rv1, rv2)
-        new_positions = transform_positions(state.positions, state.cell, new_cell)
+        new_positions = transform_positions(
+            state.positions, state.cell, new_cell
+        )
 
-        new_energy, count, overflow = backend(
-            new_positions, state.types, new_cell, state.max_neighbors,
+        result = backend(
+            new_positions,
+            state.types,
+            new_cell,
+            state.max_neighbors,
             ensemble_params=state.ensemble_params,
+        )
+        new_energy, count, overflow = (
+            result.energy,
+            result.max_neighbor_count,
+            result.overflow,
         )
 
         cell_valid = check_cell_shape(
@@ -94,7 +103,8 @@ def build_kernel(
         accepted = energy_ok & cell_valid
 
         reject_reason = jnp.where(
-            accepted, jnp.int32(0),
+            accepted,
+            jnp.int32(0),
             jnp.where(~energy_ok, jnp.int32(1), jnp.int32(2)),
         )
 

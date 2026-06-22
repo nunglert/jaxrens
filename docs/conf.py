@@ -106,15 +106,23 @@ autodoc_pydantic_model_show_field_summary = False
 autodoc_pydantic_model_show_config = False
 autodoc_pydantic_model_show_config_summary = False
 autodoc_pydantic_model_show_validator_members = False
+autodoc_pydantic_model_show_validator_summary = False
 autodoc_pydantic_model_member_order = "bysource"
 autodoc_pydantic_settings_show_json = False
 autodoc_pydantic_settings_show_field_summary = False
 autodoc_pydantic_settings_show_config = False
 autodoc_pydantic_settings_show_config_summary = False
 autodoc_pydantic_settings_show_validator_members = False
+autodoc_pydantic_settings_show_validator_summary = False
 autodoc_pydantic_settings_member_order = "bysource"
 autodoc_pydantic_field_list_validators = False
 autodoc_pydantic_field_show_constraints = False
+# Suppress the prose ``Field(description=...)`` text in the config reference so
+# the page stays a scannable overview (name · type · default · constraints).
+# The schema fields carry no attribute docstrings, so the "docstring" policy
+# renders no body. Descriptions still live in the schema and ``dump-schema``
+# JSON; prose explanations live in the concept pages.
+autodoc_pydantic_field_doc_policy = "docstring"
 
 
 # Notebook execution toggle. "auto" runs every tutorial at build time

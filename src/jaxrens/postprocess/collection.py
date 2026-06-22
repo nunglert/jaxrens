@@ -171,8 +171,12 @@ class MonitorCollection:
         each ``.energies`` log is stashed on each Monitor as
         ``volume_trace`` so callers can compute ``<V>(T)`` separately.
 
-        For single-run checkpoints (no batch axis) this delegates to
-        ``Monitor.from_directory`` and returns a one-element collection.
+        For single-run checkpoints (no batch axis) this builds a one-element
+        collection using the same convention as the multi-run path (reading
+        the ``<prefix>.energies`` log, ``dead_volumes=None``, bare volume
+        stashed as ``volume_trace``) rather than delegating to
+        ``Monitor.from_directory``, so single- and multi-replica collections
+        behave identically.
 
         Config auto-discovery: when ``config`` is ``None`` the constructor
         looks for ``config.yaml`` in ``path`` and then in ``path.parent``
@@ -271,24 +275,32 @@ class MonitorCollection:
             else None
         )
 
-        # Single-run checkpoint (no batch axis): delegate.
+        # Resolve leading batch axes → n_total replicas, funnelling all cases
+        # through the same per-replica construction loop below.  A 1-D
+        # ``energies`` is a single-run checkpoint (one replica, no batch
+        # axis); 2-D is a flat ``(P,)`` sweep; 3-D a ``(G, P)`` grid.  The
+        # single-run case is built here rather than delegated to
+        # ``Monitor.from_directory`` so single- and multi-replica collections
+        # carry identical conventions: ``dead_volumes=None`` (energy column is
+        # the full thermal variable) with the bare cell volume stashed as
+        # ``volume_trace``.  Delegating instead yielded a Monitor that lacked
+        # ``volume_trace`` and folded the volume column into log Z.
         if live_E.ndim == 1:
-            label = labels[0] if labels else None
-            return cls(
-                [Monitor.from_directory(
-                    path, label=label, prefix=prefix, prefer_final=prefer_final,
-                )]
-            )
-
-        # Multi-run: flatten leading batch axes (P,) or (G, P) → n_total.
-        if live_E.ndim == 2:
+            n_total = 1
+            single_run = True
+            live_E_flat = live_E[None, :]
+            log_Z_flat = np.atleast_1d(log_Z)
+            iter_flat = np.atleast_1d(iteration)
+        elif live_E.ndim == 2:
             n_total = live_E.shape[0]
+            single_run = False
             live_E_flat = live_E
             log_Z_flat = log_Z
             iter_flat = iteration
         elif live_E.ndim == 3:
             G, P, K = live_E.shape
             n_total = G * P
+            single_run = False
             live_E_flat = live_E.reshape(n_total, K)
             log_Z_flat = log_Z.reshape(n_total)
             iter_flat = iteration.reshape(n_total)
@@ -312,7 +324,11 @@ class MonitorCollection:
 
         monitors: list[Monitor] = []
         for i in range(n_total):
-            elog_path = path / f"{prefix}.run{i:02d}.energies"
+            elog_path = (
+                path / f"{prefix}.energies"
+                if single_run
+                else path / f"{prefix}.run{i:02d}.energies"
+            )
             if not elog_path.exists():
                 raise FileNotFoundError(
                     f"Per-replica energies file missing: {elog_path}"

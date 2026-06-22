@@ -54,13 +54,23 @@ def build_kernel(
         # HIGHEST precision: TF32 (10-bit mantissa on GPU) corrupts positions@T
         # by ~3.7e-3 even for identity T, spiking LJ energy at dense packing.
         new_positions = jnp.einsum(
-            "ij,jk->ik", state.positions, transform,
+            "ij,jk->ik",
+            state.positions,
+            transform,
             precision=jax.lax.Precision.HIGHEST,
         )
 
-        new_energy, count, overflow = backend(
-            new_positions, state.types, new_cell, state.max_neighbors,
+        result = backend(
+            new_positions,
+            state.types,
+            new_cell,
+            state.max_neighbors,
             ensemble_params=state.ensemble_params,
+        )
+        new_energy, count, overflow = (
+            result.energy,
+            result.max_neighbor_count,
+            result.overflow,
         )
 
         cell_valid = check_cell_shape(
@@ -71,7 +81,8 @@ def build_kernel(
         accepted = energy_ok & cell_valid
 
         reject_reason = jnp.where(
-            accepted, jnp.int32(0),
+            accepted,
+            jnp.int32(0),
             jnp.where(~energy_ok, jnp.int32(1), jnp.int32(2)),
         )
 

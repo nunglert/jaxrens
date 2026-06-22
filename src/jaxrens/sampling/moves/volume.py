@@ -55,14 +55,24 @@ def build_kernel(
         # HIGHEST precision: TF32 (10-bit mantissa on GPU) corrupts positions@T
         # by ~3.7e-3 even for identity T, spiking LJ energy at dense packing.
         new_positions = jnp.einsum(
-            "ij,jk->ik", state.positions, transform,
+            "ij,jk->ik",
+            state.positions,
+            transform,
             precision=jax.lax.Precision.HIGHEST,
         )
 
         # Evaluate energy
-        new_energy, count, overflow = backend(
-            new_positions, state.types, new_cell, state.max_neighbors,
+        result = backend(
+            new_positions,
+            state.types,
+            new_cell,
+            state.max_neighbors,
             ensemble_params=state.ensemble_params,
+        )
+        new_energy, count, overflow = (
+            result.energy,
+            result.max_neighbor_count,
+            result.overflow,
         )
 
         # Check cell shape validity
@@ -72,7 +82,7 @@ def build_kernel(
 
         # Volume prior acceptance
         p_accept = jnp.where(
-            flat_v_prior, 1.0, jnp.minimum(1.0, vol_ratio ** n_atoms)
+            flat_v_prior, 1.0, jnp.minimum(1.0, vol_ratio**n_atoms)
         )
 
         # Accept/reject — order matters for reject_reason attribution
@@ -83,9 +93,13 @@ def build_kernel(
         # Reject priority: energy > cell > prior (so energy reason is reported
         # when multiple reasons apply — usually the most actionable signal)
         reject_reason = jnp.where(
-            accepted, jnp.int32(0),
-            jnp.where(~energy_ok, jnp.int32(1),
-                      jnp.where(~cell_valid, jnp.int32(2), jnp.int32(3))),
+            accepted,
+            jnp.int32(0),
+            jnp.where(
+                ~energy_ok,
+                jnp.int32(1),
+                jnp.where(~cell_valid, jnp.int32(2), jnp.int32(3)),
+            ),
         )
 
         # Gate the bucket-sizing signals on ``cell_valid``: hard cell-shape

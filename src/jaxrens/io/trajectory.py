@@ -25,11 +25,18 @@ class ExtxyzTrajectoryWriter:
         wrap: bool = True,
         mode: str = "w",
         restart_iteration: int = 0,
+        clean_snapshots: bool = False,
     ):
         self.path = Path(path)
         self.symbol_map = symbol_map
         self.wrap = wrap
         self._mode = mode
+        self.clean_snapshots = clean_snapshots
+        # Path of the most recently written walker snapshot.  When
+        # ``clean_snapshots`` is set we delete it as soon as the *next*
+        # snapshot is safely on disk (so the directory keeps at most one
+        # walker snapshot, but a complete one always exists).
+        self._prev_snapshot_path: Path | None = None
         # First write of a run with mode="w" must overwrite any leftover
         # file; subsequent writes within the same run must append so frames
         # accumulate instead of replacing each other.
@@ -79,6 +86,26 @@ class ExtxyzTrajectoryWriter:
 
         ase_write(str(snapshot_path), atoms_list)
 
+        # snapshot_clean: now that the new snapshot is fully on disk, drop
+        # the previous one (the "second last") so the output directory
+        # doesn't accumulate one walker dump per interval.  Deleting only
+        # after the new write guarantees at least one complete snapshot
+        # always exists, even if the run crashes mid-write.
+        if (
+            self.clean_snapshots
+            and self._prev_snapshot_path is not None
+            and self._prev_snapshot_path != snapshot_path
+        ):
+            try:
+                self._prev_snapshot_path.unlink()
+            except OSError as exc:
+                logger.warning(
+                    "snapshot_clean: could not delete previous snapshot %s: %s",
+                    self._prev_snapshot_path,
+                    exc,
+                )
+        self._prev_snapshot_path = snapshot_path
+
     def close(self) -> None:
         pass
 
@@ -92,6 +119,7 @@ class H5TrajectoryWriter:
         symbol_map: dict[int, str],
         mode: str = "w",
         restart_iteration: int = 0,
+        clean_snapshots: bool = False,
     ):
         import h5py
 
@@ -99,6 +127,13 @@ class H5TrajectoryWriter:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.symbol_map = symbol_map
         self._mode = mode
+        self.clean_snapshots = clean_snapshots
+        # Name of the most recently written snapshot group.  When
+        # ``clean_snapshots`` is set we delete it once the next snapshot
+        # group is written.  HDF5 does not return freed bytes to the OS, but
+        # its free-space manager reuses them for subsequent same-size writes,
+        # so the file stays bounded instead of growing one group per snapshot.
+        self._prev_snapshot_name: str | None = None
         # Restart: drop per-iteration groups flushed past the checkpoint.
         # Done before opening so the append handle sees the rewound file.
         if mode == "a" and restart_iteration > 0:
@@ -120,9 +155,43 @@ class H5TrajectoryWriter:
     def write_walker_snapshot(
         self, iteration: int, walkers: Any
     ) -> None:
-        grp = self._file.create_group(f"snapshot_{iteration}")
-        grp.create_dataset("positions", data=np.asarray(walkers["positions"]))
-        grp.create_dataset("energies", data=np.asarray(walkers["energies"]))
+        from jaxrens.io.formats import walker_to_h5_group
+
+        grp_name = f"snapshot_{iteration}"
+        grp = self._file.create_group(grp_name)
+        grp.attrs["iteration"] = iteration
+
+        # Store the full per-walker state (positions, types, energy, box) in
+        # one subgroup per walker, mirroring the extxyz writer's per-frame
+        # dump.  ``walker_to_h5_group`` is the same helper used for dead
+        # points, so snapshots round-trip via ``h5_group_to_walker``.
+        positions = np.asarray(walkers["positions"])
+        types = np.asarray(walkers["types"])
+        energies = np.asarray(walkers["energies"])
+        cells = walkers.get("cells")
+        cells = np.asarray(cells) if cells is not None else None
+        grp.attrs["n_walkers"] = positions.shape[0]
+
+        for i in range(positions.shape[0]):
+            w = {
+                "positions": positions[i],
+                "types": types[i],
+                "energy": energies[i],
+            }
+            if cells is not None:
+                w["box"] = cells[i]
+            walker_to_h5_group(grp.create_group(f"walker_{i}"), w)
+
+        # snapshot_clean: drop the previous snapshot group now that the new
+        # one is fully written, keeping only the latest in the file.
+        if (
+            self.clean_snapshots
+            and self._prev_snapshot_name is not None
+            and self._prev_snapshot_name != grp_name
+            and self._prev_snapshot_name in self._file
+        ):
+            del self._file[self._prev_snapshot_name]
+        self._prev_snapshot_name = grp_name
 
     def close(self) -> None:
         self._file.close()

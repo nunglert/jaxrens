@@ -3,13 +3,21 @@
 Provides dummy data, known-answer toy problems, and helper functions
 used across test modules.
 
-Also handles **pytest-xdist GPU pinning**: when running under ``pytest -n
-N`` on a multi-GPU host, each worker is pinned to its own GPU via
-``CUDA_VISIBLE_DEVICES`` *before* JAX is imported.  JAX preallocates
-~75% VRAM per process, so two workers on the same GPU OOM at startup —
-sharing a GPU between processes is not supported by design.  Multi-GPU
-integration tests (``-m multi_gpu``) need every device visible and must
-be run in a separate, non-xdist invocation.
+Also handles **GPU visibility** so the device count a test sees matches
+the execution model:
+
+* Under ``pytest -n N`` each xdist worker is pinned to its own GPU via
+  ``CUDA_VISIBLE_DEVICES`` *before* JAX is imported.  JAX preallocates
+  ~75% VRAM per process, so two workers on the same GPU OOM at startup —
+  sharing a GPU between processes is not supported by design.
+* Without ``-n`` (single-process run), tests are pinned to **one** GPU.
+  Otherwise JAX would register every local device, and device-count-
+  sensitive tests (e.g. replica/topology resolution) would behave as if
+  multiple GPUs were in play — which the default suite does not intend.
+
+The opt-in multi-GPU suite (``-m multi_gpu``) genuinely needs every device
+visible; it is exempt from the single-GPU pin and must be run in its own,
+non-xdist invocation.
 """
 
 from __future__ import annotations
@@ -18,16 +26,28 @@ import os
 import subprocess
 
 
+def _visible_gpu_count() -> int:
+    """Count GPUs reported by ``nvidia-smi -L`` (0 if none / unavailable)."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "-L"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return 0  # no GPU / no nvidia-smi → leave JAX on CPU
+    return sum(1 for line in out.splitlines() if line.startswith("GPU "))
+
+
 def _pin_xdist_worker_to_gpu() -> None:
     """Pin each pytest-xdist worker to a distinct GPU.
 
     Reads ``PYTEST_XDIST_WORKER`` (set by xdist to ``gw0``, ``gw1``, ...
-    inside each worker subprocess), counts visible GPUs via
-    ``nvidia-smi -L``, and sets ``CUDA_VISIBLE_DEVICES = str(worker_id)``
-    so each worker sees exactly one device.  Must run before any
-    ``import jax`` because JAX reads ``CUDA_VISIBLE_DEVICES`` once at
-    backend init and preallocates ~75% of that GPU's VRAM — two workers
-    on the same GPU OOM at startup, and JAX cannot share a device
+    inside each worker subprocess) and sets ``CUDA_VISIBLE_DEVICES =
+    str(worker_id)`` so each worker sees exactly one device.  Must run
+    before any ``import jax`` because JAX reads ``CUDA_VISIBLE_DEVICES``
+    once at backend init and preallocates ~75% of that GPU's VRAM — two
+    workers on the same GPU OOM at startup, and JAX cannot share a device
     between processes.
 
     No-op when:
@@ -48,16 +68,7 @@ def _pin_xdist_worker_to_gpu() -> None:
     if cvd and "," not in cvd:
         return  # caller already pinned to a single device, respect that
 
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "-L"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return  # no GPU / no nvidia-smi → leave JAX on CPU
-
-    n_gpus = sum(1 for line in out.splitlines() if line.startswith("GPU "))
+    n_gpus = _visible_gpu_count()
     if n_gpus == 0:
         return
 
@@ -72,6 +83,58 @@ def _pin_xdist_worker_to_gpu() -> None:
 
 
 _pin_xdist_worker_to_gpu()
+
+
+def _multi_gpu_selected(config) -> bool:
+    """Whether the active ``-m`` expression selects the ``multi_gpu`` suite.
+
+    Evaluated against pytest's own marker-expression parser so compound
+    expressions (``not multi_gpu``, the default ``not ... and not
+    multi_gpu`` from addopts) resolve correctly, not by substring match.
+    """
+    markexpr = getattr(config.option, "markexpr", "") or ""
+    if not markexpr:
+        return False
+    try:
+        from _pytest.mark.expression import Expression
+
+        return Expression.compile(markexpr).evaluate(
+            lambda name: name == "multi_gpu"
+        )
+    except Exception:
+        # Parser/API drift: conservative fallback (positive mention only).
+        return "multi_gpu" in markexpr and "not multi_gpu" not in markexpr
+
+
+def pytest_configure(config) -> None:
+    """Outside pytest-xdist, restrict the session to a single GPU.
+
+    Runs before collection (and thus before JAX is imported inside any
+    fixture), so setting ``CUDA_VISIBLE_DEVICES`` here still takes effect
+    at JAX backend init.  Deliberately a no-op for:
+
+    * xdist workers — already pinned in ``_pin_xdist_worker_to_gpu``;
+    * the xdist controller (``-n`` set) — workers claim their own device,
+      the controller must leave every GPU visible to hand them out;
+    * a caller-provided single-device ``CUDA_VISIBLE_DEVICES``;
+    * the ``-m multi_gpu`` suite, which needs every device;
+    * CPU-only hosts (no ``nvidia-smi`` / zero GPUs).
+    """
+    if os.environ.get("PYTEST_XDIST_WORKER", "").startswith("gw"):
+        return  # xdist worker: pinned at import
+    if getattr(config.option, "numprocesses", None):
+        return  # xdist controller: leave all GPUs visible for the workers
+
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if cvd and "," not in cvd:
+        return  # caller already pinned to a single device, respect that
+    if _multi_gpu_selected(config):
+        return  # multi-GPU suite needs every device
+    if _visible_gpu_count() == 0:
+        return  # CPU-only host
+
+    # Restrict to the first visible device (respect an explicit list's head).
+    os.environ["CUDA_VISIBLE_DEVICES"] = cvd.split(",")[0] if cvd else "0"
 
 
 # JAX (and anything that pulls it transitively, like jaxrens.state.*) is

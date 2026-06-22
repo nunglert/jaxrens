@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from jaxrens.backends.base import BackendResult
 from jaxrens.backends.toy import create_harmonic
 from jaxrens.sampling.moves.random_walk import build_kernel as rw_build_kernel
 from jaxrens.sampling.moves.galilean import build_kernel as gmc_build_kernel
@@ -406,7 +407,7 @@ class TestGalileanBaldockSemantics:
             # (forcing every proposed step to NaN-out).
             diff = jnp.any(jnp.abs(p - nan_check_pos) > 1e-6)
             e = jnp.where(diff, jnp.nan, 0.25)
-            return e, 0, False
+            return BackendResult(energy=e)
 
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
         step = jax.jit(gmc_build_kernel(nan_backend, n_reflect=3, use_forces=False))

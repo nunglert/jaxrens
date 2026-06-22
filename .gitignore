@@ -17,11 +17,10 @@ build/
 .venv/
 experiments/*
 # Allowlist the lj8_npt postprocessing fixture used by
-# tests/test_postprocess_monitor.py::TestSmokeRealRun.
-!experiments/examples/
-!experiments/examples/**
-!experiments/examples/**/*.h5
-!experiments/examples/**/*.extxyz
+# tests/postprocess/test_monitor.py::TestSmokeRealRun.
+!tests/data/**/*.h5
+!tests/data/**/*.extxyz
+!tests/data/**/*.npz
 .vscode
 WORKLOG.md
 .claude

@@ -37,6 +37,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from jaxrens.backends.base import eval_energy_and_forces
 from jaxrens.base import MoveInfo
 
 
@@ -101,23 +102,31 @@ def build_kernel(
             new_pos = pos + state.step_size * direction
 
             if use_forces:
-                # Energy + forces via autodiff through backend
-                def energy_fn(p):
-                    e, count, overflow = backend(
-                        p, state.types, state.cell, max_neighbors,
-                        ensemble_params=ensemble_params,
-                    )
-                    return e, (count, overflow)
-
-                (new_energy, (count, overflow)), grad = jax.value_and_grad(
-                    energy_fn, has_aux=True
-                )(new_pos)
-            else:
-                new_energy, count, overflow = backend(
-                    new_pos, state.types, state.cell, max_neighbors,
+                # Energy + forces; backend uses its native force path when
+                # available, otherwise eval_energy_and_forces autodiffs.
+                res = eval_energy_and_forces(
+                    backend,
+                    new_pos,
+                    state.types,
+                    state.cell,
+                    max_neighbors,
                     ensemble_params=ensemble_params,
                 )
-                grad = None
+                force = res.forces
+            else:
+                res = backend(
+                    new_pos,
+                    state.types,
+                    state.cell,
+                    max_neighbors,
+                    ensemble_params=ensemble_params,
+                )
+                force = None
+            new_energy, count, overflow = (
+                res.energy,
+                res.max_neighbor_count,
+                res.overflow,
+            )
 
             # Accumulate overflow tracking
             acc_count = jnp.maximum(acc_count, count)
@@ -133,9 +142,15 @@ def build_kernel(
             violated = new_energy >= likelihood_constraint
 
             if use_forces:
-                grad_norm = jnp.sqrt(jnp.sum(grad**2))
-                f_hat = grad / jnp.maximum(grad_norm, 1e-10)
-                reflected_dir = direction - 2.0 * jnp.sum(f_hat * direction) * f_hat
+                # Reflect off the constraint surface normal. The force is
+                # antiparallel to the energy gradient, and the reflection
+                # d - 2(n·d)n is invariant under n -> -n, so using the force
+                # direction is identical to using the gradient.
+                f_norm = jnp.sqrt(jnp.sum(force**2))
+                f_hat = force / jnp.maximum(f_norm, 1e-10)
+                reflected_dir = (
+                    direction - 2.0 * jnp.sum(f_hat * direction) * f_hat
+                )
             else:
                 reflected_dir = _random_direction(step_key, direction.shape)
 
@@ -147,16 +162,29 @@ def build_kernel(
             pos_out = new_pos
             energy_out = new_energy
 
-            return (pos_out, direction_out, energy_out, acc_count, acc_overflow), None
+            return (
+                pos_out,
+                direction_out,
+                energy_out,
+                acc_count,
+                acc_overflow,
+            ), None
 
         reflect_keys = jax.random.split(key_reflect, n_reflect)
         init_carry = (
-            state.positions, direction, state.energy,
-            state.max_neighbor_count, state.overflow,
+            state.positions,
+            direction,
+            state.energy,
+            state.max_neighbor_count,
+            state.overflow,
         )
-        (final_pos, final_dir, final_energy, acc_count, acc_overflow), _ = (
-            jax.lax.scan(reflect_step, init_carry, reflect_keys)
-        )
+        (
+            final_pos,
+            final_dir,
+            final_energy,
+            acc_count,
+            acc_overflow,
+        ), _ = jax.lax.scan(reflect_step, init_carry, reflect_keys)
 
         # Accept if final energy < Emax
         accepted = final_energy < likelihood_constraint

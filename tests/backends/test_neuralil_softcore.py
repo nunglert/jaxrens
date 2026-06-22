@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jaxrens.backends.neuralil import is_available, _NEURALIL_IMPORT_ERROR
+from jaxrens.backends.neuralil import _NEURALIL_IMPORT_ERROR, is_available
 
 neuralil_required = pytest.mark.skipif(
     not is_available(),
@@ -57,7 +57,9 @@ def _build_softcore_model(n_types=2, embed_d=4, r_cutoff=4.0, n_max=3):
     from neuralil.bessel_descriptors import PowerSpectrumGenerator
     from neuralil.model import ResNetCore
 
-    descriptor_gen = PowerSpectrumGenerator(n_max, r_cutoff, n_types, (1, 1, 1))
+    descriptor_gen = PowerSpectrumGenerator(
+        n_max, r_cutoff, n_types, (1, 1, 1)
+    )
     core_model = ResNetCore([8, 4])
     return SoftCoreNeuralIL(
         n_types,
@@ -79,7 +81,9 @@ def _build_plain_model(n_types=2, embed_d=4, r_cutoff=4.0, n_max=3):
     from neuralil.bessel_descriptors import PowerSpectrumGenerator
     from neuralil.model import NeuralIL, ResNetCore
 
-    descriptor_gen = PowerSpectrumGenerator(n_max, r_cutoff, n_types, (1, 1, 1))
+    descriptor_gen = PowerSpectrumGenerator(
+        n_max, r_cutoff, n_types, (1, 1, 1)
+    )
     core_model = ResNetCore([8, 4])
     return NeuralIL(
         n_types,
@@ -270,9 +274,9 @@ class TestSoftCorePlainEnsemble:
         with no ``soft_core`` or ``morse`` leaves."""
         inner = params.get("params", params)
         # PlainEnsemble nests the NeuralIL submodule under "neuralil".
-        assert "neuralil" in inner, (
-            f"Expected 'neuralil' key in ensemble params, got {inner.keys()}"
-        )
+        assert (
+            "neuralil" in inner
+        ), f"Expected 'neuralil' key in ensemble params, got {inner.keys()}"
         sub_keys = set(inner["neuralil"].keys())
         # Standard NeuralIL has core_model + embed + denormalizer.
         assert "morse" not in sub_keys, (
@@ -298,7 +302,10 @@ class TestSoftCorePlainEnsemble:
         )
         softcore = FixedRepulsiveMorse(A0, B0, D0, R_CORE_CUT, R_CORE_SWITCH)
         morse_atomic = softcore.apply(
-            {}, radii, types, all_types,
+            {},
+            radii,
+            types,
+            all_types,
             method=softcore.calc_atomic_energies,
         )
         # Shape is (n_atoms,) — single evaluation, no ensemble axis.
@@ -312,6 +319,165 @@ class TestSoftCorePlainEnsemble:
         # Atoms 2 and 3 are well past r_core_cut → ~0.
         assert abs(float(morse_atomic[2])) < 1e-3
         assert abs(float(morse_atomic[3])) < 1e-3
+
+
+@neuralil_required
+@softcore_required
+class TestSoftCoreEnsembleForces:
+    """Native ``energy_and_forces`` on an ensemble soft-core backend.
+
+    Confirms the ``(n_ensemble, N, 3)`` member-force Jacobian is reduced to
+    the committee mean ``(N, 3)`` (mirroring the energy ``.mean()``), and that
+    the soft-core repulsion is included in the native forces (they match the
+    autodiff fallback of the full ``__call__``).
+    """
+
+    @pytest.fixture
+    def backend(self):
+        from jaxrens.backends.neuralil import NeuralILBackend
+
+        n_ensemble = 3
+        model = SoftCorePlainEnsemble(
+            _build_softcore_model(), n_models=n_ensemble
+        )
+        key = jax.random.key(0)
+        params = model.init(
+            key,
+            _far_positions(),
+            _types(),
+            _cell(),
+            max_neighbors=8,
+            method=model.calc_potential_energy,
+        )
+        return NeuralILBackend(
+            model_params=params,
+            r_cutoff=4.0,
+            sorted_elements=["H", "Si"],
+            supercell_trafo=(1, 1, 1),
+            n_max=3,
+            embed_d=4,
+            core_widths=[8, 4],
+            is_ensemble=True,
+            has_morse=False,
+            n_ensemble=n_ensemble,
+            softcore=True,
+        )
+
+    def test_force_reduced_to_per_atom_mean(self, backend):
+        positions, species, cell = _far_positions(), _types(), _cell()
+        res = backend.energy_and_forces(positions, species, cell, 8)
+        assert res.forces is not None
+        # Reduced over the ensemble axis: one (N, 3) force, not (n_ens, N, 3).
+        assert res.forces.shape == positions.shape
+
+    def test_native_forces_match_autodiff(self, backend):
+        positions, species, cell = _close_positions(), _types(), _cell()
+
+        def energy_of(pos):
+            return backend(pos, species, cell, 8).energy
+
+        autodiff_forces = -jax.grad(energy_of)(positions)
+        native_forces = backend.energy_and_forces(
+            positions, species, cell, 8
+        ).forces
+        np.testing.assert_allclose(
+            np.asarray(native_forces),
+            np.asarray(autodiff_forces),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+    def test_members_committee_uncertainty(self, backend):
+        """``members()`` keeps the per-member axis; ``committee_uncertainty``
+        reduces it to energy-σ + per-atom force-σ, both > 0 for a real
+        (random-init) committee."""
+        from jaxrens.backends.base import committee_uncertainty
+
+        positions, species, cell = _close_positions(), _types(), _cell()
+        n_atoms = positions.shape[0]
+        res = backend.members(positions, species, cell, 8)
+
+        assert res.energy_members.shape == (3,)  # n_ensemble = 3
+        assert res.forces_members.shape == (3, n_atoms, 3)
+        # Reduced fields are the committee means.
+        assert abs(float(res.energy) - float(res.energy_members.mean())) < 1e-5
+        np.testing.assert_allclose(
+            np.asarray(res.forces),
+            np.asarray(res.forces_members.mean(axis=0)),
+            atol=1e-5,
+        )
+
+        e_std, f_std = committee_uncertainty(res)
+        assert float(e_std) > 0.0
+        assert f_std.shape == (n_atoms,)
+        assert float(jnp.min(f_std)) >= 0.0
+        assert float(jnp.max(f_std)) > 0.0
+
+    def test_get_committee_backend_unwraps(self, backend):
+        from jaxrens.backends.base import get_committee_backend
+        from jaxrens.backends.ensemble import EnsembleBackend
+
+        # The committee backend itself is returned directly.
+        assert get_committee_backend(backend) is backend
+        # And it is found through an EnsembleBackend (per-run) wrapper.
+        wrapped = EnsembleBackend(backend, pressure=0.0)
+        assert get_committee_backend(wrapped) is backend
+
+    def test_get_committee_backend_none_for_non_committee(self):
+        from jaxrens.backends.base import get_committee_backend
+
+        assert get_committee_backend(object()) is None
+        assert get_committee_backend(None) is None
+
+
+@neuralil_required
+class TestSingleModelMembers:
+    """A non-ensemble model: ``members()`` adds a leading M=1 axis so the
+    ``(M, …)`` contract holds, and the committee spread is exactly zero."""
+
+    @pytest.fixture
+    def backend(self):
+        from jaxrens.backends.neuralil import NeuralILBackend
+
+        model = _build_plain_model()
+        key = jax.random.key(0)
+        params = model.init(
+            key,
+            _far_positions(),
+            _types(),
+            _cell(),
+            max_neighbors=8,
+            method=model.calc_potential_energy,
+        )
+        return NeuralILBackend(
+            model_params=params,
+            r_cutoff=4.0,
+            sorted_elements=["H", "Si"],
+            supercell_trafo=(1, 1, 1),
+            n_max=3,
+            embed_d=4,
+            core_widths=[8, 4],
+            is_ensemble=False,
+            has_morse=False,
+            n_ensemble=1,
+            softcore=False,
+        )
+
+    def test_members_m1_zero_spread(self, backend):
+        from jaxrens.backends.base import committee_uncertainty
+
+        positions, species, cell = _far_positions(), _types(), _cell()
+        n_atoms = positions.shape[0]
+        res = backend.members(positions, species, cell, 8)
+
+        assert res.energy_members.shape == (1,)
+        assert res.forces_members.shape == (1, n_atoms, 3)
+        assert abs(float(res.energy) - float(res.energy_members.mean())) < 1e-6
+
+        e_std, f_std = committee_uncertainty(res)
+        assert float(e_std) == 0.0
+        assert f_std.shape == (n_atoms,)
+        assert float(jnp.max(jnp.abs(f_std))) == 0.0
 
 
 # ---------------------------------------------------------------------------

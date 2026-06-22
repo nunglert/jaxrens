@@ -33,6 +33,8 @@ from typing import Any
 
 import jax.numpy as jnp
 
+from jaxrens.backends.base import BackendResult
+
 DEFAULT_SOFTCORE_KWARGS: dict[str, float] = {
     "a0": 1.0,
     "b0": 3.0,
@@ -167,9 +169,9 @@ class SoftCoreBackend:
         cell: jnp.ndarray,
         max_neighbors: int,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> tuple[jnp.ndarray, int, bool]:
-        """Return ``(U + E_core, count, overflow)`` from the wrapped backend."""
-        U, count, overflow = self.base(
+    ) -> BackendResult:
+        """Return the wrapped backend's result with ``E_core`` added to energy."""
+        res = self.base(
             positions, species, cell, max_neighbors,
             ensemble_params=ensemble_params,
         )
@@ -178,7 +180,7 @@ class SoftCoreBackend:
             self.a0, self.b0, self.d0,
             self.r_core_switch, self.r_core_cut,
         )
-        return U + E_core, count, overflow
+        return res._replace(energy=res.energy + E_core)
 
     def __getattr__(self, name: str) -> Any:
         # Called only when normal lookup fails, so this does not shadow

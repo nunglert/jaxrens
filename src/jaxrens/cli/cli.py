@@ -15,7 +15,7 @@ import logging
 import re
 import sys
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -85,9 +85,12 @@ def _deep_set(d: dict[str, Any], path: list[str | int], value: Any) -> None:
         node[last] = value
 
 
-def _apply_overrides(raw: dict[str, Any], overrides: list[str]) -> dict[str, Any]:
+def _apply_overrides(
+    raw: dict[str, Any], overrides: list[str]
+) -> dict[str, Any]:
     """Return a copy of *raw* with all ``--set`` overrides applied."""
     import copy
+
     d = copy.deepcopy(raw)
     for spec in overrides:
         path, value = _parse_set_override(spec)
@@ -98,6 +101,7 @@ def _apply_overrides(raw: dict[str, Any], overrides: list[str]) -> dict[str, Any
 # ---------------------------------------------------------------------------
 # Subcommand implementations
 # ---------------------------------------------------------------------------
+
 
 def _load_and_validate(config_path: str, overrides: list[str]) -> RootSpec:
     from jaxrens.cli.schema import RootSpec
@@ -146,7 +150,9 @@ def _assert_n_gpus(expected: int | None) -> int:
     if expected is None:
         return 0
     import os
+
     import jax
+
     devices = jax.local_devices()
     n_visible = len(devices)
     if n_visible == expected:
@@ -243,10 +249,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # init slot.  Downstream Mode-D logic in the resolver kicks in as
         # if the user had set ``init.restart_file`` explicitly.
         chosen = discover_checkpoint(
-            root.output.working_dir, root.output.out_file_prefix,
+            root.output.working_dir,
+            root.output.out_file_prefix,
         )
         root = root.model_copy(
-            update={"init": root.init.model_copy(update={"restart_file": chosen})},
+            update={
+                "init": root.init.model_copy(update={"restart_file": chosen})
+            },
         )
 
     if not restart_intent:
@@ -295,14 +304,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         ).rstrip(),
     )
 
-    from jaxrens.sampling.batch_descriptor import (
-        ShardedSingleRun,
-        SingleRun,
-    )
     from jaxrens.cli.run import (
         run_multi_gpu_from_config,
         run_sharded_from_config,
     )
+    from jaxrens.sampling.batch_descriptor import ShardedSingleRun, SingleRun
 
     resolved = resolve(root)
 
@@ -333,7 +339,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
             resolved.ns.n_gpu * resolved.ns.n_per_gpu,
             ", ".join(
                 f"{p.get('pressure'):.4g}"
-                if p.get("pressure") is not None else "—"
+                if p.get("pressure") is not None
+                else "—"
                 for p in resolved.ensemble_params_per_run
             ),
         )
@@ -359,10 +366,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         return 0
 
     from jaxrens.cli.resolve import resolve
-    from jaxrens.sampling.batch_descriptor import (
-        ShardedSingleRun,
-        SingleRun,
-    )
+    from jaxrens.sampling.batch_descriptor import ShardedSingleRun, SingleRun
 
     resolved = resolve(root)
     n_moves = len(resolved.moves)
@@ -397,6 +401,13 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 
 def _cmd_dump_schema(args: argparse.Namespace) -> int:
+    # dump-schema only serialises pydantic models — it imports JAX-bound
+    # modules transitively but executes no JAX op, so silence _jax_init's
+    # CPU/TMPDIR runtime checks.  Must be set before the schema import below.
+    import os
+
+    os.environ["JAXRENS_SKIP_RUNTIME_CHECKS"] = "1"
+
     from jaxrens.cli.schema import RootSpec
 
     schema = RootSpec.model_json_schema()
@@ -442,20 +453,24 @@ def _cmd_migrate_ns_inp(args: argparse.Namespace) -> int:
     ``RootSpec.model_validate``; any validation error is printed to stderr
     and the command returns exit code 1.
     """
-    from jaxrens.cli.migrate import migrate_ns_inp
-    from jaxrens.cli.parser import parse_input_file
     import io
     import tempfile
+
+    from jaxrens.cli.migrate import migrate_ns_inp
+    from jaxrens.cli.parser import parse_input_file
 
     # Read input ----------------------------------------------------------
     if args.input == "-":
         raw_text = sys.stdin.read()
         # parse_input_file needs a file; write to a temp file.
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".inp", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".inp", delete=False
+        ) as tmp:
             tmp.write(raw_text)
             tmp_path = tmp.name
         raw = parse_input_file(tmp_path)
         import os
+
         os.unlink(tmp_path)
     else:
         raw = parse_input_file(args.input)
@@ -489,6 +504,7 @@ def _cmd_migrate_ns_inp(args: argparse.Namespace) -> int:
     # Optional validation round-trip --------------------------------------
     if args.validate:
         from jaxrens.cli.schema import RootSpec
+
         try:
             RootSpec.model_validate(yaml.safe_load(yaml_text))
         except Exception as exc:
@@ -503,6 +519,7 @@ def _cmd_migrate_ns_inp(args: argparse.Namespace) -> int:
 # Argument parser
 # ---------------------------------------------------------------------------
 
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jaxrens",
@@ -511,13 +528,29 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # -- run --
-    p_run = sub.add_parser("run", help="Run nested sampling from a YAML config.")
-    p_run.add_argument("-c", "--config", required=True, metavar="FILE",
-                       help="Path to YAML config file.")
-    p_run.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
-                       help="Override a config value (may be repeated; later wins).")
+    p_run = sub.add_parser(
+        "run", help="Run nested sampling from a YAML config."
+    )
     p_run.add_argument(
-        "--n-gpus", type=int, default=None, dest="n_gpus", metavar="N",
+        "-c",
+        "--config",
+        required=True,
+        metavar="FILE",
+        help="Path to YAML config file.",
+    )
+    p_run.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override a config value (may be repeated; later wins).",
+    )
+    p_run.add_argument(
+        "--n-gpus",
+        type=int,
+        default=None,
+        dest="n_gpus",
+        metavar="N",
         help=(
             "Assert that JAX sees exactly N local GPU devices; exit non-zero "
             "with a diagnostic on mismatch.  Typically passed from SLURM as "
@@ -526,7 +559,9 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_run.add_argument(
-        "--force", action="store_true", default=False,
+        "--force",
+        action="store_true",
+        default=False,
         help=(
             "Delete pre-existing artifacts in working_dir matching "
             "out_file_prefix (.energies, .traj.*, .adaptation.h5, "
@@ -536,7 +571,9 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_run.add_argument(
-        "--resume", action="store_true", default=False,
+        "--resume",
+        action="store_true",
+        default=False,
         help=(
             "Resume the run by auto-discovering a checkpoint in working_dir "
             "(prefers <prefix>.final.checkpoint.h5, falls back to "
@@ -547,9 +584,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # -- validate --
-    p_val = sub.add_parser("validate", help="Validate a YAML config without running.")
+    p_val = sub.add_parser(
+        "validate", help="Validate a YAML config without running."
+    )
     p_val.add_argument("-c", "--config", required=True, metavar="FILE")
-    p_val.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    p_val.add_argument(
+        "--set", action="append", default=[], metavar="KEY=VALUE"
+    )
     p_val.add_argument(
         "--parse-only",
         action="store_true",
@@ -563,7 +604,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # -- dump-schema --
-    p_dump = sub.add_parser("dump-schema", help="Print the JSON schema for RootSpec.")
+    p_dump = sub.add_parser(
+        "dump-schema", help="Print the JSON schema for RootSpec."
+    )
     p_dump.add_argument("--format", choices=["json"], default="json")
 
     # -- migrate-ns-inp --
@@ -572,13 +615,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Convert an old ns.inp key=value file to jaxrens YAML format.",
     )
     p_mig.add_argument(
-        "-i", "--input",
+        "-i",
+        "--input",
         default="-",
         metavar="INPUT.inp",
         help="Path to the old ns.inp file (default: stdin).",
     )
     p_mig.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         default="-",
         metavar="OUTPUT.yaml",
         help="Path for the output YAML file (default: stdout).",
@@ -611,10 +656,58 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_plot.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         default=None,
         metavar="OUTPUT.png",
         help="Output PNG path.  Default: sibling <stem>.<kind>.png.",
+    )
+
+    # -- annotate-uncertainty --
+    p_unc = sub.add_parser(
+        "annotate-uncertainty",
+        help=(
+            "Post-hoc: annotate a written NS trajectory with committee "
+            "energy/force uncertainty (ns_energy_std / ns_force_std)."
+        ),
+    )
+    p_unc.add_argument(
+        "--traj",
+        required=True,
+        metavar="FILE",
+        help="Trajectory to annotate (.extxyz/.xyz/.h5/.hdf5).",
+    )
+    p_unc.add_argument(
+        "--model",
+        required=True,
+        metavar="PICKLE",
+        help="NeuralIL ensemble model pickle (the committee).",
+    )
+    p_unc.add_argument(
+        "--supercell",
+        nargs=3,
+        type=int,
+        default=[1, 1, 1],
+        metavar=("A", "B", "C"),
+        help="Supercell transform passed to the backend.  Default 1 1 1.",
+    )
+    p_unc.add_argument(
+        "--no-forces",
+        action="store_false",
+        dest="forces",
+        help="Only compute energy uncertainty (skip the force jacobian).",
+    )
+    p_unc.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Edit the trajectory in place instead of writing *.annotated.<ext>.",
+    )
+    p_unc.add_argument(
+        "--chunk-size",
+        type=int,
+        default=64,
+        metavar="N",
+        help="Frames per batched evaluation (bounds memory).  Default 64.",
     )
 
     return parser
@@ -626,6 +719,7 @@ def _iter_basemodel_types(annotation: Any) -> Any:
     / ``Annotated[...]`` wrappers.
     """
     import typing
+
     from pydantic import BaseModel
 
     origin = typing.get_origin(annotation)
@@ -640,7 +734,9 @@ def _iter_basemodel_types(annotation: Any) -> Any:
 
 
 def _collect_field_paths(
-    model_cls: Any, prefix: str = "", _seen: set | None = None,
+    model_cls: Any,
+    prefix: str = "",
+    _seen: set | None = None,
 ) -> list[str]:
     """Recursively collect dotted field paths from a pydantic model.
 
@@ -681,11 +777,14 @@ def _suggest_for_extra_field(bad_key: str, parent_path: str) -> str:
     parent_fields = [
         p.rsplit(".", 1)[-1] if "." in p else p
         for p in all_paths
-        if p.rsplit(".", 1)[0] == parent_path or (parent_path == "" and "." not in p)
+        if p.rsplit(".", 1)[0] == parent_path
+        or (parent_path == "" and "." not in p)
     ]
     fuzzy = difflib.get_close_matches(bad_key, parent_fields, n=3, cutoff=0.6)
     fuzzy_paths = [
-        (f"{parent_path}.{f}" if parent_path else f) for f in fuzzy if f != bad_key
+        (f"{parent_path}.{f}" if parent_path else f)
+        for f in fuzzy
+        if f != bad_key
     ]
 
     suggestions: list[str] = []
@@ -728,6 +827,35 @@ def _format_validation_error(exc: Any, config_path: str) -> str:
     return "\n".join(lines)
 
 
+def _cmd_annotate_uncertainty(args: argparse.Namespace) -> int:
+    """Standalone post-hoc committee-uncertainty annotation of a trajectory."""
+    from jaxrens.backends.base import get_committee_backend
+    from jaxrens.backends.neuralil import create_neuralil
+    from jaxrens.postprocess.uncertainty import annotate_trajectory_uncertainty
+
+    backend = create_neuralil(
+        pickle_file=args.model,
+        supercell_trafo=tuple(args.supercell),
+    )
+    committee = get_committee_backend(backend)
+    if committee is None:
+        print(
+            "jaxrens: the provided model is not an NN committee (ensemble); "
+            "committee uncertainty requires an ensemble model.",
+            file=sys.stderr,
+        )
+        return 2
+    out = annotate_trajectory_uncertainty(
+        args.traj,
+        committee,
+        with_forces=args.forces,
+        in_place=args.in_place,
+        chunk_size=args.chunk_size,
+    )
+    print(f"Wrote committee-uncertainty annotation: {out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point registered via ``[project.scripts]``."""
     from pydantic import ValidationError
@@ -741,6 +869,7 @@ def main(argv: list[str] | None = None) -> None:
         "dump-schema": _cmd_dump_schema,
         "migrate-ns-inp": _cmd_migrate_ns_inp,
         "plot": _cmd_plot,
+        "annotate-uncertainty": _cmd_annotate_uncertainty,
     }
     handler = dispatch[args.command]
     try:

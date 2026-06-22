@@ -10,7 +10,7 @@ myst:
 
 user/introduction
 user/overview
-tutorials/index
+<!-- tutorials/index -->
 ```
 
 ```{toctree}
@@ -19,6 +19,7 @@ tutorials/index
 
 reference/index
 reference/cli
+reference/config
 reference/notation
 ```
 
@@ -27,6 +28,7 @@ reference/notation
 :hidden:
 
 dev/install
+dev/contributing
 ```
 
 # jaxrens documentation

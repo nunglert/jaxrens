@@ -239,30 +239,36 @@ class TestUnknownKey:
 
 
 # ---------------------------------------------------------------------------
-# 6. Deferred-but-consumed: write_traj_db lands in output.write_traj_db
+# 6. Removed DB / time-snapshot keys are dropped; snapshot_clean routes through
 # ---------------------------------------------------------------------------
 
 class TestDeferredField:
-    def test_write_traj_db_routes_to_output(self):
+    def test_write_traj_db_is_dropped(self):
         raw = {**_minimal_raw(), "write_traj_db": "T"}
         result = migrate_ns_inp(raw)
-        assert result["config"].get("output", {}).get("write_traj_db") is True
+        assert "write_traj_db" not in result["config"].get("output", {})
+        warns = [e["message"] for e in result["logs"] if e["level"] == "WARNING"]
+        assert any("write_traj_db" in m for m in warns)
 
-    def test_write_traj_db_info_log(self):
-        raw = {**_minimal_raw(), "write_traj_db": "T"}
-        result = migrate_ns_inp(raw)
-        info_msgs = [e["message"] for e in result["logs"] if e["level"] == "INFO"]
-        assert any("write_traj_db" in m for m in info_msgs)
-
-    def test_write_traj_db_validates(self):
-        raw = {**_minimal_raw(), "write_traj_db": "T"}
-        cfg = _migrate_and_validate(raw)
-        assert cfg.output.write_traj_db is True
-
-    def test_write_walkers_db_routes_to_output(self):
+    def test_write_walkers_db_is_dropped(self):
         raw = {**_minimal_raw(), "write_walkers_db": "F"}
         result = migrate_ns_inp(raw)
-        assert result["config"].get("output", {}).get("write_walkers_db") is False
+        assert "write_walkers_db" not in result["config"].get("output", {})
+
+    def test_snapshot_time_is_dropped(self):
+        raw = {**_minimal_raw(), "snapshot_time": "60.0"}
+        result = migrate_ns_inp(raw)
+        assert "snapshot_time" not in result["config"].get("output", {})
+
+    def test_snapshot_clean_routes_to_output(self):
+        raw = {**_minimal_raw(), "snapshot_clean": "T"}
+        result = migrate_ns_inp(raw)
+        assert result["config"].get("output", {}).get("snapshot_clean") is True
+
+    def test_snapshot_clean_validates(self):
+        raw = {**_minimal_raw(), "snapshot_clean": "T"}
+        cfg = _migrate_and_validate(raw)
+        assert cfg.output.snapshot_clean is True
 
     def test_cell_config_deferred_fields(self):
         raw = {**_minimal_raw(), "max_volume_per_atom": "500.0", "min_volume_per_atom": "2.0"}

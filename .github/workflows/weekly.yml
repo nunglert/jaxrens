@@ -1,0 +1,24 @@
+name: Weekly (full + multi-GPU)
+
+# Weekly heavy run, sharing the consolidated single-node job in full-suite.yml
+# with ci.yml.  Triggers it on a cron; use ``workflow_dispatch`` to run on demand.
+on:
+  schedule:
+    # 03:00 UTC every Monday = 04:00 CET (Europe/Berlin).  Cron is UTC-only and
+    # cannot follow DST, so during CEST (summer) this fires at 05:00 local.
+    # Scheduled runs use the workflow file on the default branch (main).  GitHub
+    # disables scheduled workflows after 60 days of repo inactivity (re-enable
+    # via the emailed link).
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+# A weekly run has no superseding pushes, but keep the guard so a manual
+# dispatch on top of a scheduled run doesn't double-book the GPU instance.
+concurrency:
+  group: weekly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full:
+    uses: ./.github/workflows/full-suite.yml
+    secrets: inherit

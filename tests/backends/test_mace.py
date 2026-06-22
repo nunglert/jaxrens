@@ -59,11 +59,20 @@ class TestSupercellEdges:
         positions = jnp.array([[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]])
         cell = jnp.eye(3) * 5.0
         r_cutoff = 2.0
-        image_offsets = jnp.array(_make_image_offsets(2, 2, 2), dtype=jnp.int32)
+        image_offsets = jnp.array(
+            _make_image_offsets(2, 2, 2), dtype=jnp.int32
+        )
         max_edges = 100
 
-        senders, receivers, shifts, n_actual, overflow, true_max = (
-            _supercell_edges(positions, cell, r_cutoff, max_edges, image_offsets)
+        (
+            senders,
+            receivers,
+            shifts,
+            n_actual,
+            overflow,
+            true_max,
+        ) = _supercell_edges(
+            positions, cell, r_cutoff, max_edges, image_offsets
         )
 
         # In a 5A box with cutoff 2A, atom 0 and atom 1 are 1.5A apart
@@ -83,10 +92,16 @@ class TestSupercellEdges:
         positions = jnp.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
         cell = jnp.eye(3) * 3.0
         r_cutoff = 2.0
-        image_offsets = jnp.array(_make_image_offsets(2, 2, 2), dtype=jnp.int32)
+        image_offsets = jnp.array(
+            _make_image_offsets(2, 2, 2), dtype=jnp.int32
+        )
 
         _, _, _, n_actual, overflow, true_max = _supercell_edges(
-            positions, cell, r_cutoff, max_edges=1, image_offsets=image_offsets,
+            positions,
+            cell,
+            r_cutoff,
+            max_edges=1,
+            image_offsets=image_offsets,
         )
         # At least 2 edges exist, but max_edges=1
         assert overflow
@@ -99,10 +114,16 @@ class TestSupercellEdges:
         positions = jnp.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
         cell = jnp.eye(3) * 5.0
         r_cutoff = 2.0
-        image_offsets = jnp.array(_make_image_offsets(2, 2, 2), dtype=jnp.int32)
+        image_offsets = jnp.array(
+            _make_image_offsets(2, 2, 2), dtype=jnp.int32
+        )
 
         _, _, _, _, overflow, _ = _supercell_edges(
-            positions, cell, r_cutoff, max_edges=100, image_offsets=image_offsets,
+            positions,
+            cell,
+            r_cutoff,
+            max_edges=100,
+            image_offsets=image_offsets,
         )
         assert not overflow
 
@@ -110,11 +131,17 @@ class TestSupercellEdges:
         """Edge finding works under JIT."""
         positions = jnp.array([[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]])
         cell = jnp.eye(3) * 5.0
-        image_offsets = jnp.array(_make_image_offsets(2, 2, 2), dtype=jnp.int32)
+        image_offsets = jnp.array(
+            _make_image_offsets(2, 2, 2), dtype=jnp.int32
+        )
 
         jit_fn = jax.jit(_supercell_edges, static_argnums=(2, 3))
         senders, receivers, shifts, n_actual, overflow, true_max = jit_fn(
-            positions, cell, 2.0, 100, image_offsets,
+            positions,
+            cell,
+            2.0,
+            100,
+            image_offsets,
         )
         assert int(n_actual) == 2
         assert not overflow
@@ -125,10 +152,16 @@ class TestSupercellEdges:
         positions = jnp.array([[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]])
         cell = jnp.eye(3) * 5.0
         r_cutoff = 2.0
-        image_offsets = jnp.array(_make_image_offsets(2, 2, 2), dtype=jnp.int32)
+        image_offsets = jnp.array(
+            _make_image_offsets(2, 2, 2), dtype=jnp.int32
+        )
 
         senders, receivers, shifts, n_actual, _, _ = _supercell_edges(
-            positions, cell, r_cutoff, 100, image_offsets,
+            positions,
+            cell,
+            r_cutoff,
+            100,
+            image_offsets,
         )
 
         # Reconstruct edge vectors: pos[receiver] - pos[sender] + shift
@@ -137,7 +170,9 @@ class TestSupercellEdges:
             s, r = int(senders[i]), int(receivers[i])
             vec = positions[r] - positions[s] + shifts[i]
             dist = float(jnp.linalg.norm(vec))
-            assert dist < r_cutoff, f"Edge {i}: dist={dist} >= r_cutoff={r_cutoff}"
+            assert (
+                dist < r_cutoff
+            ), f"Edge {i}: dist={dist} >= r_cutoff={r_cutoff}"
             assert dist > 1e-10, f"Edge {i}: self-interaction"
 
 
@@ -154,7 +189,11 @@ class TestMACEBackend:
 
         return create_mace(
             model_path=str(FIXTURE_DIR),
-            supercell_trafo=(4, 4, 4),  # SrTiO3 a=3.9A, r_cutoff=6A -> need sc>=4
+            supercell_trafo=(
+                4,
+                4,
+                4,
+            ),  # SrTiO3 a=3.9A, r_cutoff=6A -> need sc>=4
         )
 
     @pytest.fixture
@@ -172,13 +211,14 @@ class TestMACEBackend:
         cell = jnp.array(reference["cell"])
         ref_energy = float(reference["jax_energy"])
 
-        energy, count, overflow = backend(positions, species, cell, max_neighbors=100)
+        _r = backend(positions, species, cell, max_neighbors=100)
+        energy, count, overflow = _r.energy, _r.max_neighbor_count, _r.overflow
 
         assert not overflow, "Overflow with max_neighbors=100"
         assert jnp.isfinite(energy), "Energy is not finite"
-        assert abs(float(energy) - ref_energy) < 1e-2, (
-            f"Energy mismatch: {float(energy):.6f} vs ref {ref_energy:.6f}"
-        )
+        assert (
+            abs(float(energy) - ref_energy) < 1e-2
+        ), f"Energy mismatch: {float(energy):.6f} vs ref {ref_energy:.6f}"
 
     def test_jit_compatible(self, backend, reference):
         positions = jnp.array(reference["positions"])
@@ -186,7 +226,8 @@ class TestMACEBackend:
         cell = jnp.array(reference["cell"])
 
         jit_backend = jax.jit(backend, static_argnums=(3,))
-        energy, count, overflow = jit_backend(positions, species, cell, 100)
+        _r = jit_backend(positions, species, cell, 100)
+        energy, count, overflow = _r.energy, _r.max_neighbor_count, _r.overflow
 
         assert jnp.isfinite(energy)
         assert not overflow
@@ -197,7 +238,7 @@ class TestMACEBackend:
         cell = jnp.array(reference["cell"])
 
         def energy_fn(pos):
-            e, _, _ = backend(pos, species, cell, 100)
+            e = backend(pos, species, cell, 100).energy
             return e
 
         forces = -jax.grad(energy_fn)(positions)
@@ -209,7 +250,7 @@ class TestMACEBackend:
         species = jnp.array(reference["species"], dtype=jnp.int32)
         cell = jnp.array(reference["cell"])
 
-        _, _, overflow = backend(positions, species, cell, max_neighbors=1)
+        overflow = backend(positions, species, cell, max_neighbors=1).overflow
         assert overflow, "Should overflow with max_neighbors=1"
 
 
@@ -231,9 +272,14 @@ class TestMACENSStep:
             supercell_trafo=(4, 4, 4),
         )
 
-        init_fn, step_fn, _ = build_mwg(backend, [
-            MoveKernel("random_walk", random_walk.build_kernel, step_size=0.01),
-        ])
+        init_fn, step_fn, _ = build_mwg(
+            backend,
+            [
+                MoveKernel(
+                    "random_walk", random_walk.build_kernel, step_size=0.01
+                ),
+            ],
+        )
 
         n_walkers = 4
         key = jax.random.key(0)
@@ -242,19 +288,25 @@ class TestMACENSStep:
         )
         # Add small random noise per walker
         key, noise_key = jax.random.split(key)
-        positions = positions + 0.01 * jax.random.normal(noise_key, positions.shape)
+        positions = positions + 0.01 * jax.random.normal(
+            noise_key, positions.shape
+        )
 
         species = jnp.array(ref["species"], dtype=jnp.int32)
         cell = jnp.array(ref["cell"])
         cells = jnp.tile(cell[None, :, :], (n_walkers, 1, 1))
 
-        energies = jax.vmap(
-            lambda pos: backend(pos, species, cell, 100)[0]
-        )(positions)
+        energies = jax.vmap(lambda pos: backend(pos, species, cell, 100)[0])(
+            positions
+        )
 
         state = init_ns(
-            init_fn, positions, species, energies,
-            cells=cells, rng_key=key,
+            init_fn,
+            positions,
+            species,
+            energies,
+            cells=cells,
+            rng_key=key,
         )
         # Set max_neighbors for MACE (static field, controls edge buffer size)
         state = state.set(

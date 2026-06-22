@@ -26,7 +26,7 @@ RUN pip install -e ".[dev,mace,neuralil,nequix,jaxmd]"
 # Without this, ``pytest.importorskip(...)`` would silently skip the
 # corresponding integration tests and CI would report green on a broken
 # install (ABI mismatch, missing native deps, upstream pin drift, etc.).
-RUN python -c "import mace_jax, neuralil, nequix, jax_md; print('optional backends import OK:', mace_jax, neuralil, nequix, jax_md)"
+RUN JAX_PLATFORMS=cpu python -c "import mace_jax, neuralil, nequix, jax_md; print('optional backends import OK:', mace_jax, neuralil, nequix, jax_md)"
 
 # Repo code is mounted at /workspace at runtime by the CI workflow,
 # which always overrides the parent image's default CMD with its own

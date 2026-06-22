@@ -105,6 +105,10 @@ _DROPPED: dict[str, str] = {
     "sample_propto_uncty": "active-learning block; step 8",
     "score_func": "active-learning block; step 8",
     "metric": "active-learning block; step 8",
+    # Output DB writers and time-based snapshots — removed from jaxrens
+    "write_traj_db": "trajectory DB writer was removed; no DB output in jaxrens",
+    "write_walkers_db": "walker DB writer was removed; no DB output in jaxrens",
+    "snapshot_time": "time-based snapshots were removed; use iteration-based snapshot_interval",
     # Misc fields not yet in jaxrens
     "chemical_numbers": "implicit in backend choice; not a user-facing field in jaxrens",
     "n_sweep_move_atoms": "internal sweep parameter; not exposed in jaxrens",
@@ -142,16 +146,7 @@ _DROPPED: dict[str, str] = {
 # Maps old key -> (target nested path as tuple, coercion callable)
 # These keys land in the new schema, but the resolver emits a deferred warning.
 _DEFERRED: dict[str, tuple[tuple[str, ...], Any]] = {
-    "write_traj_db": (("output", "write_traj_db"), _str_to_bool),
-    "write_walkers_db": (("output", "write_walkers_db"), _str_to_bool),
     "wrap_atoms": (("output", "wrap_atoms"), _str_to_bool),
-    "snapshot_clean": (("output", "snapshot_clean"), _str_to_bool),
-    # ``save_stepsizes`` is intentionally dropped: in jaxrens, step
-    # sizes are recoverable from ``<prefix>.adaptation.h5`` (iter-0
-    # baseline row + bisection events), so a dedicated step-size
-    # trajectory file is redundant.  Legacy configs that set it will
-    # have the value preserved under ``_unknown`` for manual review.
-    "snapshot_time": (("output", "snapshot_time"), float),
     # Cell config (deferred: not threaded into move kernels yet)
     "max_volume_per_atom": (("cell", "max_volume_per_atom"), float),
     "min_volume_per_atom": (("cell", "min_volume_per_atom"), float),
@@ -624,6 +619,10 @@ def _handle_snapshot_interval(value: str, cfg: dict, logs: list) -> None:
     _nest(cfg, "output", "snapshot_interval", value=int(value))
 
 
+def _handle_snapshot_clean(value: str, cfg: dict, logs: list) -> None:
+    _nest(cfg, "output", "snapshot_clean", value=_str_to_bool(value))
+
+
 def _handle_info_interval(value: str, cfg: dict, logs: list) -> None:
     _nest(cfg, "output", "info_interval", value=int(float(value)))
 
@@ -912,6 +911,7 @@ _ROUTING_TABLE: dict[str, Handler] = {
     "config_file_format": _handle_config_file_format,
     "traj_interval": _handle_traj_interval,
     "snapshot_interval": _handle_snapshot_interval,
+    "snapshot_clean": _handle_snapshot_clean,
     "info_interval": _handle_info_interval,
     "out_file_prefix": _handle_out_file_prefix,
     "working_dir": _handle_working_dir,

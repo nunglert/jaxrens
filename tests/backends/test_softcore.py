@@ -33,7 +33,6 @@ from jaxrens.backends.softcore import (
 )
 from jaxrens.backends.toy import HarmonicBackend
 
-
 A0 = DEFAULT_SOFTCORE_KWARGS["a0"]
 B0 = DEFAULT_SOFTCORE_KWARGS["b0"]
 D0 = DEFAULT_SOFTCORE_KWARGS["d0"]
@@ -69,7 +68,13 @@ class TestSoftCoreEnergy:
         positions = _two_atoms_at(r)
         E = float(
             _softcore_energy(
-                positions, jnp.zeros((3, 3)), A0, B0, D0, R_SWITCH, R_CUT,
+                positions,
+                jnp.zeros((3, 3)),
+                A0,
+                B0,
+                D0,
+                R_SWITCH,
+                R_CUT,
             )
         )
         phi = D0 * np.exp(-2.0 * A0 * (r - B0))
@@ -87,7 +92,13 @@ class TestSoftCoreEnergy:
             positions = _two_atoms_at(r)
             E = float(
                 _softcore_energy(
-                    positions, jnp.zeros((3, 3)), A0, B0, D0, R_SWITCH, R_CUT,
+                    positions,
+                    jnp.zeros((3, 3)),
+                    A0,
+                    B0,
+                    D0,
+                    R_SWITCH,
+                    R_CUT,
                 )
             )
             assert E == 0.0, f"r={r}: expected 0, got {E}"
@@ -97,7 +108,13 @@ class TestSoftCoreEnergy:
         positions = jnp.array([[0.0, 0.0, 0.0]], dtype=jnp.float32)
         E = float(
             _softcore_energy(
-                positions, jnp.zeros((3, 3)), A0, B0, D0, R_SWITCH, R_CUT,
+                positions,
+                jnp.zeros((3, 3)),
+                A0,
+                B0,
+                D0,
+                R_SWITCH,
+                R_CUT,
             )
         )
         assert E == 0.0
@@ -112,14 +129,19 @@ class TestSoftCoreEnergy:
         L = 4.0
         cell = L * jnp.eye(3, dtype=jnp.float32)
         pos = jnp.array(
-            [[0.08, 0.0, 0.0], [3.92, 0.0, 0.0]], dtype=jnp.float32,
+            [[0.08, 0.0, 0.0], [3.92, 0.0, 0.0]],
+            dtype=jnp.float32,
         )
-        e_mic = float(
-            _softcore_energy(pos, cell, A0, B0, D0, R_SWITCH, R_CUT)
-        )
+        e_mic = float(_softcore_energy(pos, cell, A0, B0, D0, R_SWITCH, R_CUT))
         e_raw = float(
             _softcore_energy(
-                pos, jnp.zeros((3, 3)), A0, B0, D0, R_SWITCH, R_CUT,
+                pos,
+                jnp.zeros((3, 3)),
+                A0,
+                B0,
+                D0,
+                R_SWITCH,
+                R_CUT,
             )
         )
         # MIC distance 0.16 Å < r_switch → full Morse term.
@@ -134,7 +156,8 @@ class TestSoftCoreEnergy:
         """The periodic (MIC) branch compiles under jax.jit."""
         cell = 4.0 * jnp.eye(3, dtype=jnp.float32)
         pos = jnp.array(
-            [[0.08, 0.0, 0.0], [3.92, 0.0, 0.0]], dtype=jnp.float32,
+            [[0.08, 0.0, 0.0], [3.92, 0.0, 0.0]],
+            dtype=jnp.float32,
         )
         f = jax.jit(
             lambda p, c: _softcore_energy(p, c, A0, B0, D0, R_SWITCH, R_CUT)
@@ -148,12 +171,14 @@ class TestSoftCoreEnergy:
         """smooth_cutoff is exactly 1 below r_switch, 0 above r_cut."""
         # Below r_switch: exactly 1
         for r in (0.1, 0.5, 0.74):
-            assert float(_smooth_cutoff(jnp.asarray(r), R_SWITCH, R_CUT)) \
-                == pytest.approx(1.0, abs=1e-6)
+            assert float(
+                _smooth_cutoff(jnp.asarray(r), R_SWITCH, R_CUT)
+            ) == pytest.approx(1.0, abs=1e-6)
         # Above r_cut: exactly 0
         for r in (1.26, 1.5, 5.0):
-            assert float(_smooth_cutoff(jnp.asarray(r), R_SWITCH, R_CUT)) \
-                == pytest.approx(0.0, abs=1e-6)
+            assert float(
+                _smooth_cutoff(jnp.asarray(r), R_SWITCH, R_CUT)
+            ) == pytest.approx(0.0, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -170,8 +195,8 @@ class TestSoftCoreBackendWrapper:
         species = _species(2)
         cell = _cell()
 
-        E_base, _, _ = base(positions, species, cell, 0)
-        E_wrapped, _, _ = wrapped(positions, species, cell, 0)
+        E_base = base(positions, species, cell, 0).energy
+        E_wrapped = wrapped(positions, species, cell, 0).energy
         assert float(E_wrapped) == pytest.approx(float(E_base), rel=1e-6)
 
     def test_close_contact_penalty(self):
@@ -182,7 +207,7 @@ class TestSoftCoreBackendWrapper:
         species = _species(2)
         cell = _cell()
 
-        E_wrapped, _, _ = wrapped(positions, species, cell, 0)
+        E_wrapped = wrapped(positions, species, cell, 0).energy
         # phi(0.3) = exp(-2 * (0.3 - 3.0)) = exp(5.4) ≈ 221
         expected = D0 * np.exp(-2.0 * A0 * (0.3 - B0))
         assert float(E_wrapped) == pytest.approx(expected, rel=1e-4)
@@ -195,9 +220,10 @@ class TestSoftCoreBackendWrapper:
         species = _species(2)
         # 0.16 Å apart by MIC across the x-boundary; 3.84 Å raw.
         pos = jnp.array(
-            [[0.08, 0.0, 0.0], [3.92, 0.0, 0.0]], dtype=jnp.float32,
+            [[0.08, 0.0, 0.0], [3.92, 0.0, 0.0]],
+            dtype=jnp.float32,
         )
-        E, _, _ = wrapped(pos, species, cell, 0)
+        E = wrapped(pos, species, cell, 0).energy
         expected = D0 * np.exp(-2.0 * A0 * (0.16 - B0))
         assert float(E) == pytest.approx(expected, rel=1e-3)
 
@@ -210,7 +236,7 @@ class TestSoftCoreBackendWrapper:
         cell = _cell()
 
         def go(pos):
-            E, _, _ = wrapped(pos, species, cell, 0)
+            E = wrapped(pos, species, cell, 0).energy
             return E
 
         E_eager = float(go(positions))
@@ -225,17 +251,18 @@ class TestSoftCoreBackendWrapper:
         cell = _cell()
 
         batch = jnp.stack(
-            [_two_atoms_at(r) for r in (0.5, 1.0, 2.0)], axis=0,
+            [_two_atoms_at(r) for r in (0.5, 1.0, 2.0)],
+            axis=0,
         )
 
         def one(pos):
-            E, _, _ = wrapped(pos, species, cell, 0)
+            E = wrapped(pos, species, cell, 0).energy
             return E
 
         Es = jax.vmap(one)(batch)
         assert Es.shape == (3,)
         # The r=2.0 case should equal the base alone
-        E_base_far, _, _ = base(batch[2], species, cell, 0)
+        E_base_far = base(batch[2], species, cell, 0).energy
         assert float(Es[2]) == pytest.approx(float(E_base_far), rel=1e-5)
 
     def test_attr_forwarding(self):
@@ -254,13 +281,14 @@ class TestSoftCoreBackendWrapper:
 
         base = HarmonicBackend(k=1.0)
         stacked = EnsembleBackend(
-            SoftCoreBackend(base), pressure=0.5,
+            SoftCoreBackend(base),
+            pressure=0.5,
         )
         positions = _two_atoms_at(0.5)
         species = _species(2)
         cell = _cell()
 
-        E, _, _ = stacked(positions, species, cell, 0)
+        E = stacked(positions, species, cell, 0).energy
 
         # Reconstruct expected.
         E_U = 0.5 * 1.0 * float(jnp.sum(positions**2))
@@ -306,14 +334,18 @@ class TestParityWithFixedRepulsiveMorse:
         r = 0.5
         positions = _two_atoms_at(r)
         radii = jnp.array(
-            [[0.0, r], [r, 0.0]], dtype=jnp.float32,
+            [[0.0, r], [r, 0.0]],
+            dtype=jnp.float32,
         )
         types = jnp.array([0, 1], dtype=jnp.int32)
         all_types = types
 
         softcore = FixedRepulsiveMorse(A0, B0, D0, R_CUT, R_SWITCH)
         morse_atomic = softcore.apply(
-            {}, radii, types, all_types,
+            {},
+            radii,
+            types,
+            all_types,
             method=softcore.calc_atomic_energies,
         )
         ref_total = float(jnp.sum(morse_atomic))
@@ -321,7 +353,13 @@ class TestParityWithFixedRepulsiveMorse:
         # against the non-periodic (zero-cell) path.
         wrapper_total = float(
             _softcore_energy(
-                positions, jnp.zeros((3, 3)), A0, B0, D0, R_SWITCH, R_CUT,
+                positions,
+                jnp.zeros((3, 3)),
+                A0,
+                B0,
+                D0,
+                R_SWITCH,
+                R_CUT,
             )
         )
         assert wrapper_total == pytest.approx(ref_total, rel=1e-5)
@@ -344,8 +382,11 @@ class TestSchemaMutex:
                 checkpoint_path="/tmp/nonexistent.pkl",
                 softcore=True,
                 softcore_repulsion={
-                    "a0": 1.0, "b0": 3.0, "d0": 1.0,
-                    "r_core_cut": 1.25, "r_core_switch": 0.75,
+                    "a0": 1.0,
+                    "b0": 3.0,
+                    "d0": 1.0,
+                    "r_core_cut": 1.25,
+                    "r_core_switch": 0.75,
                 },
             )
 
@@ -366,8 +407,11 @@ class TestSchemaMutex:
             epsilon=1.0,
             sigma=1.0,
             softcore_repulsion={
-                "a0": 2.0, "b0": 3.0, "d0": 1.0,
-                "r_core_cut": 1.25, "r_core_switch": 0.75,
+                "a0": 2.0,
+                "b0": 3.0,
+                "d0": 1.0,
+                "r_core_cut": 1.25,
+                "r_core_switch": 0.75,
             },
         )
         cfg = spec.to_backend_config()

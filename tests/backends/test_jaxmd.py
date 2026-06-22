@@ -28,7 +28,6 @@ pytest.importorskip("jax_md")
 from jaxrens.backends.ensemble import EnsembleBackend
 from jaxrens.backends.jaxmd import create_jaxmd, is_available
 
-
 pytestmark = pytest.mark.jaxmd
 
 
@@ -39,24 +38,27 @@ pytestmark = pytest.mark.jaxmd
 
 SI_LATTICE_CONST = 5.431  # Tersoff '88 has a different relaxed `a` than '89.
 
-_JAXMD_SRC_TERSOFF_FIXTURE = (
-    Path("/home/nico.unglert/code/jax-md/tests/data/Si.tersoff")
+_JAXMD_SRC_TERSOFF_FIXTURE = Path(
+    "/home/nico.unglert/code/jax-md/tests/data/Si.tersoff"
 )
 
 
 def _si_diamond_positions(a: float = SI_LATTICE_CONST) -> jnp.ndarray:
-    basis = np.array(
-        [
-            [0.00, 0.00, 0.00],
-            [0.00, 0.50, 0.50],
-            [0.50, 0.00, 0.50],
-            [0.50, 0.50, 0.00],
-            [0.25, 0.25, 0.25],
-            [0.25, 0.75, 0.75],
-            [0.75, 0.25, 0.75],
-            [0.75, 0.75, 0.25],
-        ]
-    ) * a
+    basis = (
+        np.array(
+            [
+                [0.00, 0.00, 0.00],
+                [0.00, 0.50, 0.50],
+                [0.50, 0.00, 0.50],
+                [0.50, 0.50, 0.00],
+                [0.25, 0.25, 0.25],
+                [0.25, 0.75, 0.75],
+                [0.75, 0.25, 0.75],
+                [0.75, 0.75, 0.25],
+            ]
+        )
+        * a
+    )
     return jnp.asarray(basis, dtype=jnp.float32)
 
 
@@ -85,7 +87,9 @@ def test_factory_rejects_unknown_potential():
 def test_factory_rejects_unknown_inline_set():
     with pytest.raises(ValueError, match="Unknown inline Tersoff"):
         create_jaxmd(
-            potential="tersoff", periodic=True, tersoff_params="unobtanium",
+            potential="tersoff",
+            periodic=True,
+            tersoff_params="unobtanium",
         )
 
 
@@ -94,8 +98,10 @@ def test_factory_requires_exactly_one_param_source():
         create_jaxmd(potential="tersoff", periodic=True)
     with pytest.raises(ValueError, match="Exactly one of"):
         create_jaxmd(
-            potential="tersoff", periodic=True,
-            tersoff_params="si", tersoff_params_file="/dev/null",
+            potential="tersoff",
+            periodic=True,
+            tersoff_params="si",
+            tersoff_params_file="/dev/null",
         )
 
 
@@ -122,11 +128,13 @@ def test_si_dimer_energy_negative_and_finite():
     """Si-Si dimer at d ≈ 2.35 Å should yield a bound (negative) energy."""
     b = _make_backend(periodic=False)
     positions = jnp.array(
-        [[0.0, 0.0, 0.0], [2.35, 0.0, 0.0]], dtype=jnp.float32,
+        [[0.0, 0.0, 0.0], [2.35, 0.0, 0.0]],
+        dtype=jnp.float32,
     )
     species = jnp.zeros(2, dtype=jnp.int32)
     cell = jnp.zeros((3, 3), dtype=jnp.float32)  # ignored in free space
-    e, n, overflow = b(positions, species, cell)
+    _r = b(positions, species, cell)
+    e, n, overflow = _r.energy, _r.max_neighbor_count, _r.overflow
     assert jnp.isfinite(e)
     assert float(e) < 0.0
     assert int(n) == 0
@@ -147,7 +155,8 @@ def test_si_diamond_energy_finite():
     positions = _si_diamond_positions()
     species = jnp.zeros(8, dtype=jnp.int32)
     cell = SI_LATTICE_CONST * jnp.eye(3, dtype=jnp.float32)
-    e, n, overflow = b(positions, species, cell, max_neighbors=0)
+    _r = b(positions, species, cell, max_neighbors=0)
+    e, n, overflow = _r.energy, _r.max_neighbor_count, _r.overflow
     assert jnp.isfinite(e)
     e_per_atom = float(e) / 8.0
     assert -4.7 < e_per_atom < -4.5, (
@@ -194,7 +203,7 @@ def test_jit_compiles_and_no_retrace_across_cells():
     @jax.jit
     def jitted_energy(pos, cell):
         trace_counter["n"] += 1
-        e, _, _ = b(pos, species, cell)
+        e = b(pos, species, cell).energy
         return e
 
     e1 = jitted_energy(positions, SI_LATTICE_CONST * jnp.eye(3))
@@ -228,7 +237,7 @@ def test_vmap_over_walker_axis():
     positions_K = base[None] + noise  # (K=4, N=8, 3)
 
     def one_call(pos):
-        e, _, _ = b(pos, species, cell)
+        e = b(pos, species, cell).energy
         return e
 
     energies = jax.vmap(one_call)(positions_K)
@@ -249,7 +258,7 @@ def test_value_and_grad_finite():
     cell = SI_LATTICE_CONST * jnp.eye(3, dtype=jnp.float32)
 
     def total_e(pos):
-        e, _, _ = b(pos, species, cell)
+        e = b(pos, species, cell).energy
         return e
 
     e, grad = jax.value_and_grad(total_e)(positions)
@@ -288,10 +297,13 @@ def test_ensemble_backend_wraps_jaxmd():
     v_large = float(jnp.linalg.det(cell_large))
     expected_gap = pressure * (v_large - v_small)
     observed_gap = (
-        float(e_wrap_large) - float(e_wrap_small)
+        float(e_wrap_large)
+        - float(e_wrap_small)
         - (float(e_base_large) - float(e_base_small))
     )
-    assert abs(observed_gap - expected_gap) < 1e-3 * max(abs(expected_gap), 1.0)
+    assert abs(observed_gap - expected_gap) < 1e-3 * max(
+        abs(expected_gap), 1.0
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -311,10 +323,13 @@ def test_tersoff_from_lammps_file_matches_inline():
     structure.
     """
     b_inline = create_jaxmd(
-        potential="tersoff", periodic=True, tersoff_params="si",
+        potential="tersoff",
+        periodic=True,
+        tersoff_params="si",
     )
     b_file = create_jaxmd(
-        potential="tersoff", periodic=True,
+        potential="tersoff",
+        periodic=True,
         tersoff_params_file=str(_JAXMD_SRC_TERSOFF_FIXTURE),
     )
 
@@ -324,6 +339,6 @@ def test_tersoff_from_lammps_file_matches_inline():
 
     e_inline, *_ = b_inline(positions, species, cell)
     e_file, *_ = b_file(positions, species, cell)
-    assert jnp.allclose(e_inline, e_file, atol=1e-5), (
-        f"inline vs file disagree: {float(e_inline)} vs {float(e_file)}"
-    )
+    assert jnp.allclose(
+        e_inline, e_file, atol=1e-5
+    ), f"inline vs file disagree: {float(e_inline)} vs {float(e_file)}"

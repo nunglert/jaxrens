@@ -59,6 +59,8 @@ from typing import Any
 
 import jax.numpy as jnp
 
+from jaxrens.backends.base import BackendResult
+
 logger = logging.getLogger(__name__)
 
 _JAXMD_AVAILABLE = False
@@ -186,7 +188,7 @@ class JaxMDBackend:
         cell: jnp.ndarray,
         max_neighbors: int = 0,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> tuple[jnp.ndarray, int, bool]:
+    ) -> BackendResult:
         del species, max_neighbors, ensemble_params  # all-pairs single-species
         if self.periodic:
             # ``_build_displacement_fn`` uses ``fractional_coordinates=True``
@@ -197,7 +199,7 @@ class JaxMDBackend:
             e = self._energy_fn(frac_positions, new_box=cell)
         else:
             e = self._energy_fn(positions)
-        return e, 0, False
+        return BackendResult(energy=e)
 
     def __repr__(self) -> str:
         return (

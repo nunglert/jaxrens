@@ -1,6 +1,6 @@
-# Tiny LJ NPT NS example used by tests/test_postprocess_monitor.py::TestSmokeRealRun.
-# Single-run NPT NS on 8 Ar-like LJ atoms; sized to finish in ~5 s on a GPU and
-# produce committed reference artefacts under ./output/ that exercise the full
+# Tiny LJ NPT NS example used by tests/postprocess/test_monitor.py::TestSmokeRealRun.
+# Single-run NPT NS on 8 Ar-like LJ atoms; sized to finish quickly and produce
+# committed reference artefacts under ./output/ that exercise the full
 # postprocessing stack (Monitor.from_directory, heat_capacity, energy/iteration
 # trace).  Keep it cheap — these artefacts are tracked in git.
 

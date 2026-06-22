@@ -38,7 +38,9 @@ class BackendConfig:
     cutoff: float | None = None
 
     # NeuralIL-specific
-    max_neighbors_list: list[int] = field(default_factory=lambda: [30, 35, 40, 45, 50])
+    max_neighbors_list: list[int] = field(
+        default_factory=lambda: [30, 35, 40, 45, 50]
+    )
     max_neighbors_offset: int = 5
 
     # Hysteresis-gated bucket shrinking (opt-in).  When ``shrink_dwell == 0``
@@ -103,14 +105,14 @@ class OutputConfig:
     save_re_stats: bool = False
 
     # Finite-difference temperature estimator (Baldock et al. 2017).
-    # ``temperature_lag`` is the length of the Emax FIFO used for the
+    # ``temperature_lag_interval`` is the length of the Emax FIFO used for the
     # finite difference; ``None`` disables the callback entirely.
-    # Both ``temperature_lag`` and ``temperature_interval`` are scaled by
+    # Both ``temperature_lag_interval`` and ``temperature_interval`` are scaled by
     # ``RootSpec.interval_units`` (``per_walker`` → multiply by ``n_live``)
     # in the resolver before reaching this runtime dataclass.
     # ``temperature_kB`` defaults to eV/K (ASE convention) — set ``1.0``
     # for reduced-unit backends (LJ, harmonic).
-    temperature_lag: int | None = 100
+    temperature_lag_interval: int | None = 100
     temperature_interval: int = 100
     temperature_kB: float = 8.6173324e-5
 
@@ -129,6 +131,24 @@ class OutputConfig:
     # keeps absolute Cartesians so off-the-shelf viewers don't show
     # boundary-wrap artifacts; set True if you want all atoms inside ``[0,L)``.
     wrap_atoms: bool = False
+
+    # When True, ``ExtxyzTrajectoryWriter`` deletes the previous walker
+    # snapshot right after the next one is written, keeping at most one
+    # ``*.snap.<iter>.extxyz`` file on disk.  Walker snapshots are a crash-
+    # inspection convenience; cleaning them stops the output directory from
+    # growing one dump per ``snapshot_interval``.  No-op for the h5/none
+    # writers.
+    snapshot_clean: bool = True
+
+    # Post-hoc committee-uncertainty annotation (Phase 4 / active learning).
+    # When ``write_uncertainty`` is True and the backend is an NN committee
+    # (ensemble), a post-run step annotates the written trajectory with
+    # per-frame ``ns_energy_std`` (and, when ``write_force_uncertainty``,
+    # per-atom ``ns_force_std``).  No effect on the sampling run itself; a
+    # non-committee backend just emits a warning and skips.
+    write_uncertainty: bool = False
+    write_force_uncertainty: bool = True
+    uncertainty_in_place: bool = False
 
 
 @dataclass(frozen=True)
