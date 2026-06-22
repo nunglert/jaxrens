@@ -94,8 +94,13 @@ class TestNeuralILBackend:
 
         energy = backend(positions, species, cell, max_neighbors).energy
 
-        assert (
-            abs(float(energy) - ref_energy) < 1e-3
+        # Relative tolerance: the energy is computed in float32 (x64 is pinned
+        # off), so the result drifts ~1e-4 relative across GPU architectures
+        # (TF32 matmuls + reduction order). An absolute bound silently coupled
+        # this to the runner family; rtol keeps it hardware-portable while still
+        # catching real regressions, which shift the energy far more than meV.
+        assert abs(float(energy) - ref_energy) < 1e-3 * abs(
+            ref_energy
         ), f"Energy mismatch: {float(energy):.6f} vs ref {ref_energy:.6f}"
 
     def test_overflow_with_tiny_budget(self, backend, reference):
