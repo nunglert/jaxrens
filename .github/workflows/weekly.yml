@@ -1,12 +1,7 @@
 name: Weekly (full + multi-GPU)
 
-# Weekly heavy run on a single 4× T4 node (g4dn.12xlarge):
-#   1. the whole pytest suite parallelised with ``-n 4`` (each xdist worker
-#      pinned to its own GPU by tests/conftest.py), and
-#   2. the multi_gpu integration tests.
-# Both run on the SAME ephemeral instance (two steps, one node) to avoid
-# paying for a second g4dn.12xlarge.  Use ``workflow_dispatch`` to trigger
-# it on demand.
+# Weekly heavy run, sharing the consolidated single-node job in full-suite.yml
+# with ci.yml.  Triggers it on a cron; use ``workflow_dispatch`` to run on demand.
 on:
   schedule:
     # 03:00 UTC every Monday = 04:00 CET (Europe/Berlin).  Cron is UTC-only and
@@ -24,59 +19,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  weekly:
-    name: Full (-n 4) + multi-GPU (4× T4)
-    runs-on:
-      - runs-on=${{ github.run_id }}
-      - family=g4dn.12xlarge
-      - image=ubuntu24-gpu-x64
-      - spot=price-capacity-optimized
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build CI image
-        run: docker build -f Dockerfile.ci -t jaxrens-ci:${{ github.sha }} .
-
-      - name: pytest tests -n 4 (full suite, coverage)
-        # ``--gpus all`` exposes all 4 T4s; tests/conftest.py pins each xdist
-        # worker (gw0..gw3) to a distinct GPU before JAX is imported.
-        run: |
-          docker run --rm --gpus all \
-            -v "${{ github.workspace }}:/workspace" \
-            -w /workspace \
-            jaxrens-ci:${{ github.sha }} \
-            pytest tests -n 4 -v --tb=short -m "not multi_gpu" -o addopts="" \
-              --cov=jaxrens \
-              --cov-branch \
-              --cov-report=term-missing \
-              --cov-report=xml \
-              --cov-fail-under=50
-
-      - name: Upload coverage to Codecov
-        if: ${{ always() }}
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage.xml
-          fail_ci_if_error: false
-
-      - name: pytest -m multi_gpu (whole tree)
-        # Always run even if the full suite failed, so a single flaky test
-        # doesn't hide multi-GPU regressions.
-        if: ${{ always() }}
-        # ``--shm-size=1g``: the 4× T4 on g4dn.12xlarge have no NVLink, so
-        # NCCL uses its SHM/direct transport for intra-node GPU↔GPU comms,
-        # which lives in /dev/shm.  Docker's default 64 MB /dev/shm is too
-        # small for 4-rank NCCL — 1 GB is ample headroom.
-        run: |
-          docker run --rm --gpus all \
-            --shm-size=1g \
-            -v "${{ github.workspace }}:/workspace" \
-            -w /workspace \
-            -e PYTHONUNBUFFERED=1 \
-            -e JAX_LOG_COMPILES=1 \
-            -e NCCL_DEBUG=INFO \
-            jaxrens-ci:${{ github.sha }} \
-            pytest tests -v -s --tb=long -m multi_gpu \
-              --timeout=600 --timeout-method=thread \
-              -o addopts=""
+  full:
+    uses: ./.github/workflows/full-suite.yml
+    secrets: inherit
