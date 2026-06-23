@@ -5,12 +5,23 @@ from __future__ import annotations
 import warnings
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from jaxrens.cli.schema.adaptation import AdaptationSpec
 from jaxrens.cli.schema.backend import BackendSpec
 from jaxrens.cli.schema.cell import CellSpec
-from jaxrens.cli.schema.ensemble import EnsembleSpec, NVTEnsembleSpec, NPTEnsembleSpec
+from jaxrens.cli.schema.constraints import ConstraintSpec
+from jaxrens.cli.schema.ensemble import (
+    EnsembleSpec,
+    NPTEnsembleSpec,
+    NVTEnsembleSpec,
+)
 from jaxrens.cli.schema.init import InitSpec
 from jaxrens.cli.schema.inter_re import InterRESpec
 from jaxrens.cli.schema.moves import MoveSpec
@@ -92,6 +103,9 @@ class RootSpec(BaseModel):
     cell: CellSpec = Field(default_factory=CellSpec)
     # inter_re is optional; None → no replica-exchange swaps (zero overhead).
     inter_re: InterRESpec | None = None
+    # Configuration constraints (e.g. minimum inter-atomic distance). Empty by
+    # default → no constraint gating, zero overhead. See jaxrens.constraints.
+    constraints: list[ConstraintSpec] = Field(default_factory=list)
 
     @field_validator("moves", mode="before")
     @classmethod
@@ -192,7 +206,10 @@ class RootSpec(BaseModel):
             )
 
         too_frequent = [
-            ("inter_re.re_interval", self.inter_re.re_interval if self.inter_re else None),
+            (
+                "inter_re.re_interval",
+                self.inter_re.re_interval if self.inter_re else None,
+            ),
             ("output.traj_interval", self.output.traj_interval),
         ]
         for label, value in too_frequent:

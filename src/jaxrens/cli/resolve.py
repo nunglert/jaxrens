@@ -36,6 +36,7 @@ from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
 from jaxrens.cli.schema.init import InitSpec
 from jaxrens.cli.schema.root import RootSpec
 from jaxrens.cli.schema.termination import IterationTerminationSpec
+from jaxrens.constraints.base import ConstraintDescriptor
 from jaxrens.init.cells import cell_shape_walk, sample_initial_volume
 from jaxrens.init.positions import (
     grid_positions_in_cell,
@@ -198,6 +199,61 @@ class ResolvedInit:
     # of shape ``(n_gpu, n_per_gpu)`` for multi-replica restart; ``None`` when
     # starting fresh.  Consumer (``cli/run.py``) dispatches by isinstance.
     restart_state: RestartBundle | list[list[RestartBundle]] | None = None
+
+
+def _check_initial_constraints(
+    descriptors: tuple[ConstraintDescriptor, ...],
+    resolved_init: ResolvedInit,
+) -> None:
+    """Fail fast if any initial walker violates a configuration constraint.
+
+    The MWG constraint gate assumes every walker entering a step already
+    satisfies the constraints (a move can then only be *blamed* for a new
+    violation). That invariant is established here: a starting configuration
+    that is already illegal is a user error, reported before the run begins.
+    """
+    positions = jnp.asarray(resolved_init.initial_positions)
+    types = jnp.asarray(resolved_init.initial_types)
+    n_live = int(positions.shape[0])
+    cells = resolved_init.initial_cells
+    cells = jnp.zeros((n_live, 3, 3)) if cells is None else jnp.asarray(cells)
+
+    for desc in descriptors:
+        predicate = desc.build(**desc.build_kwargs)
+        valid = jax.vmap(lambda p, c: predicate(p, types, c))(positions, cells)
+        valid = np.asarray(valid)
+        if not valid.all():
+            bad = int(np.argmax(~valid))
+            raise ValueError(
+                f"Initial walker {bad} of {n_live} violates the "
+                f"{desc.name!r} configuration constraint. Adjust the initial "
+                f"configuration (e.g. start_species / start_config_file) or "
+                f"relax the constraint before running."
+            )
+
+
+def _resolve_constraints(
+    root: RootSpec, resolved_init: ResolvedInit
+) -> tuple[ConstraintDescriptor, ...]:
+    """Build constraint descriptors from the config and validate initial state.
+
+    Returns an empty tuple when no constraints are configured (the common
+    case — zero overhead downstream).
+    """
+    if not root.constraints:
+        return ()
+    if resolved_init.symbol_map is None:
+        raise ValueError(
+            "Configuration constraints require a resolved species map, but "
+            "none is available for this init mode. This is a jaxrens "
+            "limitation — please report it."
+        )
+    descriptors = tuple(
+        c.to_descriptor(symbol_map=resolved_init.symbol_map)
+        for c in root.constraints
+    )
+    _check_initial_constraints(descriptors, resolved_init)
+    return descriptors
 
 
 def _build_cells(
@@ -974,6 +1030,9 @@ class ResolvedConfig:
     initial_walk_config: Any = None
     adaptation_cfg: Any = None
     inter_re_config: Any = None  # InterREConfig | None
+    # Configuration constraints to enforce via the MWG gate. Empty when none
+    # are configured (the common case). See jaxrens.constraints.
+    constraint_descriptors: tuple[ConstraintDescriptor, ...] = ()
     # Batcher describing the (G, P) topology.  ``SingleRun`` when
     # n_total == 1, ``PmapVmapRuns(n_gpu, n_per_gpu)`` otherwise.
     # Consumed uniformly by ``_run_loop``, ``build_adapt_step``,
@@ -1169,6 +1228,8 @@ def _resolve_single_replica(
         for m, policy in zip(root.moves, adaptation_policies)
     )
 
+    constraint_descriptors = _resolve_constraints(root, resolved_init)
+
     if shard_n_gpu > 1:
         from jaxrens.sampling.batch_descriptor import ShardedSingleRun
 
@@ -1180,6 +1241,7 @@ def _resolve_single_replica(
         ns=ns,
         moves=moves,
         move_descriptors=move_descriptors,
+        constraint_descriptors=constraint_descriptors,
         backend=backend,
         base_backend=base_backend,
         output=output,
@@ -1682,10 +1744,13 @@ def _resolve_multi_replica(
         for m, policy in zip(root.moves, adaptation_policies)
     )
 
+    constraint_descriptors = _resolve_constraints(root, stacked_init)
+
     return ResolvedConfig(
         ns=ns,
         moves=moves,
         move_descriptors=move_descriptors,
+        constraint_descriptors=constraint_descriptors,
         backend=backend_cfg,
         base_backend=base_backend,
         output=output,

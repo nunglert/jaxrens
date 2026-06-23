@@ -130,6 +130,7 @@ def _run_single(resolved, *, writer_mode: str = "w") -> None:
         symbol_map=resolved.init.symbol_map,
         restart_state=resolved.init.restart_state,
         move_descriptors=list(resolved.move_descriptors),
+        constraint_descriptors=resolved.constraint_descriptors,
         initial_walk_config=resolved.initial_walk_config,
         adaptation_config=resolved.adaptation_cfg,
         termination_criteria=list(resolved.termination),

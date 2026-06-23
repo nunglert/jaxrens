@@ -328,6 +328,7 @@ def run_from_config(
     initial_walk_config=None,
     adaptation_config=None,
     move_descriptors=None,
+    constraint_descriptors: tuple = (),
     base_backend: Any = None,
     writer_mode: str = "w",
 ) -> dict:
@@ -401,7 +402,7 @@ def run_from_config(
     # stretch, single_atom_sweep, alchemical_morph).
     if move_descriptors is not None:
         init_fn, step_fn, per_move_fns = build_mwg(
-            backend, list(move_descriptors)
+            backend, list(move_descriptors), tuple(constraint_descriptors)
         )
     else:
         init_fn, step_fn, per_move_fns = setup_mwg(move_config, backend)
@@ -800,7 +801,9 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
     backend = EnsembleBackend(base_backend, pressure=0.0)
 
     init_fn, step_fn, per_move_fns = build_mwg(
-        backend, list(resolved.move_descriptors)
+        backend,
+        list(resolved.move_descriptors),
+        resolved.constraint_descriptors,
     )
 
     working_dir = resolved.output.working_dir
@@ -1271,6 +1274,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
     init_fn, step_fn, per_move_fns = build_mwg(
         backend,
         list(resolved.move_descriptors),
+        resolved.constraint_descriptors,
     )
 
     working_dir = resolved.output.working_dir
