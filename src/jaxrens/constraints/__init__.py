@@ -11,6 +11,10 @@ from jaxrens.constraints.base import (
     ConstraintDescriptor,
     make_move_gate,
 )
+from jaxrens.constraints.cell_geometry import (
+    build_cell_geometry,
+    cell_geometry_descriptor,
+)
 from jaxrens.constraints.min_distance import (
     build_min_distance,
     min_distance_descriptor,
@@ -23,4 +27,6 @@ __all__ = [
     "make_move_gate",
     "build_min_distance",
     "min_distance_descriptor",
+    "build_cell_geometry",
+    "cell_geometry_descriptor",
 ]

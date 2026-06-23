@@ -12,7 +12,8 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.base import MoveInfo
-from jaxrens.utils.cell import check_cell_shape, get_volume
+from jaxrens.constraints.cell_geometry import build_cell_geometry
+from jaxrens.utils.cell import get_volume
 
 
 def build_kernel(
@@ -36,6 +37,14 @@ def build_kernel(
     Returns:
         step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
     """
+
+    # Cell-geometry guard, defined once in the constraints framework. The
+    # kernel claims this constraint (rather than the central MWG gate) because
+    # its result also gates the neighbor-bucket bookkeeping below and the
+    # reject-reason ordering; see jaxrens.constraints.cell_geometry.
+    cell_geometry = build_cell_geometry(
+        n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect
+    )
 
     def step(rng_key, state, likelihood_constraint):
         k1, k2 = jax.random.split(rng_key)
@@ -76,9 +85,7 @@ def build_kernel(
         )
 
         # Check cell shape validity
-        cell_valid = check_cell_shape(
-            new_cell, n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect
-        )
+        cell_valid = cell_geometry(new_positions, state.types, new_cell)
 
         # Volume prior acceptance
         p_accept = jnp.where(

@@ -12,7 +12,8 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.base import MoveInfo
-from jaxrens.utils.cell import check_cell_shape, transform_positions
+from jaxrens.constraints.cell_geometry import build_cell_geometry
+from jaxrens.utils.cell import transform_positions
 
 
 def _build_shear_cell(cell, shear_idx, rv1, rv2):
@@ -70,6 +71,12 @@ def build_kernel(
         step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
     """
 
+    # Cell-geometry guard (kernel-claimed); see
+    # jaxrens.constraints.cell_geometry and the volume kernel for rationale.
+    cell_geometry = build_cell_geometry(
+        n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect
+    )
+
     def step(rng_key, state, likelihood_constraint):
         k1, k2 = jax.random.split(rng_key)
 
@@ -95,9 +102,7 @@ def build_kernel(
             result.overflow,
         )
 
-        cell_valid = check_cell_shape(
-            new_cell, n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect
-        )
+        cell_valid = cell_geometry(new_positions, state.types, new_cell)
 
         energy_ok = new_energy < likelihood_constraint
         accepted = energy_ok & cell_valid
