@@ -78,7 +78,7 @@ def make_mc_state_class(extra_fields: dict[str, type] | None = None) -> type:
         (
             "ensemble_params",
             dict,
-        ),  # e.g. {"pressure": scalar, "mu": (n_species,)}
+        ),  # e.g. {"pressure": scalar, "chemical_potentials": (n_species,)}
     ]
 
     # Move-specific fields

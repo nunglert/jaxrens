@@ -420,6 +420,86 @@ def _validate_cells(
             )
 
 
+def _compute_initial_energies(
+    energy_backend: EnergyBackend,
+    types: jnp.ndarray,
+    batcher: BatchDescriptor,
+    positions: jnp.ndarray,
+    cells: jnp.ndarray,
+    bucket: int,
+    ensemble_params_batched: Any | None,
+) -> jnp.ndarray:
+    """Batched initial-energy evaluation at a fixed neighbor ``bucket``.
+
+    Routes the per-replica energy compute through ``batcher.wrap_for_batch``
+    (SingleRun / PmapVmapRuns) exactly like the surrounding finalize.
+
+    ``ensemble_params_batched`` is an ensemble-agnostic pytree (e.g.
+    ``{"pressure": (*prefix,), "chemical_potentials": (*prefix, n_species)}``)
+    whose leaves carry one entry per replica along the batcher's
+    ``shape_prefix`` axes.  ``jax.vmap``/``pmap`` map those leaves natively, so
+    each replica's per-call ``ensemble_params`` dict flows through to the
+    backend and its initial energy reflects that replica's own P·V and −μ·N
+    terms.  When ``None`` (no ensemble corrections, or the SingleRun path
+    where the backend already closes over its ensemble params) no
+    ``ensemble_params`` kwarg is passed.
+
+    ``bucket`` is the static neighbor-list size to compile at — ``0`` for
+    backends without ``max_neighbors_for``, else the chosen starting bucket.
+    """
+    if ensemble_params_batched is None:
+
+        def per_replica(pos_K, cells_K):
+            return jax.vmap(
+                lambda p, c: energy_backend(p, types, c, bucket)[0]
+            )(pos_K, cells_K)
+
+        return batcher.wrap_for_batch(per_replica)(positions, cells)
+
+    def per_replica_ep(pos_K, cells_K, ep):
+        return jax.vmap(
+            lambda p, c: energy_backend(
+                p,
+                types,
+                c,
+                bucket,
+                ensemble_params=ep,
+            )[0]
+        )(pos_K, cells_K)
+
+    return batcher.wrap_for_batch(per_replica_ep)(
+        positions, cells, ensemble_params_batched
+    )
+
+
+def _stack_ensemble_params(
+    params_per_run: tuple[dict, ...] | list[dict],
+    keys: tuple[str, ...],
+    shape_prefix: tuple[int, ...],
+) -> dict | None:
+    """Stack per-replica ensemble-param dicts into one batched pytree.
+
+    For each key in ``keys`` present in *every* replica dict, stacks the
+    per-replica values along a new leading axis and reshapes to
+    ``shape_prefix + leaf_shape`` so the leaves align with the batcher's
+    replica axes.  Returns ``None`` if no key qualifies (no ensemble
+    corrections to thread).
+
+    Only energy-relevant keys should be passed in ``keys`` — these are the
+    same per-replica dicts the runtime NS loop hands to its ``EnsembleBackend``
+    via ``ensemble_params_per_run``, so resolved initial energies match the
+    runtime by construction.
+    """
+    batched: dict = {}
+    for k in keys:
+        if all(k in p for p in params_per_run):
+            stacked = jnp.stack(
+                [jnp.asarray(p[k]) for p in params_per_run], axis=0
+            )
+            batched[k] = stacked.reshape(shape_prefix + stacked.shape[1:])
+    return batched or None
+
+
 def _finalise_initial_energies_and_counts(
     energy_backend: EnergyBackend | None,
     positions: jnp.ndarray,
@@ -428,7 +508,7 @@ def _finalise_initial_energies_and_counts(
     batcher: BatchDescriptor | None = None,
     ladder: tuple[int, ...] | None = None,
     offset: int = 0,
-    pressures: jnp.ndarray | None = None,
+    ensemble_params_batched: Any | None = None,
 ) -> tuple[jnp.ndarray | None, jnp.ndarray | None]:
     """Compute per-walker initial ``(energies, max_neighbor_counts)``.
 
@@ -463,14 +543,15 @@ def _finalise_initial_energies_and_counts(
     function, not vmap-axis aligned — it's identical across walkers
     and across replicas.
 
-    ``pressures`` (shape ``batcher.shape_prefix``) carries per-replica
-    pressure values for NPT runs.  When supplied with a PmapVmapRuns
-    batcher and an EnsembleBackend, the per-call
-    ``ensemble_params={"pressure": ...}`` kwarg flows through so each
-    replica's initial energy reflects its own P·V term — even though
-    a single EnsembleBackend instance handles all replicas in the
-    consolidated finalize.  When ``None``, the backend's own closured
-    pressure is used (SingleRun path).
+    ``ensemble_params_batched`` is an ensemble-agnostic pytree (leaves
+    shaped ``batcher.shape_prefix + leaf_shape``) carrying per-replica
+    ensemble params — ``pressure`` for NPT, ``chemical_potentials`` for
+    semi-grand μPT, or both.  When supplied with an EnsembleBackend, each
+    replica's initial energy reflects its own P·V and −μ·N terms, matching
+    the runtime NS loop by construction — even though a single
+    EnsembleBackend instance handles all replicas in the consolidated
+    finalize.  When ``None``, no ensemble correction is threaded (the
+    backend's own closured params are used, as on the SingleRun path).
 
     Returns ``(energies, counts)``; either or both may be ``None``.
     """
@@ -519,31 +600,15 @@ def _finalise_initial_energies_and_counts(
             init_bucket,
         )
 
-        if pressures is None:
-
-            def per_replica_energy(pos_K, cells_K):
-                return jax.vmap(
-                    lambda p, c: energy_backend(p, types, c, init_bucket)[0]
-                )(pos_K, cells_K)
-
-            batched_energy = batcher.wrap_for_batch(per_replica_energy)
-            energies = batched_energy(positions, cells)
-        else:
-
-            def per_replica_energy_p(pos_K, cells_K, pressure_scalar):
-                ep = {"pressure": pressure_scalar}
-                return jax.vmap(
-                    lambda p, c: energy_backend(
-                        p,
-                        types,
-                        c,
-                        init_bucket,
-                        ensemble_params=ep,
-                    )[0]
-                )(pos_K, cells_K)
-
-            batched_energy = batcher.wrap_for_batch(per_replica_energy_p)
-            energies = batched_energy(positions, cells, pressures)
+        energies = _compute_initial_energies(
+            energy_backend,
+            types,
+            batcher,
+            positions,
+            cells,
+            init_bucket,
+            ensemble_params_batched,
+        )
         return energies, counts
 
     logger.info(
@@ -555,31 +620,15 @@ def _finalise_initial_energies_and_counts(
         type(batcher).__name__,
     )
 
-    if pressures is None:
-
-        def per_replica_energy_no_nl(pos_K, cells_K):
-            return jax.vmap(lambda p, c: energy_backend(p, types, c, 0)[0])(
-                pos_K, cells_K
-            )
-
-        batched_energy = batcher.wrap_for_batch(per_replica_energy_no_nl)
-        energies = batched_energy(positions, cells)
-    else:
-
-        def per_replica_energy_no_nl_p(pos_K, cells_K, pressure_scalar):
-            ep = {"pressure": pressure_scalar}
-            return jax.vmap(
-                lambda p, c: energy_backend(
-                    p,
-                    types,
-                    c,
-                    0,
-                    ensemble_params=ep,
-                )[0]
-            )(pos_K, cells_K)
-
-        batched_energy = batcher.wrap_for_batch(per_replica_energy_no_nl_p)
-        energies = batched_energy(positions, cells, pressures)
+    energies = _compute_initial_energies(
+        energy_backend,
+        types,
+        batcher,
+        positions,
+        cells,
+        0,
+        ensemble_params_batched,
+    )
     return energies, None
 
 
@@ -1591,20 +1640,21 @@ def _resolve_multi_replica(
         else None
     )
 
-    pressures = jnp.asarray(
-        [
-            float(params_per_run[r].get("pressure", 0.0))
-            for r in range(n_total)
-        ],
-        dtype=jnp.float32,
-    ).reshape(n_gpu, n_per_gpu)
+    # Thread the per-replica ensemble params the runtime NS loop uses
+    # (``ensemble_params_per_run``) into the consolidated initial-energy
+    # compute, so resolved initial energies include the same P·V and −μ·N
+    # terms the EnsembleBackend applies at runtime — matching by construction.
+    # ``EnsembleBackend`` reads exactly these keys; others (e.g.
+    # ``target_composition``) are not energy terms and are not threaded.
+    _ENERGY_KEYS = ("pressure", "chemical_potentials")
+    ensemble_params_batched = _stack_ensemble_params(
+        params_per_run, _ENERGY_KEYS, (n_gpu, n_per_gpu)
+    )
 
-    # Use a single base-or-ensemble backend for the consolidated call.
-    # If any replica has a pressure, all replicas share the same
-    # EnsembleBackend wrapper and per-replica pressure flows through
-    # ``ensemble_params``; otherwise use the raw base backend.
-    any_pressure = any(p.get("pressure") is not None for p in params_per_run)
-    if any_pressure:
+    # If any replica carries an energy-relevant ensemble param, all replicas
+    # share one EnsembleBackend wrapper and their per-replica params flow
+    # through ``ensemble_params``; otherwise use the raw base backend.
+    if ensemble_params_batched is not None:
         finalize_backend = EnsembleBackend(base_backend, pressure=0.0)
     else:
         finalize_backend = base_backend
@@ -1617,7 +1667,7 @@ def _resolve_multi_replica(
         batcher=batcher,
         ladder=tuple(backend_cfg.max_neighbors_list),
         offset=int(backend_cfg.max_neighbors_offset),
-        pressures=pressures if any_pressure else None,
+        ensemble_params_batched=ensemble_params_batched,
     )
 
     # Collapse the (G, P, K, ...) shape back to (n_total, K, ...) so

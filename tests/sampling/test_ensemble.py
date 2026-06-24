@@ -1,7 +1,9 @@
-"""Tests for pressure/enthalpy (NPT) support via EnsembleBackend.
+"""Tests for ensemble corrections (NPT/μPT) via EnsembleBackend.
 
 Verifies:
-- EnsembleBackend correctly adds PV to energy
+- EnsembleBackend correctly adds the P·V (NPT) and −μ·N (μPT) terms
+- the resolver threads per-replica ensemble params into the initial energy
+  so resolved energies match the runtime NS loop by construction
 - NS state tracking of dead_volumes
 - NPT NS runs converge correctly
 - Post-processing with volumes
@@ -121,6 +123,177 @@ class TestEnsembleBackend:
         e_b = backend(pos, types, cell_b, 0).energy
         # Different volumes → different PV → different energies
         assert float(e_b) > float(e_a)
+
+    def test_chemical_potentials_subtract_muN(self):
+        # Grand-canonical: H = U - μ·N, applied via the per-call
+        # ensemble_params key "chemical_potentials" (regression: the backend
+        # previously read key "mu", so this term was silently dropped).
+        base = create_harmonic(k=1.0)
+        backend = EnsembleBackend(base, pressure=0.0)
+        pos = jnp.zeros((3, 3))
+        types = jnp.array([0, 0, 1])  # counts: species 0 → 2, species 1 → 1
+        cell = 5.0 * jnp.eye(3)
+        mu = jnp.array([1.0, 2.0], dtype=jnp.float32)
+        e_raw = base(pos, types, cell, 0).energy
+        e_ens = backend(
+            pos,
+            types,
+            cell,
+            0,
+            ensemble_params={"chemical_potentials": mu},
+        ).energy
+        # U - (1*2 + 2*1) = U - 4
+        assert jnp.allclose(e_ens, e_raw - 4.0, atol=1e-5)
+
+    def test_chemical_potentials_closured_default(self):
+        # μ supplied to the constructor is used when no per-call override.
+        base = create_harmonic(k=1.0)
+        mu = jnp.array([1.0, 2.0], dtype=jnp.float32)
+        backend = EnsembleBackend(base, chemical_potentials=mu)
+        pos = jnp.zeros((3, 3))
+        types = jnp.array([0, 0, 1])
+        cell = 5.0 * jnp.eye(3)
+        e_raw = base(pos, types, cell, 0).energy
+        e_ens = backend(pos, types, cell, 0).energy
+        assert jnp.allclose(e_ens, e_raw - 4.0, atol=1e-5)
+
+    def test_pressure_and_chemical_potentials_combined(self):
+        base = create_harmonic(k=1.0)
+        backend = EnsembleBackend(base, pressure=0.01)
+        pos = jnp.zeros((3, 3))
+        types = jnp.array([0, 0, 1])
+        cell = 5.0 * jnp.eye(3)
+        mu = jnp.array([1.0, 2.0], dtype=jnp.float32)
+        e_raw = base(pos, types, cell, 0).energy
+        e_ens = backend(
+            pos,
+            types,
+            cell,
+            0,
+            ensemble_params={"chemical_potentials": mu},
+        ).energy
+        V = 5.0**3
+        # H = U + P*V - μ·N
+        assert jnp.allclose(e_ens, e_raw + 0.01 * V - 4.0, atol=1e-4)
+
+
+class TestInitialEnergyEnsembleThreading:
+    """The resolver's initial-energy compute must thread the SAME per-replica
+    ensemble params the runtime NS loop uses, so resolved energies include
+    P·V and −μ·N by construction.
+
+    Regression for the semi-grand bug where ``chemical_potentials`` were
+    silently dropped from the initial energy (the resolver extracted only
+    ``pressure``), so the first NS contour disagreed with the running chain
+    and with ``SemiGrandSwap``'s ``Ω = U − μ·N`` assumption.
+    """
+
+    def test_finalise_threads_chemical_potentials_per_replica(self):
+        import jax
+
+        from jaxrens.cli.resolve import _finalise_initial_energies_and_counts
+        from jaxrens.sampling.batch_descriptor import VmapRuns
+
+        base = create_harmonic(k=1.0)
+        backend = EnsembleBackend(base, pressure=0.0)
+
+        n_runs, K, n_atoms = 2, 3, 2
+        positions = jax.random.uniform(
+            jax.random.key(0), (n_runs, K, n_atoms, 3)
+        )
+        cells = jnp.tile(5.0 * jnp.eye(3), (n_runs, K, 1, 1))
+        types = jnp.array([0, 1], dtype=jnp.int32)  # N = [1, 1]
+
+        # Distinct μ per replica → distinct −μ·N shift per run.
+        mu = jnp.array([[1.0, 2.0], [0.5, 0.5]], dtype=jnp.float32)
+        ep_batched = {"chemical_potentials": mu}
+
+        energies, counts = _finalise_initial_energies_and_counts(
+            backend,
+            positions,
+            types,
+            cells,
+            batcher=VmapRuns(n_runs),
+            ensemble_params_batched=ep_batched,
+        )
+        assert counts is None
+        assert energies.shape == (n_runs, K)
+
+        U = jax.vmap(jax.vmap(lambda p, c: base(p, types, c, 0).energy))(
+            positions, cells
+        )
+        N = jnp.array([1.0, 1.0])
+        expected = U - (mu @ N)[:, None]  # per-run μ·N, broadcast over K
+        assert jnp.allclose(energies, expected, atol=1e-4)
+
+    def test_finalise_without_ensemble_params_is_raw_energy(self):
+        import jax
+
+        from jaxrens.cli.resolve import _finalise_initial_energies_and_counts
+        from jaxrens.sampling.batch_descriptor import VmapRuns
+
+        base = create_harmonic(k=1.0)
+        n_runs, K, n_atoms = 2, 3, 2
+        positions = jax.random.uniform(
+            jax.random.key(1), (n_runs, K, n_atoms, 3)
+        )
+        cells = jnp.tile(5.0 * jnp.eye(3), (n_runs, K, 1, 1))
+        types = jnp.array([0, 1], dtype=jnp.int32)
+
+        energies, counts = _finalise_initial_energies_and_counts(
+            base,
+            positions,
+            types,
+            cells,
+            batcher=VmapRuns(n_runs),
+            ensemble_params_batched=None,
+        )
+        U = jax.vmap(jax.vmap(lambda p, c: base(p, types, c, 0).energy))(
+            positions, cells
+        )
+        assert jnp.allclose(energies, U, atol=1e-5)
+
+    def test_stack_ensemble_params_shapes_and_keys(self):
+        from jaxrens.cli.resolve import _stack_ensemble_params
+
+        params = [
+            {"pressure": 0.01, "chemical_potentials": jnp.array([1.0, 2.0])},
+            {"pressure": 0.02, "chemical_potentials": jnp.array([3.0, 4.0])},
+        ]
+        out = _stack_ensemble_params(
+            params, ("pressure", "chemical_potentials"), (2,)
+        )
+        assert set(out) == {"pressure", "chemical_potentials"}
+        assert out["pressure"].shape == (2,)
+        assert out["chemical_potentials"].shape == (2, 2)
+        assert jnp.allclose(
+            out["chemical_potentials"], jnp.array([[1.0, 2.0], [3.0, 4.0]])
+        )
+        # 2-D (G, P) prefix reshapes leaves correctly.
+        out2 = _stack_ensemble_params(params, ("chemical_potentials",), (1, 2))
+        assert out2["chemical_potentials"].shape == (1, 2, 2)
+
+    def test_stack_ensemble_params_none_when_no_energy_keys(self):
+        from jaxrens.cli.resolve import _stack_ensemble_params
+
+        # target_composition is an XRENS morph target, not an energy term.
+        params = [
+            {"target_composition": jnp.array([1, 1])},
+            {"target_composition": jnp.array([1, 1])},
+        ]
+        assert (
+            _stack_ensemble_params(
+                params, ("pressure", "chemical_potentials"), (2,)
+            )
+            is None
+        )
+
+    def test_stack_ensemble_params_skips_partial_keys(self):
+        # A key present in only some replicas is skipped (no ragged stack).
+        from jaxrens.cli.resolve import _stack_ensemble_params
+
+        params = [{"pressure": 0.01}, {}]
+        assert _stack_ensemble_params(params, ("pressure",), (2,)) is None
 
 
 # ---------------------------------------------------------------------------
