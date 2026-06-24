@@ -30,6 +30,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.backends.base import BackendResult
+from jaxrens.backends.softcore import DEFAULT_SOFTCORE_KWARGS
 
 logger = logging.getLogger(__name__)
 
@@ -64,15 +65,6 @@ except ImportError:
     SoftCoreNeuralIL = None  # type: ignore[assignment]
     SoftCorePlainEnsemble = None  # type: ignore[assignment]
     _SOFTCORE_AVAILABLE = False
-
-
-DEFAULT_SOFTCORE_KWARGS: dict[str, float] = {
-    "a0": 1.0,
-    "b0": 3.0,
-    "d0": 1.0,
-    "r_core_cut": 1.25,
-    "r_core_switch": 0.75,
-}
 
 
 def _require_neuralil() -> None:

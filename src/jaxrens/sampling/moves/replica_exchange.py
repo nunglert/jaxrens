@@ -37,6 +37,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.sampling.morph import morph_types_to_composition
+from jaxrens.utils.cell import get_volume
 
 # ---------------------------------------------------------------------------
 # SwapKernel abstraction
@@ -224,8 +225,8 @@ class PressureRENSSwap(SwapKernel):
         )
 
         if use_pressure:
-            v_a = _get_volume(proposed["cell_a"])
-            v_b = _get_volume(proposed["cell_b"])
+            v_a = get_volume(proposed["cell_a"])
+            v_b = get_volume(proposed["cell_b"])
             # Stored e_a, e_b are enthalpies at self's pressure (EnsembleBackend
             # adds P_self·V).  Recover U by subtracting self's PV, then re-add
             # at the partner's pressure to get the enthalpy under the receiving
@@ -322,7 +323,7 @@ def perform_swap(
         h_self_b = energies_pair[1] + pressures_pair[1] * volumes_pair[1]
 
         # Fake cell matrices whose determinant equals the supplied volumes.
-        # _get_volume calls jnp.linalg.det, so we need actual (3,3) matrices.
+        # get_volume calls jnp.linalg.det, so we need actual (3,3) matrices.
         # Use a diagonal matrix: det(diag(cbrt(V), cbrt(V), cbrt(V))) = V.
         def _volume_to_cell(v: jnp.ndarray) -> jnp.ndarray:
             side = jnp.cbrt(v)
@@ -351,16 +352,6 @@ def perform_swap(
         ensemble_params_a,
         ensemble_params_b,
     )
-
-
-# ---------------------------------------------------------------------------
-# Volume helper
-# ---------------------------------------------------------------------------
-
-
-def _get_volume(cell: jnp.ndarray) -> jnp.ndarray:
-    """Compute volume from cell matrix. cell shape: (3, 3)."""
-    return jnp.abs(jnp.linalg.det(cell))
 
 
 def _pad_pairs(pairs, n_valid, max_len):
@@ -543,8 +534,8 @@ def replica_exchange_step(
             if pressures is not None and bxs is not None:
                 p_i = pressures[run_i]
                 p_j = pressures[run_j]
-                v_i = _get_volume(bxs[run_i, wi])
-                v_j = _get_volume(bxs[run_j, wj])
+                v_i = get_volume(bxs[run_i, wi])
+                v_j = get_volume(bxs[run_j, wj])
                 u_i = e_i - p_i * v_i  # recover raw U from stored H_self
                 u_j = e_j - p_j * v_j
                 new_e_into_run_i = (

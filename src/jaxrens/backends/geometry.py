@@ -24,8 +24,8 @@ def pairwise_distances(
     are measured correctly; for a non-periodic system (``cell`` all zeros /
     singular) raw Cartesian distances are used. MIC is single-image ("111",
     O(N^2), no supercell expansion) — exact as long as the relevant cutoff
-    stays below half the shortest perpendicular cell width (see
-    :func:`jaxrens.utils.cell.min_perpendicular_distance`).
+    stays below half the shortest perpendicular cell width (the smallest
+    face-to-face distance of the cell).
 
     The diagonal is the self-distance and is therefore exactly 0; callers
     that sum or threshold over pairs must mask it themselves.

@@ -14,26 +14,6 @@ def get_volume(cell: jnp.ndarray) -> jnp.ndarray:
     return jnp.abs(jnp.linalg.det(cell))
 
 
-def min_perpendicular_distance(cell: jnp.ndarray) -> jnp.ndarray:
-    """Minimum perpendicular distance between opposite faces of the parallelepiped.
-
-    For each pair of opposite faces (perpendicular to lattice vector i), the
-    inter-face distance is V / ||b_j × b_k||. Returns the minimum over the
-    three pairs — this is the tightest dimension of the cell, the relevant
-    quantity for the minimum image convention (MIC needs r_cut ≤ ½ · this).
-    """
-    volume = get_volume(cell)
-    cross_bc = jnp.cross(cell[1], cell[2])
-    cross_ca = jnp.cross(cell[2], cell[0])
-    cross_ab = jnp.cross(cell[0], cell[1])
-    norms = jnp.stack([
-        jnp.linalg.norm(cross_bc),
-        jnp.linalg.norm(cross_ca),
-        jnp.linalg.norm(cross_ab),
-    ])
-    return volume / jnp.max(norms)
-
-
 def min_aspect_ratio(cell: jnp.ndarray, volume: jnp.ndarray) -> jnp.ndarray:
     """Minimum aspect ratio across 3 cell vector pairs.
 
@@ -104,4 +84,6 @@ def transform_positions(
     T = get_cell_transformation(new_cell, old_cell)
     # HIGHEST precision: TF32 (10-bit mantissa on GPU) corrupts positions@T
     # by ~3.7e-3 even for identity T, spiking LJ energy at dense packing.
-    return jnp.einsum("ij,jk->ik", positions, T, precision=jax.lax.Precision.HIGHEST)
+    return jnp.einsum(
+        "ij,jk->ik", positions, T, precision=jax.lax.Precision.HIGHEST
+    )
