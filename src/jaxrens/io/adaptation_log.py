@@ -35,9 +35,13 @@ from pathlib import Path
 
 import numpy as np
 
+from jaxrens.io._buffered_h5 import BufferedH5Logger
+
 logger = logging.getLogger(__name__)
 
-_FLUSH_INTERVAL = 1  # flush buffer to HDF5 every N entries — crash-durable by default
+_FLUSH_INTERVAL = (
+    1  # flush buffer to HDF5 every N entries — crash-durable by default
+)
 
 
 @dataclass
@@ -65,18 +69,22 @@ class AdaptationLog:
             subset. None for v1/v2 files.
     """
 
-    iterations: np.ndarray          # (n_entries,)
-    step_sizes: np.ndarray          # (n_entries, n_runs, n_moves)
-    acceptance_rates: np.ndarray    # (n_entries, n_runs, n_moves)
+    iterations: np.ndarray  # (n_entries,)
+    step_sizes: np.ndarray  # (n_entries, n_runs, n_moves)
+    acceptance_rates: np.ndarray  # (n_entries, n_runs, n_moves)
     move_names: list[str]
     n_runs: int
     n_moves: int
     adjustment_stats: "dict[str, np.ndarray] | None" = None
-    n_evaluations: "np.ndarray | None" = None       # (n_entries, n_runs, n_moves) int64
-    n_grad_evaluations: "np.ndarray | None" = None  # (n_entries, n_runs, n_moves) int64
+    n_evaluations: "np.ndarray | None" = (
+        None  # (n_entries, n_runs, n_moves) int64
+    )
+    n_grad_evaluations: "np.ndarray | None" = (
+        None  # (n_entries, n_runs, n_moves) int64
+    )
 
 
-class AdaptationLogger:
+class AdaptationLogger(BufferedH5Logger):
     """Append-only HDF5 writer for per-iteration per-move step sizes and rates.
 
     Buffers writes in memory and flushes to HDF5 every ``_FLUSH_INTERVAL``
@@ -98,30 +106,28 @@ class AdaptationLogger:
         mode: str = "w",
         restart_iteration: int = 0,
     ) -> None:
-        self.path = Path(path)
+        # AdaptationLogger keeps its own buffer-length flush trigger
+        # (``_FLUSH_INTERVAL`` entries), so the base's iteration-interval
+        # cadence is unused here — pass it through for the shared scaffolding.
+        super().__init__(path, _FLUSH_INTERVAL, mode, restart_iteration)
         self.move_names = list(move_names)
         self.n_runs = int(n_runs)
         self.n_moves = len(move_names)
-        self._mode = mode
-        # First flush honors ``mode`` (so mode="w" truncates a stale file);
-        # subsequent flushes always append.
-        self._first_flush = True
-        # Restart: rewind entries flushed past the checkpoint before appending.
-        if mode == "a" and restart_iteration > 0:
-            from jaxrens.io.restart_truncate import truncate_h5_iterations
-            truncate_h5_iterations(self.path, restart_iteration)
 
         # In-memory buffers
-        self._buf_iters: list[int] = []
-        self._buf_ss: list[np.ndarray] = []     # each (n_runs, n_moves)
-        self._buf_acc: list[np.ndarray] = []    # each (n_runs, n_moves)
+        self._buf_ss: list[np.ndarray] = []  # each (n_runs, n_moves)
+        self._buf_acc: list[np.ndarray] = []  # each (n_runs, n_moves)
 
         # Adjustment stats buffers — keyed by stat name; each entry (n_runs, n_moves) or (n_runs, n_moves, 4)
         self._buf_adj: dict[str, list[np.ndarray]] = {}
 
         # v3: evaluation counter buffers
-        self._buf_n_evals: list[np.ndarray] = []       # each (n_runs, n_moves) int64
-        self._buf_n_grad_evals: list[np.ndarray] = []  # each (n_runs, n_moves) int64
+        self._buf_n_evals: list[
+            np.ndarray
+        ] = []  # each (n_runs, n_moves) int64
+        self._buf_n_grad_evals: list[
+            np.ndarray
+        ] = []  # each (n_runs, n_moves) int64
 
         self._closed = False
 
@@ -246,7 +252,9 @@ class AdaptationLogger:
         with h5py.File(path, "r") as f:
             iterations = np.array(f["iterations"][:], dtype=np.int64)
             step_sizes = np.array(f["step_sizes"][:], dtype=np.float32)
-            acceptance_rates = np.array(f["acceptance_rates"][:], dtype=np.float32)
+            acceptance_rates = np.array(
+                f["acceptance_rates"][:], dtype=np.float32
+            )
             move_names = json.loads(f.attrs["move_names"])
             n_runs = int(f.attrs["n_runs"])
             n_moves = int(f.attrs["n_moves"])
@@ -258,7 +266,9 @@ class AdaptationLogger:
                 adjustment_stats = {}
                 for key, dtype in _ADJ_STAT_DTYPES.items():
                     if key in grp:
-                        adjustment_stats[key] = np.array(grp[key][:], dtype=dtype)
+                        adjustment_stats[key] = np.array(
+                            grp[key][:], dtype=dtype
+                        )
 
             # v3: load evaluation count datasets if present
             n_evaluations: "np.ndarray | None" = None
@@ -266,7 +276,9 @@ class AdaptationLogger:
             if "n_evaluations" in f:
                 n_evaluations = np.array(f["n_evaluations"][:], dtype=np.int64)
             if "n_grad_evaluations" in f:
-                n_grad_evaluations = np.array(f["n_grad_evaluations"][:], dtype=np.int64)
+                n_grad_evaluations = np.array(
+                    f["n_grad_evaluations"][:], dtype=np.int64
+                )
 
         return AdaptationLog(
             iterations=iterations,
@@ -304,8 +316,6 @@ class AdaptationLogger:
 
     def _flush(self) -> None:
         """Write buffered entries to HDF5, extending existing datasets."""
-        import h5py
-
         if not self._buf_iters:
             return
 
@@ -335,17 +345,18 @@ class AdaptationLogger:
         grad_evals_new: "np.ndarray | None" = None
         if has_evals:
             evals_new = np.stack(self._buf_n_evals, axis=0).astype(np.int64)
-            grad_evals_new = np.stack(self._buf_n_grad_evals, axis=0).astype(np.int64)
+            grad_evals_new = np.stack(self._buf_n_grad_evals, axis=0).astype(
+                np.int64
+            )
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-
-        mode = self._mode if self._first_flush else "a"
-        self._first_flush = False
-        with h5py.File(self.path, mode) as f:
+        with self._open_flush_file() as f:
             if "iterations" not in f:
                 # First write: create extensible datasets and write attrs
                 f.create_dataset(
-                    "iterations", data=iters_new, maxshape=(None,), chunks=(256,)
+                    "iterations",
+                    data=iters_new,
+                    maxshape=(None,),
+                    chunks=(256,),
                 )
                 f.create_dataset(
                     "step_sizes",
@@ -372,10 +383,15 @@ class AdaptationLogger:
                 if has_adj:
                     grp = f.create_group("adjustment_stats")
                     for key, arr in adj_new.items():
-                        maxshape = _ADJ_STAT_MAXSHAPES.get(key, (None,) * arr.ndim)
+                        maxshape = _ADJ_STAT_MAXSHAPES.get(
+                            key, (None,) * arr.ndim
+                        )
                         chunk_shape = (min(256, n_new),) + arr.shape[1:]
                         grp.create_dataset(
-                            key, data=arr, maxshape=maxshape, chunks=chunk_shape
+                            key,
+                            data=arr,
+                            maxshape=maxshape,
+                            chunks=chunk_shape,
                         )
 
                 if has_evals:

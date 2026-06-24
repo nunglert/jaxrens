@@ -23,6 +23,8 @@ from pathlib import Path
 
 import numpy as np
 
+from jaxrens.io._buffered_h5 import BufferedH5Logger
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,7 +54,7 @@ class RELog:
         return (self.n_accepted_per_pair / denom).astype(np.float32)
 
 
-class RELogger:
+class RELogger(BufferedH5Logger):
     """Append-only HDF5 writer for per-fire inter-RE swap counts.
 
     Buffers writes in memory and flushes once the NS iteration index
@@ -83,23 +85,12 @@ class RELogger:
         mode: str = "w",
         restart_iteration: int = 0,
     ) -> None:
-        self.path = Path(path)
+        super().__init__(path, flush_interval, mode, restart_iteration)
         self.n_pairs = int(n_pairs)
         self.flavor = str(flavor)
-        self.flush_interval = max(1, int(flush_interval))
-        self._mode = mode
-        # First flush honors ``mode``; subsequent flushes always append.
-        self._first_flush = True
-        # Restart: rewind entries flushed past the checkpoint before appending.
-        if mode == "a" and restart_iteration > 0:
-            from jaxrens.io.restart_truncate import truncate_h5_iterations
-            truncate_h5_iterations(self.path, restart_iteration)
 
-        self._buf_iters: list[int] = []
         self._buf_n_acc: list[np.ndarray] = []
         self._buf_n_att: list[np.ndarray] = []
-        self._last_flush_iter: int | None = None
-        self._closed = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -130,21 +121,7 @@ class RELogger:
         self._buf_n_acc.append(n_acc)
         self._buf_n_att.append(n_att)
 
-        if self._last_flush_iter is None:
-            self._last_flush_iter = iter_int
-        elif iter_int - self._last_flush_iter >= self.flush_interval:
-            self._flush()
-            self._last_flush_iter = iter_int
-
-    def close(self) -> None:
-        """Flush remaining buffer and close the logger.
-
-        If no entries were ever written, no file is created.
-        """
-        if not self._closed:
-            if self._buf_iters:
-                self._flush()
-            self._closed = True
+        self._maybe_flush(iter_int)
 
     @staticmethod
     def read(path: Path | str) -> RELog:
@@ -183,21 +160,15 @@ class RELogger:
 
     def _flush(self) -> None:
         """Append buffered entries to the HDF5 file (creating it if needed)."""
-        import h5py
-
         if not self._buf_iters:
             return
 
         n_new = len(self._buf_iters)
         new_iters = np.array(self._buf_iters, dtype=np.int64)
-        new_n_acc = np.stack(self._buf_n_acc, axis=0)        # (n_new, n_pairs)
+        new_n_acc = np.stack(self._buf_n_acc, axis=0)  # (n_new, n_pairs)
         new_n_att = np.stack(self._buf_n_att, axis=0)
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-
-        mode = self._mode if self._first_flush else "a"
-        self._first_flush = False
-        with h5py.File(self.path, mode) as f:
+        with self._open_flush_file() as f:
             if "iterations" not in f:
                 f.attrs["n_pairs"] = self.n_pairs
                 f.attrs["flavor"] = self.flavor

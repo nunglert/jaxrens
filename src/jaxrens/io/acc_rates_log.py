@@ -26,6 +26,8 @@ from pathlib import Path
 
 import numpy as np
 
+from jaxrens.io._buffered_h5 import BufferedH5Logger
+
 logger = logging.getLogger(__name__)
 
 
@@ -62,7 +64,7 @@ class AccRatesLog:
         return (self.n_accepted / denom).astype(np.float32)
 
 
-class AccRatesLogger:
+class AccRatesLogger(BufferedH5Logger):
     """Append-only HDF5 writer for per-iteration chain acc counts.
 
     Buffers writes in memory and flushes once the NS iteration index has
@@ -91,24 +93,13 @@ class AccRatesLogger:
         mode: str = "w",
         restart_iteration: int = 0,
     ) -> None:
-        self.path = Path(path)
+        super().__init__(path, flush_interval, mode, restart_iteration)
         self.move_names = list(move_names)
         self.n_runs = int(n_runs)
         self.n_moves = len(move_names)
-        self.flush_interval = max(1, int(flush_interval))
-        self._mode = mode
-        # First flush honors ``mode``; subsequent flushes always append.
-        self._first_flush = True
-        # Restart: rewind entries flushed past the checkpoint before appending.
-        if mode == "a" and restart_iteration > 0:
-            from jaxrens.io.restart_truncate import truncate_h5_iterations
-            truncate_h5_iterations(self.path, restart_iteration)
 
-        self._buf_iters: list[int] = []
         self._buf_n_acc: list[np.ndarray] = []
         self._buf_n_prop: list[np.ndarray] = []
-        self._last_flush_iter: int | None = None
-        self._closed = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -139,21 +130,7 @@ class AccRatesLogger:
         self._buf_n_acc.append(n_acc)
         self._buf_n_prop.append(n_prop)
 
-        if self._last_flush_iter is None:
-            self._last_flush_iter = iter_int
-        elif iter_int - self._last_flush_iter >= self.flush_interval:
-            self._flush()
-            self._last_flush_iter = iter_int
-
-    def close(self) -> None:
-        """Flush remaining buffer and close the logger.
-
-        If no entries were ever written, no file is created.
-        """
-        if not self._closed:
-            if self._buf_iters:
-                self._flush()
-            self._closed = True
+        self._maybe_flush(iter_int)
 
     @staticmethod
     def read(path: Path | str) -> AccRatesLog:
@@ -201,8 +178,6 @@ class AccRatesLogger:
 
     def _flush(self) -> None:
         """Write buffered entries to HDF5, extending existing datasets."""
-        import h5py
-
         if not self._buf_iters:
             return
 
@@ -211,22 +186,23 @@ class AccRatesLogger:
         prop_new = np.stack(self._buf_n_prop, axis=0).astype(np.int64)
         n_new = len(iters_new)
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        mode = self._mode if self._first_flush else "a"
-        self._first_flush = False
-        with h5py.File(self.path, mode) as f:
+        with self._open_flush_file() as f:
             if "iterations" not in f:
                 f.create_dataset(
-                    "iterations", data=iters_new,
-                    maxshape=(None,), chunks=(256,),
+                    "iterations",
+                    data=iters_new,
+                    maxshape=(None,),
+                    chunks=(256,),
                 )
                 f.create_dataset(
-                    "n_accepted", data=acc_new,
+                    "n_accepted",
+                    data=acc_new,
                     maxshape=(None, self.n_runs, self.n_moves),
                     chunks=(min(256, n_new), self.n_runs, self.n_moves),
                 )
                 f.create_dataset(
-                    "n_proposed", data=prop_new,
+                    "n_proposed",
+                    data=prop_new,
                     maxshape=(None, self.n_runs, self.n_moves),
                     chunks=(min(256, n_new), self.n_runs, self.n_moves),
                 )
