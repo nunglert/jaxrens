@@ -129,11 +129,7 @@ class TestRoundTrip:
         assert ws.positions.shape == (4, 2, 3)
 
     def test_checkpoint_without_dead_arrays_loads(self, tmp_path):
-        """Real checkpoints omit dead arrays (streamed to disk) — must load.
-
-        Regression: ``load_restart`` previously required ``dead_energies`` /
-        ``dead_positions`` and rejected every production checkpoint.
-        """
+        """Real checkpoints omit dead arrays (streamed to disk) — must load."""
         state = _make_ns_state_dict_no_dead(n_walkers=4, n_atoms=2, n_dead=7)
         p = _write_checkpoint(tmp_path, state)
         ws, bundle = load_restart(p)

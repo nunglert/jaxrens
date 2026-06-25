@@ -189,7 +189,9 @@ def _immutable_equal(a: Any, b: Any) -> bool:
         for key in set(a) | set(b):
             va = a.get(key, _MISSING)
             vb = b.get(key, _MISSING)
-            if (va is _MISSING and vb is None) or (vb is _MISSING and va is None):
+            if (va is _MISSING and vb is None) or (
+                vb is _MISSING and va is None
+            ):
                 continue
             if not _immutable_equal(va, vb):
                 return False
@@ -248,8 +250,9 @@ def validate_restart_compatibility(
         logger.warning(
             "[restart] config snapshot not found (looked for %s); "
             "skipping snapshot-based compatibility check.  "
-            "Run will proceed; consider re-running the original from a "
-            "post-fix jaxrens to get full restart validation.",
+            "Run will proceed; consider re-running the original with a "
+            "jaxrens that records config snapshots to get full restart "
+            "validation.",
             snapshot_path,
         )
         return
@@ -310,7 +313,9 @@ def validate_restart_compatibility(
     for path, snap_val, cur_val in soft:
         logger.warning(
             "[restart] %s changed across restart: snapshot=%s current=%s",
-            path, _format_value(snap_val), _format_value(cur_val),
+            path,
+            _format_value(snap_val),
+            _format_value(cur_val),
         )
 
     # Seed: warn when it is *unchanged* on restart — the continuation

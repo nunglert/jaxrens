@@ -29,7 +29,6 @@ from jaxrens.sampling.moves.replica_exchange import (
 )
 from jaxrens.state.config import InterREConfig
 
-
 # ---------------------------------------------------------------------------
 # Helper: build minimal state dict
 # ---------------------------------------------------------------------------
@@ -84,8 +83,8 @@ class TestSemiGrandProposeConvention:
         types_a = jnp.array([0, 0, 1], dtype=jnp.int32)  # N_A = [2, 1]
         types_b = jnp.array([1, 1, 0], dtype=jnp.int32)  # N_B = [1, 2]
         # Stored energies in EnsembleBackend convention: Ω_self = U - μ_self·N
-        stored_a = jnp.array(3.0 - (mu_a[0] * 2 + mu_a[1] * 1))   # = 3.0
-        stored_b = jnp.array(5.0 - (mu_b[0] * 1 + mu_b[1] * 2))   # = 2.5
+        stored_a = jnp.array(3.0 - (mu_a[0] * 2 + mu_a[1] * 1))  # = 3.0
+        stored_b = jnp.array(5.0 - (mu_b[0] * 1 + mu_b[1] * 2))  # = 2.5
 
         sa = _state(jnp.zeros((3, 3)), types_a, stored_a)
         sb = _state(jnp.zeros((3, 3)), types_b, stored_b)
@@ -94,15 +93,15 @@ class TestSemiGrandProposeConvention:
 
         proposed, n_e, n_g = kernel.propose(sa, sb, ea, eb, key, None)
 
-        expected_omega_a = 3.0 - (0.5 * 2 + 1.0 * 1)   # = 1.0
-        expected_omega_b = 5.0 - (0.0 * 1 + 0.0 * 2)   # = 5.0
+        expected_omega_a = 3.0 - (0.5 * 2 + 1.0 * 1)  # = 1.0
+        expected_omega_b = 5.0 - (0.0 * 1 + 0.0 * 2)  # = 5.0
 
-        assert abs(float(proposed["energy_a"]) - expected_omega_a) < 1e-5, (
-            f"Ω_A_new = {float(proposed['energy_a'])}, expected {expected_omega_a}"
-        )
-        assert abs(float(proposed["energy_b"]) - expected_omega_b) < 1e-5, (
-            f"Ω_B_new = {float(proposed['energy_b'])}, expected {expected_omega_b}"
-        )
+        assert (
+            abs(float(proposed["energy_a"]) - expected_omega_a) < 1e-5
+        ), f"Ω_A_new = {float(proposed['energy_a'])}, expected {expected_omega_a}"
+        assert (
+            abs(float(proposed["energy_b"]) - expected_omega_b) < 1e-5
+        ), f"Ω_B_new = {float(proposed['energy_b'])}, expected {expected_omega_b}"
 
     def test_no_backend_calls(self):
         """propose() must return (proposed, 0, 0) — zero energy/grad evals."""
@@ -114,7 +113,9 @@ class TestSemiGrandProposeConvention:
         sa = _state(jnp.zeros((4, 3)), types_a, jnp.array(1.0))
         sb = _state(jnp.zeros((4, 3)), types_b, jnp.array(2.0))
 
-        _, n_e, n_g = kernel.propose(sa, sb, _ens([0.0, 0.0]), _ens([1.0, 2.0]), key, None)
+        _, n_e, n_g = kernel.propose(
+            sa, sb, _ens([0.0, 0.0]), _ens([1.0, 2.0]), key, None
+        )
         assert n_e == 0, f"Expected 0 energy evals, got {n_e}"
         assert n_g == 0, f"Expected 0 grad evals, got {n_g}"
 
@@ -130,19 +131,27 @@ class TestSemiGrandProposeConvention:
         sa = _state(pos_a, types_a, jnp.array(1.0))
         sb = _state(pos_b, types_b, jnp.array(2.0))
 
-        proposed, _, _ = kernel.propose(sa, sb, _ens([0.0, 0.0]), _ens([0.5, 1.0]), key, None)
+        proposed, _, _ = kernel.propose(
+            sa, sb, _ens([0.0, 0.0]), _ens([0.5, 1.0]), key, None
+        )
 
-        assert jnp.allclose(proposed["positions_a"], pos_a), "positions_a should be A's positions"
-        assert jnp.allclose(proposed["positions_b"], pos_b), "positions_b should be B's positions"
-        assert jnp.array_equal(proposed["types_a"], types_a), "types_a must be unchanged"
-        assert jnp.array_equal(proposed["types_b"], types_b), "types_b must be unchanged"
+        assert jnp.allclose(
+            proposed["positions_a"], pos_a
+        ), "positions_a should be A's positions"
+        assert jnp.allclose(
+            proposed["positions_b"], pos_b
+        ), "positions_b should be B's positions"
+        assert jnp.array_equal(
+            proposed["types_a"], types_a
+        ), "types_a must be unchanged"
+        assert jnp.array_equal(
+            proposed["types_b"], types_b
+        ), "types_b must be unchanged"
 
     def test_hand_calculated_energies_both_mu_nonzero(self):
-        """Self-subtract regression: μ_A ≠ 0 AND μ_B ≠ 0.
+        """Self-subtract: μ_A ≠ 0 AND μ_B ≠ 0.
 
-        The pre-fix implementation treated ``state.energy`` as raw U and only
-        subtracted ``μ_partner · N``.  Production has
-        ``state.energy = Ω_self = U - μ_self · N`` (EnsembleBackend
+        Production has ``state.energy = Ω_self = U - μ_self · N`` (EnsembleBackend
         convention), so the kernel must add ``μ_self · N`` back to recover U
         before subtracting ``μ_partner · N``.  This test pins both terms.
 
@@ -153,9 +162,7 @@ class TestSemiGrandProposeConvention:
           state.energy_A = U_A - μ_A · N_A = 3.0 - (1·2 + 2·1) = -1.0
 
           Expected Ω_A_new = U_A - μ_B · N_A = 3.0 - 0 = 3.0
-            Pre-fix code: state.energy_A - μ_B·N_A = -1.0 - 0 = -1.0  (wrong)
-            Post-fix    : state.energy_A + μ_A·N_A - μ_B·N_A
-                       = -1.0 + 4.0 - 0 = 3.0  (correct)
+            kernel: state.energy_A + μ_A·N_A - μ_B·N_A = -1.0 + 4.0 - 0 = 3.0
         """
         kernel = SemiGrandSwap(n_species=2)
         key = jax.random.PRNGKey(0)
@@ -172,16 +179,18 @@ class TestSemiGrandProposeConvention:
 
         sa = _state(jnp.zeros((3, 3)), types_a, jnp.array(stored_a))
         sb = _state(jnp.zeros((3, 3)), types_b, jnp.array(stored_b))
-        proposed, _, _ = kernel.propose(sa, sb, _ens(mu_a), _ens(mu_b), key, None)
+        proposed, _, _ = kernel.propose(
+            sa, sb, _ens(mu_a), _ens(mu_b), key, None
+        )
 
         # Ω_A_new = U_A - μ_B · N_A = 3.0 - 0 = 3.0
         # Ω_B_new = U_B - μ_A · N_B = 5.0 - (1·1 + 2·2) = 0.0
-        assert abs(float(proposed["energy_a"]) - 3.0) < 1e-5, (
-            f"Ω_A_new = {float(proposed['energy_a'])}, expected 3.0"
-        )
-        assert abs(float(proposed["energy_b"]) - 0.0) < 1e-5, (
-            f"Ω_B_new = {float(proposed['energy_b'])}, expected 0.0"
-        )
+        assert (
+            abs(float(proposed["energy_a"]) - 3.0) < 1e-5
+        ), f"Ω_A_new = {float(proposed['energy_a'])}, expected 3.0"
+        assert (
+            abs(float(proposed["energy_b"]) - 0.0) < 1e-5
+        ), f"Ω_B_new = {float(proposed['energy_b'])}, expected 0.0"
 
     def test_symmetric_zero_mu(self):
         """With μ_A = μ_B = 0, propose returns Ω = U (unchanged energies)."""
@@ -195,7 +204,9 @@ class TestSemiGrandProposeConvention:
         sa = _state(jnp.zeros((3, 3)), types_a, u_a)
         sb = _state(jnp.zeros((3, 3)), types_b, u_b)
 
-        proposed, _, _ = kernel.propose(sa, sb, _ens([0.0, 0.0]), _ens([0.0, 0.0]), key, None)
+        proposed, _, _ = kernel.propose(
+            sa, sb, _ens([0.0, 0.0]), _ens([0.0, 0.0]), key, None
+        )
 
         assert abs(float(proposed["energy_a"]) - float(u_a)) < 1e-5
         assert abs(float(proposed["energy_b"]) - float(u_b)) < 1e-5
@@ -224,28 +235,37 @@ class TestSemiGrandAccept:
     def test_accept_both_below_emax(self):
         kernel = SemiGrandSwap(n_species=2)
         proposed = self._make_proposed(0.5, 0.3)
-        result = kernel.accept(proposed, jnp.array(1.0), jnp.array(1.0), {}, {})
+        result = kernel.accept(
+            proposed, jnp.array(1.0), jnp.array(1.0), {}, {}
+        )
         assert bool(result), "Should accept when both energies below emax"
 
     def test_reject_a_above_emax(self):
         kernel = SemiGrandSwap(n_species=2)
         proposed = self._make_proposed(2.0, 0.3)  # Ω_A > Emax_A
-        result = kernel.accept(proposed, jnp.array(1.0), jnp.array(1.0), {}, {})
+        result = kernel.accept(
+            proposed, jnp.array(1.0), jnp.array(1.0), {}, {}
+        )
         assert not bool(result), "Should reject when Ω_A >= Emax_A"
 
     def test_reject_b_above_emax(self):
         kernel = SemiGrandSwap(n_species=2)
         proposed = self._make_proposed(0.3, 2.0)  # Ω_B > Emax_B
-        result = kernel.accept(proposed, jnp.array(1.0), jnp.array(1.0), {}, {})
+        result = kernel.accept(
+            proposed, jnp.array(1.0), jnp.array(1.0), {}, {}
+        )
         assert not bool(result), "Should reject when Ω_B >= Emax_B"
 
     def test_accept_returns_bool(self):
         kernel = SemiGrandSwap(n_species=2)
         proposed = self._make_proposed(0.1, 0.2)
-        result = kernel.accept(proposed, jnp.array(1.0), jnp.array(1.0), {}, {})
-        assert jnp.issubdtype(result.dtype, jnp.bool_) or result.dtype == jnp.bool_, (
-            f"accept() must return bool, got dtype={result.dtype}"
+        result = kernel.accept(
+            proposed, jnp.array(1.0), jnp.array(1.0), {}, {}
         )
+        assert (
+            jnp.issubdtype(result.dtype, jnp.bool_)
+            or result.dtype == jnp.bool_
+        ), f"accept() must return bool, got dtype={result.dtype}"
 
     def test_accept_jit_compatible(self):
         """accept() must work under jax.jit."""
@@ -285,7 +305,9 @@ class TestSemiGrandNSpeciesMismatch:
         sb = _state(jnp.zeros((4, 3)), types, jnp.array(2.0))
         # 2-element μ when n_species=3
         with pytest.raises(ValueError, match="n_species"):
-            kernel.propose(sa, sb, _ens([0.0, 1.0]), _ens([1.0, 2.0]), key, None)
+            kernel.propose(
+                sa, sb, _ens([0.0, 1.0]), _ens([1.0, 2.0]), key, None
+            )
 
     def test_propose_missing_chemical_potentials_raises(self):
         """Missing 'chemical_potentials' key must raise ValueError."""
@@ -310,9 +332,11 @@ class TestSemiGrandStepFunction:
     def _make_inputs(n_runs=2, n_walkers=5, n_atoms=4, n_species=2, seed=0):
         key = jax.random.PRNGKey(seed)
         k1, k2 = jax.random.split(key)
-        positions = jax.random.normal(k1, (n_runs, n_walkers, n_atoms, 3)) * 0.1
+        positions = (
+            jax.random.normal(k1, (n_runs, n_walkers, n_atoms, 3)) * 0.1
+        )
         types = jnp.zeros((n_runs, n_walkers, n_atoms), dtype=jnp.int32)
-        types = types.at[1, :, n_atoms // 2:].set(1)  # run 1: half species 1
+        types = types.at[1, :, n_atoms // 2 :].set(1)  # run 1: half species 1
         energies = jax.random.normal(k2, (n_runs, n_walkers)) * 2.0
         emax = jnp.max(energies, axis=1)  # (n_runs,)
         chem_pots = jnp.array([[0.0, 0.0], [0.5, 1.0]], dtype=jnp.float32)
@@ -335,9 +359,9 @@ class TestSemiGrandStepFunction:
             semi_grand_kernel=kernel,
             n_swap_cycles=1,
         )
-        assert int(swap_info["n_energy_evals"]) == 0, (
-            f"Expected 0 energy evals, got {swap_info['n_energy_evals']}"
-        )
+        assert (
+            int(swap_info["n_energy_evals"]) == 0
+        ), f"Expected 0 energy evals, got {swap_info['n_energy_evals']}"
 
     def test_jit_compatible(self):
         """semi_grand_replica_exchange_step must run under jax.jit."""
@@ -372,14 +396,22 @@ class TestSemiGrandStepFunction:
         """n_runs=1 means no swap pairs possible → state unchanged."""
         n_runs, n_walkers, n_atoms, n_species = 1, 5, 4, 2
         key = jax.random.PRNGKey(0)
-        positions = jax.random.normal(key, (n_runs, n_walkers, n_atoms, 3)) * 0.1
+        positions = (
+            jax.random.normal(key, (n_runs, n_walkers, n_atoms, 3)) * 0.1
+        )
         types = jnp.zeros((n_runs, n_walkers, n_atoms), dtype=jnp.int32)
         energies = jax.random.normal(key, (n_runs, n_walkers))
         emax = jnp.max(energies, axis=1)
         chem_pots = jnp.array([[0.0, 0.0]], dtype=jnp.float32)
         kernel = SemiGrandSwap(n_species=n_species)
 
-        new_pos, new_types, new_ene, _, swap_info = semi_grand_replica_exchange_step(
+        (
+            new_pos,
+            new_types,
+            new_ene,
+            _,
+            swap_info,
+        ) = semi_grand_replica_exchange_step(
             rng_key=key,
             all_positions=positions,
             all_types=types,
@@ -400,7 +432,9 @@ class TestSemiGrandStepFunction:
 
     def test_attempted_swaps_positive(self):
         """With 2 runs, at least 1 swap must be attempted per cycle."""
-        positions, types, energies, emax, chem_pots = self._make_inputs(n_runs=2)
+        positions, types, energies, emax, chem_pots = self._make_inputs(
+            n_runs=2
+        )
         kernel = SemiGrandSwap(n_species=2)
         key = jax.random.PRNGKey(5)
 
@@ -415,9 +449,9 @@ class TestSemiGrandStepFunction:
             semi_grand_kernel=kernel,
             n_swap_cycles=2,
         )
-        assert int(swap_info["n_attempted"]) > 0, (
-            f"Expected >0 attempted swaps, got {swap_info['n_attempted']}"
-        )
+        assert (
+            int(swap_info["n_attempted"]) > 0
+        ), f"Expected >0 attempted swaps, got {swap_info['n_attempted']}"
 
     def test_positions_unchanged_after_swap(self):
         """Positions and types must never change in semi-grand RE."""
@@ -437,8 +471,12 @@ class TestSemiGrandStepFunction:
             n_swap_cycles=1,
         )
         # Positions and types must be unchanged (only energies update on swap).
-        assert jnp.allclose(new_pos, positions), "positions must not change in semi-grand RE"
-        assert jnp.array_equal(new_types, types), "types must not change in semi-grand RE"
+        assert jnp.allclose(
+            new_pos, positions
+        ), "positions must not change in semi-grand RE"
+        assert jnp.array_equal(
+            new_types, types
+        ), "types must not change in semi-grand RE"
 
     def test_identical_mu_zero_grand_potential_accepts(self):
         """With μ_A = μ_B = 0, Ω = U, so swap accepts iff U < Emax."""
@@ -465,9 +503,10 @@ class TestSemiGrandStepFunction:
             n_swap_cycles=1,
         )
         # With μ=0 and U=0.5 < emax=10.0, all swaps must be accepted.
-        assert int(swap_info["n_accepted"]) > 0 or int(swap_info["n_attempted"]) == 0, (
-            "With μ=0 and energies << emax, swaps should be accepted"
-        )
+        assert (
+            int(swap_info["n_accepted"]) > 0
+            or int(swap_info["n_attempted"]) == 0
+        ), "With μ=0 and energies << emax, swaps should be accepted"
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +528,12 @@ class TestSemiGrandEndToEnd:
 
         backend = create_harmonic(k=1.0)
         descriptors = [
-            MoveKernel("rw", random_walk.build_kernel, step_size=0.3, step_size_max=2.0)
+            MoveKernel(
+                "rw",
+                random_walk.build_kernel,
+                step_size=0.3,
+                step_size_max=2.0,
+            )
         ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
@@ -576,9 +620,9 @@ class TestSemiGrandEndToEnd:
             semi_grand_kernel=kernel,
             n_swap_cycles=1,
         )
-        assert int(swap_info["n_energy_evals"]) == 0, (
-            f"Expected n_energy_evals=0, got {swap_info['n_energy_evals']}"
-        )
+        assert (
+            int(swap_info["n_energy_evals"]) == 0
+        ), f"Expected n_energy_evals=0, got {swap_info['n_energy_evals']}"
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +646,12 @@ class TestSemiGrandPmapVmapSmoke:
 
         backend = create_harmonic(k=1.0)
         descriptors = [
-            MoveKernel("rw", random_walk.build_kernel, step_size=0.3, step_size_max=2.0)
+            MoveKernel(
+                "rw",
+                random_walk.build_kernel,
+                step_size=0.3,
+                step_size_max=2.0,
+            )
         ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
@@ -661,6 +710,7 @@ class TestInterRESpecSemiGrand:
 
     def test_semi_grand_valid_spec(self):
         from jaxrens.cli.schema.inter_re import InterRESpec
+
         spec = InterRESpec(
             flavor="semi_grand",
             re_interval=1,
@@ -673,21 +723,26 @@ class TestInterRESpecSemiGrand:
 
     def test_semi_grand_missing_chemical_potentials_raises(self):
         from jaxrens.cli.schema.inter_re import InterRESpec
+
         with pytest.raises((ValueError, Exception)):
             InterRESpec(flavor="semi_grand")
 
     def test_semi_grand_inconsistent_row_lengths_raises(self):
         from jaxrens.cli.schema.inter_re import InterRESpec
+
         with pytest.raises((ValueError, Exception)):
             InterRESpec(
                 flavor="semi_grand",
-                chemical_potentials=[[0.0, 0.0], [0.5, 1.0, 2.0]],  # different lengths
+                chemical_potentials=[
+                    [0.0, 0.0],
+                    [0.5, 1.0, 2.0],
+                ],  # different lengths
             )
 
-    def test_semi_grand_no_longer_raises_not_implemented(self):
-        """semi_grand must no longer raise NotImplementedError (commit 5 lands it)."""
+    def test_semi_grand_flavor_valid(self):
+        """A semi_grand inter-RE spec is valid and constructs successfully."""
         from jaxrens.cli.schema.inter_re import InterRESpec
-        # Should not raise NotImplementedError; valid spec must succeed.
+
         spec = InterRESpec(
             flavor="semi_grand",
             chemical_potentials=[[0.0, 0.0], [1.0, 1.0]],
@@ -696,6 +751,7 @@ class TestInterRESpecSemiGrand:
 
     def test_pressure_flavor_still_valid(self):
         from jaxrens.cli.schema.inter_re import InterRESpec
+
         spec = InterRESpec(flavor="pressure", re_interval=2, n_swap_cycles=1)
         cfg = spec.to_inter_re_config()
         assert cfg.flavor == "pressure"
@@ -703,6 +759,7 @@ class TestInterRESpecSemiGrand:
 
     def test_to_inter_re_config_roundtrip(self):
         from jaxrens.cli.schema.inter_re import InterRESpec
+
         spec = InterRESpec(
             flavor="semi_grand",
             re_interval=3,

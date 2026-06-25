@@ -23,7 +23,6 @@ from jaxrens.sampling.nested_sampling import (
     ns_step,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -33,9 +32,12 @@ from jaxrens.sampling.nested_sampling import (
 def harmonic_setup():
     """Single-run harmonic oscillator NS problem."""
     backend = create_harmonic(k=1.0)
-    init_fn, step_fn, _ = build_mwg(backend, [
-        MoveKernel("random_walk", random_walk.build_kernel),
-    ])
+    init_fn, step_fn, _ = build_mwg(
+        backend,
+        [
+            MoveKernel("random_walk", random_walk.build_kernel),
+        ],
+    )
 
     n_walkers = 50
     n_atoms = 1
@@ -67,9 +69,12 @@ def harmonic_setup():
 def parallel_setup():
     """2-run parallel harmonic oscillator NS problem."""
     backend = create_harmonic(k=1.0)
-    init_fn, step_fn, _ = build_mwg(backend, [
-        MoveKernel("random_walk", random_walk.build_kernel),
-    ])
+    init_fn, step_fn, _ = build_mwg(
+        backend,
+        [
+            MoveKernel("random_walk", random_walk.build_kernel),
+        ],
+    )
 
     n_runs = 2
     n_walkers = 20
@@ -77,7 +82,9 @@ def parallel_setup():
 
     keys = jax.random.split(jax.random.key(0), n_runs)
     positions = jax.vmap(
-        lambda k: jax.random.uniform(k, (n_walkers, n_atoms, 3), minval=-3.0, maxval=3.0)
+        lambda k: jax.random.uniform(
+            k, (n_walkers, n_atoms, 3), minval=-3.0, maxval=3.0
+        )
     )(keys)
 
     types = jnp.zeros((n_atoms,), dtype=jnp.int32)
@@ -112,9 +119,7 @@ def jit_step():
 def jit_vmap_step(parallel_setup):
     """JIT-compiled vmap(ns_step) for parallel tests."""
     s = parallel_setup
-    return jax.jit(jax.vmap(
-        lambda state: ns_step(state, s["step_fn"], 10, 0)
-    ))
+    return jax.jit(jax.vmap(lambda state: ns_step(state, s["step_fn"], 10, 0)))
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +132,11 @@ class TestInitNS:
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
         assert state.population.positions.shape == s["positions"].shape
         assert state.population.energy.shape == (s["n_walkers"],)
@@ -138,8 +146,11 @@ class TestInitNS:
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
         pop = state.population
         assert pop.positions.shape[0] == s["n_walkers"]
@@ -157,8 +168,11 @@ class TestNSStep:
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
 
         new_state, info = jit_step(state, s["step_fn"], 10, 0)
@@ -170,8 +184,11 @@ class TestNSStep:
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
 
         emaxes = []
@@ -185,8 +202,11 @@ class TestNSStep:
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
 
         for _ in range(50):
@@ -198,8 +218,11 @@ class TestNSStep:
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
 
         new_state, info = jit_step(state, s["step_fn"], 10, 5)
@@ -211,8 +234,11 @@ class TestNSStep:
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
 
         emaxes = []
@@ -220,7 +246,9 @@ class TestNSStep:
             state, info = jit_step(state, s["step_fn"], 10, 3)
             emaxes.append(float(info["emax"]))
 
-        assert emaxes[-1] < emaxes[0], "Emax should decrease during NS with n_extra"
+        assert (
+            emaxes[-1] < emaxes[0]
+        ), "Emax should decrease during NS with n_extra"
 
 
 # ---------------------------------------------------------------------------
@@ -244,15 +272,19 @@ class TestGetExtraIndices:
         # Try many keys; the picked indices must never collide with either.
         for seed in range(50):
             picks = _get_extra_indices(
-                worst_idx, clone_idx,
-                n_walkers=10, n_extra=5,
+                worst_idx,
+                clone_idx,
+                n_walkers=10,
+                n_extra=5,
                 rng_key=jax.random.key(seed),
             )
             assert picks.shape == (5,)
-            assert not bool(jnp.any(picks == worst_idx)), \
-                f"seed {seed}: extras picked worst_idx ({int(worst_idx)})"
-            assert not bool(jnp.any(picks == clone_idx)), \
-                f"seed {seed}: extras picked clone_idx ({int(clone_idx)})"
+            assert not bool(
+                jnp.any(picks == worst_idx)
+            ), f"seed {seed}: extras picked worst_idx ({int(worst_idx)})"
+            assert not bool(
+                jnp.any(picks == clone_idx)
+            ), f"seed {seed}: extras picked clone_idx ({int(clone_idx)})"
             # All picks must be unique (argsort-based selection guarantees this).
             assert len(set(int(p) for p in picks)) == 5
 
@@ -262,8 +294,10 @@ class TestGetExtraIndices:
         worst_idx = jnp.int32(0)
         clone_idx = jnp.int32(5)
         picks = _get_extra_indices(
-            worst_idx, clone_idx,
-            n_walkers=10, n_extra=8,
+            worst_idx,
+            clone_idx,
+            n_walkers=10,
+            n_extra=8,
             rng_key=jax.random.key(0),
         )
         expected = {1, 2, 3, 4, 6, 7, 8, 9}
@@ -279,13 +313,17 @@ class TestVmapNsStep:
     def test_vmap_two_runs(self, parallel_setup):
         s = parallel_setup
         ns_states = init_ns_parallel(
-            s["init_fn"], s["positions"], s["types"], s["energies"],
-            cells=None, rng_keys=s["rng_keys"],
+            s["init_fn"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_keys=s["rng_keys"],
         )
 
-        vmapped = jax.jit(jax.vmap(
-            lambda state: ns_step(state, s["step_fn"], 10, 0)
-        ))
+        vmapped = jax.jit(
+            jax.vmap(lambda state: ns_step(state, s["step_fn"], 10, 0))
+        )
         new_states, infos = vmapped(ns_states)
 
         assert new_states.iteration.shape == (2,)
@@ -295,13 +333,17 @@ class TestVmapNsStep:
     def test_different_keys_different_results(self, parallel_setup):
         s = parallel_setup
         ns_states = init_ns_parallel(
-            s["init_fn"], s["positions"], s["types"], s["energies"],
-            cells=None, rng_keys=s["rng_keys"],
+            s["init_fn"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_keys=s["rng_keys"],
         )
 
-        vmapped = jax.jit(jax.vmap(
-            lambda state: ns_step(state, s["step_fn"], 10, 0)
-        ))
+        vmapped = jax.jit(
+            jax.vmap(lambda state: ns_step(state, s["step_fn"], 10, 0))
+        )
 
         for _ in range(5):
             ns_states, infos = vmapped(ns_states)
@@ -314,13 +356,17 @@ class TestVmapNsStep:
     def test_vmap_with_n_extra(self, parallel_setup):
         s = parallel_setup
         ns_states = init_ns_parallel(
-            s["init_fn"], s["positions"], s["types"], s["energies"],
-            cells=None, rng_keys=s["rng_keys"],
+            s["init_fn"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_keys=s["rng_keys"],
         )
 
-        vmapped = jax.jit(jax.vmap(
-            lambda state: ns_step(state, s["step_fn"], 10, 3)
-        ))
+        vmapped = jax.jit(
+            jax.vmap(lambda state: ns_step(state, s["step_fn"], 10, 3))
+        )
         new_states, infos = vmapped(ns_states)
 
         assert new_states.iteration.shape == (2,)
@@ -328,20 +374,23 @@ class TestVmapNsStep:
 
 
 # ---------------------------------------------------------------------------
-# Per-move chain-level counters (new in Task A)
+# Per-move chain-level counters
 # ---------------------------------------------------------------------------
 
 
 class TestPerMoveCounters:
     """Verify n_accepted_per_move / n_proposed_per_move / reject_reason_counts_per_move."""
 
-    def test_new_info_keys_present(self, harmonic_setup, jit_step):
-        """ns_step info always contains the three new per-move count keys."""
+    def test_info_keys_present(self, harmonic_setup, jit_step):
+        """ns_step info always contains the three per-move count keys."""
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
         _, info = jit_step(state, s["step_fn"], 10, 0)
 
@@ -354,8 +403,11 @@ class TestPerMoveCounters:
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
         _, info = jit_step(state, s["step_fn"], 10, 0)
 
@@ -366,21 +418,31 @@ class TestPerMoveCounters:
     def test_shapes_two_moves(self):
         """With two move types, per-move arrays have shape (2,) / (2, 4)."""
         from jaxrens.sampling.moves import random_walk as rw
+
         backend = create_harmonic(k=1.0)
-        init_fn, step_fn, _ = build_mwg(backend, [
-            MoveKernel("rw1", rw.build_kernel),
-            MoveKernel("rw2", rw.build_kernel),
-        ])
+        init_fn, step_fn, _ = build_mwg(
+            backend,
+            [
+                MoveKernel("rw1", rw.build_kernel),
+                MoveKernel("rw2", rw.build_kernel),
+            ],
+        )
 
         n_walkers = 20
         n_atoms = 1
         key = jax.random.key(7)
         key, init_key = jax.random.split(key)
-        positions = jax.random.uniform(init_key, (n_walkers, n_atoms, 3), minval=-2.0, maxval=2.0)
+        positions = jax.random.uniform(
+            init_key, (n_walkers, n_atoms, 3), minval=-2.0, maxval=2.0
+        )
         types = jnp.zeros((n_atoms,), dtype=jnp.int32)
-        energies = jax.vmap(lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0])(positions)
+        energies = jax.vmap(
+            lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
+        )(positions)
 
-        state = init_ns(init_fn, positions, types, energies, cells=None, rng_key=key)
+        state = init_ns(
+            init_fn, positions, types, energies, cells=None, rng_key=key
+        )
         jit_step = jax.jit(ns_step, static_argnums=(1, 2, 3))
         _, info = jit_step(state, step_fn, 20, 0)
 
@@ -394,16 +456,19 @@ class TestPerMoveCounters:
         n_mcmc = 15
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
         _, info = jit_step(state, s["step_fn"], n_mcmc, 0)
 
         # n_walk=1 (no n_extra), 1 chain × 15 steps = 15 total proposals
         total_proposed = int(jnp.sum(info["n_proposed_per_move"]))
-        assert total_proposed == 1 * n_mcmc, (
-            f"Expected {1 * n_mcmc} proposals, got {total_proposed}"
-        )
+        assert (
+            total_proposed == 1 * n_mcmc
+        ), f"Expected {1 * n_mcmc} proposals, got {total_proposed}"
 
     def test_proposed_counts_with_n_extra(self, harmonic_setup, jit_step):
         """sum(n_proposed_per_move) == (1 + n_extra) * n_mcmc_steps."""
@@ -412,36 +477,47 @@ class TestPerMoveCounters:
         n_extra = 3
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
         _, info = jit_step(state, s["step_fn"], n_mcmc, n_extra)
 
         total_proposed = int(jnp.sum(info["n_proposed_per_move"]))
         expected = (1 + n_extra) * n_mcmc
-        assert total_proposed == expected, (
-            f"Expected {expected} proposals, got {total_proposed}"
-        )
+        assert (
+            total_proposed == expected
+        ), f"Expected {expected} proposals, got {total_proposed}"
 
     def test_accepted_leq_proposed(self, harmonic_setup, jit_step):
         """n_accepted_per_move <= n_proposed_per_move element-wise."""
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
         _, info = jit_step(state, s["step_fn"], 20, 0)
 
-        assert jnp.all(info["n_accepted_per_move"] <= info["n_proposed_per_move"])
+        assert jnp.all(
+            info["n_accepted_per_move"] <= info["n_proposed_per_move"]
+        )
 
     def test_acceptance_rate_invariant(self, harmonic_setup, jit_step):
         """sum(n_accepted_per_move) / sum(n_proposed_per_move) ≈ acceptance_rate."""
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
         _, info = jit_step(state, s["step_fn"], 20, 0)
 
@@ -450,48 +526,57 @@ class TestPerMoveCounters:
         rate_from_counts = total_acc / total_prop
         rate_direct = float(info["acceptance_rate"])
 
-        assert abs(rate_from_counts - rate_direct) < 1e-5, (
-            f"Rate from counts={rate_from_counts:.4f} vs direct rate={rate_direct:.4f}"
-        )
+        assert (
+            abs(rate_from_counts - rate_direct) < 1e-5
+        ), f"Rate from counts={rate_from_counts:.4f} vs direct rate={rate_direct:.4f}"
 
     def test_rr_counts_bucket_invariant(self, harmonic_setup, jit_step):
         """For each move: sum of rr_counts row == n_proposed_per_move."""
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
         _, info = jit_step(state, s["step_fn"], 20, 0)
 
-        rr = info["reject_reason_counts_per_move"]   # (n_moves, 4)
-        row_sums = jnp.sum(rr, axis=1)               # (n_moves,)
-        assert jnp.array_equal(row_sums, info["n_proposed_per_move"]), (
-            f"rr row sums {row_sums} != n_proposed {info['n_proposed_per_move']}"
-        )
+        rr = info["reject_reason_counts_per_move"]  # (n_moves, 4)
+        row_sums = jnp.sum(rr, axis=1)  # (n_moves,)
+        assert jnp.array_equal(
+            row_sums, info["n_proposed_per_move"]
+        ), f"rr row sums {row_sums} != n_proposed {info['n_proposed_per_move']}"
 
     def test_rr_col0_equals_n_accepted(self, harmonic_setup, jit_step):
         """rr_counts[:, 0] (accepted bucket) == n_accepted_per_move."""
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
         _, info = jit_step(state, s["step_fn"], 20, 0)
 
         rr = info["reject_reason_counts_per_move"]
-        assert jnp.array_equal(rr[:, 0], info["n_accepted_per_move"]), (
-            f"rr[:,0]={rr[:, 0]} != n_accepted={info['n_accepted_per_move']}"
-        )
+        assert jnp.array_equal(
+            rr[:, 0], info["n_accepted_per_move"]
+        ), f"rr[:,0]={rr[:, 0]} != n_accepted={info['n_accepted_per_move']}"
 
     def test_dtypes_are_int32(self, harmonic_setup, jit_step):
         """Per-move count arrays must be int32."""
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
         _, info = jit_step(state, s["step_fn"], 10, 0)
 
@@ -504,8 +589,11 @@ class TestPerMoveCounters:
         s = harmonic_setup
         state = init_ns(
             s["init_fn"],
-            s["positions"], s["types"], s["energies"],
-            cells=None, rng_key=s["key"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_key=s["key"],
         )
         n_mcmc = 10
 
@@ -528,19 +616,26 @@ class TestPerMoveCounters:
         # see an error or shape mismatch rather than silent pass.
         assert "n_accepted_per_move" in info1
         assert "n_accepted_per_move" in info2
-        assert info2["n_proposed_per_move"].shape == info1["n_proposed_per_move"].shape
+        assert (
+            info2["n_proposed_per_move"].shape
+            == info1["n_proposed_per_move"].shape
+        )
 
     def test_vmap_ns_step_per_move_shapes(self, parallel_setup):
         """vmap(ns_step) returns per-move counts with (n_runs, n_moves[, 4]) shape."""
         s = parallel_setup
         ns_states = init_ns_parallel(
-            s["init_fn"], s["positions"], s["types"], s["energies"],
-            cells=None, rng_keys=s["rng_keys"],
+            s["init_fn"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            rng_keys=s["rng_keys"],
         )
 
-        vmapped = jax.jit(jax.vmap(
-            lambda state: ns_step(state, s["step_fn"], 10, 0)
-        ))
+        vmapped = jax.jit(
+            jax.vmap(lambda state: ns_step(state, s["step_fn"], 10, 0))
+        )
         _, infos = vmapped(ns_states)
 
         n_runs = s["n_runs"]
@@ -574,8 +669,8 @@ class TestRejectReasonGating:
 
     def test_rejected_non_cell_move_goes_to_energy_bucket(self):
         """random_walk at ss=1e6 should always reject; all counts must land in bucket 1."""
-        from jaxrens.sampling.moves import random_walk as rw
         from jaxrens.sampling.move_kernel import MoveKernel
+        from jaxrens.sampling.moves import random_walk as rw
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, ns_step
 
@@ -583,9 +678,12 @@ class TestRejectReasonGating:
 
         # Use a single random_walk move with enormous step size so that the
         # proposed energy always exceeds emax → 100% rejection.
-        init_fn, step_fn, _ = build_mwg(backend, [
-            MoveKernel("random_walk", rw.build_kernel),
-        ])
+        init_fn, step_fn, _ = build_mwg(
+            backend,
+            [
+                MoveKernel("random_walk", rw.build_kernel),
+            ],
+        )
 
         n_walkers = 30
         n_atoms = 1
@@ -601,7 +699,9 @@ class TestRejectReasonGating:
             lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
         )(positions)
 
-        state = init_ns(init_fn, positions, types, energies, cells=None, rng_key=key)
+        state = init_ns(
+            init_fn, positions, types, energies, cells=None, rng_key=key
+        )
 
         # Override step_sizes to an astronomically large value so every
         # random_walk proposal lands far outside emax.
@@ -612,18 +712,18 @@ class TestRejectReasonGating:
         jit_step = jax.jit(ns_step, static_argnums=(1, 2, 3))
         _, info = jit_step(state, step_fn, n_mcmc, 0)
 
-        n_acc = info["n_accepted_per_move"]           # (1,)
-        n_prop = info["n_proposed_per_move"]          # (1,)
-        rr = info["reject_reason_counts_per_move"]    # (1, 4)
+        n_acc = info["n_accepted_per_move"]  # (1,)
+        n_prop = info["n_proposed_per_move"]  # (1,)
+        rr = info["reject_reason_counts_per_move"]  # (1, 4)
 
         # With a huge step size the walker always rejects
-        assert int(n_acc[rw_idx]) == 0, (
-            f"Expected 0 accepted for huge-ss random_walk, got {int(n_acc[rw_idx])}"
-        )
+        assert (
+            int(n_acc[rw_idx]) == 0
+        ), f"Expected 0 accepted for huge-ss random_walk, got {int(n_acc[rw_idx])}"
         # All proposals must be recorded
-        assert int(n_prop[rw_idx]) == n_mcmc, (
-            f"Expected {n_mcmc} proposals, got {int(n_prop[rw_idx])}"
-        )
+        assert (
+            int(n_prop[rw_idx]) == n_mcmc
+        ), f"Expected {n_mcmc} proposals, got {int(n_prop[rw_idx])}"
         # Accepted bucket (col 0) must be zero — not inflated by rejected moves
         assert int(rr[rw_idx, 0]) == 0, (
             f"rr[rw, 0] (accepted bucket) = {int(rr[rw_idx, 0])} != 0. "
@@ -638,15 +738,18 @@ class TestRejectReasonGating:
 
     def test_rejected_non_cell_move_goes_to_energy_bucket_under_jit(self):
         """Same rejection-gating invariant, explicitly exercised under jax.jit."""
-        from jaxrens.sampling.moves import random_walk as rw
         from jaxrens.sampling.move_kernel import MoveKernel
+        from jaxrens.sampling.moves import random_walk as rw
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, ns_step
 
         backend = create_harmonic(k=1.0)
-        init_fn, step_fn, _ = build_mwg(backend, [
-            MoveKernel("rw", rw.build_kernel),
-        ])
+        init_fn, step_fn, _ = build_mwg(
+            backend,
+            [
+                MoveKernel("rw", rw.build_kernel),
+            ],
+        )
 
         n_walkers = 20
         n_atoms = 1
@@ -662,7 +765,9 @@ class TestRejectReasonGating:
             lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
         )(positions)
 
-        state = init_ns(init_fn, positions, types, energies, cells=None, rng_key=key)
+        state = init_ns(
+            init_fn, positions, types, energies, cells=None, rng_key=key
+        )
         huge_ss = jnp.full_like(state.population.step_sizes, 1e6)
         state = state.set(population=state.population.set(step_sizes=huge_ss))
 
@@ -671,7 +776,7 @@ class TestRejectReasonGating:
         _, info = jit_ns(state, step_fn, n_mcmc, 0)
 
         rr = info["reject_reason_counts_per_move"]  # (1, 4)
-        n_acc = info["n_accepted_per_move"]         # (1,)
+        n_acc = info["n_accepted_per_move"]  # (1,)
 
         # Invariant: accepted bucket == n_accepted_per_move
         assert jnp.array_equal(rr[:, 0], n_acc), (
@@ -679,6 +784,6 @@ class TestRejectReasonGating:
             "reject_reason gating invariant violated under JIT."
         )
         # Rejected moves (all, since ss=1e6) land in bucket 1, not bucket 0
-        assert int(rr[0, 0]) == 0, (
-            f"Accepted bucket {int(rr[0, 0])} should be 0 when all moves reject."
-        )
+        assert (
+            int(rr[0, 0]) == 0
+        ), f"Accepted bucket {int(rr[0, 0])} should be 0 when all moves reject."

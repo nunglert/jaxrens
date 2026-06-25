@@ -33,8 +33,10 @@ from jaxrens.sampling.nested_sampling import (
     run_ns_multi_gpu,
     run_ns_parallel,
 )
-from jaxrens.sampling.termination import IterationTermination, PriorMassTermination
-
+from jaxrens.sampling.termination import (
+    IterationTermination,
+    PriorMassTermination,
+)
 
 # ---------------------------------------------------------------------------
 # Skip guard
@@ -61,9 +63,12 @@ def _make_harmonic_problem(
     backend = create_harmonic(k=1.0)
     descriptors = [
         MoveKernel(
-            "rw", random_walk.build_kernel,
-            step_size=0.2, step_size_max=5.0,
-            min_rate=0.2, max_rate=0.7,
+            "rw",
+            random_walk.build_kernel,
+            step_size=0.2,
+            step_size_max=5.0,
+            min_rate=0.2,
+            max_rate=0.7,
         ),
     ]
     init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
@@ -117,8 +122,12 @@ def pmap_harmonic_setup():
     en_batch = jnp.broadcast_to(energies[None], (n_total, n_walkers))
 
     flat_states = init_ns_parallel(
-        init_fn, pos_batch, types, en_batch,
-        cells=None, rng_keys=rng_keys_flat,
+        init_fn,
+        pos_batch,
+        types,
+        en_batch,
+        cells=None,
+        rng_keys=rng_keys_flat,
     )
 
     # Reshape (G*P, K, ...) -> (G, P, K, ...).
@@ -149,7 +158,8 @@ class TestBuildAdaptStepPmapVmap:
             move_descriptors=setup["descriptors"],
             per_move_fns=setup["per_move_fns"],
             batcher=PmapVmapRuns(
-                n_gpu=setup["n_gpu"], n_per_gpu=setup["n_per_gpu"],
+                n_gpu=setup["n_gpu"],
+                n_per_gpu=setup["n_per_gpu"],
             ),
             adjust_n_samples=10,
             adjust_factor=1.5,
@@ -168,15 +178,18 @@ class TestBuildAdaptStepPmapVmap:
 
         emax = jnp.max(ns_states.population.energy, axis=2)  # (G, P)
         run_keys = jax.random.split(
-            jax.random.key(10), n_gpu * n_per_gpu,
+            jax.random.key(10),
+            n_gpu * n_per_gpu,
         ).reshape(n_gpu, n_per_gpu)
 
         new_state, diag, new_key = adapt(ns_states, emax, run_keys)
 
         assert new_key.shape == (n_gpu, n_per_gpu)
         # step_sizes pulled out via the same axis as the input.
-        assert new_state.population.step_sizes.shape \
+        assert (
+            new_state.population.step_sizes.shape
             == ns_states.population.step_sizes.shape
+        )
 
     def test_diag_output_shapes(self, pmap_harmonic_setup):
         """Diagnostics have shape (G, P, n_moves) for PmapVmapRuns."""
@@ -189,7 +202,8 @@ class TestBuildAdaptStepPmapVmap:
 
         emax = jnp.max(ns_states.population.energy, axis=2)
         run_keys = jax.random.split(
-            jax.random.key(11), n_gpu * n_per_gpu,
+            jax.random.key(11),
+            n_gpu * n_per_gpu,
         ).reshape(n_gpu, n_per_gpu)
 
         _, diag, _ = adapt(ns_states, emax, run_keys)
@@ -209,13 +223,15 @@ class TestBuildAdaptStepPmapVmap:
 
         emax = jnp.max(ns_states.population.energy, axis=2)
         run_keys = jax.random.split(
-            jax.random.key(12), n_gpu * n_per_gpu,
+            jax.random.key(12),
+            n_gpu * n_per_gpu,
         ).reshape(n_gpu, n_per_gpu)
 
         new_state, _, _ = adapt(ns_states, emax, run_keys)
         ss = new_state.population.step_sizes
         assert jnp.all(ss > 0.0)
         assert jnp.all(jnp.isfinite(ss))
+
 
 # ---------------------------------------------------------------------------
 # init_ns_multi_gpu
@@ -237,12 +253,19 @@ class TestInitNsMultiGpu:
         pos_flat = jnp.broadcast_to(
             setup["positions"][None], (n_total, n_walkers, 1, 3)
         )
-        en_flat = jnp.broadcast_to(setup["energies"][None], (n_total, n_walkers))
+        en_flat = jnp.broadcast_to(
+            setup["energies"][None], (n_total, n_walkers)
+        )
 
         state = init_ns_multi_gpu(
-            setup["init_fn"], pos_flat, setup["types"], en_flat,
-            cells=None, rng_keys=rng_keys_flat,
-            n_gpu=n_gpu, n_per_gpu=n_per_gpu,
+            setup["init_fn"],
+            pos_flat,
+            setup["types"],
+            en_flat,
+            cells=None,
+            rng_keys=rng_keys_flat,
+            n_gpu=n_gpu,
+            n_per_gpu=n_per_gpu,
         )
 
         # Check leading shape
@@ -269,10 +292,14 @@ class TestRunNsMultiGpu:
         pos_batch = jnp.broadcast_to(
             setup["positions"][None], (n_total, n_walkers, 1, 3)
         )
-        en_batch = jnp.broadcast_to(setup["energies"][None], (n_total, n_walkers))
+        en_batch = jnp.broadcast_to(
+            setup["energies"][None], (n_total, n_walkers)
+        )
 
         result = run_ns_multi_gpu(
-            pos_batch, setup["types"], en_batch,
+            pos_batch,
+            setup["types"],
+            en_batch,
             cells=None,
             init_fn=setup["init_fn"],
             step_fn=setup["step_fn"],
@@ -289,17 +316,18 @@ class TestRunNsMultiGpu:
     def test_smoke_finite_log_evidence(self):
         """run_ns_multi_gpu produces finite log_evidence."""
         result = self._run_short(seed=42, n_per_gpu=2, n_iters=5)
-        assert jnp.all(jnp.isfinite(result["log_evidence"])), (
-            f"Non-finite log_evidence: {result['log_evidence']}"
-        )
+        assert jnp.all(
+            jnp.isfinite(result["log_evidence"])
+        ), f"Non-finite log_evidence: {result['log_evidence']}"
 
     def test_output_shapes(self):
         """Output arrays have (1, P) leading shape."""
         n_gpu, n_per_gpu = 1, 2
         result = self._run_short(seed=10, n_per_gpu=n_per_gpu, n_iters=5)
-        assert result["log_evidence"].shape == (n_gpu, n_per_gpu), (
-            f"Expected ({n_gpu}, {n_per_gpu}), got {result['log_evidence'].shape}"
-        )
+        assert result["log_evidence"].shape == (
+            n_gpu,
+            n_per_gpu,
+        ), f"Expected ({n_gpu}, {n_per_gpu}), got {result['log_evidence'].shape}"
         assert result["n_dead"].shape == (n_gpu, n_per_gpu)
         assert result["iteration"].shape == (n_gpu, n_per_gpu)
         assert result["n_gpu"] == n_gpu
@@ -322,16 +350,21 @@ class TestRunNsMultiGpu:
         n_total = n_gpu * n_per_gpu
         setup = _make_harmonic_problem(seed=55, n_walkers=12)
         rng_keys = jax.random.split(jax.random.key(55), n_total)
-        pos_batch = jnp.broadcast_to(setup["positions"][None], (n_total, 12, 1, 3))
+        pos_batch = jnp.broadcast_to(
+            setup["positions"][None], (n_total, 12, 1, 3)
+        )
         en_batch = jnp.broadcast_to(setup["energies"][None], (n_total, 12))
 
         result = run_ns_multi_gpu(
-            pos_batch, setup["types"], en_batch,
+            pos_batch,
+            setup["types"],
+            en_batch,
             cells=None,
             init_fn=setup["init_fn"],
             step_fn=setup["step_fn"],
             rng_keys=rng_keys,
-            n_gpu=n_gpu, n_per_gpu=n_per_gpu,
+            n_gpu=n_gpu,
+            n_per_gpu=n_per_gpu,
             max_iterations=5,
             n_mcmc_steps=3,
             initial_step_size=0.2,
@@ -353,22 +386,30 @@ class TestRunNsMultiGpuValidation:
         _require_gpu()
         with pytest.raises(ValueError, match="n_gpu must be >= 1"):
             run_ns_multi_gpu(
-                jnp.zeros((2, 10, 1, 3)), jnp.zeros((1,), dtype=jnp.int32),
-                jnp.zeros((2, 10)), None,
-                init_fn=lambda *a, **kw: None, step_fn=lambda *a, **kw: None,
+                jnp.zeros((2, 10, 1, 3)),
+                jnp.zeros((1,), dtype=jnp.int32),
+                jnp.zeros((2, 10)),
+                None,
+                init_fn=lambda *a, **kw: None,
+                step_fn=lambda *a, **kw: None,
                 rng_keys=jax.random.split(jax.random.key(0), 2),
-                n_gpu=0, n_per_gpu=2,
+                n_gpu=0,
+                n_per_gpu=2,
             )
 
     def test_n_per_gpu_zero(self):
         _require_gpu()
         with pytest.raises(ValueError, match="n_per_gpu must be >= 1"):
             run_ns_multi_gpu(
-                jnp.zeros((1, 10, 1, 3)), jnp.zeros((1,), dtype=jnp.int32),
-                jnp.zeros((1, 10)), None,
-                init_fn=lambda *a, **kw: None, step_fn=lambda *a, **kw: None,
+                jnp.zeros((1, 10, 1, 3)),
+                jnp.zeros((1,), dtype=jnp.int32),
+                jnp.zeros((1, 10)),
+                None,
+                init_fn=lambda *a, **kw: None,
+                step_fn=lambda *a, **kw: None,
                 rng_keys=jax.random.split(jax.random.key(0), 1),
-                n_gpu=1, n_per_gpu=0,
+                n_gpu=1,
+                n_per_gpu=0,
             )
 
     def test_n_gpu_exceeds_devices(self):
@@ -378,10 +419,13 @@ class TestRunNsMultiGpuValidation:
             run_ns_multi_gpu(
                 jnp.zeros((n_available + 1, 10, 1, 3)),
                 jnp.zeros((1,), dtype=jnp.int32),
-                jnp.zeros((n_available + 1, 10)), None,
-                init_fn=lambda *a, **kw: None, step_fn=lambda *a, **kw: None,
+                jnp.zeros((n_available + 1, 10)),
+                None,
+                init_fn=lambda *a, **kw: None,
+                step_fn=lambda *a, **kw: None,
                 rng_keys=jax.random.split(jax.random.key(0), n_available + 1),
-                n_gpu=n_available + 1, n_per_gpu=1,
+                n_gpu=n_available + 1,
+                n_per_gpu=1,
             )
 
 
@@ -411,16 +455,21 @@ class TestParityPmapVmapVsVmap:
         pos_batch = jnp.broadcast_to(
             setup["positions"][None], (n_total, n_walkers, 1, 3)
         )
-        en_batch = jnp.broadcast_to(setup["energies"][None], (n_total, n_walkers))
+        en_batch = jnp.broadcast_to(
+            setup["energies"][None], (n_total, n_walkers)
+        )
 
         # PmapVmapRuns(n_gpu=1, n_per_gpu=2) run
         result_pmap = run_ns_multi_gpu(
-            pos_batch, setup["types"], en_batch,
+            pos_batch,
+            setup["types"],
+            en_batch,
             cells=None,
             init_fn=setup["init_fn"],
             step_fn=setup["step_fn"],
             rng_keys=rng_keys_flat,
-            n_gpu=n_gpu, n_per_gpu=n_per_gpu,
+            n_gpu=n_gpu,
+            n_per_gpu=n_per_gpu,
             max_iterations=n_iters,
             n_mcmc_steps=3,
             initial_step_size=0.2,
@@ -429,7 +478,9 @@ class TestParityPmapVmapVsVmap:
 
         # VmapRuns(n_runs=2) run with same keys
         result_vmap = run_ns_parallel(
-            pos_batch, setup["types"], en_batch,
+            pos_batch,
+            setup["types"],
+            en_batch,
             cells=None,
             init_fn=setup["init_fn"],
             step_fn=setup["step_fn"],
@@ -459,7 +510,7 @@ class TestParityPmapVmapVsVmap:
 
 
 # ---------------------------------------------------------------------------
-# Task A: callbacks wiring in run_ns_multi_gpu
+# Callbacks wiring in run_ns_multi_gpu
 # ---------------------------------------------------------------------------
 
 
@@ -469,7 +520,9 @@ class MockCallback:
     def __init__(self):
         self.calls: list[tuple[int, object, dict]] = []
 
-    def on_iteration(self, iteration: int, ns_state: object, info: dict) -> None:
+    def on_iteration(
+        self, iteration: int, ns_state: object, info: dict
+    ) -> None:
         self.calls.append((iteration, ns_state, info))
 
 
@@ -489,11 +542,15 @@ class TestRunNsMultiGpuCallbacks:
         pos_batch = jnp.broadcast_to(
             setup["positions"][None], (n_total, n_walkers, 1, 3)
         )
-        en_batch = jnp.broadcast_to(setup["energies"][None], (n_total, n_walkers))
+        en_batch = jnp.broadcast_to(
+            setup["energies"][None], (n_total, n_walkers)
+        )
 
         cb = MockCallback()
         run_ns_multi_gpu(
-            pos_batch, setup["types"], en_batch,
+            pos_batch,
+            setup["types"],
+            en_batch,
             cells=None,
             init_fn=setup["init_fn"],
             step_fn=setup["step_fn"],
@@ -507,9 +564,9 @@ class TestRunNsMultiGpuCallbacks:
             callbacks=[cb],
         )
 
-        assert len(cb.calls) == n_iters, (
-            f"Expected {n_iters} callback calls, got {len(cb.calls)}"
-        )
+        assert (
+            len(cb.calls) == n_iters
+        ), f"Expected {n_iters} callback calls, got {len(cb.calls)}"
 
     def test_callbacks_info_has_batch_key(self):
         """Each on_iteration info dict carries '_batcher' key."""
@@ -524,11 +581,15 @@ class TestRunNsMultiGpuCallbacks:
         pos_batch = jnp.broadcast_to(
             setup["positions"][None], (n_total, n_walkers, 1, 3)
         )
-        en_batch = jnp.broadcast_to(setup["energies"][None], (n_total, n_walkers))
+        en_batch = jnp.broadcast_to(
+            setup["energies"][None], (n_total, n_walkers)
+        )
 
         cb = MockCallback()
         run_ns_multi_gpu(
-            pos_batch, setup["types"], en_batch,
+            pos_batch,
+            setup["types"],
+            en_batch,
             cells=None,
             init_fn=setup["init_fn"],
             step_fn=setup["step_fn"],
@@ -543,9 +604,9 @@ class TestRunNsMultiGpuCallbacks:
         )
 
         for _iter, _state, info in cb.calls:
-            assert "_batcher" in info, (
-                f"'_batcher' missing from info at iteration {_iter}"
-            )
+            assert (
+                "_batcher" in info
+            ), f"'_batcher' missing from info at iteration {_iter}"
 
     def test_callbacks_batch_descriptor_is_batched(self):
         """info['_batcher'].is_batched is True for all calls."""
@@ -560,11 +621,15 @@ class TestRunNsMultiGpuCallbacks:
         pos_batch = jnp.broadcast_to(
             setup["positions"][None], (n_total, n_walkers, 1, 3)
         )
-        en_batch = jnp.broadcast_to(setup["energies"][None], (n_total, n_walkers))
+        en_batch = jnp.broadcast_to(
+            setup["energies"][None], (n_total, n_walkers)
+        )
 
         cb = MockCallback()
         run_ns_multi_gpu(
-            pos_batch, setup["types"], en_batch,
+            pos_batch,
+            setup["types"],
+            en_batch,
             cells=None,
             init_fn=setup["init_fn"],
             step_fn=setup["step_fn"],

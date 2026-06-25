@@ -158,11 +158,8 @@ class TestCheckpoint:
         assert loaded["cells"] is None
 
     def test_rng_key_roundtrip_preserves_stream(self, ns_state, tmp_path):
-        """save_checkpoint persists the PRNG state so load can resume it.
-
-        Pre-fix, save_checkpoint silently dropped ns_state["rng_key"] and
-        load_checkpoint returned a caller-supplied or default key —
-        resumed runs silently reseeded, breaking reproducibility-on-resume.
+        """save_checkpoint persists the PRNG state so load can resume it,
+        keeping resumed runs reproducible instead of silently reseeding.
         """
         path = tmp_path / "rng_roundtrip.h5"
         save_checkpoint(path, ns_state)

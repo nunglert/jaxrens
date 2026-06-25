@@ -126,8 +126,7 @@ class TestEnsembleBackend:
 
     def test_chemical_potentials_subtract_muN(self):
         # Grand-canonical: H = U - μ·N, applied via the per-call
-        # ensemble_params key "chemical_potentials" (regression: the backend
-        # previously read key "mu", so this term was silently dropped).
+        # ensemble_params key "chemical_potentials".
         base = create_harmonic(k=1.0)
         backend = EnsembleBackend(base, pressure=0.0)
         pos = jnp.zeros((3, 3))
@@ -180,12 +179,8 @@ class TestEnsembleBackend:
 class TestInitialEnergyEnsembleThreading:
     """The resolver's initial-energy compute must thread the SAME per-replica
     ensemble params the runtime NS loop uses, so resolved energies include
-    P·V and −μ·N by construction.
-
-    Regression for the semi-grand bug where ``chemical_potentials`` were
-    silently dropped from the initial energy (the resolver extracted only
-    ``pressure``), so the first NS contour disagreed with the running chain
-    and with ``SemiGrandSwap``'s ``Ω = U − μ·N`` assumption.
+    P·V and −μ·N by construction — keeping the first NS contour consistent
+    with the running chain and with ``SemiGrandSwap``'s ``Ω = U − μ·N``.
     """
 
     def test_finalise_threads_chemical_potentials_per_replica(self):
@@ -305,7 +300,7 @@ class TestNSStepDeadWalker:
     """``info['dead_walker']`` is a ``WalkerState`` pytree (positions /
     types / energy / cell) holding the dead walker's pre-cull state.  This
     replaces the older parallel ``dead_position`` / ``dead_volume`` /
-    ``dead_cell`` / ``dead_energy`` keys — see WORKLOG 2026-05-28.
+    ``dead_cell`` / ``dead_energy`` keys.
     """
 
     def test_dead_walker_has_walker_state_fields(self, periodic_setup_npt):

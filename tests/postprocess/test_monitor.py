@@ -16,18 +16,17 @@ import logging
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")  # headless, must be before any other matplotlib import
 
 import numpy as np
 import pytest
 
 from jaxrens.cli.monitor import (
-    _format_reject_breakdown,
     EnergyCheckCallback,
     ProgressCallback,
+    _format_reject_breakdown,
 )
-from jaxrens.postprocess.monitor import Monitor
-from jaxrens.postprocess.collection import MonitorCollection
 from jaxrens.postprocess import (
     plot_energy_trace,
     plot_free_energy,
@@ -35,18 +34,26 @@ from jaxrens.postprocess import (
     plot_log_evidence_trace,
     plot_partition_function,
 )
+from jaxrens.postprocess.collection import MonitorCollection
+from jaxrens.postprocess.monitor import Monitor
+from jaxrens.postprocess.thermodynamics import calc_log_weights
 from jaxrens.postprocess.thermodynamics import (
-    calc_log_weights,
-    heat_capacity as thermo_heat_capacity,
     expectation as thermo_expectation,
-    partition_function as thermo_partition_function,
+)
+from jaxrens.postprocess.thermodynamics import (
     free_energy as thermo_free_energy,
 )
-
+from jaxrens.postprocess.thermodynamics import (
+    heat_capacity as thermo_heat_capacity,
+)
+from jaxrens.postprocess.thermodynamics import (
+    partition_function as thermo_partition_function,
+)
 
 # ---------------------------------------------------------------------------
 # _format_reject_breakdown unit tests
 # ---------------------------------------------------------------------------
+
 
 class TestFormatRejectBreakdown:
     """Unit tests for the reject-reason column formatter in monitor.py.
@@ -70,9 +77,20 @@ class TestFormatRejectBreakdown:
 
     def test_all_accepted_returns_empty(self):
         """counts=[10,0,0,0] with any reasons_used -> empty string."""
-        assert _format_reject_breakdown([10, 0, 0, 0], reasons_used=frozenset({"energy"})) == ""
+        assert (
+            _format_reject_breakdown(
+                [10, 0, 0, 0], reasons_used=frozenset({"energy"})
+            )
+            == ""
+        )
         assert _format_reject_breakdown([10, 0, 0, 0], reasons_used=None) == ""
-        assert _format_reject_breakdown([10, 0, 0, 0], reasons_used=frozenset({"energy", "cell", "prior"})) == ""
+        assert (
+            _format_reject_breakdown(
+                [10, 0, 0, 0],
+                reasons_used=frozenset({"energy", "cell", "prior"}),
+            )
+            == ""
+        )
 
     def test_all_three_reasons(self):
         """counts=[5,3,1,1] with all three reasons -> E= 60% C= 20% P= 20%."""
@@ -120,6 +138,7 @@ class TestFormatRejectBreakdown:
 # ProgressCallback column-alignment tests
 # ---------------------------------------------------------------------------
 
+
 def _capture_progress_lines(info: dict, batched: bool = False) -> list[str]:
     """Run ProgressCallback.on_iteration with a synthetic ns_state and capture the log output.
 
@@ -155,7 +174,9 @@ def _capture_progress_lines(info: dict, batched: bool = False) -> list[str]:
         target_logger.removeHandler(handler)
         target_logger.setLevel(old_level)
 
-    assert records, "ProgressCallback.on_iteration did not emit any log message"
+    assert (
+        records
+    ), "ProgressCallback.on_iteration did not emit any log message"
     # The callback emits a single multi-line message; split it.
     return records[0].split("\n")
 
@@ -170,7 +191,9 @@ def _acc_col_offset(row: str) -> int:
 class TestProgressCallbackAlignment:
     """Assert that acc= starts at the same column across all per-move rows."""
 
-    def _make_single_run_info(self, n_moves: int = 3, with_rejects: bool = True):
+    def _make_single_run_info(
+        self, n_moves: int = 3, with_rejects: bool = True
+    ):
         """Build a minimal info dict for single-run mode."""
         import jax.numpy as jnp
 
@@ -180,11 +203,13 @@ class TestProgressCallbackAlignment:
 
         if with_rejects:
             # galilean: energy rejects only; volume: energy+cell; shear: energy only
-            rc = jnp.array([
-                [620, 380, 0, 0],    # galilean: 38% energy reject
-                [100, 90, 810, 0],   # volume: energy + cell rejects
-                [500, 500, 0, 0],    # shear: energy rejects
-            ])
+            rc = jnp.array(
+                [
+                    [620, 380, 0, 0],  # galilean: 38% energy reject
+                    [100, 90, 810, 0],  # volume: energy + cell rejects
+                    [500, 500, 0, 0],  # shear: energy rejects
+                ]
+            )
             move_reject_reasons = (
                 frozenset({"energy"}),
                 frozenset({"energy", "cell"}),
@@ -212,14 +237,17 @@ class TestProgressCallbackAlignment:
         # shape (n_runs, n_moves)
         ss = jnp.ones((n_runs, n_moves)) * jnp.array([5.0, 0.011, 0.5])
         acc = jnp.ones((n_runs, n_moves)) * jnp.array([0.62, 0.10, 0.50])
-        rc = jnp.ones((n_runs, n_moves, 4), dtype=jnp.int32) * jnp.array([500, 300, 200, 0])
+        rc = jnp.ones((n_runs, n_moves, 4), dtype=jnp.int32) * jnp.array(
+            [500, 300, 200, 0]
+        )
 
         return {
             "emax": jnp.array([-102.3, -102.1, -102.5]),
             "step_sizes_per_move": ss,
             "move_names": move_names,
             "n_accepted_per_move": acc * 1000,
-            "n_proposed_per_move": jnp.ones((n_runs, n_moves), dtype=jnp.int32) * 1000,
+            "n_proposed_per_move": jnp.ones((n_runs, n_moves), dtype=jnp.int32)
+            * 1000,
             "reject_reason_counts_per_move": rc,
             "move_reject_reasons": (
                 frozenset({"energy"}),
@@ -233,7 +261,9 @@ class TestProgressCallbackAlignment:
         info = self._make_single_run_info(with_rejects=True)
         lines = _capture_progress_lines(info, batched=False)
         move_rows = [l for l in lines if "acc=" in l]
-        assert len(move_rows) == 3, f"Expected 3 per-move rows, got: {move_rows}"
+        assert (
+            len(move_rows) == 3
+        ), f"Expected 3 per-move rows, got: {move_rows}"
         offsets = [_acc_col_offset(r) for r in move_rows]
         assert len(set(offsets)) == 1, (
             f"acc= column offset differs across rows: {offsets}\nRows:\n"
@@ -253,10 +283,17 @@ class TestProgressCallbackAlignment:
             "move_names": ["galilean", "volume"],
             "n_accepted_per_move": jnp.array([1000, 200]),
             "n_proposed_per_move": jnp.array([1000, 1000]),
-            "reject_reason_counts_per_move": jnp.array([
-                [1000, 0, 0, 0],   # galilean: all accepted -> no reject suffix
-                [200, 500, 300, 0], # volume: energy+cell rejects
-            ]),
+            "reject_reason_counts_per_move": jnp.array(
+                [
+                    [
+                        1000,
+                        0,
+                        0,
+                        0,
+                    ],  # galilean: all accepted -> no reject suffix
+                    [200, 500, 300, 0],  # volume: energy+cell rejects
+                ]
+            ),
             "move_reject_reasons": (
                 frozenset({"energy"}),
                 frozenset({"energy", "cell"}),
@@ -268,10 +305,14 @@ class TestProgressCallbackAlignment:
         offsets = [_acc_col_offset(r) for r in move_rows]
         assert len(set(offsets)) == 1, (
             f"acc= column not aligned between galilean (no-reject) and volume (with-reject):\n"
-            + "\n".join(f"  offset={o}: {repr(r)}" for o, r in zip(offsets, move_rows))
+            + "\n".join(
+                f"  offset={o}: {repr(r)}" for o, r in zip(offsets, move_rows)
+            )
         )
         # Additionally verify that galilean row has no "reject:" and volume row does.
-        assert "reject:" not in move_rows[0], "galilean should have no reject suffix"
+        assert (
+            "reject:" not in move_rows[0]
+        ), "galilean should have no reject suffix"
         assert "reject:" in move_rows[1], "volume should have reject suffix"
 
     def test_batched_acc_aligned(self):
@@ -286,9 +327,11 @@ class TestProgressCallbackAlignment:
             + "\n".join(move_rows)
         )
 
+
 # ---------------------------------------------------------------------------
 # Synthetic data helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_monitor(
     n_dead: int = 100,
@@ -326,6 +369,7 @@ def _make_monitor(
 # ---------------------------------------------------------------------------
 # Monitor unit tests
 # ---------------------------------------------------------------------------
+
 
 class TestMonitorConstruction:
     def test_basic_construction(self):
@@ -386,10 +430,16 @@ class TestMonitorObservables:
         dead_e = jnp.asarray(monitor.dead_energies)
         live_e = jnp.asarray(monitor.live_energies)
 
-        expected = np.array([
-            float(thermo_heat_capacity(float(b), dead_e, live_e, n_live=monitor.n_live))
-            for b in betas
-        ])
+        expected = np.array(
+            [
+                float(
+                    thermo_heat_capacity(
+                        float(b), dead_e, live_e, n_live=monitor.n_live
+                    )
+                )
+                for b in betas
+            ]
+        )
         result = monitor.heat_capacity(T)
         np.testing.assert_allclose(result, expected, rtol=1e-6)
 
@@ -414,10 +464,20 @@ class TestMonitorObservables:
         live_obs = jnp.full(live_e.shape[0], live_obs_val)
         obs_full = jnp.concatenate([jnp.asarray(obs), live_obs])
 
-        expected = np.array([
-            float(thermo_expectation(obs_full, float(b), dead_e, live_e, n_live=monitor.n_live))
-            for b in betas
-        ])
+        expected = np.array(
+            [
+                float(
+                    thermo_expectation(
+                        obs_full,
+                        float(b),
+                        dead_e,
+                        live_e,
+                        n_live=monitor.n_live,
+                    )
+                )
+                for b in betas
+            ]
+        )
         result = monitor.expectation(obs, T)
         np.testing.assert_allclose(result, expected, rtol=1e-6)
 
@@ -457,6 +517,7 @@ class TestMonitorObservables:
 # Monitor.from_directory
 # ---------------------------------------------------------------------------
 
+
 class TestMonitorFromDirectory:
     """Synthesise a run directory and round-trip through from_directory."""
 
@@ -489,7 +550,9 @@ class TestMonitorFromDirectory:
                 np.concatenate([dead_e, np.full(1000, np.inf)])
             ),
             "dead_positions": jnp.asarray(
-                np.concatenate([dead_positions, np.zeros((1000, 4, 3))], axis=0)
+                np.concatenate(
+                    [dead_positions, np.zeros((1000, 4, 3))], axis=0
+                )
             ),
             "dead_volumes": None,
             "live_volumes": None,
@@ -526,9 +589,10 @@ class TestMonitorFromDirectory:
 
     def test_from_directory_prefers_final(self, tmp_path):
         """Prefers .final.checkpoint.h5 over .checkpoint.h5."""
+        import jax.numpy as jnp
+
         from jaxrens.io.checkpoint import save_checkpoint
         from jaxrens.io.energy_log import EnergyLogger
-        import jax.numpy as jnp
 
         rng = np.random.default_rng(0)
         n_live, n_dead = 5, 10
@@ -563,7 +627,9 @@ class TestMonitorFromDirectory:
         _write(tmp_path / "ns.final.checkpoint.h5", log_evidence_val=99.0)
 
         energy_logger = EnergyLogger(
-            tmp_path / "ns.energies", n_walkers=n_live, n_cull=1,
+            tmp_path / "ns.energies",
+            n_walkers=n_live,
+            n_cull=1,
         )
         energy_logger.write_header()
         for i, e in enumerate(np.sort(rng.uniform(0, 5, n_dead))):
@@ -582,19 +648,24 @@ class TestMonitorFromDirectory:
 # Plotting tests
 # ---------------------------------------------------------------------------
 
+
 class TestPlotting:
     @pytest.fixture
     def monitor(self):
-        return _make_monitor(n_dead=50, n_live=10, with_trace=True, label="run1")
+        return _make_monitor(
+            n_dead=50, n_live=10, with_trace=True, label="run1"
+        )
 
     def test_plot_energy_trace_returns_axes(self, monitor):
         import matplotlib.pyplot as plt
+
         ax = plot_energy_trace(monitor)
         assert hasattr(ax, "get_xlabel")
         plt.close("all")
 
     def test_plot_energy_trace_axis_labels(self, monitor):
         import matplotlib.pyplot as plt
+
         ax = plot_energy_trace(monitor)
         assert ax.get_xlabel() != ""
         assert ax.get_ylabel() != ""
@@ -602,6 +673,7 @@ class TestPlotting:
 
     def test_plot_energy_trace_reuses_ax(self, monitor):
         import matplotlib.pyplot as plt
+
         _, existing_ax = plt.subplots()
         returned = plot_energy_trace(monitor, ax=existing_ax)
         assert returned is existing_ax
@@ -614,12 +686,14 @@ class TestPlotting:
 
     def test_plot_log_evidence_trace_returns_axes(self, monitor):
         import matplotlib.pyplot as plt
+
         ax = plot_log_evidence_trace(monitor)
         assert hasattr(ax, "get_xlabel")
         plt.close("all")
 
     def test_plot_log_evidence_trace_axis_labels(self, monitor):
         import matplotlib.pyplot as plt
+
         ax = plot_log_evidence_trace(monitor)
         assert ax.get_xlabel() != ""
         assert ax.get_ylabel() != ""
@@ -627,6 +701,7 @@ class TestPlotting:
 
     def test_plot_log_evidence_trace_reuses_ax(self, monitor):
         import matplotlib.pyplot as plt
+
         _, existing_ax = plt.subplots()
         returned = plot_log_evidence_trace(monitor, ax=existing_ax)
         assert returned is existing_ax
@@ -634,6 +709,7 @@ class TestPlotting:
 
     def test_plot_heat_capacity_returns_axes(self, monitor):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 5)
         ax = plot_heat_capacity(monitor, T)
         assert hasattr(ax, "get_xlabel")
@@ -641,6 +717,7 @@ class TestPlotting:
 
     def test_plot_heat_capacity_axis_labels(self, monitor):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 5)
         ax = plot_heat_capacity(monitor, T)
         assert "T" in ax.get_xlabel()
@@ -649,6 +726,7 @@ class TestPlotting:
 
     def test_plot_heat_capacity_reuses_ax(self, monitor):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 5)
         _, existing_ax = plt.subplots()
         returned = plot_heat_capacity(monitor, T, ax=existing_ax)
@@ -657,6 +735,7 @@ class TestPlotting:
 
     def test_plot_partition_function_returns_axes(self, monitor):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 5)
         ax = plot_partition_function(monitor, T)
         assert hasattr(ax, "get_xlabel")
@@ -664,6 +743,7 @@ class TestPlotting:
 
     def test_plot_partition_function_axis_labels(self, monitor):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 5)
         ax = plot_partition_function(monitor, T)
         assert ax.get_xlabel() != ""
@@ -672,6 +752,7 @@ class TestPlotting:
 
     def test_plot_partition_function_reuses_ax(self, monitor):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 5)
         _, existing_ax = plt.subplots()
         returned = plot_partition_function(monitor, T, ax=existing_ax)
@@ -680,6 +761,7 @@ class TestPlotting:
 
     def test_plot_free_energy_returns_axes(self, monitor):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 5)
         ax = plot_free_energy(monitor, T)
         assert hasattr(ax, "get_xlabel")
@@ -687,6 +769,7 @@ class TestPlotting:
 
     def test_plot_free_energy_axis_labels(self, monitor):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 5)
         ax = plot_free_energy(monitor, T)
         assert ax.get_xlabel() != ""
@@ -695,6 +778,7 @@ class TestPlotting:
 
     def test_plot_free_energy_reuses_ax(self, monitor):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 5)
         _, existing_ax = plt.subplots()
         returned = plot_free_energy(monitor, T, ax=existing_ax)
@@ -706,11 +790,14 @@ class TestPlotting:
 # MonitorCollection tests
 # ---------------------------------------------------------------------------
 
+
 class TestMonitorCollection:
     @pytest.fixture
     def three_monitors(self):
         return [
-            _make_monitor(n_dead=60, n_live=15, seed=i, label=f"run{i}", with_trace=True)
+            _make_monitor(
+                n_dead=60, n_live=15, seed=i, label=f"run{i}", with_trace=True
+            )
             for i in range(3)
         ]
 
@@ -768,6 +855,7 @@ class TestMonitorCollection:
 
     def test_plot_heat_capacity_three_lines(self, collection):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 5)
         ax = collection.plot_heat_capacity(T)
         assert len(ax.get_lines()) == 3
@@ -779,6 +867,7 @@ class TestMonitorCollection:
 
     def test_plot_heat_capacity_reuses_ax(self, collection):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 5)
         _, existing_ax = plt.subplots()
         returned = collection.plot_heat_capacity(T, ax=existing_ax)
@@ -787,6 +876,7 @@ class TestMonitorCollection:
 
     def test_plot_partition_function_overlay(self, collection):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 4)
         ax = collection.plot_partition_function(T)
         assert len(ax.get_lines()) == 3
@@ -794,6 +884,7 @@ class TestMonitorCollection:
 
     def test_plot_free_energy_overlay(self, collection):
         import matplotlib.pyplot as plt
+
         T = np.linspace(0.5, 5.0, 4)
         ax = collection.plot_free_energy(T)
         assert len(ax.get_lines()) == 3
@@ -801,9 +892,10 @@ class TestMonitorCollection:
 
     def test_from_directories_round_trip(self, tmp_path):
         """from_directories loads each dir into a Monitor."""
+        import jax.numpy as jnp
+
         from jaxrens.io.checkpoint import save_checkpoint
         from jaxrens.io.energy_log import EnergyLogger
-        import jax.numpy as jnp
 
         dirs = []
         for i in range(2):
@@ -838,7 +930,9 @@ class TestMonitorCollection:
             save_checkpoint(d / "ns.final.checkpoint.h5", ns_state)
 
             energy_logger = EnergyLogger(
-                d / "ns.energies", n_walkers=n_live, n_cull=1,
+                d / "ns.energies",
+                n_walkers=n_live,
+                n_cull=1,
             )
             energy_logger.write_header()
             for j, e in enumerate(dead_e):
@@ -847,7 +941,9 @@ class TestMonitorCollection:
 
             dirs.append(d)
 
-        coll = MonitorCollection.from_directories(dirs, labels=["a", "b"], prefix="ns")
+        coll = MonitorCollection.from_directories(
+            dirs, labels=["a", "b"], prefix="ns"
+        )
         assert len(coll) == 2
         assert coll[0].label == "a"
         assert coll[1].label == "b"
@@ -888,7 +984,9 @@ class TestFromMultiRunDirectoryConfigInference:
         n_dead = np.full((n_runs,), n_dead_per_run, dtype=np.int32)
 
         n_atoms = 2
-        positions = rng.uniform(0.0, 1.0, (n_runs, n_live, n_atoms, 3)).astype(np.float32)
+        positions = rng.uniform(0.0, 1.0, (n_runs, n_live, n_atoms, 3)).astype(
+            np.float32
+        )
         types = np.zeros((n_runs, n_live, n_atoms), dtype=np.int32)
         ckpt_path = out_dir / f"{prefix}.final.checkpoint.h5"
         with h5py.File(ckpt_path, "w") as f:
@@ -903,7 +1001,8 @@ class TestFromMultiRunDirectoryConfigInference:
         for i in range(n_runs):
             elog = EnergyLogger(
                 out_dir / f"{prefix}.run{i:02d}.energies",
-                n_walkers=n_live, n_cull=1,
+                n_walkers=n_live,
+                n_cull=1,
             )
             elog.write_header()
             for k in range(n_dead_per_run):
@@ -940,7 +1039,9 @@ class TestFromMultiRunDirectoryConfigInference:
 
         coll = MonitorCollection.from_multi_run_directory(out_dir)
         assert [m.label for m in coll] == [
-            "P= 2.00 GPa", "P= 4.00 GPa", "P= 6.00 GPa",
+            "P= 2.00 GPa",
+            "P= 4.00 GPa",
+            "P= 6.00 GPa",
         ]
         assert [m.pressure_gpa for m in coll] == [2.0, 4.0, 6.0]
 
@@ -955,7 +1056,9 @@ class TestFromMultiRunDirectoryConfigInference:
         )
 
         coll = MonitorCollection.from_multi_run_directory(
-            out_dir, prefix=prefix, labels=["foo", "bar"],
+            out_dir,
+            prefix=prefix,
+            labels=["foo", "bar"],
         )
         assert [m.label for m in coll] == ["foo", "bar"]
         # Pressure metadata still attaches when config matches n_total.
@@ -983,7 +1086,8 @@ class TestFromMultiRunDirectoryConfigInference:
         )
 
         coll = MonitorCollection.from_multi_run_directory(
-            out_dir, config=config_path,
+            out_dir,
+            config=config_path,
         )
         assert [m.pressure_gpa for m in coll] == [3.0, 5.0]
 
@@ -1028,7 +1132,9 @@ class TestFromMultiRunDirectoryConfigInference:
         )
 
         coll = MonitorCollection.from_multi_run_directory(out_dir)
-        ax = coll.plot_heatmap(np.linspace(0.5, 2.0, 4), "heat_capacity", fmt="TP")
+        ax = coll.plot_heatmap(
+            np.linspace(0.5, 2.0, 4), "heat_capacity", fmt="TP"
+        )
         assert ax.get_xlabel() == "T"
         assert ax.get_ylabel() == "P [GPa]"
         plt.close("all")
@@ -1063,7 +1169,9 @@ class TestFromMultiRunDirectoryConfigInference:
             return np.full(T.shape, float(monitor.pressure_gpa))
 
         ax = coll.plot_heatmap(
-            np.linspace(0.5, 2.0, 4), constant_obs, cbar_label="P",
+            np.linspace(0.5, 2.0, 4),
+            constant_obs,
+            cbar_label="P",
         )
         # The pcolormesh should have data spanning the pressure range.
         mesh = ax.collections[0]
@@ -1077,12 +1185,16 @@ class TestFromMultiRunDirectoryConfigInference:
         self._write_multi_run_artefacts(out_dir, prefix="ns", n_runs=2)
         coll = MonitorCollection.from_multi_run_directory(out_dir)
         with pytest.raises(ValueError, match="Unknown observable"):
-            coll.plot_heatmap(np.linspace(0.5, 2.0, 4), "not_a_real_observable")
+            coll.plot_heatmap(
+                np.linspace(0.5, 2.0, 4), "not_a_real_observable"
+            )
 
     def test_adaptation_trace_loaded_into_collection(self, tmp_path):
         """``from_multi_run_directory`` should pick up ``<prefix>.adaptation.h5``
         and attach it to the collection (not to individual monitors)."""
-        import h5py, json
+        import json
+
+        import h5py
 
         out_dir = tmp_path / "output"
         prefix = "adap"
@@ -1096,19 +1208,26 @@ class TestFromMultiRunDirectoryConfigInference:
             f.attrs["n_moves"] = n_moves
             f.attrs["n_runs"] = n_runs
             f.attrs["move_names"] = json.dumps(["galilean", "volume"])
-            f.create_dataset("iterations", data=np.arange(n_entries, dtype=np.int64))
+            f.create_dataset(
+                "iterations", data=np.arange(n_entries, dtype=np.int64)
+            )
             f.create_dataset(
                 "step_sizes",
-                data=np.linspace(0.01, 0.1, n_entries * n_runs * n_moves,
-                                 dtype=np.float32).reshape(n_entries, n_runs, n_moves),
+                data=np.linspace(
+                    0.01, 0.1, n_entries * n_runs * n_moves, dtype=np.float32
+                ).reshape(n_entries, n_runs, n_moves),
             )
             f.create_dataset(
                 "acceptance_rates",
-                data=np.full((n_entries, n_runs, n_moves), 0.4, dtype=np.float32),
+                data=np.full(
+                    (n_entries, n_runs, n_moves), 0.4, dtype=np.float32
+                ),
             )
             f.create_dataset(
                 "n_evaluations",
-                data=np.full((n_entries, n_runs, n_moves), 100, dtype=np.int64),
+                data=np.full(
+                    (n_entries, n_runs, n_moves), 100, dtype=np.int64
+                ),
             )
             f.create_dataset(
                 "n_grad_evaluations",
@@ -1152,7 +1271,9 @@ class TestFromMultiRunDirectoryConfigInference:
     def test_plot_step_sizes_uses_collection_trace(self, tmp_path):
         """``MonitorCollection.plot_step_sizes`` should plot from the
         cohort-level adaptation trace, not from per-monitor traces."""
-        import h5py, json
+        import json
+
+        import h5py
         import matplotlib.pyplot as plt
 
         out_dir = tmp_path / "output"
@@ -1182,12 +1303,25 @@ class TestFromMultiRunDirectoryConfigInference:
                 data=np.full((4, 2, 2), 50, dtype=np.int64),
             )
             stats = f.create_group("adjustment_stats")
-            stats.create_dataset("n_rounds", data=np.ones((4, 2, 2), dtype=np.int32))
-            stats.create_dataset("converged", data=np.ones((4, 2, 2), dtype=bool))
-            stats.create_dataset("cap_hits", data=np.zeros((4, 2, 2), dtype=np.int32))
-            stats.create_dataset("floor_hits", data=np.zeros((4, 2, 2), dtype=np.int32))
-            stats.create_dataset("bracket_detected", data=np.zeros((4, 2, 2), dtype=bool))
-            stats.create_dataset("reject_reason_counts", data=np.zeros((4, 2, 2, 4), dtype=np.int32))
+            stats.create_dataset(
+                "n_rounds", data=np.ones((4, 2, 2), dtype=np.int32)
+            )
+            stats.create_dataset(
+                "converged", data=np.ones((4, 2, 2), dtype=bool)
+            )
+            stats.create_dataset(
+                "cap_hits", data=np.zeros((4, 2, 2), dtype=np.int32)
+            )
+            stats.create_dataset(
+                "floor_hits", data=np.zeros((4, 2, 2), dtype=np.int32)
+            )
+            stats.create_dataset(
+                "bracket_detected", data=np.zeros((4, 2, 2), dtype=bool)
+            )
+            stats.create_dataset(
+                "reject_reason_counts",
+                data=np.zeros((4, 2, 2, 4), dtype=np.int32),
+            )
         (tmp_path / "config.yaml").write_text(
             f"output:\n  out_file_prefix: {prefix}\n"
         )
@@ -1205,6 +1339,7 @@ class TestFromMultiRunDirectoryConfigInference:
     def test_plot_heatmap_low_level_shape_validation(self):
         """plot_heatmap rejects mismatched (n_P, n_T) shapes loudly."""
         import matplotlib.pyplot as plt
+
         from jaxrens.postprocess.plotting import plot_heatmap
 
         T = np.linspace(0.0, 1.0, 5)
@@ -1223,7 +1358,9 @@ class TestFromMultiRunDirectoryConfigInference:
             f"output:\n  out_file_prefix: {prefix}\n"
             # 16-entry pressure list, but only 3 replicas — must not crash.
             "ensemble:\n  type: npt\n  pressure: "
-            + "[" + ",".join(str(float(p)) for p in range(1, 17)) + "]\n"
+            + "["
+            + ",".join(str(float(p)) for p in range(1, 17))
+            + "]\n"
             "  pressure_units: gpa\n"
         )
 
@@ -1249,7 +1386,9 @@ class TestSmokeRealRun:
     """
 
     def test_from_directory_lj8_npt(self):
-        m = Monitor.from_directory(_LJ8_NPT_OUTPUT, prefix="lj8_npt", label="lj8_smoke")
+        m = Monitor.from_directory(
+            _LJ8_NPT_OUTPUT, prefix="lj8_npt", label="lj8_smoke"
+        )
         assert m.n_dead > 0
         assert m.n_live > 0
         assert np.isfinite(m.log_evidence)
@@ -1258,7 +1397,9 @@ class TestSmokeRealRun:
     def test_heat_capacity_on_real_run(self, tmp_path):
         import matplotlib.pyplot as plt
 
-        m = Monitor.from_directory(_LJ8_NPT_OUTPUT, prefix="lj8_npt", label="lj8_smoke")
+        m = Monitor.from_directory(
+            _LJ8_NPT_OUTPUT, prefix="lj8_npt", label="lj8_smoke"
+        )
         T = np.array([0.5, 1.0, 2.0])
         Cv = m.heat_capacity(T)
         assert Cv.shape == (3,)
@@ -1272,14 +1413,16 @@ class TestSmokeRealRun:
         assert out_path.exists()
 
     def test_energy_trace_loaded(self):
-        m = Monitor.from_directory(_LJ8_NPT_OUTPUT, prefix="lj8_npt", label="lj8_smoke")
+        m = Monitor.from_directory(
+            _LJ8_NPT_OUTPUT, prefix="lj8_npt", label="lj8_smoke"
+        )
         assert m.energy_trace is not None
         assert m.iteration_trace is not None
         assert len(m.energy_trace) == len(m.iteration_trace)
 
 
 # ---------------------------------------------------------------------------
-# Task B: ProgressCallback smoke test with PmapVmapRuns (ndim==2 log_evidence)
+# ProgressCallback smoke test with PmapVmapRuns (ndim==2 log_evidence)
 # ---------------------------------------------------------------------------
 
 
@@ -1288,8 +1431,9 @@ class TestProgressCallbackPmapVmap:
 
     def test_pmap_vmap_no_exception_and_logz_bracket(self):
         """on_iteration does not raise for (1,2)-shaped log_evidence."""
-        import jax.numpy as jnp
         import logging
+
+        import jax.numpy as jnp
 
         from jaxrens.cli.monitor import ProgressCallback
         from jaxrens.sampling.batch_descriptor import PmapVmapRuns
@@ -1301,7 +1445,7 @@ class TestProgressCallbackPmapVmap:
         ns_state = {"log_evidence": jnp.array([[5.1, 6.2]])}  # shape (1, 2)
 
         info = {
-            "emax": jnp.array([[-10.0, -9.5]]),   # (G, P) emax
+            "emax": jnp.array([[-10.0, -9.5]]),  # (G, P) emax
             "_batch": descriptor,
         }
 
@@ -1328,13 +1472,13 @@ class TestProgressCallbackPmapVmap:
 
         assert records, "ProgressCallback.on_iteration emitted no log output"
         header = records[0].split("\n")[0]
-        assert "log_Z=[" in header, (
-            f"Expected 'log_Z=[...]' bracket format in header, got: {repr(header)}"
-        )
+        assert (
+            "log_Z=[" in header
+        ), f"Expected 'log_Z=[...]' bracket format in header, got: {repr(header)}"
         # Verify min/max are present (floats from (1,2) array)
-        assert ".." in header, (
-            f"Expected min..max format in log_Z bracket, got: {repr(header)}"
-        )
+        assert (
+            ".." in header
+        ), f"Expected min..max format in log_Z bracket, got: {repr(header)}"
 
 
 class TestEnergyCheckCallbackPerReplica:
@@ -1343,6 +1487,7 @@ class TestEnergyCheckCallbackPerReplica:
     @staticmethod
     def _capture_warnings(cb_action):
         import jax.numpy as jnp  # local; jnp used downstream in test bodies
+
         records: list[str] = []
 
         class _Rec(logging.Handler):
@@ -1363,19 +1508,23 @@ class TestEnergyCheckCallbackPerReplica:
 
     def test_scalar_singlerun_descending_no_warn(self):
         cb = EnergyCheckCallback()
-        msgs = self._capture_warnings(lambda: (
-            cb.on_iteration(0, None, {"emax": np.array(10.0)}),
-            cb.on_iteration(1, None, {"emax": np.array(8.0)}),
-            cb.on_iteration(2, None, {"emax": np.array(5.0)}),
-        ))
+        msgs = self._capture_warnings(
+            lambda: (
+                cb.on_iteration(0, None, {"emax": np.array(10.0)}),
+                cb.on_iteration(1, None, {"emax": np.array(8.0)}),
+                cb.on_iteration(2, None, {"emax": np.array(5.0)}),
+            )
+        )
         assert msgs == []
 
     def test_scalar_singlerun_ascending_warns(self):
         cb = EnergyCheckCallback()
-        msgs = self._capture_warnings(lambda: (
-            cb.on_iteration(0, None, {"emax": np.array(10.0)}),
-            cb.on_iteration(1, None, {"emax": np.array(11.0)}),
-        ))
+        msgs = self._capture_warnings(
+            lambda: (
+                cb.on_iteration(0, None, {"emax": np.array(10.0)}),
+                cb.on_iteration(1, None, {"emax": np.array(11.0)}),
+            )
+        )
         assert len(msgs) == 1
         assert "non-monotonic" in msgs[0]
 
@@ -1383,13 +1532,15 @@ class TestEnergyCheckCallbackPerReplica:
         """The bug-of-record case: global max would hide a single regression."""
         cb = EnergyCheckCallback()
         # 16 replicas, all descending — except replica 3 which jumps up.
-        prev = np.linspace(50.0, 35.0, 16)            # descending across runs
-        curr = np.linspace(48.0, 34.0, 16).copy()     # mostly descending
-        curr[3] = prev[3] + 2.5                        # replica 3 ASCENDS
-        msgs = self._capture_warnings(lambda: (
-            cb.on_iteration(0, None, {"emax": prev}),
-            cb.on_iteration(1, None, {"emax": curr}),
-        ))
+        prev = np.linspace(50.0, 35.0, 16)  # descending across runs
+        curr = np.linspace(48.0, 34.0, 16).copy()  # mostly descending
+        curr[3] = prev[3] + 2.5  # replica 3 ASCENDS
+        msgs = self._capture_warnings(
+            lambda: (
+                cb.on_iteration(0, None, {"emax": prev}),
+                cb.on_iteration(1, None, {"emax": curr}),
+            )
+        )
         assert len(msgs) == 1
         assert "non-monotonic on 1 replica" in msgs[0]
         assert "replica[3]" in msgs[0]
@@ -1398,16 +1549,20 @@ class TestEnergyCheckCallbackPerReplica:
         cb = EnergyCheckCallback()
         prev = np.array([[20.0, 19.0], [18.0, 17.0]])
         curr = np.array([[19.0, 19.5], [17.5, 16.5]])  # (0,1) ascends
-        msgs = self._capture_warnings(lambda: (
-            cb.on_iteration(0, None, {"emax": prev}),
-            cb.on_iteration(1, None, {"emax": curr}),
-        ))
+        msgs = self._capture_warnings(
+            lambda: (
+                cb.on_iteration(0, None, {"emax": prev}),
+                cb.on_iteration(1, None, {"emax": curr}),
+            )
+        )
         assert len(msgs) == 1
         assert "replica[0,1]" in msgs[0]
 
     def test_iteration_zero_never_warns(self):
         cb = EnergyCheckCallback()
-        msgs = self._capture_warnings(lambda: cb.on_iteration(
-            0, None, {"emax": np.array([[100.0, 200.0]])}
-        ))
+        msgs = self._capture_warnings(
+            lambda: cb.on_iteration(
+                0, None, {"emax": np.array([[100.0, 200.0]])}
+            )
+        )
         assert msgs == []

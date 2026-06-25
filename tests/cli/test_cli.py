@@ -187,9 +187,8 @@ class TestRun:
     def test_run_from_config_format_h5(self, tmp_path):
         """``format='h5'`` writes a ``.traj.h5`` file.
 
-        Regression: the run path forwards ``wrap=output.wrap_atoms`` to every
-        writer; ``H5TrajectoryWriter`` previously didn't accept ``wrap`` and
-        raised TypeError, so ``format: h5`` crashed at writer construction.
+        The run path forwards ``wrap=output.wrap_atoms`` to every writer, so
+        ``H5TrajectoryWriter`` must accept ``wrap``.
         """
         ns_config = NSConfig(
             n_live=12, max_iterations=10, n_mcmc_steps=2, seed=0

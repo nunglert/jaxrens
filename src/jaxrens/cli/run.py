@@ -793,7 +793,7 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
     batched-aware variants where needed:
 
     * ``ProgressCallback``, ``AdaptationCallback``, ``EnergyCheckCallback`` —
-      already (G, P)-safe (see WORKLOG 2026-04-18 Task A/B).
+      already (G, P)-safe.
     * ``CheckpointCallback`` — saves HDF5 with batched shapes via the
       already-batched-safe ``io/checkpoint.py`` path.
     * ``BatchedTrajectoryCallback`` — one writer + energy logger per replica,

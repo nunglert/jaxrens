@@ -16,7 +16,6 @@ from jaxrens.sampling.moves.replica_exchange import (
     replica_exchange_step,
 )
 
-
 # ---------------------------------------------------------------------------
 # get_swap_pairs
 # ---------------------------------------------------------------------------
@@ -178,11 +177,8 @@ class TestPressureRENSStoredEnthalpyConvention:
     """The kernel's input is the stored enthalpy ``H_self = U + P_self · V``.
 
     Production calls feed in ``state.energy`` directly (an EnsembleBackend
-    output, i.e. enthalpy at self's pressure).  Pre-fix, the kernel added
-    ``P_partner · V`` on top of stored H, double-counting PV by
-    ``P_self · V``.  At iter-24 conditions (Si16, V≈320 Å³, P=1 GPa
-    ≈6.24e-3 eV/Å³) this added ~2 eV of spurious energy and collapsed
-    acceptance from ~0.78 to ~0.05.
+    output, i.e. enthalpy at self's pressure), so the kernel must add only the
+    cross term ``ΔP · V`` and not a second ``P_self · V``.
     """
 
     def test_swap_at_iter_24_conditions_accepts(self):
@@ -190,11 +186,9 @@ class TestPressureRENSStoredEnthalpyConvention:
 
         With both replicas at the same U and V and equal pressures, the swap
         is a no-op physically — moving walker A to run B's pressure changes
-        nothing.  Acceptance must therefore depend only on U being below Emax.
-
-        Pre-fix the kernel added an extra ``P_self · V ≈ 2 eV`` per side which
-        pushed h_a_in_b above tight Emax thresholds.  Post-fix, that spurious
-        term cancels and the swap accepts.
+        nothing.  Acceptance must therefore depend only on U being below Emax;
+        a spurious extra ``P_self · V`` would lift the cross-enthalpy above a
+        tight Emax and wrongly reject.
         """
         # Reproduce realistic Si16 magnitudes:
         # - V ≈ 320 Å³ (~20 Å³/atom · 16 atoms)
@@ -226,21 +220,19 @@ class TestPressureRENSStoredEnthalpyConvention:
 
         accepted = kernel.accept(proposed, emax_a, emax_b, ens_a, ens_b)
         assert bool(accepted), (
-            "Equal pressure + equal U on both sides should always accept; "
-            "if this fails, the kernel is double-counting P·V (pre-fix bug)."
+            "Equal pressure + equal U on both sides should always accept "
+            "(a double-counted P·V would reject)."
         )
 
-    def test_pv_double_count_distinguishes_pre_and_post_fix(self):
-        """Tight Emax with adjacent pressures: pre-fix rejects, post-fix accepts.
-
-        Pair on a staggered P-ladder, same U on both sides.  After fix,
-        ``h_A_in_B = U_A + P_B · V_A`` (one PV term).  Pre-fix added
-        another ``P_A · V_A`` on top.  We choose Emax so that the
-        single-PV result is just below the threshold and the double-PV
-        result is just above.  Asserts post-fix acceptance.
+    def test_pv_not_double_counted_at_tight_emax(self):
+        """Tight Emax with adjacent pressures on a staggered P-ladder, same U
+        on both sides.  The correct cross-enthalpy is ``h_A_in_B = U_A + P_B ·
+        V_A`` (exactly one PV term).  Emax is chosen so this single-PV result
+        sits just below the threshold; a spurious extra ``P_A · V_A`` would
+        push it above and reject.
         """
-        p_a = jnp.array(0.006242)            # 1 GPa in eV/Å³
-        p_b = jnp.array(0.01248)             # 2 GPa
+        p_a = jnp.array(0.006242)  # 1 GPa in eV/Å³
+        p_b = jnp.array(0.01248)  # 2 GPa
         v_a = jnp.array(320.0)
         v_b = jnp.array(320.0)
         u_a = -85.0
@@ -248,13 +240,11 @@ class TestPressureRENSStoredEnthalpyConvention:
         h_self_a = u_a + float(p_a) * float(v_a)  # ≈ -83.00
         h_self_b = u_b + float(p_b) * float(v_b)  # ≈ -81.01
 
-        # After fix:
+        # Correct cross-enthalpies (one PV term each):
         #   h_A_in_B = U_A + P_B · V_A = -85 + 0.01248·320 = -81.01
         #   h_B_in_A = U_B + P_A · V_B = -85 + 0.006242·320 = -83.00
-        # Pre-fix (double-PV):
-        #   h_A_in_B = h_self_A + P_B·V_A = -83.00 + 3.99 = -79.01
-        #   h_B_in_A = h_self_B + P_A·V_B = -81.01 + 2.00 = -79.01
-        # Pick Emax = -80 → post-fix accepts (both ≤ -81), pre-fix rejects.
+        # A spurious extra self-PV would lift both to ≈-79.
+        # Emax = -80 → accepts (both ≤ -81); a double-counted P·V rejects.
         emax_a = jnp.array(-80.0)
         emax_b = jnp.array(-80.0)
 
@@ -270,9 +260,8 @@ class TestPressureRENSStoredEnthalpyConvention:
 
         accepted = kernel.accept(proposed, emax_a, emax_b, ens_a, ens_b)
         assert bool(accepted), (
-            "Post-fix: only ΔP·V contributes → both legs sit at ≈-81 eV, "
-            "below Emax=-80.  If this fails, pressure-RENS is still "
-            "double-counting P·V."
+            "Only ΔP·V contributes → both legs sit at ≈-81 eV, below "
+            "Emax=-80; a double-counted P·V would reject."
         )
 
     def test_jit_compiles(self):
@@ -487,7 +476,9 @@ class TestJITCompatibility:
         pos, types, ene, cells = _make_re_data(n_runs, n_walkers)
         emax = jnp.array([100.0, 100.0, 100.0])
         key = jax.random.key(0)
-        jitted = jax.jit(replica_exchange_step, static_argnames=("n_swap_cycles",))
+        jitted = jax.jit(
+            replica_exchange_step, static_argnames=("n_swap_cycles",)
+        )
         new_pos, _, new_ene, _, info = jitted(
             key, pos, types, ene, cells, emax, n_swap_cycles=1
         )
@@ -560,9 +551,9 @@ class TestPressureRENSSwapAccept:
         emax = jnp.array([5.0, 5.0])
         volumes = jnp.array([1.0, 1.0])
         pressures = jnp.array([1.0, 1.0])
-        assert bool(self._kernel_accept(energies, emax, volumes, pressures)) == bool(
-            perform_swap(energies, emax, volumes, pressures)
-        )
+        assert bool(
+            self._kernel_accept(energies, emax, volumes, pressures)
+        ) == bool(perform_swap(energies, emax, volumes, pressures))
 
     def test_reject_matches_perform_swap_pressure(self):
         # H_A_in_j = 1.0 + 10.0*1.0 = 11.0 > 5.0 => reject
@@ -570,9 +561,9 @@ class TestPressureRENSSwapAccept:
         emax = jnp.array([5.0, 5.0])
         volumes = jnp.array([1.0, 1.0])
         pressures = jnp.array([1.0, 10.0])
-        assert bool(self._kernel_accept(energies, emax, volumes, pressures)) == bool(
-            perform_swap(energies, emax, volumes, pressures)
-        )
+        assert bool(
+            self._kernel_accept(energies, emax, volumes, pressures)
+        ) == bool(perform_swap(energies, emax, volumes, pressures))
 
     def test_boundary_matches_perform_swap(self):
         # Boundary: E_A == Emax_j should reject (strict <)
@@ -586,7 +577,9 @@ class TestPressureRENSSwapAccept:
         """accept must return a JAX boolean scalar (shape ())."""
         kernel = PressureRENSSwap()
         proposed = {"energy_a": jnp.array(1.0), "energy_b": jnp.array(2.0)}
-        result = kernel.accept(proposed, jnp.array(5.0), jnp.array(5.0), {}, {})
+        result = kernel.accept(
+            proposed, jnp.array(5.0), jnp.array(5.0), {}, {}
+        )
         assert result.shape == ()
         assert result.dtype == jnp.bool_
 
@@ -595,7 +588,12 @@ class TestPressureRENSSwapAccept:
         kernel = PressureRENSSwap()
 
         def _accept(e_a, e_b, emax_a, emax_b, cell_a, cell_b, p_a, p_b):
-            proposed = {"energy_a": e_a, "energy_b": e_b, "cell_a": cell_a, "cell_b": cell_b}
+            proposed = {
+                "energy_a": e_a,
+                "energy_b": e_b,
+                "cell_a": cell_a,
+                "cell_b": cell_b,
+            }
             ens_a = {"pressure": p_a}
             ens_b = {"pressure": p_b}
             return kernel.accept(proposed, emax_a, emax_b, ens_a, ens_b)
@@ -603,10 +601,14 @@ class TestPressureRENSSwapAccept:
         jitted = jax.jit(_accept)
         cell = jnp.eye(3)
         result = jitted(
-            jnp.array(1.0), jnp.array(1.0),
-            jnp.array(5.0), jnp.array(5.0),
-            cell, cell,
-            jnp.array(1.0), jnp.array(1.0),
+            jnp.array(1.0),
+            jnp.array(1.0),
+            jnp.array(5.0),
+            jnp.array(5.0),
+            cell,
+            cell,
+            jnp.array(1.0),
+            jnp.array(1.0),
         )
         assert result.shape == ()
 
@@ -627,22 +629,39 @@ class TestReplicaExchangeStepWithKernel:
         key = jax.random.key(17)
 
         # Default (no swap_kernel argument)
-        new_pos_default, _, new_ene_default, new_cells_default, info_default = (
-            replica_exchange_step(key, pos, types, ene, cells, emax)
-        )
+        (
+            new_pos_default,
+            _,
+            new_ene_default,
+            new_cells_default,
+            info_default,
+        ) = replica_exchange_step(key, pos, types, ene, cells, emax)
         # Explicit kernel
-        new_pos_explicit, _, new_ene_explicit, new_cells_explicit, info_explicit = (
-            replica_exchange_step(
-                key, pos, types, ene, cells, emax,
-                swap_kernel=PressureRENSSwap(),
-            )
+        (
+            new_pos_explicit,
+            _,
+            new_ene_explicit,
+            new_cells_explicit,
+            info_explicit,
+        ) = replica_exchange_step(
+            key,
+            pos,
+            types,
+            ene,
+            cells,
+            emax,
+            swap_kernel=PressureRENSSwap(),
         )
 
         assert jnp.allclose(new_pos_default, new_pos_explicit)
         assert jnp.allclose(new_ene_default, new_ene_explicit)
         assert jnp.allclose(new_cells_default, new_cells_explicit)
-        assert int(info_default["n_accepted"]) == int(info_explicit["n_accepted"])
-        assert int(info_default["n_attempted"]) == int(info_explicit["n_attempted"])
+        assert int(info_default["n_accepted"]) == int(
+            info_explicit["n_accepted"]
+        )
+        assert int(info_default["n_attempted"]) == int(
+            info_explicit["n_attempted"]
+        )
 
     def test_explicit_kernel_pressure_matches_default(self):
         """Same seed + pressures: explicit kernel matches default."""
@@ -656,7 +675,13 @@ class TestReplicaExchangeStepWithKernel:
             key, pos, types, ene, cells, emax, pressures=pressures
         )
         explicit_result = replica_exchange_step(
-            key, pos, types, ene, cells, emax, pressures=pressures,
+            key,
+            pos,
+            types,
+            ene,
+            cells,
+            emax,
+            pressures=pressures,
             swap_kernel=PressureRENSSwap(),
         )
 
@@ -679,8 +704,14 @@ class TestReplicaExchangeStepWithKernel:
             static_argnames=("n_swap_cycles", "swap_kernel"),
         )
         new_pos, _, new_ene, _, info = jitted(
-            key, pos, types, ene, cells, emax,
-            n_swap_cycles=1, swap_kernel=kernel,
+            key,
+            pos,
+            types,
+            ene,
+            cells,
+            emax,
+            n_swap_cycles=1,
+            swap_kernel=kernel,
         )
         assert new_pos.shape == pos.shape
         assert int(info["n_attempted"]) > 0

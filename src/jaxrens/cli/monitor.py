@@ -53,8 +53,7 @@ def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
 
     Handles single-run scalar shapes (``iteration`` / ``n_dead`` as Python
     ints) and batched multi-run shapes (``(G, P)`` or ``(n_runs,)``) by
-    keeping batched scalars as arrays; ``save_checkpoint`` is batched-safe
-    since WORKLOG 2026-04-18 Task A.
+    keeping batched scalars as arrays; ``save_checkpoint`` is batched-safe.
     """
     pop = ns_state.population
     ep = (

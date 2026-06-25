@@ -2,6 +2,8 @@
 
 [![codecov](https://codecov.io/github/nunglert/jaxrens/graph/badge.svg?token=KY8R8JZ9FC)](https://codecov.io/github/nunglert/jaxrens)
 [![CI](https://github.com/nunglert/jaxrens/actions/workflows/ci.yml/badge.svg)](https://github.com/nunglert/jaxrens/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-latest-blue)](https://nunglert.github.io/jaxrens/)
+
 
 JAX-based nested sampling for atomistic systems — multi-GPU parallel replicas,
 pressure / composition / semi-grand inter-replica exchange (RENS / XRENS /

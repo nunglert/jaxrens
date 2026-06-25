@@ -910,7 +910,7 @@ def _resolve_init_species(
 
     if init.pos_autoscale_cells:
         logger.warning(
-            "pos_autoscale_cells=True is set but not yet implemented in step 2. "
+            "pos_autoscale_cells=True is set but not yet implemented. "
             "The cell will not be scaled to guarantee minimum atom distances. "
             "Rejection sampling may fail if the cell is too small."
         )

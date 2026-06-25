@@ -264,7 +264,7 @@ def init_ns(
         # If the checkpoint persisted the PRNG buffer, resume the saved
         # stream instead of using the caller-supplied (config-seed-derived)
         # key.  Legacy checkpoints without a saved key fall through to the
-        # caller's rng_key (the pre-fix behaviour, which silently reseeded).
+        # caller's rng_key.
         if rs.rng_key_data is not None:
             rng_key = jax.random.wrap_key_data(jnp.asarray(rs.rng_key_data))
 
