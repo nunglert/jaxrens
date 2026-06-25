@@ -25,6 +25,7 @@ from jaxrens.backends._graph_neighbors import (
     _supercell_edges,
 )
 from jaxrens.backends.base import BackendResult
+from jaxrens.utils.cell import wrap_positions
 
 # Re-export the edge-finding helpers under the `mace` namespace for
 # backwards-compat with existing tests (`tests/test_mace.py` imports
@@ -198,21 +199,37 @@ class MACEBackend:
         n_atoms = positions.shape[0]
         max_edges = n_atoms * max_neighbors
 
+        positions = wrap_positions(positions, cell)
+
         # 1. Find edges via supercell expansion.  ``true_max_per_atom`` is the
         # actual max neighbor count per atom computed from the pre-truncation
         # mask; the outer-loop overflow retry relies on this being independent
         # of ``max_edges`` so that escalation doesn't saturate at the bucket.
-        senders, receivers, shifts, n_actual, overflow, true_max_per_atom = (
-            _supercell_edges(
-                positions, cell, self.r_cutoff, max_edges, self.image_offsets,
-            )
+        (
+            senders,
+            receivers,
+            shifts,
+            n_actual,
+            overflow,
+            true_max_per_atom,
+        ) = _supercell_edges(
+            positions,
+            cell,
+            self.r_cutoff,
+            max_edges,
+            self.image_offsets,
         )
 
         # 2. Build data dict for mace-jax
         data = _build_mace_data(
-            positions, species, cell,
-            senders, receivers, shifts,
-            self.num_species, n_atoms,
+            positions,
+            species,
+            cell,
+            senders,
+            receivers,
+            shifts,
+            self.num_species,
+            n_atoms,
         )
 
         # 3. Run MACE model (energy-only path)
@@ -237,8 +254,14 @@ class MACEBackend:
         neighbor bucket and accurate per-walker ``max_neighbor_count``,
         without probing the GNN forward pass.  vmap-friendly.
         """
+        # Wrap to match the energy path so the bucket sizing counts the same
+        # neighbors the forward pass will see.
+        positions = wrap_positions(positions, cell)
         return _compute_true_max_neighbors(
-            positions, cell, self.r_cutoff, self.image_offsets,
+            positions,
+            cell,
+            self.r_cutoff,
+            self.image_offsets,
         )
 
 
@@ -296,7 +319,9 @@ def create_mace(
 
     logger.info(
         "MACE backend created: r_cutoff=%.2f, %d species, supercell=%s",
-        r_cutoff, num_species, supercell_trafo,
+        r_cutoff,
+        num_species,
+        supercell_trafo,
     )
 
     return MACEBackend(
