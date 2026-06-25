@@ -58,8 +58,9 @@ except ImportError as exc:
 def _require_mace():
     if not _MACE_JAX_AVAILABLE:
         raise ImportError(
-            f"mace-jax is required for the MACE backend but not installed: "
-            f"{_MACE_IMPORT_ERROR}"
+            "mace-jax is required for the MACE backend but is not installed.\n"
+            "Install it with:  pip install '.[mace]'\n"
+            f"Original import error: {_MACE_IMPORT_ERROR}"
         )
 
 

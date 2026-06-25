@@ -136,6 +136,11 @@ def _run_single(resolved, *, writer_mode: str = "w") -> None:
         termination_criteria=list(resolved.termination),
         base_backend=resolved.base_backend,
         writer_mode=writer_mode,
+        ensemble_params=(
+            resolved.ensemble_params_per_run[0]
+            if resolved.ensemble_params_per_run
+            else None
+        ),
     )
 
 

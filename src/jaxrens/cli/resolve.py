@@ -32,7 +32,7 @@ from jaxrens.cli.schema.adaptation import (
 )
 from jaxrens.cli.schema.backend import LJBackendSpec
 from jaxrens.cli.schema.cell import CellSpec
-from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
+from jaxrens.cli.schema.ensemble import SemiGrandEnsembleSpec
 from jaxrens.cli.schema.init import InitSpec
 from jaxrens.cli.schema.root import RootSpec
 from jaxrens.cli.schema.termination import IterationTerminationSpec
@@ -1138,6 +1138,7 @@ def _resolve_single_replica(
     # ``ensemble_params`` is passed in by ``resolve`` (the caller already
     # built it via ``root.ensemble.to_ensemble_params(cohort_index=0)``).
     pressure = ensemble_params.get("pressure", None)
+    chemical_potentials = ensemble_params.get("chemical_potentials", None)
 
     seed = root.run.seed
 
@@ -1149,7 +1150,6 @@ def _resolve_single_replica(
         n_extra=root.run.n_extra,
         n_cull=root.run.n_cull,
         seed=seed,
-        pressure=pressure,
     )
 
     backend = root.backend.to_backend_config()
@@ -1167,17 +1167,25 @@ def _resolve_single_replica(
         )
 
     # For initial-energy evaluation, locally wrap with EnsembleBackend so the
-    # resolver's energies match the NS-loop scale (U + P*V for NPT) — without
+    # resolver's energies match the NS-loop scale (U + P*V - μ·N) — without
     # this, walkers are initialized with bare LJ energies while the MWG
     # step_fn returns ensemble-corrected energies, causing systematic
     # emax < new_energy for all cell moves and 100% rejection from the first
     # adapt call.  Discarded after _resolve_init returns; only ``base_backend``
     # crosses the resolver boundary, leaving wrapping to the runtime.
-    if pressure is not None:
+    if pressure is not None or chemical_potentials is not None:
+        import jax.numpy as jnp
+
         from jaxrens.backends.ensemble import EnsembleBackend
 
         init_energy_backend = EnsembleBackend(
-            base_backend, pressure=float(pressure)
+            base_backend,
+            pressure=float(pressure) if pressure is not None else 0.0,
+            chemical_potentials=(
+                jnp.asarray(chemical_potentials, dtype=jnp.float32)
+                if chemical_potentials is not None
+                else None
+            ),
         )
     else:
         init_energy_backend = base_backend
@@ -1339,11 +1347,9 @@ def _derive_replica_axes(
         ValueError: On any inconsistency described above.
     """
     # ---- Gather per-replica axis lengths ------------------------------------
-    pressure_list: list[float] | None = None
-    if isinstance(root.ensemble, NPTEnsembleSpec):
-        plist = root.ensemble._pressure_list()
-        if len(plist) > 1:
-            pressure_list = plist
+    # The ensemble spec owns its own replica axis (NPT pressure list, semi_grand
+    # μ / pressure list); ask it generically rather than special-casing keys.
+    ensemble_cohort = root.ensemble.cohort_size()
 
     comp_targets: list[list[int]] | None = None
     chem_pots: list[list[float]] | None = None
@@ -1351,16 +1357,23 @@ def _derive_replica_axes(
         if root.inter_re.flavor == "xrens":
             comp_targets = list(root.inter_re.composition_targets or [])
         elif root.inter_re.flavor == "semi_grand":
+            # μ may come from the ensemble spec OR inter_re, never both.
+            if isinstance(root.ensemble, SemiGrandEnsembleSpec):
+                raise ValueError(
+                    "Conflicting chemical potentials: both ensemble "
+                    "(type=semi_grand) and inter_re (flavor=semi_grand) specify "
+                    "chemical_potentials. Set them in exactly one place."
+                )
             chem_pots = list(root.inter_re.chemical_potentials or [])
-        elif root.inter_re.flavor == "pressure" and pressure_list is None:
+        elif root.inter_re.flavor == "pressure" and ensemble_cohort <= 1:
             raise ValueError(
                 "inter_re.flavor='pressure' requires a list-valued "
                 "ensemble.pressure with at least 2 entries (one per replica)."
             )
 
     lengths: list[tuple[str, int]] = []
-    if pressure_list is not None:
-        lengths.append(("ensemble.pressure", len(pressure_list)))
+    if ensemble_cohort > 1:
+        lengths.append(("ensemble", ensemble_cohort))
     if comp_targets:
         lengths.append(("inter_re.composition_targets", len(comp_targets)))
     if chem_pots:
@@ -1402,26 +1415,21 @@ def _derive_replica_axes(
     n_per_gpu = n_total // n_gpu
 
     # ---- Build per-replica ensemble_params dicts ----------------------------
-    # Pressures (scalar fallback: if pressure is scalar, broadcast).
-    if pressure_list is not None:
-        pressures = pressure_list
-    elif isinstance(root.ensemble, NPTEnsembleSpec):
-        # Scalar pressure broadcast to all replicas.
-        pressures = root.ensemble._pressure_list() * n_total
-    else:
-        pressures = None
-
-    # For list-valued pressure, honour pressure_units from the spec.
-    if pressures is not None and isinstance(root.ensemble, NPTEnsembleSpec):
-        if root.ensemble.pressure_units == "gpa":
-            _GPA_TO_EVA3 = 0.006241509
-            pressures = [p * _GPA_TO_EVA3 for p in pressures]
-
+    # Start from the ensemble spec's own params (handles pressure-unit
+    # conversion, μ vectors, and scalar→broadcast), then layer on the
+    # inter_re-specific axes.  ``cohort_index`` broadcasts when the ensemble is
+    # scalar (cohort 1) and indexes per-replica when it's a list.
     params_per_run: list[dict] = []
     for r in range(n_total):
-        params: dict = {}
-        if pressures is not None:
-            params["pressure"] = float(pressures[r])
+        cohort_index = r if ensemble_cohort > 1 else 0
+        params: dict = dict(
+            root.ensemble.to_ensemble_params(cohort_index=cohort_index)
+        )
+        # Normalise vector leaves (e.g. chemical_potentials) to device arrays.
+        if "chemical_potentials" in params:
+            params["chemical_potentials"] = jnp.asarray(
+                params["chemical_potentials"], dtype=jnp.float32
+            )
         if comp_targets:
             params["target_composition"] = jnp.asarray(
                 comp_targets[r], dtype=jnp.int32
@@ -1723,7 +1731,6 @@ def _resolve_multi_replica(
         n_extra=root.run.n_extra,
         n_cull=root.run.n_cull,
         seed=root.run.seed,
-        pressure=None,  # per-replica pressure lives in ensemble_params_per_run.
         inter_re=(
             root.inter_re.to_inter_re_config()
             if root.inter_re is not None

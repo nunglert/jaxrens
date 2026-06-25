@@ -206,9 +206,6 @@ class NSConfig:
     n_cull: int = 1
     seed: int = 42
 
-    # Ensemble
-    pressure: float | None = None  # pressure for NPT ensemble (None = NVT)
-
     # Inter-replica exchange (optional; None → disabled)
     inter_re: InterREConfig | None = None
 

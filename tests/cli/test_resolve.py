@@ -141,7 +141,6 @@ class TestResolve:
             seed=0,
             convergence_threshold=0.1,
             n_cull=1,
-            pressure=None,
         )
         expected_move = MoveConfig(
             move_type="random_walk",
@@ -752,18 +751,6 @@ class TestEnsembleResolver:
         assert spec.to_ensemble_params(cohort_index=1)[
             "pressure"
         ] == pytest.approx(2.0 * _GPA_TO_EVA3)
-
-    def test_legacy_pressure_resolver_synthesizes_correct_ensemble_params(
-        self,
-    ):
-        d = _minimal_dict()
-        d["run"]["pressure"] = 0.03
-        root = RootSpec.model_validate(d)
-        resolved = resolve(root)
-        assert resolved.ensemble_params_per_run[0][
-            "pressure"
-        ] == pytest.approx(0.03)
-        assert resolved.ns.pressure == pytest.approx(0.03)
 
 
 # ---------------------------------------------------------------------------

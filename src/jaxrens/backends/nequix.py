@@ -70,8 +70,9 @@ except ImportError as exc:
 def _require_nequix() -> None:
     if not _NEQUIX_AVAILABLE:
         raise ImportError(
-            f"nequix is required for the Nequix backend but not installed: "
-            f"{_NEQUIX_IMPORT_ERROR}"
+            "nequix is required for the Nequix backend but is not installed.\n"
+            "Install it with:  pip install '.[nequix]'\n"
+            f"Original import error: {_NEQUIX_IMPORT_ERROR}"
         )
 
 

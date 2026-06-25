@@ -70,9 +70,9 @@ except ImportError:
 def _require_neuralil() -> None:
     if not _NEURALIL_AVAILABLE:
         raise ImportError(
-            "NeuralIL is required for the neuralil backend but is not installed. "
-            f"Original import error: {_NEURALIL_IMPORT_ERROR}\n"
-            "Install it with: pip install neuralil"
+            "NeuralIL is required for the neuralil backend but is not installed.\n"
+            "Install it with:  pip install '.[neuralil]'\n"
+            f"Original import error: {_NEURALIL_IMPORT_ERROR}"
         )
 
 
@@ -146,7 +146,7 @@ def _build_dynamics_model(
         raise ImportError(
             "softcore=True requires neuralil.softcore.model, which was not "
             "importable. Update your neuralil install to a version that "
-            "ships the softcore subpackage."
+            "ships the softcore subpackage:  pip install '.[neuralil]'"
         )
 
     descriptor_gen = PowerSpectrumGenerator(

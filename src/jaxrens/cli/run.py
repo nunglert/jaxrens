@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 
 import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
-from jaxrens.backends.ensemble import EnsembleBackend, make_ensemble_params
+from jaxrens.backends.ensemble import EnsembleBackend
 from jaxrens.backends.loader import load_backend
 from jaxrens.cli.monitor import (
     AdaptationCallback,
@@ -52,6 +52,26 @@ logger = logging.getLogger(__name__)
 
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+def _to_runtime_ensemble_params(params: dict | None) -> dict | None:
+    """Normalise a config ensemble-params dict for the JIT'd NS step.
+
+    Generic: list/tuple leaves (e.g. ``chemical_potentials``) become float32
+    arrays; scalar leaves (e.g. ``pressure``) pass through unchanged — matching
+    the per-run dicts the multi-replica resolver builds.  Returns ``None`` for
+    an empty/``None`` dict (NVT) so callers can skip the EnsembleBackend wrap.
+    """
+    if not params:
+        return None
+    return {
+        k: (
+            jnp.asarray(v, dtype=jnp.float32)
+            if isinstance(v, (list, tuple))
+            else v
+        )
+        for k, v in params.items()
+    }
 
 
 def configure_file_logging(
@@ -331,6 +351,7 @@ def run_from_config(
     constraint_descriptors: tuple = (),
     base_backend: Any = None,
     writer_mode: str = "w",
+    ensemble_params: dict | None = None,
 ) -> dict:
     """Run NS from typed config objects.
 
@@ -371,11 +392,14 @@ def run_from_config(
             **backend_config.softcore_repulsion,
         )
 
-    # Wrap with ensemble corrections if needed
-    ensemble_params = None
-    if ns_config.pressure:
-        backend = EnsembleBackend(base_backend, pressure=ns_config.pressure)
-        ensemble_params = make_ensemble_params(pressure=ns_config.pressure)
+    # Ensemble corrections (P·V, -μ·N, ...) are driven entirely by the generic
+    # per-call ``ensemble_params`` dict — same contract the multi-replica runner
+    # uses.  Wrap with neutral defaults when any are configured; the dict's
+    # array-valued leaves (e.g. chemical_potentials) are normalised for the
+    # JIT'd step.  An empty/None dict means NVT → no wrap, zero overhead.
+    ensemble_params = _to_runtime_ensemble_params(ensemble_params)
+    if ensemble_params is not None:
+        backend = EnsembleBackend(base_backend, pressure=0.0)
     else:
         backend = base_backend
 

@@ -19,6 +19,7 @@ PYTHON = sys.executable
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _minimal_raw() -> dict[str, str]:
     """Smallest valid raw dict that produces a validatable RootSpec."""
     return {
@@ -50,6 +51,7 @@ def _log_levels(raw: dict[str, str]) -> list[str]:
 # ---------------------------------------------------------------------------
 # 1. Round-trip: minimal config validates correctly
 # ---------------------------------------------------------------------------
+
 
 class TestRoundTrip:
     def test_minimal_validates(self):
@@ -93,6 +95,7 @@ class TestRoundTrip:
     def test_legacy_ns_inp_file(self):
         """The fixture file in tests/data/cli/legacy_ns.inp must validate."""
         from jaxrens.cli.parser import parse_input_file
+
         path = Path(__file__).parent.parent / "data" / "cli" / "legacy_ns.inp"
         raw = parse_input_file(path)
         cfg = _migrate_and_validate(raw)
@@ -103,6 +106,7 @@ class TestRoundTrip:
 # ---------------------------------------------------------------------------
 # 2. Unit conversion: pressure in GPa
 # ---------------------------------------------------------------------------
+
 
 class TestPressureConversion:
     def test_pressure_single_gpa(self):
@@ -117,6 +121,7 @@ class TestPressureConversion:
         raw = {**_minimal_raw(), "MC_cell_P": "0.1"}
         cfg = _migrate_and_validate(raw)
         from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
+
         assert isinstance(cfg.ensemble, NPTEnsembleSpec)
         # pressure_units=gpa means the schema converts; check eV/A3 value
         params = cfg.ensemble.to_ensemble_params(cohort_index=0)
@@ -135,6 +140,7 @@ class TestPressureConversion:
 # 3. List cohort: space-separated pressures
 # ---------------------------------------------------------------------------
 
+
 class TestPressureCohort:
     def test_multi_pressure_list(self):
         raw = {**_minimal_raw(), "MC_cell_P": "0.1 0.5 1.0"}
@@ -146,6 +152,7 @@ class TestPressureCohort:
         raw = {**_minimal_raw(), "MC_cell_P": "0.1 0.5"}
         cfg = _migrate_and_validate(raw)
         from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
+
         assert isinstance(cfg.ensemble, NPTEnsembleSpec)
         assert cfg.ensemble.cohort_size() == 2
 
@@ -153,6 +160,7 @@ class TestPressureCohort:
 # ---------------------------------------------------------------------------
 # 4. Drop list: dropped keys do not appear in config
 # ---------------------------------------------------------------------------
+
 
 class TestDropList:
     def test_pivot_interval_dropped(self):
@@ -168,7 +176,9 @@ class TestDropList:
         result = migrate_ns_inp(raw)
         assert "random_energy_perturbation" not in str(result["config"])
         warnings = [e for e in result["logs"] if e["level"] == "WARNING"]
-        assert any("random_energy_perturbation" in w["message"] for w in warnings)
+        assert any(
+            "random_energy_perturbation" in w["message"] for w in warnings
+        )
 
     def test_n_swap_steps_dropped(self):
         raw = {**_minimal_raw(), "n_swap_steps": "3"}
@@ -197,11 +207,15 @@ class TestDropList:
 # 5. Unknown key: preserved as comment, not as live YAML key
 # ---------------------------------------------------------------------------
 
+
 class TestUnknownKey:
     def test_unknown_key_in_unknown_bucket(self):
         raw = {**_minimal_raw(), "some_future_param": "42"}
         result = migrate_ns_inp(raw)
-        assert result["config"].get("_unknown", {}).get("some_future_param") == "42"
+        assert (
+            result["config"].get("_unknown", {}).get("some_future_param")
+            == "42"
+        )
 
     def test_unknown_key_warning_emitted(self):
         raw = {**_minimal_raw(), "some_future_param": "42"}
@@ -212,20 +226,34 @@ class TestUnknownKey:
     def test_unknown_key_as_yaml_comment(self, tmp_path):
         """CLI must render _unknown keys as comments, not live YAML keys."""
         inp = tmp_path / "test.inp"
-        inp.write_text("\n".join([
-            "n_walkers = 50",
-            "n_iter = 100",
-            "energy_calculator = lj",
-            "n_atoms = 13",
-            "n_gmc_steps = 1",
-            "atom_traj_len = 5",
-            "start_species = 18",
-            "some_future_param = 42",
-        ]))
+        inp.write_text(
+            "\n".join(
+                [
+                    "n_walkers = 50",
+                    "n_iter = 100",
+                    "energy_calculator = lj",
+                    "n_atoms = 13",
+                    "n_gmc_steps = 1",
+                    "atom_traj_len = 5",
+                    "start_species = 18",
+                    "some_future_param = 42",
+                ]
+            )
+        )
         out = tmp_path / "out.yaml"
         proc = subprocess.run(
-            [PYTHON, "-m", "jaxrens.cli.cli", "migrate-ns-inp", "-i", str(inp), "-o", str(out)],
-            capture_output=True, text=True,
+            [
+                PYTHON,
+                "-m",
+                "jaxrens.cli.cli",
+                "migrate-ns-inp",
+                "-i",
+                str(inp),
+                "-o",
+                str(out),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert proc.returncode == 0, proc.stderr
         yaml_text = out.read_text()
@@ -242,12 +270,15 @@ class TestUnknownKey:
 # 6. Removed DB / time-snapshot keys are dropped; snapshot_clean routes through
 # ---------------------------------------------------------------------------
 
+
 class TestDeferredField:
     def test_write_traj_db_is_dropped(self):
         raw = {**_minimal_raw(), "write_traj_db": "T"}
         result = migrate_ns_inp(raw)
         assert "write_traj_db" not in result["config"].get("output", {})
-        warns = [e["message"] for e in result["logs"] if e["level"] == "WARNING"]
+        warns = [
+            e["message"] for e in result["logs"] if e["level"] == "WARNING"
+        ]
         assert any("write_traj_db" in m for m in warns)
 
     def test_write_walkers_db_is_dropped(self):
@@ -271,7 +302,11 @@ class TestDeferredField:
         assert cfg.output.snapshot_clean is True
 
     def test_cell_config_deferred_fields(self):
-        raw = {**_minimal_raw(), "max_volume_per_atom": "500.0", "min_volume_per_atom": "2.0"}
+        raw = {
+            **_minimal_raw(),
+            "max_volume_per_atom": "500.0",
+            "min_volume_per_atom": "2.0",
+        }
         result = migrate_ns_inp(raw)
         cell = result["config"].get("cell", {})
         assert cell.get("max_volume_per_atom") == pytest.approx(500.0)
@@ -287,32 +322,45 @@ class TestDeferredField:
 # 7. --validate flag
 # ---------------------------------------------------------------------------
 
+
 class TestValidateFlag:
     def test_validate_flag_passes_on_good_config(self, tmp_path):
         inp = tmp_path / "good.inp"
-        inp.write_text("\n".join([
-            "n_walkers = 50",
-            "n_iter = 100",
-            "energy_calculator = lj",
-            "n_atoms = 13",
-            "n_gmc_steps = 1",
-            "atom_traj_len = 5",
-            "start_species = 18",
-        ]))
+        inp.write_text(
+            "\n".join(
+                [
+                    "n_walkers = 50",
+                    "n_iter = 100",
+                    "energy_calculator = lj",
+                    "n_atoms = 13",
+                    "n_gmc_steps = 1",
+                    "atom_traj_len = 5",
+                    "start_species = 18",
+                ]
+            )
+        )
         proc = subprocess.run(
-            [PYTHON, "-m", "jaxrens.cli.cli", "migrate-ns-inp",
-             "-i", str(inp), "--validate"],
-            capture_output=True, text=True,
+            [
+                PYTHON,
+                "-m",
+                "jaxrens.cli.cli",
+                "migrate-ns-inp",
+                "-i",
+                str(inp),
+                "--validate",
+            ],
+            capture_output=True,
+            text=True,
         )
         assert proc.returncode == 0, proc.stderr
         assert "Validation OK" in proc.stderr
 
     def test_validate_flag_fails_on_bad_config(self, tmp_path):
-        # Produce a YAML that will fail RootSpec because both run.pressure
-        # and ensemble are set — deliberately inject this scenario by handing
-        # the migrator a raw dict we know will produce a broken config.
-        # The easiest way: write a YAML directly that would fail.
-        yaml_str = textwrap.dedent("""\
+        # Produce a YAML that will fail RootSpec: ``run.pressure`` is no longer
+        # a valid field (removed in favour of the ensemble: section), so
+        # extra="forbid" rejects it.
+        yaml_str = textwrap.dedent(
+            """\
             run:
               n_live: 10
               max_iterations: 10
@@ -331,27 +379,42 @@ class TestValidateFlag:
               type: npt
               pressure: 0.01
               pressure_units: gpa
-        """)
+        """
+        )
         # Validate directly (not via migrate) to confirm this is actually invalid
         with pytest.raises(Exception):
             RootSpec.model_validate(yaml.safe_load(yaml_str))
 
     def test_validate_roundtrip_via_cli(self, tmp_path):
         inp = tmp_path / "valid.inp"
-        inp.write_text("\n".join([
-            "n_walkers = 30",
-            "n_iter = 200",
-            "energy_calculator = lj",
-            "n_atoms = 5",
-            "n_gmc_steps = 1",
-            "atom_traj_len = 3",
-            "start_species = 1",
-        ]))
+        inp.write_text(
+            "\n".join(
+                [
+                    "n_walkers = 30",
+                    "n_iter = 200",
+                    "energy_calculator = lj",
+                    "n_atoms = 5",
+                    "n_gmc_steps = 1",
+                    "atom_traj_len = 3",
+                    "start_species = 1",
+                ]
+            )
+        )
         out = tmp_path / "out.yaml"
         proc = subprocess.run(
-            [PYTHON, "-m", "jaxrens.cli.cli", "migrate-ns-inp",
-             "-i", str(inp), "-o", str(out), "--validate"],
-            capture_output=True, text=True,
+            [
+                PYTHON,
+                "-m",
+                "jaxrens.cli.cli",
+                "migrate-ns-inp",
+                "-i",
+                str(inp),
+                "-o",
+                str(out),
+                "--validate",
+            ],
+            capture_output=True,
+            text=True,
         )
         assert proc.returncode == 0, proc.stderr
         assert out.exists()
@@ -363,21 +426,34 @@ class TestValidateFlag:
 # 8. End-to-end CLI: subprocess with tempfile
 # ---------------------------------------------------------------------------
 
+
 class TestEndToEndCLI:
     def test_stdout_output(self, tmp_path):
         inp = tmp_path / "e2e.inp"
-        inp.write_text("\n".join([
-            "n_walkers = 100",
-            "n_iter = 2000",
-            "energy_calculator = lj",
-            "n_atoms = 13",
-            "n_gmc_steps = 1",
-            "atom_traj_len = 8",
-            "start_species = 18",
-        ]))
+        inp.write_text(
+            "\n".join(
+                [
+                    "n_walkers = 100",
+                    "n_iter = 2000",
+                    "energy_calculator = lj",
+                    "n_atoms = 13",
+                    "n_gmc_steps = 1",
+                    "atom_traj_len = 8",
+                    "start_species = 18",
+                ]
+            )
+        )
         proc = subprocess.run(
-            [PYTHON, "-m", "jaxrens.cli.cli", "migrate-ns-inp", "-i", str(inp)],
-            capture_output=True, text=True,
+            [
+                PYTHON,
+                "-m",
+                "jaxrens.cli.cli",
+                "migrate-ns-inp",
+                "-i",
+                str(inp),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert proc.returncode == 0, proc.stderr
         parsed = yaml.safe_load(proc.stdout)
@@ -388,19 +464,32 @@ class TestEndToEndCLI:
     def test_file_output(self, tmp_path):
         inp = tmp_path / "in.inp"
         out = tmp_path / "out.yaml"
-        inp.write_text("\n".join([
-            "n_walkers = 50",
-            "n_iter = 500",
-            "energy_calculator = lj",
-            "n_atoms = 8",
-            "n_gmc_steps = 1",
-            "atom_traj_len = 4",
-            "start_species = 1",
-        ]))
+        inp.write_text(
+            "\n".join(
+                [
+                    "n_walkers = 50",
+                    "n_iter = 500",
+                    "energy_calculator = lj",
+                    "n_atoms = 8",
+                    "n_gmc_steps = 1",
+                    "atom_traj_len = 4",
+                    "start_species = 1",
+                ]
+            )
+        )
         proc = subprocess.run(
-            [PYTHON, "-m", "jaxrens.cli.cli", "migrate-ns-inp",
-             "-i", str(inp), "-o", str(out)],
-            capture_output=True, text=True,
+            [
+                PYTHON,
+                "-m",
+                "jaxrens.cli.cli",
+                "migrate-ns-inp",
+                "-i",
+                str(inp),
+                "-o",
+                str(out),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert proc.returncode == 0, proc.stderr
         assert out.exists()
@@ -409,19 +498,31 @@ class TestEndToEndCLI:
 
     def test_warnings_on_stderr_not_stdout(self, tmp_path):
         inp = tmp_path / "warn.inp"
-        inp.write_text("\n".join([
-            "n_walkers = 50",
-            "n_iter = 100",
-            "energy_calculator = lj",
-            "n_atoms = 5",
-            "n_gmc_steps = 1",
-            "atom_traj_len = 3",
-            "start_species = 1",
-            "pivot_interval = 5",   # dropped key — should emit WARNING on stderr
-        ]))
+        inp.write_text(
+            "\n".join(
+                [
+                    "n_walkers = 50",
+                    "n_iter = 100",
+                    "energy_calculator = lj",
+                    "n_atoms = 5",
+                    "n_gmc_steps = 1",
+                    "atom_traj_len = 3",
+                    "start_species = 1",
+                    "pivot_interval = 5",  # dropped key — should emit WARNING on stderr
+                ]
+            )
+        )
         proc = subprocess.run(
-            [PYTHON, "-m", "jaxrens.cli.cli", "migrate-ns-inp", "-i", str(inp)],
-            capture_output=True, text=True,
+            [
+                PYTHON,
+                "-m",
+                "jaxrens.cli.cli",
+                "migrate-ns-inp",
+                "-i",
+                str(inp),
+            ],
+            capture_output=True,
+            text=True,
         )
         assert proc.returncode == 0, proc.stderr
         # stdout must be clean YAML
@@ -433,6 +534,7 @@ class TestEndToEndCLI:
 # ---------------------------------------------------------------------------
 # Additional: n_iter_times_fraction_killed resolution
 # ---------------------------------------------------------------------------
+
 
 class TestFractionalIter:
     def test_fractional_iter_resolved(self):
@@ -459,6 +561,7 @@ class TestFractionalIter:
 # ---------------------------------------------------------------------------
 # Additional: neuralil backend mapping
 # ---------------------------------------------------------------------------
+
 
 class TestBackendMapping:
     def test_nn_maps_to_neuralil(self):
@@ -505,6 +608,7 @@ class TestBackendMapping:
 # Additional: termination criteria
 # ---------------------------------------------------------------------------
 
+
 class TestTerminationRouting:
     def test_converge_down_to_T(self):
         raw = {**_minimal_raw(), "converge_down_to_T": "100.0"}
@@ -527,6 +631,7 @@ class TestTerminationRouting:
 # Additional: adaptation fields
 # ---------------------------------------------------------------------------
 
+
 class TestAdaptationRouting:
     def test_full_auto_step_sizes(self):
         raw = {**_minimal_raw(), "full_auto_step_sizes": "T"}
@@ -534,7 +639,11 @@ class TestAdaptationRouting:
         assert result["config"].get("adaptation", {}).get("full_auto") is True
 
     def test_GMC_adjust_rates(self):
-        raw = {**_minimal_raw(), "GMC_adjust_min_rate": "0.3", "GMC_adjust_max_rate": "0.8"}
+        raw = {
+            **_minimal_raw(),
+            "GMC_adjust_min_rate": "0.3",
+            "GMC_adjust_max_rate": "0.8",
+        }
         result = migrate_ns_inp(raw)
         per_move = result["config"].get("adaptation", {}).get("per_move", {})
         assert per_move.get("gmc", {}).get("min_rate") == pytest.approx(0.3)
@@ -543,9 +652,15 @@ class TestAdaptationRouting:
     def test_MC_adjust_step_factor(self):
         raw = {**_minimal_raw(), "MC_adjust_step_factor": "2.0"}
         result = migrate_ns_inp(raw)
-        assert result["config"].get("adaptation", {}).get("defaults", {}).get("adjust_factor") == pytest.approx(2.0)
+        assert result["config"].get("adaptation", {}).get("defaults", {}).get(
+            "adjust_factor"
+        ) == pytest.approx(2.0)
 
     def test_adaptation_validates(self):
-        raw = {**_minimal_raw(), "full_auto_step_sizes": "T", "GMC_adjust_min_rate": "0.2"}
+        raw = {
+            **_minimal_raw(),
+            "full_auto_step_sizes": "T",
+            "GMC_adjust_min_rate": "0.2",
+        }
         cfg = _migrate_and_validate(raw)
         assert cfg.adaptation.full_auto is True

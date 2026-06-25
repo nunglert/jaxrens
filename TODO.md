@@ -1,9 +1,14 @@
 # TODO
 
 ## Ensemble specifications in RunSpec
-The RunSpec currently takes only a pressure, this needs to be more general to also account for chemical potentials, etc. 
+- [done] Legacy `run.pressure` removed. Ensemble params now live entirely in the
+  `ensemble:` section (NVT / NPT / semi_grand) and flow through the generic
+  `ensemble_params` dict — `NSConfig` no longer carries pressure. Added
+  `SemiGrandEnsembleSpec` (chemical_potentials + optional pressure), generalised
+  `_derive_replica_axes` to drive the ensemble axis via `cohort_size()` /
+  `to_ensemble_params()`, and made the single-run path thread the dict.
 
-target_acceptance
+- target_acceptance
 
 - The migrator has a bug: it emits n_walkers/n_cull into temperature-termination specs that the current schema forbids, so migrate-ns-inp --validate fails on
   any temperature-terminated config. Easy fix in migrate.py:_handle_converge_down_to_T (stop adding those keys). Want me to patch it?
@@ -11,16 +16,6 @@ target_acceptance
 - A separate SingleRun bug: my first smoke test used a single pressure and crashed in the adaptation logger (Expected shape (1, 5), got (1, 1) at
   monitor.py:516 → adaptation_log.py:300). The real config uses 24 pressures (VmapRuns path), which works fine — but the single-replica baseline-row path looks
   broken. Note this is unrelated to your working-tree changes in nested_sampling.py. Let me know if you'd like me to dig into it.
-
-- ImportErrors for backend dependencies should suggest "pip install .[neuralil]" etc. 
-
-- [done] for restarts, do we also save stepsizes? Now persisted in the
-  checkpoint (`step_sizes` dataset) and restored into the live population by
-  `init_ns`. No `SamplerState` needed — `step_sizes` is the only sampler state
-  that persists between iterations (adaptation is stateless per call). Legacy
-  checkpoints (no field) fall back to the configured initial step.
-
-- what happens if outfile_prefix is not set?
 
 - check which XLA flags from the batch script we actually need, e.g. should we force no autotuning?
 
