@@ -18,11 +18,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jaxrens.init.restart import RestartBundle, infer_restart_shape, load_restart
+import jaxrens.sampling.moves.random_walk as _rw_mod
+from jaxrens.init.restart import (
+    RestartBundle,
+    infer_restart_shape,
+    load_restart,
+)
 from jaxrens.init.walker_set import WalkerSet
 from jaxrens.io.checkpoint import save_checkpoint
 from jaxrens.sampling.move_kernel import MoveKernel
-import jaxrens.sampling.moves.random_walk as _rw_mod
 
 
 def _rw_descriptor():
@@ -40,6 +44,7 @@ def _rw_descriptor():
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_ns_state_dict(
     n_walkers: int = 4,
     n_atoms: int = 1,
@@ -54,7 +59,9 @@ def _make_ns_state_dict(
     cells = np.stack([np.eye(3, dtype=np.float32) * 5.0] * n_walkers)
 
     dead_energies = rng.uniform(5, 10, n_dead).astype(np.float32)
-    dead_positions = rng.uniform(-2, 2, (n_dead, n_atoms, 3)).astype(np.float32)
+    dead_positions = rng.uniform(-2, 2, (n_dead, n_atoms, 3)).astype(
+        np.float32
+    )
 
     state = {
         "positions": positions,
@@ -74,14 +81,20 @@ def _make_ns_state_dict(
     }
 
     if npt:
-        state["dead_volumes"] = rng.uniform(100, 200, n_dead).astype(np.float32)
-        state["live_volumes"] = rng.uniform(100, 200, n_walkers).astype(np.float32)
+        state["dead_volumes"] = rng.uniform(100, 200, n_dead).astype(
+            np.float32
+        )
+        state["live_volumes"] = rng.uniform(100, 200, n_walkers).astype(
+            np.float32
+        )
 
     return state
 
 
 def _make_ns_state_dict_no_dead(
-    n_walkers: int = 4, n_atoms: int = 1, n_dead: int = 3,
+    n_walkers: int = 4,
+    n_atoms: int = 1,
+    n_dead: int = 3,
 ) -> dict:
     """NS-state dict WITHOUT dead arrays — matches production checkpoints.
 
@@ -95,7 +108,9 @@ def _make_ns_state_dict_no_dead(
     return state
 
 
-def _write_checkpoint(tmp_path: Path, state: dict, name: str = "ckpt.h5") -> Path:
+def _write_checkpoint(
+    tmp_path: Path, state: dict, name: str = "ckpt.h5"
+) -> Path:
     p = tmp_path / name
     save_checkpoint(p, state, symbol_map={0: "Si"})
     return p
@@ -104,6 +119,7 @@ def _write_checkpoint(tmp_path: Path, state: dict, name: str = "ckpt.h5") -> Pat
 # ---------------------------------------------------------------------------
 # Round-trip: save_checkpoint + load_restart
 # ---------------------------------------------------------------------------
+
 
 class TestRoundTrip:
     def test_walker_set_positions_shape(self, tmp_path):
@@ -198,8 +214,36 @@ class TestRoundTrip:
 
 
 # ---------------------------------------------------------------------------
+# Step sizes (single-run / scalar branch)
+# ---------------------------------------------------------------------------
+
+
+class TestStepSizes:
+    def test_step_sizes_round_trip(self, tmp_path):
+        """Scalar checkpoint round-trips adapted step sizes into the bundle."""
+        state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=3)
+        saved_ss = np.full((4, 2), 0.0123, dtype=np.float32)  # (K, n_moves)
+        state["step_sizes"] = saved_ss
+        p = _write_checkpoint(tmp_path, state)
+        _, bundle = load_restart(p)
+        assert bundle.step_sizes is not None
+        assert bundle.step_sizes.shape == (4, 2)
+        np.testing.assert_allclose(
+            np.asarray(bundle.step_sizes), saved_ss, atol=1e-6
+        )
+
+    def test_step_sizes_absent_is_none(self, tmp_path):
+        """Legacy checkpoint without step_sizes leaves the field None."""
+        state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=3)
+        p = _write_checkpoint(tmp_path, state)  # no step_sizes
+        _, bundle = load_restart(p)
+        assert bundle.step_sizes is None
+
+
+# ---------------------------------------------------------------------------
 # Error conditions
 # ---------------------------------------------------------------------------
+
 
 class TestErrors:
     def test_missing_file_raises_file_not_found(self, tmp_path):
@@ -210,18 +254,26 @@ class TestErrors:
     def test_bare_walker_set_raises_value_error(self, tmp_path):
         p = tmp_path / "walkers.h5"
         with h5py.File(p, "w") as f:
-            f.create_dataset("positions", data=np.zeros((4, 1, 3), dtype=np.float32))
+            f.create_dataset(
+                "positions", data=np.zeros((4, 1, 3), dtype=np.float32)
+            )
             f.create_dataset("types", data=np.zeros((4, 1), dtype=np.int32))
-            f.create_dataset("cells", data=np.stack([np.eye(3)] * 4).astype(np.float32))
+            f.create_dataset(
+                "cells", data=np.stack([np.eye(3)] * 4).astype(np.float32)
+            )
         with pytest.raises(ValueError, match="not a valid NS checkpoint"):
             load_restart(p)
 
     def test_bare_walker_set_error_mentions_start_walker_set(self, tmp_path):
         p = tmp_path / "walkers.h5"
         with h5py.File(p, "w") as f:
-            f.create_dataset("positions", data=np.zeros((4, 1, 3), dtype=np.float32))
+            f.create_dataset(
+                "positions", data=np.zeros((4, 1, 3), dtype=np.float32)
+            )
             f.create_dataset("types", data=np.zeros((4, 1), dtype=np.int32))
-            f.create_dataset("cells", data=np.stack([np.eye(3)] * 4).astype(np.float32))
+            f.create_dataset(
+                "cells", data=np.stack([np.eye(3)] * 4).astype(np.float32)
+            )
         with pytest.raises(ValueError, match="start_walker_set"):
             load_restart(p)
 
@@ -230,15 +282,20 @@ class TestErrors:
 # NVT restart: dead_volumes is None
 # ---------------------------------------------------------------------------
 
+
 class TestNVTRestart:
     def test_nvt_dead_volumes_is_none(self, tmp_path):
-        state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=3, npt=False)
+        state = _make_ns_state_dict(
+            n_walkers=4, n_atoms=1, n_dead=3, npt=False
+        )
         p = _write_checkpoint(tmp_path, state)
         _, bundle = load_restart(p)
         assert bundle.dead_volumes is None
 
     def test_nvt_bundle_is_frozen_dataclass(self, tmp_path):
-        state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=2, npt=False)
+        state = _make_ns_state_dict(
+            n_walkers=4, n_atoms=1, n_dead=2, npt=False
+        )
         p = _write_checkpoint(tmp_path, state)
         _, bundle = load_restart(p)
         with pytest.raises((AttributeError, TypeError)):
@@ -248,6 +305,7 @@ class TestNVTRestart:
 # ---------------------------------------------------------------------------
 # NPT restart: dead_volumes is an array
 # ---------------------------------------------------------------------------
+
 
 class TestNPTRestart:
     def test_npt_dead_volumes_is_array(self, tmp_path):
@@ -278,6 +336,7 @@ class TestNPTRestart:
 # init_ns restart seeding
 # ---------------------------------------------------------------------------
 
+
 class TestInitNsRestart:
     def test_init_ns_with_restart_state_seeds_iteration(self, tmp_path):
         from jaxrens.backends.toy import create_harmonic
@@ -299,7 +358,12 @@ class TestInitNsRestart:
         key = jax.random.key(5)
 
         ns_state = init_ns(
-            init_fn, positions, types, energies, ws.cells, key,
+            init_fn,
+            positions,
+            types,
+            energies,
+            ws.cells,
+            key,
             restart_state=bundle,
         )
 
@@ -326,7 +390,12 @@ class TestInitNsRestart:
         key = jax.random.key(5)
 
         ns_state = init_ns(
-            init_fn, positions, types, energies, ws.cells, key,
+            init_fn,
+            positions,
+            types,
+            energies,
+            ws.cells,
+            key,
             restart_state=bundle,
         )
 
@@ -352,7 +421,12 @@ class TestInitNsRestart:
         key = jax.random.key(5)
 
         ns_state = init_ns(
-            init_fn, positions, types, energies, ws.cells, key,
+            init_fn,
+            positions,
+            types,
+            energies,
+            ws.cells,
+            key,
         )
 
         assert int(ns_state.iteration) == 0
@@ -378,11 +452,18 @@ class TestInitNsRestart:
         key = jax.random.key(5)
 
         ns_state = init_ns(
-            init_fn, positions, types, energies, ws.cells, key,
+            init_fn,
+            positions,
+            types,
+            energies,
+            ws.cells,
+            key,
             restart_state=bundle,
         )
 
-        jit_ns_step = jax.jit(ns_step, static_argnames=("step_fn", "n_mcmc_steps"))
+        jit_ns_step = jax.jit(
+            ns_step, static_argnames=("step_fn", "n_mcmc_steps")
+        )
         new_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps=3)
 
         assert int(new_state.iteration) == bundle.iteration + 1
@@ -393,6 +474,7 @@ class TestInitNsRestart:
 # Mode D resolver tests (moved from test_schema.py::TestInitSpecResolverModeD)
 # ---------------------------------------------------------------------------
 
+
 def _make_ns_checkpoint_resolver(
     tmp_path: Path,
     n_walkers: int = 4,
@@ -402,6 +484,7 @@ def _make_ns_checkpoint_resolver(
 ) -> Path:
     """Write a minimal NS checkpoint for Mode D resolver tests."""
     import numpy as _np
+
     from jaxrens.io.checkpoint import save_checkpoint
 
     rng = _np.random.default_rng(0)
@@ -410,7 +493,9 @@ def _make_ns_checkpoint_resolver(
     energies = rng.uniform(1, 10, n_walkers).astype(_np.float32)
     cells = _np.stack([_np.eye(3, dtype=_np.float32) * 6.0] * n_walkers)
     dead_energies = rng.uniform(10, 20, n_dead).astype(_np.float32)
-    dead_positions = rng.uniform(-2, 2, (n_dead, n_atoms, 3)).astype(_np.float32)
+    dead_positions = rng.uniform(-2, 2, (n_dead, n_atoms, 3)).astype(
+        _np.float32
+    )
 
     state = {
         "positions": positions,
@@ -434,6 +519,7 @@ def _make_ns_checkpoint_resolver(
 
 def _cell_cfg_permissive_restart():
     from jaxrens.cli.schema.cell import CellSpec
+
     return CellSpec(
         max_volume_per_atom=10000.0,
         min_volume_per_atom=0.01,
@@ -448,29 +534,37 @@ class TestInitSpecResolverModeD:
     """
 
     def test_mode_d_returns_resolved_init(self, tmp_path):
+        from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import ResolvedInit, _resolve_init
         from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.backends.toy import create_harmonic
 
-        p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        p = _make_ns_checkpoint_resolver(
+            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
+        )
         cfg = InitSpec(restart_file=p)
         result = _resolve_init(
-            cfg, n_live=4, seed=0,
+            cfg,
+            n_live=4,
+            seed=0,
             energy_backend=create_harmonic(),
             cell_cfg=_cell_cfg_permissive_restart(),
         )
         assert isinstance(result, ResolvedInit)
 
     def test_mode_d_restart_state_populated(self, tmp_path):
+        from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitSpec
         from jaxrens.init.restart import RestartBundle
-        from jaxrens.backends.toy import create_harmonic
 
-        p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        p = _make_ns_checkpoint_resolver(
+            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
+        )
         cfg = InitSpec(restart_file=p)
         result = _resolve_init(
-            cfg, n_live=4, seed=0,
+            cfg,
+            n_live=4,
+            seed=0,
             energy_backend=create_harmonic(),
             cell_cfg=_cell_cfg_permissive_restart(),
         )
@@ -478,66 +572,85 @@ class TestInitSpecResolverModeD:
         assert isinstance(result.restart_state, RestartBundle)
 
     def test_mode_d_restart_state_n_dead(self, tmp_path):
+        from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.backends.toy import create_harmonic
 
-        p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        p = _make_ns_checkpoint_resolver(
+            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
+        )
         cfg = InitSpec(restart_file=p)
         result = _resolve_init(
-            cfg, n_live=4, seed=0,
+            cfg,
+            n_live=4,
+            seed=0,
             energy_backend=create_harmonic(),
             cell_cfg=_cell_cfg_permissive_restart(),
         )
         assert result.restart_state.n_dead == 5
 
     def test_mode_d_restart_state_iteration(self, tmp_path):
+        from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.backends.toy import create_harmonic
 
-        p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        p = _make_ns_checkpoint_resolver(
+            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
+        )
         cfg = InitSpec(restart_file=p)
         result = _resolve_init(
-            cfg, n_live=4, seed=0,
+            cfg,
+            n_live=4,
+            seed=0,
             energy_backend=create_harmonic(),
             cell_cfg=_cell_cfg_permissive_restart(),
         )
         assert result.restart_state.iteration == 5
 
     def test_mode_d_symbol_map_populated(self, tmp_path):
+        from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.backends.toy import create_harmonic
 
-        p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        p = _make_ns_checkpoint_resolver(
+            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
+        )
         cfg = InitSpec(restart_file=p)
         result = _resolve_init(
-            cfg, n_live=4, seed=0,
+            cfg,
+            n_live=4,
+            seed=0,
             energy_backend=create_harmonic(),
             cell_cfg=_cell_cfg_permissive_restart(),
         )
         assert result.symbol_map == {0: "Si"}
 
     def test_mode_d_energies_recomputed(self, tmp_path):
+        from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import (
             _finalise_initial_energies_and_counts,
             _resolve_init,
         )
         from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.backends.toy import create_harmonic
 
-        p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        p = _make_ns_checkpoint_resolver(
+            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
+        )
         cfg = InitSpec(restart_file=p)
         backend = create_harmonic()
         result = _resolve_init(
-            cfg, n_live=4, seed=0,
+            cfg,
+            n_live=4,
+            seed=0,
             energy_backend=backend,
             cell_cfg=_cell_cfg_permissive_restart(),
         )
         # _resolve_init now leaves energies as None; caller finalizes.
         energies, _ = _finalise_initial_energies_and_counts(
-            backend, result.initial_positions, result.initial_types, result.initial_cells,
+            backend,
+            result.initial_positions,
+            result.initial_types,
+            result.initial_cells,
         )
         assert energies is not None
         assert energies.shape == (4,)
@@ -545,83 +658,124 @@ class TestInitSpecResolverModeD:
 
     def test_mode_d_random_initialise_pos_true_warns(self, tmp_path, caplog):
         import logging
+
+        from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.backends.toy import create_harmonic
 
-        p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+        p = _make_ns_checkpoint_resolver(
+            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
+        )
         cfg = InitSpec(restart_file=p, random_initialise_pos=True)
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
             _resolve_init(
-                cfg, n_live=4, seed=0,
+                cfg,
+                n_live=4,
+                seed=0,
                 energy_backend=create_harmonic(),
                 cell_cfg=_cell_cfg_permissive_restart(),
             )
         assert any(
-            "restart_file" in r.message.lower() or "verbatim" in r.message.lower()
+            "restart_file" in r.message.lower()
+            or "verbatim" in r.message.lower()
             for r in caplog.records
         )
 
     def test_multi_replica_with_restart_file_raises(self, tmp_path):
         from jaxrens.cli.resolve import resolve
         from jaxrens.cli.schema import RootSpec
-        p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+
+        p = _make_ns_checkpoint_resolver(
+            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
+        )
         d = {
-            "run": {"n_live": 4, "max_iterations": 5, "n_mcmc_steps": 2, "seed": 0},
+            "run": {
+                "n_live": 4,
+                "max_iterations": 5,
+                "n_mcmc_steps": 2,
+                "seed": 0,
+            },
             "moves": [{"type": "random_walk", "step_size": 0.3}],
             "backend": {"type": "harmonic"},
-            "output": {"format": "none", "working_dir": ".", "info_interval": 999},
+            "output": {
+                "format": "none",
+                "working_dir": ".",
+                "info_interval": 999,
+            },
             "ensemble": {"type": "npt", "pressure": [0.01, 0.02]},
             "init": {"restart_file": str(p)},
         }
         root = RootSpec.model_validate(d)
         import pytest as _pytest
+
         with _pytest.raises(ValueError, match="restart_file"):
             resolve(root)
 
-    def test_multi_replica_restart_error_message_contains_n_total(self, tmp_path):
+    def test_multi_replica_restart_error_message_contains_n_total(
+        self, tmp_path
+    ):
         from jaxrens.cli.resolve import resolve
         from jaxrens.cli.schema import RootSpec
-        p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=5)
+
+        p = _make_ns_checkpoint_resolver(
+            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
+        )
         d = {
-            "run": {"n_live": 4, "max_iterations": 5, "n_mcmc_steps": 2, "seed": 0},
+            "run": {
+                "n_live": 4,
+                "max_iterations": 5,
+                "n_mcmc_steps": 2,
+                "seed": 0,
+            },
             "moves": [{"type": "random_walk", "step_size": 0.3}],
             "backend": {"type": "harmonic"},
-            "output": {"format": "none", "working_dir": ".", "info_interval": 999},
+            "output": {
+                "format": "none",
+                "working_dir": ".",
+                "info_interval": 999,
+            },
             "ensemble": {"type": "npt", "pressure": [0.01, 0.02, 0.03]},
             "init": {"restart_file": str(p)},
         }
         root = RootSpec.model_validate(d)
         import pytest as _pytest
+
         with _pytest.raises(ValueError, match="3"):
             resolve(root)
 
     def test_mode_d_end_to_end_jit(self, tmp_path):
         """Mode D: load checkpoint, init_ns with restart_state, run ns_step under JIT."""
+        import jaxrens.sampling.moves.random_walk as rw_mod
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import (
             _finalise_initial_energies_and_counts,
             _resolve_init,
         )
         from jaxrens.cli.schema.init import InitSpec
+        from jaxrens.sampling.move_kernel import MoveKernel
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import init_ns, ns_step
-        from jaxrens.sampling.move_kernel import MoveKernel
-        import jaxrens.sampling.moves.random_walk as rw_mod
 
         n_dead_checkpoint = 5
-        p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=n_dead_checkpoint)
+        p = _make_ns_checkpoint_resolver(
+            tmp_path, n_walkers=4, n_atoms=1, n_dead=n_dead_checkpoint
+        )
 
         cfg = InitSpec(restart_file=p)
         backend = create_harmonic()
         result = _resolve_init(
-            cfg, n_live=4, seed=0,
+            cfg,
+            n_live=4,
+            seed=0,
             energy_backend=backend,
             cell_cfg=_cell_cfg_permissive_restart(),
         )
         # Finalize is the caller's job after the refactor.
         energies, _ = _finalise_initial_energies_and_counts(
-            backend, result.initial_positions, result.initial_types, result.initial_cells,
+            backend,
+            result.initial_positions,
+            result.initial_types,
+            result.initial_cells,
         )
 
         desc = MoveKernel(
@@ -647,7 +801,9 @@ class TestInitSpecResolverModeD:
 
         assert int(ns_state.iteration) == n_dead_checkpoint
 
-        jit_ns_step = jax.jit(ns_step, static_argnames=("step_fn", "n_mcmc_steps"))
+        jit_ns_step = jax.jit(
+            ns_step, static_argnames=("step_fn", "n_mcmc_steps")
+        )
         new_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps=3)
 
         assert int(new_state.iteration) == n_dead_checkpoint + 1
@@ -655,32 +811,39 @@ class TestInitSpecResolverModeD:
 
     def test_mode_d_continued_run_n_dead_increments(self, tmp_path):
         """After restart, run_ns for N more steps: n_dead >= checkpoint + N."""
+        import jaxrens.sampling.moves.random_walk as rw_mod
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.cli.resolve import (
             _finalise_initial_energies_and_counts,
             _resolve_init,
         )
         from jaxrens.cli.schema.init import InitSpec
+        from jaxrens.sampling.move_kernel import MoveKernel
         from jaxrens.sampling.mwg import build_mwg
         from jaxrens.sampling.nested_sampling import run_ns
         from jaxrens.sampling.termination import IterationTermination
-        from jaxrens.sampling.move_kernel import MoveKernel
-        import jaxrens.sampling.moves.random_walk as rw_mod
 
         n_dead_checkpoint = 5
         n_extra_iters = 5
-        p = _make_ns_checkpoint_resolver(tmp_path, n_walkers=4, n_atoms=1, n_dead=n_dead_checkpoint)
+        p = _make_ns_checkpoint_resolver(
+            tmp_path, n_walkers=4, n_atoms=1, n_dead=n_dead_checkpoint
+        )
 
         cfg = InitSpec(restart_file=p)
         backend = create_harmonic()
         result = _resolve_init(
-            cfg, n_live=4, seed=0,
+            cfg,
+            n_live=4,
+            seed=0,
             energy_backend=backend,
             cell_cfg=_cell_cfg_permissive_restart(),
         )
         # Finalize is the caller's job after the refactor.
         energies, _ = _finalise_initial_energies_and_counts(
-            backend, result.initial_positions, result.initial_types, result.initial_cells,
+            backend,
+            result.initial_positions,
+            result.initial_types,
+            result.initial_cells,
         )
 
         desc = MoveKernel(
@@ -747,11 +910,17 @@ def _make_batched_ns_state_dict(
         np.eye(3, dtype=np.float32) * 5.0,
         full_cells_shape,
     ).copy()
-    dead_energies = rng.uniform(5, 10, full_dead_energies_shape).astype(np.float32)
-    dead_positions = rng.uniform(-2, 2, full_dead_positions_shape).astype(np.float32)
+    dead_energies = rng.uniform(5, 10, full_dead_energies_shape).astype(
+        np.float32
+    )
+    dead_positions = rng.uniform(-2, 2, full_dead_positions_shape).astype(
+        np.float32
+    )
 
     # n_dead: per-run count, stored as batched array
-    n_dead_vals = rng.integers(2, max_dead - 1, size=batch_shape).astype(np.int32)
+    n_dead_vals = rng.integers(2, max_dead - 1, size=batch_shape).astype(
+        np.int32
+    )
     # iteration matches n_dead for simplicity
     iteration_vals = n_dead_vals.copy()
     # log_evidence: per-run float
@@ -763,7 +932,9 @@ def _make_batched_ns_state_dict(
     # Batched rng_key matches the batch prefix — production batched NSState
     # always has rng_key with the batcher's shape_prefix.
     n_batch = int(np.prod(batch_shape)) if batch_shape else 1
-    batched_key = jax.random.split(jax.random.key(0), n_batch).reshape(batch_shape)
+    batched_key = jax.random.split(jax.random.key(0), n_batch).reshape(
+        batch_shape
+    )
 
     state: dict = {
         "positions": positions,
@@ -783,8 +954,12 @@ def _make_batched_ns_state_dict(
     }
 
     if npt:
-        state["dead_volumes"] = rng.uniform(100, 200, full_dead_energies_shape).astype(np.float32)
-        state["live_volumes"] = rng.uniform(100, 200, batch_shape + (n_walkers,)).astype(np.float32)
+        state["dead_volumes"] = rng.uniform(
+            100, 200, full_dead_energies_shape
+        ).astype(np.float32)
+        state["live_volumes"] = rng.uniform(
+            100, 200, batch_shape + (n_walkers,)
+        ).astype(np.float32)
 
     return state
 
@@ -833,7 +1008,9 @@ class TestLoadRestartParallel:
     def test_dead_positions_shape_per_run(self, tmp_path):
         n_runs = 3
         n_atoms = 2
-        state = _make_batched_ns_state_dict(batch_shape=(n_runs,), n_atoms=n_atoms)
+        state = _make_batched_ns_state_dict(
+            batch_shape=(n_runs,), n_atoms=n_atoms
+        )
         p = tmp_path / "par.checkpoint.h5"
         save_checkpoint(p, state)
         result = load_restart(p)
@@ -888,17 +1065,23 @@ class TestLoadRestartParallel:
         n_runs = 2
         n_walkers = 6
         n_atoms = 1
-        n_dead_checkpoint = 3   # must be < max_iterations used below
+        n_dead_checkpoint = 3  # must be < max_iterations used below
         max_iterations = 8
 
         rng = np.random.default_rng(77)
-        positions = rng.uniform(-1, 1, (n_runs, n_walkers, n_atoms, 3)).astype(np.float32)
+        positions = rng.uniform(-1, 1, (n_runs, n_walkers, n_atoms, 3)).astype(
+            np.float32
+        )
         energies = rng.uniform(0, 2, (n_runs, n_walkers)).astype(np.float32)
         types = np.zeros(n_atoms, dtype=np.int32)
 
         # Build a parallel checkpoint with exactly n_dead_checkpoint dead points per run.
-        dead_energies = rng.uniform(5, 10, (n_runs, n_dead_checkpoint)).astype(np.float32)
-        dead_positions = rng.uniform(-1, 1, (n_runs, n_dead_checkpoint, n_atoms, 3)).astype(np.float32)
+        dead_energies = rng.uniform(5, 10, (n_runs, n_dead_checkpoint)).astype(
+            np.float32
+        )
+        dead_positions = rng.uniform(
+            -1, 1, (n_runs, n_dead_checkpoint, n_atoms, 3)
+        ).astype(np.float32)
 
         state: dict = {
             "positions": positions,
@@ -928,7 +1111,10 @@ class TestLoadRestartParallel:
         keys = jax.random.split(jax.random.key(42), n_runs)
 
         out = run_ns_parallel(
-            jnp.asarray(positions), jnp.asarray(types), jnp.asarray(energies), None,
+            jnp.asarray(positions),
+            jnp.asarray(types),
+            jnp.asarray(energies),
+            None,
             init_fn=init_fn,
             step_fn=step_fn,
             rng_keys=keys,
@@ -1011,7 +1197,10 @@ class TestLoadRestartMultiGpu:
 
         # Force ``len(jax.local_devices())`` to disagree with G.
         import jax as _jax
-        monkeypatch.setattr(_jax, "local_devices", lambda *_a, **_k: [object()])
+
+        monkeypatch.setattr(
+            _jax, "local_devices", lambda *_a, **_k: [object()]
+        )
 
         with pytest.raises(ValueError, match="Cross-topology restart is not"):
             load_restart(p)
@@ -1027,30 +1216,48 @@ class TestLoadRestartMultiGpu:
         n_total = n_gpu * n_per_gpu
         n_walkers = 8
         n_atoms = 1
-        n_dead_checkpoint = 3   # must be < max_iterations used below
+        n_dead_checkpoint = 3  # must be < max_iterations used below
         max_iterations = 8
 
         rng = np.random.default_rng(88)
-        positions = rng.uniform(-1, 1, (n_total, n_walkers, n_atoms, 3)).astype(np.float32)
+        positions = rng.uniform(
+            -1, 1, (n_total, n_walkers, n_atoms, 3)
+        ).astype(np.float32)
         energies = rng.uniform(0, 2, (n_total, n_walkers)).astype(np.float32)
         types = np.zeros(n_atoms, dtype=np.int32)
 
         # Build a (G, P) checkpoint with deterministic n_dead per slot.
-        dead_energies = rng.uniform(5, 10, (n_gpu, n_per_gpu, n_dead_checkpoint)).astype(np.float32)
-        dead_positions = rng.uniform(-1, 1, (n_gpu, n_per_gpu, n_dead_checkpoint, n_atoms, 3)).astype(np.float32)
+        dead_energies = rng.uniform(
+            5, 10, (n_gpu, n_per_gpu, n_dead_checkpoint)
+        ).astype(np.float32)
+        dead_positions = rng.uniform(
+            -1, 1, (n_gpu, n_per_gpu, n_dead_checkpoint, n_atoms, 3)
+        ).astype(np.float32)
 
         state: dict = {
-            "positions": positions.reshape(n_gpu, n_per_gpu, n_walkers, n_atoms, 3),
-            "types": np.zeros((n_gpu, n_per_gpu, n_walkers, n_atoms), dtype=np.int32),
+            "positions": positions.reshape(
+                n_gpu, n_per_gpu, n_walkers, n_atoms, 3
+            ),
+            "types": np.zeros(
+                (n_gpu, n_per_gpu, n_walkers, n_atoms), dtype=np.int32
+            ),
             "energies": energies.reshape(n_gpu, n_per_gpu, n_walkers),
-            "cells": np.zeros((n_gpu, n_per_gpu, n_walkers, 3, 3), dtype=np.float32),
+            "cells": np.zeros(
+                (n_gpu, n_per_gpu, n_walkers, 3, 3), dtype=np.float32
+            ),
             "dead_energies": dead_energies,
             "dead_positions": dead_positions,
             "dead_volumes": None,
             "live_volumes": None,
-            "log_evidence": np.full((n_gpu, n_per_gpu), -6.0, dtype=np.float64),
-            "iteration": np.full((n_gpu, n_per_gpu), n_dead_checkpoint, dtype=np.int32),
-            "n_dead": np.full((n_gpu, n_per_gpu), n_dead_checkpoint, dtype=np.int32),
+            "log_evidence": np.full(
+                (n_gpu, n_per_gpu), -6.0, dtype=np.float64
+            ),
+            "iteration": np.full(
+                (n_gpu, n_per_gpu), n_dead_checkpoint, dtype=np.int32
+            ),
+            "n_dead": np.full(
+                (n_gpu, n_per_gpu), n_dead_checkpoint, dtype=np.int32
+            ),
             "n_walkers": n_walkers,
             "rng_key": jax.random.key(0),
         }
@@ -1099,16 +1306,47 @@ class TestLoadRestartShapeError:
         shape3d = (1, 2, 3)  # 3-D batch prefix
 
         with h5py.File(p, "w") as f:
-            f.create_dataset("positions", data=rng.uniform(0, 1, shape3d + (n_walkers, n_atoms, 3)).astype(np.float32))
-            f.create_dataset("types", data=np.zeros(shape3d + (n_walkers, n_atoms), dtype=np.int32))
-            f.create_dataset("energies", data=rng.uniform(0, 1, shape3d + (n_walkers,)).astype(np.float32))
-            f.create_dataset("cells", data=np.zeros(shape3d + (n_walkers, 3, 3), dtype=np.float32))
-            f.create_dataset("dead_energies", data=rng.uniform(0, 1, shape3d + (5,)).astype(np.float32))
-            f.create_dataset("dead_positions", data=rng.uniform(0, 1, shape3d + (5, n_atoms, 3)).astype(np.float32))
+            f.create_dataset(
+                "positions",
+                data=rng.uniform(
+                    0, 1, shape3d + (n_walkers, n_atoms, 3)
+                ).astype(np.float32),
+            )
+            f.create_dataset(
+                "types",
+                data=np.zeros(shape3d + (n_walkers, n_atoms), dtype=np.int32),
+            )
+            f.create_dataset(
+                "energies",
+                data=rng.uniform(0, 1, shape3d + (n_walkers,)).astype(
+                    np.float32
+                ),
+            )
+            f.create_dataset(
+                "cells",
+                data=np.zeros(shape3d + (n_walkers, 3, 3), dtype=np.float32),
+            )
+            f.create_dataset(
+                "dead_energies",
+                data=rng.uniform(0, 1, shape3d + (5,)).astype(np.float32),
+            )
+            f.create_dataset(
+                "dead_positions",
+                data=rng.uniform(0, 1, shape3d + (5, n_atoms, 3)).astype(
+                    np.float32
+                ),
+            )
             # log_evidence, iteration, n_dead stored as 3-D datasets
-            f.create_dataset("log_evidence", data=rng.uniform(-10, -1, shape3d).astype(np.float64))
-            f.create_dataset("iteration", data=np.ones(shape3d, dtype=np.int32) * 5)
-            f.create_dataset("n_dead", data=np.ones(shape3d, dtype=np.int32) * 3)
+            f.create_dataset(
+                "log_evidence",
+                data=rng.uniform(-10, -1, shape3d).astype(np.float64),
+            )
+            f.create_dataset(
+                "iteration", data=np.ones(shape3d, dtype=np.int32) * 5
+            )
+            f.create_dataset(
+                "n_dead", data=np.ones(shape3d, dtype=np.int32) * 3
+            )
             f.attrs["n_walkers"] = n_walkers
 
         with pytest.raises(ValueError, match="ndim"):
@@ -1122,14 +1360,33 @@ class TestLoadRestartShapeError:
         shape3d = (2, 3, 4)
 
         with h5py.File(p, "w") as f:
-            f.create_dataset("positions", data=np.zeros(shape3d + (4, 1, 3), dtype=np.float32))
-            f.create_dataset("types", data=np.zeros(shape3d + (4, 1), dtype=np.int32))
-            f.create_dataset("energies", data=np.zeros(shape3d + (4,), dtype=np.float32))
-            f.create_dataset("cells", data=np.zeros(shape3d + (4, 3, 3), dtype=np.float32))
-            f.create_dataset("dead_energies", data=np.zeros(shape3d + (5,), dtype=np.float32))
-            f.create_dataset("dead_positions", data=np.zeros(shape3d + (5, 1, 3), dtype=np.float32))
-            f.create_dataset("log_evidence", data=rng.uniform(-10, -1, shape3d))
-            f.create_dataset("iteration", data=np.ones(shape3d, dtype=np.int32))
+            f.create_dataset(
+                "positions",
+                data=np.zeros(shape3d + (4, 1, 3), dtype=np.float32),
+            )
+            f.create_dataset(
+                "types", data=np.zeros(shape3d + (4, 1), dtype=np.int32)
+            )
+            f.create_dataset(
+                "energies", data=np.zeros(shape3d + (4,), dtype=np.float32)
+            )
+            f.create_dataset(
+                "cells", data=np.zeros(shape3d + (4, 3, 3), dtype=np.float32)
+            )
+            f.create_dataset(
+                "dead_energies",
+                data=np.zeros(shape3d + (5,), dtype=np.float32),
+            )
+            f.create_dataset(
+                "dead_positions",
+                data=np.zeros(shape3d + (5, 1, 3), dtype=np.float32),
+            )
+            f.create_dataset(
+                "log_evidence", data=rng.uniform(-10, -1, shape3d)
+            )
+            f.create_dataset(
+                "iteration", data=np.ones(shape3d, dtype=np.int32)
+            )
             f.create_dataset("n_dead", data=np.ones(shape3d, dtype=np.int32))
             f.attrs["n_walkers"] = 4
 
@@ -1149,7 +1406,9 @@ class TestSchemaDrift:
         p = _write_checkpoint(tmp_path, state)
         _, bundle = load_restart(p)
 
-        bundle_field_names = {f.name for f in dataclasses.fields(RestartBundle)}
+        bundle_field_names = {
+            f.name for f in dataclasses.fields(RestartBundle)
+        }
         for name in bundle_field_names:
             assert hasattr(bundle, name), (
                 f"RestartBundle field '{name}' missing from loaded scalar bundle. "
@@ -1167,7 +1426,9 @@ class TestSchemaDrift:
         save_checkpoint(p, state)
         bundles = load_restart(p)
 
-        bundle_field_names = {f.name for f in dataclasses.fields(RestartBundle)}
+        bundle_field_names = {
+            f.name for f in dataclasses.fields(RestartBundle)
+        }
         for b in bundles:
             for name in bundle_field_names:
                 assert hasattr(b, name), (
@@ -1185,7 +1446,9 @@ class TestSchemaDrift:
         save_checkpoint(p, state)
         bundles = load_restart(p)
 
-        bundle_field_names = {f.name for f in dataclasses.fields(RestartBundle)}
+        bundle_field_names = {
+            f.name for f in dataclasses.fields(RestartBundle)
+        }
         for g in range(G):
             for pp in range(P):
                 b = bundles[g][pp]
@@ -1221,6 +1484,7 @@ class TestInferRestartShape:
 
     def test_invalid_type_raises_type_error(self):
         from jaxrens.init.restart import infer_restart_shape
+
         with pytest.raises(TypeError, match="unrecognised"):
             infer_restart_shape("not_a_bundle")
 
@@ -1229,6 +1493,7 @@ class TestInferRestartShape:
 # load_restart_batched: multi-replica restart loader
 # ---------------------------------------------------------------------------
 
+
 class TestLoadRestartBatched:
     """Multi-replica loader returning flat (n_total, ...) arrays + 2-D bundles."""
 
@@ -1236,7 +1501,9 @@ class TestLoadRestartBatched:
         from jaxrens.init.restart import load_restart_batched
 
         n_runs = 4
-        state = _make_batched_ns_state_dict(batch_shape=(n_runs,), n_walkers=3, n_atoms=2)
+        state = _make_batched_ns_state_dict(
+            batch_shape=(n_runs,), n_walkers=3, n_atoms=2
+        )
         p = tmp_path / "vmap.checkpoint.h5"
         save_checkpoint(p, state)
 
@@ -1255,7 +1522,9 @@ class TestLoadRestartBatched:
         from jaxrens.init.restart import load_restart_batched
 
         G, P = 1, 4  # n_gpu=1 to avoid the cross-topology guard on this host.
-        state = _make_batched_ns_state_dict(batch_shape=(G, P), n_walkers=3, n_atoms=2)
+        state = _make_batched_ns_state_dict(
+            batch_shape=(G, P), n_walkers=3, n_atoms=2
+        )
         p = tmp_path / "pmap.checkpoint.h5"
         save_checkpoint(p, state)
 
@@ -1278,7 +1547,7 @@ class TestLoadRestartBatched:
         flat = batched.bundles_flat
         assert len(flat) == batched.n_total
         rebuilt = [
-            flat[g * batched.n_per_gpu:(g + 1) * batched.n_per_gpu]
+            flat[g * batched.n_per_gpu : (g + 1) * batched.n_per_gpu]
             for g in range(batched.n_gpu)
         ]
         assert rebuilt == batched.bundles_2d
@@ -1294,6 +1563,7 @@ class TestLoadRestartBatched:
 
     def test_missing_file_raises_file_not_found(self, tmp_path):
         from jaxrens.init.restart import load_restart_batched
+
         with pytest.raises(FileNotFoundError):
             load_restart_batched(tmp_path / "nope.h5")
 

@@ -21,7 +21,8 @@ Three-level parallelism (`pmap(vmap(vmap(...)))`) with data shaped
 Pluggable energy backends: Lennard-Jones (incl. per-species LJ tables),
 [MACE-JAX](https://github.com/nunglert/mace-jax), [NeuralIL](https://github.com/nunglert/neuralil-jaxrens),
 [nequix](https://github.com/atomicarchitects/nequix), and toy potentials.
-NPT supported via an `EnsembleBackend` PV-term wrapper.
+NPT and semi-grand μPT supported via an `EnsembleBackend` wrapper that adds
+the `P·V` and `−μ·N` terms.
 
 ## Install
 

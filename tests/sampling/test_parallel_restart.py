@@ -33,9 +33,12 @@ from jaxrens.io.checkpoint import save_checkpoint
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk as rw_mod
 from jaxrens.sampling.mwg import build_mwg
-from jaxrens.sampling.nested_sampling import init_ns, init_ns_parallel, run_ns_parallel
+from jaxrens.sampling.nested_sampling import (
+    init_ns,
+    init_ns_parallel,
+    run_ns_parallel,
+)
 from jaxrens.sampling.termination import IterationTermination
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -91,14 +94,22 @@ def _write_checkpoint(
     n_dead: int = 4,
     log_evidence: float = -6.0,
     name: str = "ckpt.checkpoint.h5",
+    step_sizes: np.ndarray | None = None,
 ) -> Path:
-    """Write a minimal NS checkpoint seeded from the harmonic setup *s*."""
+    """Write a minimal NS checkpoint seeded from the harmonic setup *s*.
+
+    ``step_sizes`` (shape ``(K, n_moves)``) is written when given, emulating a
+    real checkpoint carrying adapted step sizes; ``None`` emulates a legacy
+    checkpoint that pre-dates persisting them.
+    """
     rng = np.random.default_rng(7)
     n_walkers = s["n_walkers"]
     n_atoms = s["n_atoms"]
 
     dead_energies = rng.uniform(5.0, 15.0, n_dead).astype(np.float32)
-    dead_positions = rng.uniform(-2.0, 2.0, (n_dead, n_atoms, 3)).astype(np.float32)
+    dead_positions = rng.uniform(-2.0, 2.0, (n_dead, n_atoms, 3)).astype(
+        np.float32
+    )
 
     state = {
         "positions": np.asarray(s["positions"]),
@@ -116,6 +127,8 @@ def _write_checkpoint(
         "n_walkers": n_walkers,
         "rng_key": jax.random.key(1),
     }
+    if step_sizes is not None:
+        state["step_sizes"] = np.asarray(step_sizes)
     p = tmp_path / name
     save_checkpoint(p, state)
     return p
@@ -148,7 +161,12 @@ class TestInitNsParallelRestart:
         bundle = _load_bundle(p)
 
         ns_states = init_ns_parallel(
-            s["init_fn"], positions, s["types"], energies, cells, keys,
+            s["init_fn"],
+            positions,
+            s["types"],
+            energies,
+            cells,
+            keys,
             restart_states=[bundle, bundle],
         )
 
@@ -166,11 +184,18 @@ class TestInitNsParallelRestart:
         cells = jnp.stack([s["cells"]] * 2)
         keys = jax.random.split(s["key"], 2)
 
-        p = _write_checkpoint(tmp_path, s, n_dead=n_dead_checkpoint, log_evidence=log_z)
+        p = _write_checkpoint(
+            tmp_path, s, n_dead=n_dead_checkpoint, log_evidence=log_z
+        )
         bundle = _load_bundle(p)
 
         ns_states = init_ns_parallel(
-            s["init_fn"], positions, s["types"], energies, cells, keys,
+            s["init_fn"],
+            positions,
+            s["types"],
+            energies,
+            cells,
+            keys,
             restart_states=[bundle, bundle],
         )
 
@@ -191,7 +216,12 @@ class TestInitNsParallelRestart:
         bundle = _load_bundle(p)
 
         ns_states = init_ns_parallel(
-            s["init_fn"], positions, s["types"], energies, cells, keys,
+            s["init_fn"],
+            positions,
+            s["types"],
+            energies,
+            cells,
+            keys,
             restart_states=[bundle, None],
         )
 
@@ -215,7 +245,12 @@ class TestInitNsParallelRestart:
 
         with pytest.raises(ValueError, match="restart_states length"):
             init_ns_parallel(
-                s["init_fn"], positions, s["types"], energies, cells, keys,
+                s["init_fn"],
+                positions,
+                s["types"],
+                energies,
+                cells,
+                keys,
                 restart_states=[bundle, bundle],  # length 2 != n_runs=3
             )
 
@@ -229,11 +264,111 @@ class TestInitNsParallelRestart:
         keys = jax.random.split(s["key"], 2)
 
         ns_states = init_ns_parallel(
-            s["init_fn"], positions, s["types"], energies, cells, keys,
+            s["init_fn"],
+            positions,
+            s["types"],
+            energies,
+            cells,
+            keys,
         )
 
         assert int(ns_states.iteration[0]) == 0
         assert int(ns_states.iteration[1]) == 0
+
+
+# ---------------------------------------------------------------------------
+# TestStepSizeRestore
+# ---------------------------------------------------------------------------
+
+
+class TestStepSizeRestore:
+    """Adapted step sizes survive a save_checkpoint -> restart round-trip."""
+
+    def test_bundle_carries_step_sizes(self, tmp_path):
+        """load_restart populates RestartBundle.step_sizes when present."""
+        s = _make_harmonic_setup(seed=30)
+        n_walkers, n_atoms = s["n_walkers"], s["n_atoms"]
+        # One move (random_walk) → n_moves == 1.  Distinctive value so it can't
+        # be confused with any descriptor/initial default.
+        saved_ss = np.full((n_walkers, 1), 0.0123, dtype=np.float32)
+
+        p = _write_checkpoint(tmp_path, s, step_sizes=saved_ss)
+        bundle = _load_bundle(p)
+
+        assert bundle.step_sizes is not None
+        assert bundle.step_sizes.shape == (n_walkers, 1)
+        np.testing.assert_allclose(
+            np.asarray(bundle.step_sizes), saved_ss, atol=1e-6
+        )
+        # n_atoms unused beyond setup; reference to keep the linter quiet.
+        assert n_atoms == 1
+
+    def test_legacy_checkpoint_step_sizes_none(self, tmp_path):
+        """Checkpoints without step_sizes leave bundle.step_sizes as None."""
+        s = _make_harmonic_setup(seed=31)
+        p = _write_checkpoint(tmp_path, s)  # no step_sizes
+        bundle = _load_bundle(p)
+        assert bundle.step_sizes is None
+
+    def test_restored_step_sizes_land_in_population(self, tmp_path):
+        """init_ns_parallel overrides the initial seed with restored step sizes."""
+        s = _make_harmonic_setup(seed=32)
+        n_walkers = s["n_walkers"]
+        saved_ss = np.full((n_walkers, 1), 0.0123, dtype=np.float32)
+
+        positions = jnp.stack([s["positions"]] * 2)
+        energies = jnp.stack([s["energies"]] * 2)
+        cells = jnp.stack([s["cells"]] * 2)
+        keys = jax.random.split(s["key"], 2)
+
+        p = _write_checkpoint(tmp_path, s, step_sizes=saved_ss)
+        bundle = _load_bundle(p)
+
+        ns_states = init_ns_parallel(
+            s["init_fn"],
+            positions,
+            s["types"],
+            energies,
+            cells,
+            keys,
+            # Pass a contrasting initial seed; the restore must win over it.
+            step_sizes=jnp.full(1, 0.5),
+            restart_states=[bundle, bundle],
+        )
+
+        # population.step_sizes has shape (n_runs, K, n_moves).
+        pop_ss = np.asarray(ns_states.population.step_sizes)
+        assert pop_ss.shape == (2, n_walkers, 1)
+        np.testing.assert_allclose(pop_ss[0], saved_ss, atol=1e-6)
+        np.testing.assert_allclose(pop_ss[1], saved_ss, atol=1e-6)
+
+    def test_legacy_restart_keeps_initial_step_sizes(self, tmp_path):
+        """Without saved step_sizes, the population keeps the initial seed."""
+        s = _make_harmonic_setup(seed=33)
+        n_walkers = s["n_walkers"]
+
+        positions = jnp.stack([s["positions"]] * 2)
+        energies = jnp.stack([s["energies"]] * 2)
+        cells = jnp.stack([s["cells"]] * 2)
+        keys = jax.random.split(s["key"], 2)
+
+        p = _write_checkpoint(tmp_path, s)  # no step_sizes
+        bundle = _load_bundle(p)
+
+        ns_states = init_ns_parallel(
+            s["init_fn"],
+            positions,
+            s["types"],
+            energies,
+            cells,
+            keys,
+            step_sizes=jnp.full(1, 0.5),
+            restart_states=[bundle, bundle],
+        )
+
+        pop_ss = np.asarray(ns_states.population.step_sizes)
+        np.testing.assert_allclose(pop_ss, 0.5, atol=1e-6)
+        assert n_walkers == s["n_walkers"]
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +395,10 @@ class TestRunNsParallelRestart:
 
         termination = [IterationTermination(n_extra_iters)]
         out = run_ns_parallel(
-            positions, s["types"], energies, cells,
+            positions,
+            s["types"],
+            energies,
+            cells,
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
             rng_keys=keys,
@@ -284,12 +422,17 @@ class TestRunNsParallelRestart:
         cells = jnp.stack([s["cells"]] * 2)
         keys = jax.random.split(s["key"], 2)
 
-        p = _write_checkpoint(tmp_path, s, n_dead=n_dead_checkpoint, log_evidence=-5.0)
+        p = _write_checkpoint(
+            tmp_path, s, n_dead=n_dead_checkpoint, log_evidence=-5.0
+        )
         bundle = _load_bundle(p)
 
         termination = [IterationTermination(5)]
         out = run_ns_parallel(
-            positions, s["types"], energies, cells,
+            positions,
+            s["types"],
+            energies,
+            cells,
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
             rng_keys=keys,
@@ -299,9 +442,9 @@ class TestRunNsParallelRestart:
             restart_states=[bundle, bundle],
         )
 
-        assert jnp.all(jnp.isfinite(out["log_evidence"])), (
-            f"log_evidence not finite: {out['log_evidence']}"
-        )
+        assert jnp.all(
+            jnp.isfinite(out["log_evidence"])
+        ), f"log_evidence not finite: {out['log_evidence']}"
 
     def test_parallel_restart_output_shapes(self, tmp_path):
         """run_ns_parallel with restart_states returns (n_runs, ...) shaped outputs."""
@@ -319,7 +462,10 @@ class TestRunNsParallelRestart:
 
         termination = [IterationTermination(5)]
         out = run_ns_parallel(
-            positions, s["types"], energies, cells,
+            positions,
+            s["types"],
+            energies,
+            cells,
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
             rng_keys=keys,
@@ -335,7 +481,8 @@ class TestRunNsParallelRestart:
 
     def test_parallel_restart_parity_with_single_restart(self, tmp_path):
         """run_ns_parallel(n_runs=1, restart_states=[bundle]) is consistent
-        with run_ns(restart_state=bundle): both run more iterations past checkpoint."""
+        with run_ns(restart_state=bundle): both run more iterations past checkpoint.
+        """
         from jaxrens.sampling.nested_sampling import run_ns
 
         n_dead_checkpoint = 4
@@ -349,7 +496,10 @@ class TestRunNsParallelRestart:
 
         # Single run with restart
         out_single = run_ns(
-            s["positions"], s["types"], s["energies"], s["cells"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            s["cells"],
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
             rng_key=s["key"],
@@ -362,7 +512,10 @@ class TestRunNsParallelRestart:
         # Parallel run with n_runs=1 + restart_states
         keys = jax.random.split(s["key"], 1)
         out_par = run_ns_parallel(
-            s["positions"][None], s["types"], s["energies"][None], s["cells"][None],
+            s["positions"][None],
+            s["types"],
+            s["energies"][None],
+            s["cells"][None],
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
             rng_keys=keys,
@@ -392,7 +545,10 @@ class TestRunNsParallelRestart:
 
         termination = [IterationTermination(n_extra)]
         out = run_ns_parallel(
-            positions, s["types"], energies, cells,
+            positions,
+            s["types"],
+            energies,
+            cells,
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
             rng_keys=keys,
@@ -423,7 +579,10 @@ class TestRunNsParallelRestart:
         termination = [IterationTermination(5)]
         with pytest.raises(ValueError, match="restart_states length"):
             run_ns_parallel(
-                positions, s["types"], energies, cells,
+                positions,
+                s["types"],
+                energies,
+                cells,
                 init_fn=s["init_fn"],
                 step_fn=s["step_fn"],
                 rng_keys=keys,

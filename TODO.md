@@ -14,10 +14,16 @@ target_acceptance
 
 - ImportErrors for backend dependencies should suggest "pip install .[neuralil]" etc. 
 
-- for restarts, do we also save stepsizes? Could think about sth like a SamplerState
+- [done] for restarts, do we also save stepsizes? Now persisted in the
+  checkpoint (`step_sizes` dataset) and restored into the live population by
+  `init_ns`. No `SamplerState` needed — `step_sizes` is the only sampler state
+  that persists between iterations (adaptation is stateless per call). Legacy
+  checkpoints (no field) fall back to the configured initial step.
 
 - what happens if outfile_prefix is not set?
 
 - check which XLA flags from the batch script we actually need, e.g. should we force no autotuning?
 
 - trial_batch_size in auto stepsize handler? Did we resolve that problem?
+
+- re_stats plot in CLI is outdated
