@@ -459,30 +459,3 @@ class TestPartitionFunctionWithVolumes:
         )
 
         assert jnp.allclose(log_Z_base, log_Z_zero, atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Config parsing
-# ---------------------------------------------------------------------------
-
-
-class TestConfigPressure:
-    def test_pressure_parsed_from_input(self, tmp_path):
-        from jaxrens.cli.migrate import migrate_ns_inp
-        from jaxrens.cli.parser import parse_input_file
-
-        inp = tmp_path / "ns.inp"
-        inp.write_text("n_walkers = 100\npressure = 0.05\n")
-        raw = parse_input_file(inp)
-        result = migrate_ns_inp(raw)
-        assert result["config"]["ensemble"]["pressure"] == pytest.approx(0.05)
-
-    def test_no_pressure_in_input(self, tmp_path):
-        from jaxrens.cli.migrate import migrate_ns_inp
-        from jaxrens.cli.parser import parse_input_file
-
-        inp = tmp_path / "ns.inp"
-        inp.write_text("n_walkers = 100\n")
-        raw = parse_input_file(inp)
-        result = migrate_ns_inp(raw)
-        assert "pressure" not in result["config"].get("ensemble", {})

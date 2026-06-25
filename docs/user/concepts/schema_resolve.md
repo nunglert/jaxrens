@@ -47,7 +47,6 @@ flowchart TB
 | Cross-field validators ("XRENS requires composition_targets") | **Schema** | `@model_validator` methods |
 | Unit conversion (`gpa` → `eva3`) | **Schema** | `NPTEnsembleSpec.to_ensemble_params` |
 | Interval-unit scaling (`per_walker` → absolute iters) | **CLI / Resolver** | `_apply_interval_units` (run from cli before the resolver, second pass inside `resolve` is idempotent) |
-| Deprecated-alias migration | **Schema** | `cli/migrate.py` |
 | "Build a MACE backend instance" | **Resolver** | `MACEBackendSpec.build_backend()` |
 | "Compute initial walker energies at the right ensemble scale" | **Resolver** | `_finalise_initial_energies_and_counts` + `EnsembleBackend` wrap |
 | Device-topology derivation from `jax.local_devices()` | **Resolver** | `_derive_replica_axes` |

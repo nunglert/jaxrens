@@ -32,9 +32,8 @@ side of these boundaries (see {doc}`../reference/index` for the module map):
 `cli/`
 : The YAML config pipeline. Data flows one way:
   `schema/` (pydantic specs) → `resolve.py` (specs → runtime dataclasses in
-  `state/config.py`) → `run.py` (wires callbacks/writers). `migrate.py` ports
-  legacy `ns.inp` configs into the new schema. Keep validation in the schema
-  layer and runtime wiring in `run.py`.
+  `state/config.py`) → `run.py` (wires callbacks/writers). Keep validation in
+  the schema layer and runtime wiring in `run.py`.
 
 `io/trajectory.py`
 : Pluggable `TrajectoryWriter` implementations (`extxyz` / `h5` / `none`).

@@ -4,7 +4,6 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from jaxrens.cli.parser import parse_input_file
 from jaxrens.cli.run import run_from_config, setup_mwg
 from jaxrens.state.config import (
     BackendConfig,
@@ -12,41 +11,6 @@ from jaxrens.state.config import (
     NSConfig,
     OutputConfig,
 )
-
-# ---------------------------------------------------------------------------
-# Parser tests (raw-read only; dataclass-construction path removed in step 7)
-# ---------------------------------------------------------------------------
-
-
-class TestParser:
-    def test_parse_input_file(self, tmp_path):
-        config = tmp_path / "ns.inp"
-        config.write_text(
-            "n_walkers = 100\n"
-            "max_iterations = 5000\n"
-            "# this is a comment\n"
-            "\n"
-            "backend = lj\n"
-            "step_size = 0.05\n"
-        )
-        raw = parse_input_file(config)
-        assert raw["n_walkers"] == "100"
-        assert raw["max_iterations"] == "5000"
-        assert raw["backend"] == "lj"
-        assert raw["step_size"] == "0.05"
-
-    def test_parse_input_file_inline_comment(self, tmp_path):
-        config = tmp_path / "ns.inp"
-        config.write_text("n_walkers = 50  # inline comment\n")
-        raw = parse_input_file(config)
-        assert raw["n_walkers"] == "50"
-
-    def test_parse_input_file_blank_lines(self, tmp_path):
-        config = tmp_path / "ns.inp"
-        config.write_text("\n\nn_walkers = 10\n\n")
-        raw = parse_input_file(config)
-        assert raw == {"n_walkers": "10"}
-
 
 # ---------------------------------------------------------------------------
 # Run entry point tests

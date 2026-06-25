@@ -1,7 +1,7 @@
 """Configuration dataclasses for jaxrens.
 
 Frozen dataclasses replace dict/file-based configuration in the library core.
-CLI-level file parsing (reading ns.inp, YAML, etc.) is in cli/parser.py.
+CLI-level YAML parsing and validation lives in cli/schema/ and cli/resolve.py.
 """
 
 from __future__ import annotations

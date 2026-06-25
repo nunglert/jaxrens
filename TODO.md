@@ -1,12 +1,6 @@
 # TODO
 
 ## Ensemble specifications in RunSpec
-- [done] Legacy `run.pressure` removed. Ensemble params now live entirely in the
-  `ensemble:` section (NVT / NPT / semi_grand) and flow through the generic
-  `ensemble_params` dict — `NSConfig` no longer carries pressure. Added
-  `SemiGrandEnsembleSpec` (chemical_potentials + optional pressure), generalised
-  `_derive_replica_axes` to drive the ensemble axis via `cohort_size()` /
-  `to_ensemble_params()`, and made the single-run path thread the dict.
 
 - target_acceptance
 
