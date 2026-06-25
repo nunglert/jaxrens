@@ -15,6 +15,40 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _wrap_positions_np(positions: Any, cell: Any) -> np.ndarray:
+    """Wrap positions into the home cell (numpy; writer-side, jax-free).
+
+    Mirrors :func:`jaxrens.utils.cell.wrap_positions` (cell rows are lattice
+    vectors, ``positions = frac @ cell``).  No-op for a missing or degenerate
+    (non-periodic) cell, so callers can apply it unconditionally.
+    """
+    pos = np.asarray(positions, dtype=float)
+    if cell is None:
+        return pos
+    cell = np.asarray(cell, dtype=float)
+    if cell.shape != (3, 3) or abs(np.linalg.det(cell)) < 1e-12:
+        return pos
+    frac = pos @ np.linalg.inv(cell)
+    frac -= np.floor(frac)
+    return frac @ cell
+
+
+def _wrapped_walker(walker: Any, wrap: bool) -> Any:
+    """Return *walker* with positions wrapped into its own ``box``.
+
+    Only dict walkers carrying a periodic ``box`` are wrapped (the shape the
+    writers emit); anything else passes through unchanged.  Returns a shallow
+    copy so the caller's walker is not mutated.
+    """
+    if not wrap or not isinstance(walker, dict) or walker.get("box") is None:
+        return walker
+    wrapped = dict(walker)
+    wrapped["positions"] = _wrap_positions_np(
+        walker["positions"], walker["box"]
+    )
+    return wrapped
+
+
 class ExtxyzTrajectoryWriter:
     """Write dead points in extended XYZ format via ASE."""
 
@@ -45,12 +79,14 @@ class ExtxyzTrajectoryWriter:
         # Restart: rewind frames flushed past the checkpoint before appending.
         if mode == "a" and restart_iteration > 0:
             from jaxrens.io.restart_truncate import truncate_extxyz
+
             truncate_extxyz(self.path, restart_iteration)
 
     def write_dead_point(
         self, iteration: int, walker: Any, energy: float
     ) -> None:
         from ase.io import write as ase_write
+
         from jaxrens.io.formats import walker_to_ase_atoms
 
         atoms = walker_to_ase_atoms(walker, self.symbol_map)
@@ -62,12 +98,11 @@ class ExtxyzTrajectoryWriter:
         ase_write(str(self.path), atoms, append=append)
         self._first_write = False
 
-    def write_walker_snapshot(
-        self, iteration: int, walkers: Any
-    ) -> None:
+    def write_walker_snapshot(self, iteration: int, walkers: Any) -> None:
         # Write all walkers as a snapshot file
         snapshot_path = self.path.with_suffix(f".snap.{iteration}.extxyz")
         from ase.io import write as ase_write
+
         from jaxrens.io.formats import walker_to_ase_atoms
 
         positions = np.asarray(walkers["positions"])
@@ -76,10 +111,16 @@ class ExtxyzTrajectoryWriter:
 
         atoms_list = []
         for i in range(positions.shape[0]):
-            w = {"positions": positions[i], "types": types[i], "energy": energies[i]}
+            w = {
+                "positions": positions[i],
+                "types": types[i],
+                "energy": energies[i],
+            }
             if walkers.get("cells") is not None:
                 w["box"] = np.asarray(walkers["cells"])[i]
             atoms = walker_to_ase_atoms(w, self.symbol_map)
+            if self.wrap and any(atoms.get_pbc()):
+                atoms.wrap()
             atoms.info["iter"] = iteration
             atoms.info["walker_idx"] = i
             atoms_list.append(atoms)
@@ -117,6 +158,7 @@ class H5TrajectoryWriter:
         self,
         path: Path | str,
         symbol_map: dict[int, str],
+        wrap: bool = True,
         mode: str = "w",
         restart_iteration: int = 0,
         clean_snapshots: bool = False,
@@ -126,6 +168,7 @@ class H5TrajectoryWriter:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.symbol_map = symbol_map
+        self.wrap = wrap
         self._mode = mode
         self.clean_snapshots = clean_snapshots
         # Name of the most recently written snapshot group.  When
@@ -138,6 +181,7 @@ class H5TrajectoryWriter:
         # Done before opening so the append handle sees the rewound file.
         if mode == "a" and restart_iteration > 0:
             from jaxrens.io.restart_truncate import truncate_h5_traj
+
             truncate_h5_traj(self.path, restart_iteration)
         self._file = h5py.File(self.path, self._mode)
         self._file.attrs["symbol_map"] = str(symbol_map)
@@ -148,13 +192,11 @@ class H5TrajectoryWriter:
         from jaxrens.io.formats import walker_to_h5_group
 
         grp = self._file.create_group(str(iteration))
-        walker_to_h5_group(grp, walker)
+        walker_to_h5_group(grp, _wrapped_walker(walker, self.wrap))
         grp.attrs["iteration"] = iteration
         grp.attrs["energy"] = energy
 
-    def write_walker_snapshot(
-        self, iteration: int, walkers: Any
-    ) -> None:
+    def write_walker_snapshot(self, iteration: int, walkers: Any) -> None:
         from jaxrens.io.formats import walker_to_h5_group
 
         grp_name = f"snapshot_{iteration}"
@@ -180,7 +222,9 @@ class H5TrajectoryWriter:
             }
             if cells is not None:
                 w["box"] = cells[i]
-            walker_to_h5_group(grp.create_group(f"walker_{i}"), w)
+            walker_to_h5_group(
+                grp.create_group(f"walker_{i}"), _wrapped_walker(w, self.wrap)
+            )
 
         # snapshot_clean: drop the previous snapshot group now that the new
         # one is fully written, keeping only the latest in the file.
@@ -223,6 +267,8 @@ def create_trajectory_writer(
         case "h5":
             return H5TrajectoryWriter(path, symbol_map, **kwargs)
         case "none":
-            return NullTrajectoryWriter()  # ignores mode/wrap/restart_iteration kwargs
+            return (
+                NullTrajectoryWriter()
+            )  # ignores mode/wrap/restart_iteration kwargs
         case _:
             raise ValueError(f"Unknown trajectory format: {format!r}")

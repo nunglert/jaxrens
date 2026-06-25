@@ -1,26 +1,27 @@
 """Test I/O layer: formats, checkpoints, trajectory, energy log."""
 
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from pathlib import Path
 
-from jaxrens.state.walker import WalkerState
+from jaxrens.io.checkpoint import load_checkpoint, save_checkpoint
+from jaxrens.io.energy_log import EnergyLog, EnergyLogger
 from jaxrens.io.formats import (
-    walker_to_ase_atoms,
     ase_atoms_to_walker,
-    walker_to_h5_group,
     h5_group_to_walker,
+    walker_to_ase_atoms,
+    walker_to_h5_group,
 )
-from jaxrens.io.checkpoint import save_checkpoint, load_checkpoint
-from jaxrens.io.energy_log import EnergyLogger, EnergyLog
 from jaxrens.io.trajectory import (
     ExtxyzTrajectoryWriter,
-    NullTrajectoryWriter,
     H5TrajectoryWriter,
+    NullTrajectoryWriter,
     create_trajectory_writer,
 )
+from jaxrens.state.walker import WalkerState
 
 
 @pytest.fixture
@@ -105,7 +106,13 @@ class TestFormats:
 # ---------------------------------------------------------------------------
 
 
-def _make_pmap_vmap_ns_state(G: int = 1, P: int = 2, n_walkers: int = 4, n_atoms: int = 2, max_dead: int = 5):
+def _make_pmap_vmap_ns_state(
+    G: int = 1,
+    P: int = 2,
+    n_walkers: int = 4,
+    n_atoms: int = 2,
+    max_dead: int = 5,
+):
     """Construct a fake ``(G, P, ...)``-shaped NS state dict without actually running pmap.
 
     Used to test checkpoint round-trips for multi-GPU output shapes.
@@ -116,11 +123,12 @@ def _make_pmap_vmap_ns_state(G: int = 1, P: int = 2, n_walkers: int = 4, n_atoms
         "types": jnp.zeros((G, P, n_walkers, n_atoms), dtype=jnp.int32),
         "energies": jax.random.uniform(key, (G, P, n_walkers)),
         "cells": None,
-        "dead_energies": jnp.full((G, P, max_dead), jnp.inf).at[:, :, :3].set(
-            jnp.array([5.0, 4.0, 3.0])
-        ),
+        "dead_energies": jnp.full((G, P, max_dead), jnp.inf)
+        .at[:, :, :3]
+        .set(jnp.array([5.0, 4.0, 3.0])),
         "dead_positions": jnp.zeros((G, P, max_dead, n_atoms, 3)),
-        "log_evidence": jnp.full((G, P), -2.5) + jax.random.uniform(key, (G, P)) * 0.1,
+        "log_evidence": jnp.full((G, P), -2.5)
+        + jax.random.uniform(key, (G, P)) * 0.1,
         "iteration": jnp.full((G, P), 3, dtype=jnp.int32),
         "n_dead": jnp.full((G, P), 3, dtype=jnp.int32),
         "n_walkers": n_walkers,
@@ -161,14 +169,16 @@ class TestCheckpoint:
 
         loaded = load_checkpoint(path)
         # Raw uint32 buffer must be present and match the saved key's data.
-        assert loaded["rng_key_data"] is not None, (
-            "save_checkpoint must persist rng_key as 'rng_key_data'"
-        )
+        assert (
+            loaded["rng_key_data"] is not None
+        ), "save_checkpoint must persist rng_key as 'rng_key_data'"
         original_data = np.asarray(jax.random.key_data(ns_state["rng_key"]))
         assert np.array_equal(loaded["rng_key_data"], original_data)
 
         # Re-wrapped key must yield identical draws to the original key.
-        restored = jax.random.wrap_key_data(jnp.asarray(loaded["rng_key_data"]))
+        restored = jax.random.wrap_key_data(
+            jnp.asarray(loaded["rng_key_data"])
+        )
         s_orig = jax.random.uniform(ns_state["rng_key"], (5,))
         s_restored = jax.random.uniform(restored, (5,))
         assert jnp.array_equal(s_orig, s_restored)
@@ -187,9 +197,9 @@ class TestCheckpoint:
         path = tmp_path / "scalar_le.h5"
         save_checkpoint(path, ns_state)
         loaded = load_checkpoint(path)
-        assert loaded["log_evidence"].shape == (), (
-            f"Expected scalar, got shape {loaded['log_evidence'].shape}"
-        )
+        assert (
+            loaded["log_evidence"].shape == ()
+        ), f"Expected scalar, got shape {loaded['log_evidence'].shape}"
         assert jnp.allclose(loaded["log_evidence"], ns_state["log_evidence"])
 
     # ------------------------------------------------------------------
@@ -206,11 +216,11 @@ class TestCheckpoint:
             "types": jnp.zeros((n_runs, n_walkers, n_atoms), dtype=jnp.int32),
             "energies": jax.random.uniform(key, (n_runs, n_walkers)),
             "cells": None,
-            "dead_energies": jnp.full((n_runs, max_dead), jnp.inf).at[:, :3].set(
-                jnp.array([5.0, 4.0, 3.0])
-            ),
+            "dead_energies": jnp.full((n_runs, max_dead), jnp.inf)
+            .at[:, :3]
+            .set(jnp.array([5.0, 4.0, 3.0])),
             "dead_positions": jnp.zeros((n_runs, max_dead, n_atoms, 3)),
-            "log_evidence": jnp.array([-2.5, -3.0]),   # (n_runs,)
+            "log_evidence": jnp.array([-2.5, -3.0]),  # (n_runs,)
             "iteration": jnp.array([3, 3], dtype=jnp.int32),
             "n_dead": jnp.array([3, 3], dtype=jnp.int32),
             "n_walkers": n_walkers,
@@ -220,9 +230,9 @@ class TestCheckpoint:
         save_checkpoint(path, state)
         loaded = load_checkpoint(path)
 
-        assert loaded["log_evidence"].shape == (n_runs,), (
-            f"Expected (n_runs,), got {loaded['log_evidence'].shape}"
-        )
+        assert loaded["log_evidence"].shape == (
+            n_runs,
+        ), f"Expected (n_runs,), got {loaded['log_evidence'].shape}"
         assert jnp.allclose(loaded["log_evidence"], state["log_evidence"])
         assert loaded["n_dead"].shape == (n_runs,)
         assert loaded["dead_energies"].shape == (n_runs, max_dead)
@@ -239,9 +249,10 @@ class TestCheckpoint:
         save_checkpoint(path, state)
         loaded = load_checkpoint(path)
 
-        assert loaded["log_evidence"].shape == (G, P), (
-            f"Expected ({G}, {P}), got {loaded['log_evidence'].shape}"
-        )
+        assert loaded["log_evidence"].shape == (
+            G,
+            P,
+        ), f"Expected ({G}, {P}), got {loaded['log_evidence'].shape}"
 
     def test_pmap_vmap_log_evidence_value_roundtrip(self, tmp_path):
         """PmapVmapRuns state: log_evidence values are preserved."""
@@ -264,9 +275,10 @@ class TestCheckpoint:
         loaded = load_checkpoint(path)
 
         n_dead_np = np.asarray(loaded["n_dead"])
-        assert n_dead_np.shape == (G, P), (
-            f"Expected n_dead shape ({G}, {P}), got {n_dead_np.shape}"
-        )
+        assert n_dead_np.shape == (
+            G,
+            P,
+        ), f"Expected n_dead shape ({G}, {P}), got {n_dead_np.shape}"
 
     def test_pmap_vmap_dead_energies_shape_roundtrip(self, tmp_path):
         """PmapVmapRuns state: dead_energies shape (G, P, max_dead) preserved."""
@@ -276,9 +288,11 @@ class TestCheckpoint:
         save_checkpoint(path, state)
         loaded = load_checkpoint(path)
 
-        assert loaded["dead_energies"].shape == (G, P, max_dead), (
-            f"Expected ({G}, {P}, {max_dead}), got {loaded['dead_energies'].shape}"
-        )
+        assert loaded["dead_energies"].shape == (
+            G,
+            P,
+            max_dead,
+        ), f"Expected ({G}, {P}, {max_dead}), got {loaded['dead_energies'].shape}"
         # First 3 entries per run match stored values.
         assert jnp.allclose(
             loaded["dead_energies"][:, :, :3],
@@ -293,11 +307,15 @@ class TestCheckpoint:
         loaded = load_checkpoint(path)
 
         assert jnp.allclose(
-            loaded["dead_energies"], state["dead_energies"],
-            equal_nan=True,   # inf == inf under allclose
+            loaded["dead_energies"],
+            state["dead_energies"],
+            equal_nan=True,  # inf == inf under allclose
         ) or jnp.all(
             (loaded["dead_energies"] == state["dead_energies"])
-            | (jnp.isinf(loaded["dead_energies"]) & jnp.isinf(state["dead_energies"]))
+            | (
+                jnp.isinf(loaded["dead_energies"])
+                & jnp.isinf(state["dead_energies"])
+            )
         )
 
 
@@ -355,6 +373,53 @@ class TestTrajectoryWriters:
             assert "0" in f
             assert "1" in f
             assert "2" in f
+
+    def _drifted_walker(self):
+        # One atom sitting 2 cells (8 Å) outside a 4 Å cubic box on x.
+        return {
+            "positions": np.array([[9.0, 0.5, 0.5]]),
+            "types": np.array([0]),
+            "energy": 0.0,
+            "box": 4.0 * np.eye(3),
+        }
+
+    def _read_h5_pos(self, path):
+        import h5py
+
+        with h5py.File(path, "r") as f:
+            return np.asarray(f["0"]["positions"][:])
+
+    def test_h5_wrap_true_wraps_into_cell(self, tmp_path, symbol_map):
+        path = tmp_path / "wrap.h5"
+        writer = H5TrajectoryWriter(path, symbol_map, wrap=True)
+        writer.write_dead_point(0, self._drifted_walker(), 0.0)
+        writer.close()
+        pos = self._read_h5_pos(path)
+        # 9.0 mod 4.0 -> 1.0; all coords land in [0, 4).
+        np.testing.assert_allclose(pos[0], [1.0, 0.5, 0.5], atol=1e-5)
+
+    def test_h5_wrap_false_keeps_absolute(self, tmp_path, symbol_map):
+        path = tmp_path / "nowrap.h5"
+        writer = H5TrajectoryWriter(path, symbol_map, wrap=False)
+        writer.write_dead_point(0, self._drifted_walker(), 0.0)
+        writer.close()
+        pos = self._read_h5_pos(path)
+        np.testing.assert_allclose(pos[0], [9.0, 0.5, 0.5], atol=1e-5)
+
+    def test_h5_factory_accepts_wrap(self, tmp_path, symbol_map):
+        """Regression: the run path passes ``wrap=`` to every format; h5 must
+        accept it (it previously raised TypeError)."""
+        writer = create_trajectory_writer(
+            "h5",
+            tmp_path / "f.h5",
+            symbol_map,
+            wrap=True,
+            mode="w",
+            restart_iteration=0,
+            clean_snapshots=False,
+        )
+        assert isinstance(writer, H5TrajectoryWriter)
+        writer.close()
 
     def test_create_factory(self, tmp_path, symbol_map):
         writer = create_trajectory_writer("none", tmp_path / "x", symbol_map)
@@ -437,7 +502,9 @@ class TestH5WalkerSnapshot:
 
     @staticmethod
     def _snap_groups(writer):
-        return sorted(k for k in writer._file.keys() if k.startswith("snapshot_"))
+        return sorted(
+            k for k in writer._file.keys() if k.startswith("snapshot_")
+        )
 
     def test_writes_full_walker(self, tmp_path, symbol_map):
         """Snapshot must carry the whole walker (positions, types, energy,

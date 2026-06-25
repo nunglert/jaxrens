@@ -118,10 +118,14 @@ class OutputSpec(BaseModel):
         ),
     )
 
-    # Whether ``ExtxyzTrajectoryWriter`` wraps dead-point atom positions into
-    # the dead walker's own cell before writing.  Default False keeps absolute
-    # Cartesians so off-the-shelf viewers don't show boundary-wrap artifacts.
-    wrap_atoms: bool = False
+    # Whether trajectory writers wrap atom positions into each frame's own
+    # cell before writing.  Default True: atoms drift arbitrarily far from the
+    # cell over a run (moves are unwrapped Cartesian), so absolute Cartesians
+    # produce trajectories with atoms scattered across many cell lengths.
+    # Wrapping is a no-op for non-periodic frames (no cell / det≈0).  Set False
+    # to keep absolute Cartesians (e.g. to avoid splitting a molecule that
+    # straddles a periodic boundary).
+    wrap_atoms: bool = True
 
     # When True (default), only the most recent walker snapshot
     # (``*.snap.<iter>.extxyz``) is kept: the previous one is deleted as soon

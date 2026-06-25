@@ -16,3 +16,7 @@
 - trial_batch_size in auto stepsize handler? Did we resolve that problem?
 
 - re_stats plot in CLI is outdated
+
+- Do we carefully obey a walker state contract? Check this. We shouldnt switch arbitrarily between dict and WalkerState
+
+- 

@@ -184,12 +184,40 @@ class TestRun:
         )
         assert (tmp_path / "ns.traj.extxyz").exists()
 
-    # NOTE: ``format='h5'`` is intentionally untested here.  The dispatch
-    # in ``run.py:367`` forwards ``wrap=output_config.wrap_atoms`` to
-    # ``H5TrajectoryWriter.__init__`` which doesn't accept that kwarg —
-    # a pre-existing bug surfaced by a quick check while authoring this
-    # file.  Fixing it is out of scope for the coverage uplift; the
-    # extxyz test above already exercises the writer-factory dispatch.
+    def test_run_from_config_format_h5(self, tmp_path):
+        """``format='h5'`` writes a ``.traj.h5`` file.
+
+        Regression: the run path forwards ``wrap=output.wrap_atoms`` to every
+        writer; ``H5TrajectoryWriter`` previously didn't accept ``wrap`` and
+        raised TypeError, so ``format: h5`` crashed at writer construction.
+        """
+        ns_config = NSConfig(
+            n_live=12, max_iterations=10, n_mcmc_steps=2, seed=0
+        )
+        move_config = MoveConfig(move_type="random_walk", step_size=0.3)
+        backend_config = BackendConfig(backend_type="harmonic")
+        output_config = OutputConfig(
+            format="h5",
+            working_dir=tmp_path,
+            info_interval=999,
+            traj_interval=1,
+            snapshot_interval=999,
+            temperature_lag_interval=None,
+        )
+        key = jax.random.key(4)
+        positions = jax.random.uniform(
+            key, (12, 1, 3), minval=-3.0, maxval=3.0
+        )
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        run_from_config(
+            ns_config,
+            move_config,
+            backend_config,
+            output_config,
+            initial_positions=positions,
+            initial_types=types,
+        )
+        assert (tmp_path / "ns.traj.h5").exists()
 
     def test_run_from_config_with_optional_loggers(self, tmp_path):
         """``save_acc_rates`` and ``save_max_neighbors`` flags + a

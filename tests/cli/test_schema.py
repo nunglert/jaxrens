@@ -1047,7 +1047,7 @@ class TestExtendedOutputSpec:
 
         schema = OutputSpec()
         assert schema.snapshot_clean is True
-        assert schema.wrap_atoms is False
+        assert schema.wrap_atoms is True
         # save_acc_rates was promoted out of deferred into a real field.
         assert schema.save_acc_rates is False
         assert schema.acc_rates_interval == 1
