@@ -41,7 +41,10 @@ def _git_sha() -> str | None:
     try:
         out = subprocess.run(
             ["git", "-C", str(REPO_ROOT), "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, check=True, timeout=2,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=2,
         )
         return out.stdout.strip()
     except (subprocess.SubprocessError, FileNotFoundError):
@@ -52,7 +55,10 @@ def _git_dirty() -> bool | None:
     try:
         out = subprocess.run(
             ["git", "-C", str(REPO_ROOT), "status", "--porcelain"],
-            capture_output=True, text=True, check=True, timeout=2,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=2,
         )
         return bool(out.stdout.strip())
     except (subprocess.SubprocessError, FileNotFoundError):
@@ -65,6 +71,7 @@ def _env_fingerprint() -> dict:
 
     try:
         import jaxrens
+
         jaxrens_version = getattr(jaxrens, "__version__", "unknown")
     except ImportError:
         jaxrens_version = "unknown"
@@ -81,7 +88,9 @@ def _env_fingerprint() -> dict:
     }
 
 
-def _run_bench(backend_name: str, config_path: Path, n_timed_steps: int) -> dict:
+def _run_bench(
+    backend_name: str, config_path: Path, n_timed_steps: int
+) -> dict:
     """Build → cold call → warm steady-state.  Return the row dict."""
     # Imports deferred to inside the function so a missing optional dep
     # (e.g. mace_jax) raises ImportError here, where the caller catches
@@ -89,8 +98,9 @@ def _run_bench(backend_name: str, config_path: Path, n_timed_steps: int) -> dict
     import jax
     import jax.numpy as jnp
 
-    from jaxrens.backends.ensemble import EnsembleBackend, make_ensemble_params
+    from jaxrens.backends.ensemble import EnsembleBackend
     from jaxrens.cli.resolve import resolve
+    from jaxrens.cli.run import _to_runtime_ensemble_params
     from jaxrens.cli.schema import RootSpec
     from jaxrens.sampling.batch_descriptor import SingleRun
     from jaxrens.sampling.mwg import build_mwg
@@ -106,15 +116,19 @@ def _run_bench(backend_name: str, config_path: Path, n_timed_steps: int) -> dict
     root = RootSpec.model_validate(yaml.safe_load(config_path.read_text()))
     resolved = resolve(root)
 
-    # Wrap with EnsembleBackend exactly as cli/run.py:271-276 does.
-    pressure = resolved.ns.pressure
+    # Wrap with EnsembleBackend exactly as cli/run.py:run_from_config does:
+    # take the resolved per-run ensemble params (NVT, NPT, or semi-grand μPT)
+    # and wrap the base backend once when any are present.
     base_backend = resolved.base_backend
-    if pressure:
-        step_backend = EnsembleBackend(base_backend, pressure=float(pressure))
-        ensemble_params = make_ensemble_params(pressure=float(pressure))
+    ensemble_params = _to_runtime_ensemble_params(
+        resolved.ensemble_params_per_run[0]
+        if resolved.ensemble_params_per_run
+        else None
+    )
+    if ensemble_params is not None:
+        step_backend = EnsembleBackend(base_backend, pressure=0.0)
     else:
         step_backend = base_backend
-        ensemble_params = None
 
     init_fn, step_fn, _per_move_fns = build_mwg(
         step_backend, list(resolved.move_descriptors)
@@ -124,7 +138,9 @@ def _run_bench(backend_name: str, config_path: Path, n_timed_steps: int) -> dict
     ladder = tuple(int(x) for x in resolved.backend.max_neighbors_list)
     offset = int(resolved.backend.max_neighbors_offset)
     starting_bucket = _choose_starting_bucket(
-        init.initial_max_neighbor_counts, ladder, offset,
+        init.initial_max_neighbor_counts,
+        ladder,
+        offset,
     )
 
     key = jax.random.key(resolved.ns.seed)
@@ -147,7 +163,10 @@ def _run_bench(backend_name: str, config_path: Path, n_timed_steps: int) -> dict
     # — i.e. exactly the call pattern `run_loop._run_loop` uses.
     batcher = SingleRun()
     jit_step = batcher.wrap_step(
-        ns_step, step_fn, resolved.ns.n_mcmc_steps, resolved.ns.n_extra,
+        ns_step,
+        step_fn,
+        resolved.ns.n_mcmc_steps,
+        resolved.ns.n_extra,
     )
 
     t_setup = time.perf_counter() - t_setup_start
@@ -174,7 +193,9 @@ def _run_bench(backend_name: str, config_path: Path, n_timed_steps: int) -> dict
     # ---- Build row ----------------------------------------------------------
     n_atoms = int(init.initial_positions.shape[-2])
     row = {
-        "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "timestamp_utc": datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
         "git_sha": _git_sha(),
         "git_dirty": _git_dirty(),
         "backend": backend_name,
@@ -186,7 +207,11 @@ def _run_bench(backend_name: str, config_path: Path, n_timed_steps: int) -> dict
             "n_extra": int(n_extra),
             "n_moves": len(resolved.move_descriptors),
             "starting_bucket": int(starting_bucket),
-            "pressure_eva3": float(pressure) if pressure else None,
+            "pressure_eva3": (
+                float(ensemble_params["pressure"])
+                if ensemble_params and "pressure" in ensemble_params
+                else None
+            ),
         },
         "n_warmup_steps": 1,
         "n_timed_steps": n_timed_steps,
@@ -212,12 +237,23 @@ def _append_row(row: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", required=True,
-                        help="Backend label (used for the result row).")
-    parser.add_argument("--config", required=True, type=Path,
-                        help="Path to the bench YAML for this backend.")
-    parser.add_argument("--n-timed-steps", type=int, default=50,
-                        help="Steady-state iterations after the cold call.")
+    parser.add_argument(
+        "--backend",
+        required=True,
+        help="Backend label (used for the result row).",
+    )
+    parser.add_argument(
+        "--config",
+        required=True,
+        type=Path,
+        help="Path to the bench YAML for this backend.",
+    )
+    parser.add_argument(
+        "--n-timed-steps",
+        type=int,
+        default=50,
+        help="Steady-state iterations after the cold call.",
+    )
     args = parser.parse_args(argv)
 
     if not args.config.exists():
@@ -225,15 +261,21 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        row = _run_bench(args.backend, args.config.resolve(), args.n_timed_steps)
+        row = _run_bench(
+            args.backend, args.config.resolve(), args.n_timed_steps
+        )
     except ImportError as e:
-        print(f"[bench] skip {args.backend}: missing dep — {e}", file=sys.stderr)
+        print(
+            f"[bench] skip {args.backend}: missing dep — {e}", file=sys.stderr
+        )
         return 77
     except FileNotFoundError as e:
         # Model-fixture path (neuralil .pkl, nequix model dir).  Surfaces here
         # when the resolver instantiates the backend.
-        print(f"[bench] skip {args.backend}: missing fixture — {e}",
-              file=sys.stderr)
+        print(
+            f"[bench] skip {args.backend}: missing fixture — {e}",
+            file=sys.stderr,
+        )
         return 77
 
     _append_row(row)
