@@ -14,24 +14,48 @@ def get_volume(cell: jnp.ndarray) -> jnp.ndarray:
     return jnp.abs(jnp.linalg.det(cell))
 
 
-def min_perpendicular_distance(cell: jnp.ndarray) -> jnp.ndarray:
-    """Minimum perpendicular distance between opposite faces of the parallelepiped.
+def wrap_positions(positions: jnp.ndarray, cell: jnp.ndarray) -> jnp.ndarray:
+    """Wrap atom positions into the home unit cell (fractional coords in [0, 1)).
 
-    For each pair of opposite faces (perpendicular to lattice vector i), the
-    inter-face distance is V / ||b_j × b_k||. Returns the minimum over the
-    three pairs — this is the tightest dimension of the cell, the relevant
-    quantity for the minimum image convention (MIC needs r_cut ≤ ½ · this).
+    Graph backends (MACE/nequix) find neighbors via a *finite* supercell image
+    set (e.g. ``n in {-1,0,1}^3``).  That set is only complete when every atom
+    sits in (or within one cell of) the home cell, so atoms that have drifted
+    out of the cell — which they do under unwrapped Cartesian moves over a long
+    NS run — would silently lose edges and get a wrong, position-origin-dependent
+    energy.  Wrapping restores the lattice-translation invariance the periodic
+    energy must have.
+
+    Convention matches the rest of this module: ``cell`` rows are lattice
+    vectors and positions are row vectors, so ``frac = positions @ inv(cell)``
+    and ``positions = frac @ cell``.
+
+    Properties:
+    * **Grad-safe:** ``floor`` has zero gradient, so ``d(wrapped)/d(positions)``
+      is the identity almost everywhere — forces (galilean/HMC) are unchanged.
+    * **Degenerate-cell-safe:** non-periodic systems pass ``cell == 0`` (or a
+      dummy ``safe_cell``); for any singular cell this is a no-op, and the
+      ``inv`` of the singular branch is masked so no NaNs leak through.
+
+    Args:
+        positions: (N, 3) Cartesian positions.
+        cell: (3, 3) cell matrix, rows are lattice vectors.
+
+    Returns:
+        (N, 3) positions wrapped into the home cell, or ``positions`` unchanged
+        when ``cell`` is degenerate (|det| ~ 0).
     """
-    volume = get_volume(cell)
-    cross_bc = jnp.cross(cell[1], cell[2])
-    cross_ca = jnp.cross(cell[2], cell[0])
-    cross_ab = jnp.cross(cell[0], cell[1])
-    norms = jnp.stack([
-        jnp.linalg.norm(cross_bc),
-        jnp.linalg.norm(cross_ca),
-        jnp.linalg.norm(cross_ab),
-    ])
-    return volume / jnp.max(norms)
+    det = jnp.linalg.det(cell)
+    periodic = jnp.abs(det) > 1e-12
+    safe_cell = jnp.where(periodic, cell, jnp.eye(3))
+    inv_cell = jnp.linalg.inv(safe_cell)
+    frac = jnp.einsum(
+        "ij,jk->ik", positions, inv_cell, precision=jax.lax.Precision.HIGHEST
+    )
+    frac = frac - jnp.floor(frac)
+    wrapped = jnp.einsum(
+        "ij,jk->ik", frac, cell, precision=jax.lax.Precision.HIGHEST
+    )
+    return jnp.where(periodic, wrapped, positions)
 
 
 def min_aspect_ratio(cell: jnp.ndarray, volume: jnp.ndarray) -> jnp.ndarray:
@@ -104,4 +128,6 @@ def transform_positions(
     T = get_cell_transformation(new_cell, old_cell)
     # HIGHEST precision: TF32 (10-bit mantissa on GPU) corrupts positions@T
     # by ~3.7e-3 even for identity T, spiking LJ energy at dense packing.
-    return jnp.einsum("ij,jk->ik", positions, T, precision=jax.lax.Precision.HIGHEST)
+    return jnp.einsum(
+        "ij,jk->ik", positions, T, precision=jax.lax.Precision.HIGHEST
+    )

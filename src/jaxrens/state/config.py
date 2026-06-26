@@ -1,7 +1,7 @@
 """Configuration dataclasses for jaxrens.
 
 Frozen dataclasses replace dict/file-based configuration in the library core.
-CLI-level file parsing (reading ns.inp, YAML, etc.) is in cli/parser.py.
+CLI-level YAML parsing and validation lives in cli/schema/ and cli/resolve.py.
 """
 
 from __future__ import annotations
@@ -126,11 +126,11 @@ class OutputConfig:
     collision_check_threshold: float | None = None
     collision_check_interval: int = 100
 
-    # Whether ``ExtxyzTrajectoryWriter`` wraps dead-point atom positions into
-    # the (correct, dead-walker-own) cell before writing.  Default False
-    # keeps absolute Cartesians so off-the-shelf viewers don't show
-    # boundary-wrap artifacts; set True if you want all atoms inside ``[0,L)``.
-    wrap_atoms: bool = False
+    # Whether trajectory writers wrap atom positions into each frame's own
+    # cell before writing.  Default True because atoms drift far from the cell
+    # over a run (moves are unwrapped Cartesian); no-op for non-periodic
+    # frames.  Set False to keep absolute Cartesians.
+    wrap_atoms: bool = True
 
     # When True, ``ExtxyzTrajectoryWriter`` deletes the previous walker
     # snapshot right after the next one is written, keeping at most one
@@ -205,9 +205,6 @@ class NSConfig:
     n_extra: int = 0
     n_cull: int = 1
     seed: int = 42
-
-    # Ensemble
-    pressure: float | None = None  # pressure for NPT ensemble (None = NVT)
 
     # Inter-replica exchange (optional; None → disabled)
     inter_re: InterREConfig | None = None

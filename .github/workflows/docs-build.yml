@@ -57,3 +57,15 @@ jobs:
         with:
           name: docs-html
           path: docs/_build/html
+deploy:
+  # Only publish from main — never from PRs (forks can't get the Pages token anyway).
+  if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+  needs: build
+  runs-on: ubuntu-latest
+  environment:
+    name: github-pages
+    url: ${{ steps.deployment.outputs.page_url }}
+  steps:
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4

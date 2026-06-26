@@ -14,58 +14,27 @@ duplicate registration.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
 
-import jax
 import jax.numpy as jnp
 
-from jaxrens.state.walker import static_field
-
+from jaxrens.state.walker import register_dataclass_pytree, static_field
 
 # ---------------------------------------------------------------------------
-# Generic pytree helpers (work on any dataclass with static_field metadata)
+# MCState-specific helper
 # ---------------------------------------------------------------------------
-
-
-def _generic_flatten(obj):
-    """Flatten a dataclass into pytree leaves + aux data."""
-    leaves = []
-    aux = {}
-    for f in dataclasses.fields(obj):
-        val = getattr(obj, f.name)
-        if f.metadata.get("static", False):
-            aux[f.name] = val
-        else:
-            leaves.append(val)
-    return leaves, aux
-
-
-def _make_unflatten(cls):
-    """Create an unflatten function for a specific dataclass type."""
-    def unflatten(aux, leaves):
-        fields = dataclasses.fields(cls)
-        dynamic_fields = [f for f in fields if not f.metadata.get("static", False)]
-        kwargs = dict(aux)
-        for f, val in zip(dynamic_fields, leaves):
-            kwargs[f.name] = val
-        return cls(**kwargs)
-    return unflatten
 
 
 def _add_set_method(cls):
-    """Add a .set(**kwargs) method for functional updates."""
+    """Add a .set(**kwargs) method for functional updates.
+
+    WalkerState/NSState define ``.set`` in their class body; the dynamically
+    built MCState gets it injected here instead.
+    """
+
     def set_method(self, **kwargs):
         return dataclasses.replace(self, **kwargs)
+
     cls.set = set_method
-
-
-def _register_pytree(cls):
-    """Register a dataclass as a JAX pytree."""
-    jax.tree_util.register_pytree_node(
-        cls,
-        _generic_flatten,
-        _make_unflatten(cls),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +74,11 @@ def make_mc_state_class(extra_fields: dict[str, type] | None = None) -> type:
         ("n_accepted", jnp.ndarray),
         ("n_proposed", jnp.ndarray),
         ("max_neighbor_count", jnp.ndarray),  # actual max neighbors observed
-        ("overflow", jnp.ndarray),            # bool — any overflow detected
-        ("ensemble_params", dict),            # e.g. {"pressure": scalar, "mu": (n_species,)}
+        ("overflow", jnp.ndarray),  # bool — any overflow detected
+        (
+            "ensemble_params",
+            dict,
+        ),  # e.g. {"pressure": scalar, "chemical_potentials": (n_species,)}
     ]
 
     # Move-specific fields
@@ -120,7 +92,7 @@ def make_mc_state_class(extra_fields: dict[str, type] | None = None) -> type:
 
     cls = dataclasses.make_dataclass("MCState", core + extra + static)
     _add_set_method(cls)
-    _register_pytree(cls)
+    register_dataclass_pytree(cls)
 
     _MC_STATE_CACHE[cache_key] = cls
     return cls

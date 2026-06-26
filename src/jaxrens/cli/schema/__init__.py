@@ -1,10 +1,9 @@
 """Pydantic v2 schemas for jaxrens YAML configuration."""
 
 import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
-
 from jaxrens.cli.schema.adaptation import (
-    AdaptationSpec,
     AdaptationPolicy,
+    AdaptationSpec,
     ResolvedAdaptationPolicy,
 )
 from jaxrens.cli.schema.backend import (
@@ -23,8 +22,9 @@ from jaxrens.cli.schema.ensemble import (
     EnsembleSpec,
     NPTEnsembleSpec,
     NVTEnsembleSpec,
+    SemiGrandEnsembleSpec,
 )
-from jaxrens.cli.schema.init import InitSpec, InitialWalkSpec
+from jaxrens.cli.schema.init import InitialWalkSpec, InitSpec
 from jaxrens.cli.schema.moves import (
     AlchemicalMorphMoveSpec,
     AlchemicalShiftMoveSpec,
@@ -36,8 +36,8 @@ from jaxrens.cli.schema.moves import (
     RandomWalkMoveSpec,
     ShearMoveSpec,
     SingleAtomMoveSpec,
-    SingleAtomSweepMoveSpec,
     SingleAtomSwapMoveSpec,
+    SingleAtomSweepMoveSpec,
     StretchMoveSpec,
     VolumeMoveSpec,
 )
@@ -80,6 +80,7 @@ __all__ = [
     "MoveType",
     "NPTEnsembleSpec",
     "NVTEnsembleSpec",
+    "SemiGrandEnsembleSpec",
     "NeuralILBackendSpec",
     "OutputSpec",
     "PriorMassTerminationSpec",

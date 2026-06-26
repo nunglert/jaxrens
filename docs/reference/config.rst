@@ -192,3 +192,31 @@ entirely.
 
 .. autopydantic_model:: jaxrens.cli.schema.inter_re.InterRESpec
    :field-show-constraints: true
+
+
+Constraints
+-----------
+
+The ``constraints:`` key takes a list of hard configuration constraints (a
+single mapping is wrapped in a list).  Each entry's ``type:`` selects one of
+the variants below.  A constraint rejects any proposal that would move a
+walker into a forbidden region, exactly like the likelihood threshold; it is
+enforced only on the moves that can actually violate it (e.g. a
+minimum-distance constraint gates atom-displacement and cell moves, and gates
+species-changing moves only when its thresholds vary by element pair).
+
+Omitting the key (the default) means no constraints and zero overhead.
+
+.. code-block:: yaml
+
+   constraints:
+     - type: minimum_distance
+       d_min: 0.8                 # uniform floor (Angstrom)
+     - type: minimum_distance
+       d_min:                     # per-species-pair floors
+         default: 1.0
+         Si-Si: 2.0
+         Si-O: 1.6
+
+.. autopydantic_model:: jaxrens.cli.schema.constraints.MinDistanceConstraintSpec
+   :field-show-constraints: true

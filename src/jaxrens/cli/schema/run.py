@@ -27,7 +27,6 @@ class RunSpec(BaseModel):
     n_extra: int = 0
     n_cull: int = 1
     seed: int = 42
-    pressure: Optional[float] = None
     shard_n_gpu: int = Field(
         default=1,
         ge=1,

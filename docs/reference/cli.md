@@ -1,8 +1,8 @@
 # CLI reference
 
 `jaxrens` is installed as a console script (`jaxrens`) and as
-`python -m jaxrens.cli.cli`. Five subcommands are available:
-`run`, `validate`, `dump-schema`, `migrate-ns-inp`, and `plot`.
+`python -m jaxrens.cli.cli`. Four subcommands are available:
+`run`, `validate`, `dump-schema`, and `plot`.
 
 Before the per-command details: every CLI invocation flows through
 the **schema → resolve → run** pipeline — pydantic validates the
@@ -84,21 +84,6 @@ autocomplete (point your YAML LSP at the generated schema).
 ```bash
 jaxrens dump-schema --format json > jaxrens.schema.json
 ```
-
-## `jaxrens migrate-ns-inp`
-
-Convert a legacy pymatnest / jaxnest `ns.inp` key=value file into a
-jaxrens YAML config.
-
-```bash
-jaxrens migrate-ns-inp -i old_run/ns.inp -o new_run/config.yaml
-jaxrens migrate-ns-inp -i ns.inp -o - --validate
-```
-
-Passing `--validate` round-trips the generated YAML through the
-schema to confirm the migration produced a usable config.
-Unknown/unsupported keys emit warnings but do not fail; check the
-output log to see what was dropped.
 
 ## `jaxrens plot`
 

@@ -39,9 +39,11 @@ class TestFindWorstWalker:
             selections.add(int(idx))
 
         # All three tied walkers should be selected at least once
-        assert selections == {1, 2, 3}, (
-            f"Tie-breaking should be uniform; only selected indices {selections}"
-        )
+        assert selections == {
+            1,
+            2,
+            3,
+        }, f"Tie-breaking should be uniform; only selected indices {selections}"
 
     def test_tie_breaking_all_equal(self):
         """When all walkers have equal energy, any can be selected."""
@@ -66,14 +68,8 @@ class TestFindWorstWalker:
     def test_near_ties_not_collapsed(self):
         """Walkers within float ULP but not exactly equal are not tied.
 
-        Regression for the old `isclose(rtol=1e-7)` tie window: distinct
-        float values that fell inside the relative tolerance used to be
-        treated as ties, and the function could return ``potentials[idx]``
-        from a non-strict-max walker. Then a survivor with energy higher
-        than the reported `potential_max` would resurface the next
-        iteration as the new worst, raising the reported emax and
-        triggering monitor warnings. The new contract — exact equality
-        for ties, strict max as the returned value — eliminates both.
+        Contract: exact equality for ties, strict max as the returned value —
+        so a non-strict-max walker is never reported as ``potential_max``.
         """
         # Two walkers within float32 rtol but distinct floats.
         energies = jnp.array([-105.213005, -105.212997], dtype=jnp.float32)

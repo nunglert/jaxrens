@@ -12,11 +12,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
 from jaxrens.state.ns import NSState
 from jaxrens.utils.cell import get_volume
 
@@ -53,11 +53,14 @@ def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
 
     Handles single-run scalar shapes (``iteration`` / ``n_dead`` as Python
     ints) and batched multi-run shapes (``(G, P)`` or ``(n_runs,)``) by
-    keeping batched scalars as arrays; ``save_checkpoint`` is batched-safe
-    since WORKLOG 2026-04-18 Task A.
+    keeping batched scalars as arrays; ``save_checkpoint`` is batched-safe.
     """
     pop = ns_state.population
-    ep = ns_state.population.ensemble_params if hasattr(ns_state.population, "ensemble_params") else {}
+    ep = (
+        ns_state.population.ensemble_params
+        if hasattr(ns_state.population, "ensemble_params")
+        else {}
+    )
     is_npt = isinstance(ep, dict) and "pressure" in ep
 
     it_arr = jnp.asarray(ns_state.iteration)
@@ -71,6 +74,7 @@ def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
         "types": pop.types,
         "energies": pop.energy,
         "cells": pop.cell,
+        "step_sizes": pop.step_sizes,
         "log_evidence": ns_state.log_evidence,
         "iteration": iteration,
         "emax": ns_state.emax,
@@ -147,7 +151,9 @@ def _format_reject_breakdown(
 
     # Check if the declared reasons account for all rejects; if not, something
     # emitted an undeclared reason — flag it without hiding the data.
-    n_accounted = sum(int(c[_BUCKET_IDX[r]]) for r in reasons_used if r in _BUCKET_IDX)
+    n_accounted = sum(
+        int(c[_BUCKET_IDX[r]]) for r in reasons_used if r in _BUCKET_IDX
+    )
     if n_accounted < n_rej:
         parts.append(f"???={n_rej - n_accounted}")
 
@@ -238,7 +244,8 @@ class ProgressCallback:
         if batched:
             emax_arr = jnp.asarray(info.get("emax", 0))
             log_z_arr = jnp.asarray(
-                ns_state.log_evidence if isinstance(ns_state, NSState)
+                ns_state.log_evidence
+                if isinstance(ns_state, NSState)
                 else info.get("log_evidence", float("-inf"))
             )
             header = (
@@ -250,7 +257,8 @@ class ProgressCallback:
             )
         else:
             log_z = float(
-                ns_state.log_evidence if isinstance(ns_state, NSState)
+                ns_state.log_evidence
+                if isinstance(ns_state, NSState)
                 else info.get("log_evidence", float("-inf"))
             )
             header = (
@@ -262,19 +270,29 @@ class ProgressCallback:
             )
 
         # ---- per-move rows -----------------------------------------------
-        ss_per_move = info.get("step_sizes_per_move")    # (n_moves,) or (n_runs, n_moves)
+        ss_per_move = info.get(
+            "step_sizes_per_move"
+        )  # (n_moves,) or (n_runs, n_moves)
         move_names = info.get("move_names")
         # Tuple of frozensets: which reject-reason buckets each move can emit.
         # None when not provided (e.g. legacy callers or run_ns_parallel).
-        move_reject_reasons = info.get("move_reject_reasons")  # tuple[frozenset] | None
+        move_reject_reasons = info.get(
+            "move_reject_reasons"
+        )  # tuple[frozenset] | None
 
         # Chain-level acceptance: always present from ns_step (preferred).
         # Fall back to trial-phase acceptance_rates_per_move for backward compat.
-        n_accepted_per_move = info.get("n_accepted_per_move")   # (n_moves,) int32
-        n_proposed_per_move = info.get("n_proposed_per_move")   # (n_moves,) int32
+        n_accepted_per_move = info.get(
+            "n_accepted_per_move"
+        )  # (n_moves,) int32
+        n_proposed_per_move = info.get(
+            "n_proposed_per_move"
+        )  # (n_moves,) int32
         # reject_reason_counts_per_move[:, 0] = accepted,
         #   [:, 1] = energy reject, [:, 2] = cell reject, [:, 3] = prior reject.
-        rr_counts_per_move = info.get("reject_reason_counts_per_move")  # (n_moves, 4) or None
+        rr_counts_per_move = info.get(
+            "reject_reason_counts_per_move"
+        )  # (n_moves, 4) or None
 
         lines = [header]
         if ss_per_move is not None:
@@ -284,11 +302,18 @@ class ProgressCallback:
                 move_names = [f"move_{i}" for i in range(n_moves)]
 
             # Build per-move acceptance rates from chain-level counts when available.
-            if n_accepted_per_move is not None and n_proposed_per_move is not None:
+            if (
+                n_accepted_per_move is not None
+                and n_proposed_per_move is not None
+            ):
                 n_acc = jnp.asarray(n_accepted_per_move)
                 n_prop = jnp.asarray(n_proposed_per_move)
                 acc_per_move = n_acc / jnp.maximum(n_prop, 1)
-                rc = jnp.asarray(rr_counts_per_move) if rr_counts_per_move is not None else None
+                rc = (
+                    jnp.asarray(rr_counts_per_move)
+                    if rr_counts_per_move is not None
+                    else None
+                )
             else:
                 # Backward compat: trial-phase rates from the adapt step.
                 trial_acc = info.get("acceptance_rates_per_move")
@@ -298,7 +323,11 @@ class ProgressCallback:
                 else:
                     acc_per_move = trial_acc
                     reject_counts = info.get("reject_counts_per_move")
-                    rc = jnp.asarray(reject_counts) if reject_counts is not None else None
+                    rc = (
+                        jnp.asarray(reject_counts)
+                        if reject_counts is not None
+                        else None
+                    )
 
             if acc_per_move is not None:
                 acc = jnp.asarray(acc_per_move)
@@ -311,32 +340,49 @@ class ProgressCallback:
                     # Flatten leading shape-prefix dims to a single (n_runs,) axis.
                     # Prefer the batcher when present; legacy callers without
                     # info["_batcher"] fall back to a plain reshape.
-                    batcher = info.get("_batcher") if info is not None else None
+                    batcher = (
+                        info.get("_batcher") if info is not None else None
+                    )
                     if batcher is not None:
                         ss_flat = batcher.flatten(ss)
                         acc_flat = batcher.flatten(acc)
-                        rc_flat = batcher.flatten(jnp.asarray(rc)) if rc is not None else None
+                        rc_flat = (
+                            batcher.flatten(jnp.asarray(rc))
+                            if rc is not None
+                            else None
+                        )
                     else:
                         n_moves_here = ss.shape[-1]
                         ss_flat = ss.reshape(-1, n_moves_here)
                         acc_flat = acc.reshape(-1, n_moves_here)
                         rc_flat = (
                             jnp.asarray(rc).reshape(-1, n_moves_here, 4)
-                            if rc is not None else None
+                            if rc is not None
+                            else None
                         )
                     ss_mean = jnp.mean(ss_flat, axis=0)
                     ss_std = jnp.std(ss_flat, axis=0)
                     acc_mean = jnp.mean(acc_flat, axis=0)
                     acc_std = jnp.std(acc_flat, axis=0)
-                    rc_sum = jnp.sum(rc_flat, axis=0) if rc_flat is not None else None
+                    rc_sum = (
+                        jnp.sum(rc_flat, axis=0)
+                        if rc_flat is not None
+                        else None
+                    )
                     for k, name in enumerate(move_names):
                         row = (
                             f"  {name:<16}  ss={float(ss_mean[k]):>9.3e}±{float(ss_std[k]):>8.2e}"
                             f"  acc={float(acc_mean[k]):>4.2f}±{float(acc_std[k]):>4.2f}"
                         )
                         if rc_sum is not None:
-                            reasons_k = move_reject_reasons[k] if move_reject_reasons is not None else None
-                            row += _format_reject_breakdown(rc_sum[k], reasons_used=reasons_k)
+                            reasons_k = (
+                                move_reject_reasons[k]
+                                if move_reject_reasons is not None
+                                else None
+                            )
+                            row += _format_reject_breakdown(
+                                rc_sum[k], reasons_used=reasons_k
+                            )
                         lines.append(row)
                 else:
                     # single-run: ss shape (n_moves,)
@@ -349,11 +395,19 @@ class ProgressCallback:
                             f"  acc={float(acc[k]):>4.2f}"
                         )
                         if rc is not None:
-                            reasons_k = move_reject_reasons[k] if move_reject_reasons is not None else None
+                            reasons_k = (
+                                move_reject_reasons[k]
+                                if move_reject_reasons is not None
+                                else None
+                            )
                             if rc.ndim == 3:
-                                row += _format_reject_breakdown(rc[0, k], reasons_used=reasons_k)
+                                row += _format_reject_breakdown(
+                                    rc[0, k], reasons_used=reasons_k
+                                )
                             else:
-                                row += _format_reject_breakdown(rc[k], reasons_used=reasons_k)
+                                row += _format_reject_breakdown(
+                                    rc[k], reasons_used=reasons_k
+                                )
                         lines.append(row)
 
         # ---- inter-RE stats row (when present) ----
@@ -375,7 +429,9 @@ class ProgressCallback:
                 n_att_arr = np.asarray(n_att_pp, dtype=np.float64)
                 if n_acc_arr.size > 0:
                     rates = np.where(
-                        n_att_arr > 0, n_acc_arr / np.maximum(n_att_arr, 1.0), 0.0
+                        n_att_arr > 0,
+                        n_acc_arr / np.maximum(n_att_arr, 1.0),
+                        0.0,
                     )
                     per_pair_str = (
                         f"  per_pair={rates.mean():.2f}±{rates.std():.2f}"
@@ -394,7 +450,9 @@ class ProgressCallback:
             iteration_arr = jnp.asarray(ns_state.iteration)
             log_z_arr = jnp.asarray(ns_state.log_evidence)
         else:
-            log_z_arr = jnp.asarray(ns_state.get("log_evidence", float("-inf")))
+            log_z_arr = jnp.asarray(
+                ns_state.get("log_evidence", float("-inf"))
+            )
             iteration_arr = jnp.asarray(ns_state.get("iteration", 0))
 
         # Iterations stay in lock-step across replicas (outer Python loop
@@ -502,7 +560,9 @@ class AdaptationCallback:
             "cap_hits": zero_int,
             "floor_hits": zero_int,
             "bracket_detected": np.zeros((n_runs, n_moves), dtype=bool),
-            "reject_reason_counts": np.zeros((n_runs, n_moves, 4), dtype=np.int32),
+            "reject_reason_counts": np.zeros(
+                (n_runs, n_moves, 4), dtype=np.int32
+            ),
         }
         # Label the baseline with the run's starting global iteration: 0 for
         # a fresh run, the restored checkpoint iteration on restart.  This
@@ -510,7 +570,8 @@ class AdaptationCallback:
         # restart (drop iter >= restart_iteration) leaves exactly one
         # baseline at the resume boundary instead of a duplicate at 0.
         baseline_iter = (
-            0 if ns_state is None
+            0
+            if ns_state is None
             else int(jnp.asarray(ns_state.iteration).reshape(-1)[0])
         )
         self._adaptation_logger.write_entry(
@@ -590,7 +651,9 @@ class AdaptationCallback:
             if val is not None:
                 if adjustment_stats is None:
                     adjustment_stats = {}
-                adjustment_stats[_adj_rename[info_key]] = _flatten_for_hdf5(val)
+                adjustment_stats[_adj_rename[info_key]] = _flatten_for_hdf5(
+                    val
+                )
 
         # Collect per-iter evaluation counts for v3 schema (shape (n_runs, n_moves))
         n_evals_raw = info.get("n_evaluations_per_move")
@@ -599,11 +662,13 @@ class AdaptationCallback:
         n_grad_evals_np: "np.ndarray | None" = None
         if n_evals_raw is not None:
             n_evals_np = np.asarray(
-                _flatten_for_hdf5(n_evals_raw), dtype=np.int64,
+                _flatten_for_hdf5(n_evals_raw),
+                dtype=np.int64,
             )
         if n_grad_evals_raw is not None:
             n_grad_evals_np = np.asarray(
-                _flatten_for_hdf5(n_grad_evals_raw), dtype=np.int64,
+                _flatten_for_hdf5(n_grad_evals_raw),
+                dtype=np.int64,
             )
 
         self._adaptation_logger.write_entry(
@@ -670,14 +735,17 @@ class AdaptationCallback:
                     "replicas (ss=%.2e, mean trial acc=%.3f). Further "
                     "shrinking is a no-op; if acc stays ~0 the move is "
                     "functionally dead.",
-                    iteration, name, floor_runs, n_runs, mean_ss, mean_acc,
+                    iteration,
+                    name,
+                    floor_runs,
+                    n_runs,
+                    mean_ss,
+                    mean_acc,
                 )
                 self._floor_warned.add(m)
 
             is_pathological = (
-                mean_acc < 0.01
-                and floor_runs > 0
-                and bracketed_runs == 0
+                mean_acc < 0.01 and floor_runs > 0 and bracketed_runs == 0
             )
             self._stall_history[m].append(is_pathological)
             if self._stall_cooldown[m] > 0:
@@ -691,7 +759,11 @@ class AdaptationCallback:
                     "detected across last %d adjustment events. This move's "
                     "DOFs are effectively frozen; subsequent dead points are "
                     "correlated clones in this DOF.",
-                    iteration, name, mean_ss, floor_runs, n_runs,
+                    iteration,
+                    name,
+                    mean_ss,
+                    floor_runs,
+                    n_runs,
                     self._STALL_HISTORY_LEN,
                 )
                 self._stall_cooldown[m] = self._STALL_SUPPRESS_EVENTS
@@ -847,9 +919,7 @@ class RECallback:
             # valid pairs).  Skip — keeps the file iteration-indexed
             # by actual fires only.
             return
-        n_acc_arr = np.asarray(
-            re_stats["n_accepted_per_pair"], dtype=np.int32
-        )
+        n_acc_arr = np.asarray(re_stats["n_accepted_per_pair"], dtype=np.int32)
         self._logger.write_entry(
             iteration=iteration,
             n_accepted_per_pair=n_acc_arr,
@@ -885,22 +955,26 @@ class EnergyCheckCallback:
                 deltas = (emax_arr - self._prev_emax)[offenders]
                 # Report up to 4 worst, sorted by delta descending.
                 order = np.argsort(-deltas)
+
                 def _fmt_idx(coords: np.ndarray) -> str:
                     parts = tuple(int(c) for c in coords)
-                    return str(parts[0]) if len(parts) == 1 else (
-                        ",".join(str(p) for p in parts)
+                    return (
+                        str(parts[0])
+                        if len(parts) == 1
+                        else (",".join(str(p) for p in parts))
                     )
 
                 worst = [
-                    (_fmt_idx(idxs[k]), float(deltas[k]))
-                    for k in order[:4]
+                    (_fmt_idx(idxs[k]), float(deltas[k])) for k in order[:4]
                 ]
                 summary = ", ".join(
                     f"replica[{i}]: Δ=+{d:.4g}" for i, d in worst
                 )
                 logger.warning(
                     "iter=%d: Emax non-monotonic on %d replica(s) (worst: %s)",
-                    iteration, int(offenders.sum()), summary,
+                    iteration,
+                    int(offenders.sum()),
+                    summary,
                 )
 
         self._prev_emax = emax_arr
@@ -909,23 +983,27 @@ class EnergyCheckCallback:
         pass
 
 
-def _min_pair_distance_pbc(positions: jnp.ndarray, cell: jnp.ndarray) -> jnp.ndarray:
+def _min_pair_distance_pbc(
+    positions: jnp.ndarray, cell: jnp.ndarray
+) -> jnp.ndarray:
     """Minimum interatomic distance under PBC, vmapped over (n_runs, K).
 
     ``positions``: ``(n_runs, K, N, 3)``.  ``cell``: ``(n_runs, K, 3, 3)``.
     Returns ``(n_runs, K)`` minimum pair distance per walker, using the
     minimum-image convention.
     """
+
     def _one(p, c):
         cell_inv = jnp.linalg.inv(c)
         frac = p @ cell_inv
         diff_frac = frac[:, None, :] - frac[None, :, :]
         diff_frac = diff_frac - jnp.round(diff_frac)
         diff = diff_frac @ c
-        d2 = jnp.sum(diff ** 2, axis=-1)
+        d2 = jnp.sum(diff**2, axis=-1)
         n = p.shape[0]
         d2 = jnp.where(jnp.eye(n, dtype=bool), jnp.inf, d2)
         return jnp.sqrt(jnp.min(d2))
+
     return jax.vmap(jax.vmap(_one))(positions, cell)
 
 
@@ -934,12 +1012,14 @@ def _min_pair_distance_open(positions: jnp.ndarray) -> jnp.ndarray:
 
     ``positions``: ``(n_runs, K, N, 3)``.  Returns ``(n_runs, K)``.
     """
+
     def _one(p):
         diff = p[:, None, :] - p[None, :, :]
-        d2 = jnp.sum(diff ** 2, axis=-1)
+        d2 = jnp.sum(diff**2, axis=-1)
         n = p.shape[0]
         d2 = jnp.where(jnp.eye(n, dtype=bool), jnp.inf, d2)
         return jnp.sqrt(jnp.min(d2))
+
     return jax.vmap(jax.vmap(_one))(positions)
 
 
@@ -989,7 +1069,9 @@ class CollisionCheckCallback:
             positions_flat = batcher.flatten(positions)
             cell_flat = batcher.flatten(cell) if cell is not None else None
         else:
-            positions_flat = positions[None, ...] if positions.ndim == 3 else positions
+            positions_flat = (
+                positions[None, ...] if positions.ndim == 3 else positions
+            )
             if cell is not None:
                 cell_flat = cell[None, ...] if cell.ndim == 3 else cell
             else:
@@ -1016,8 +1098,7 @@ class CollisionCheckCallback:
             f"run[{r}].walker[{w}]: d_min={d:.4g}" for r, w, d in worst
         )
         logger.warning(
-            "iter=%d: %d walker(s) have atom pairs below %.4g "
-            "(worst: %s)",
+            "iter=%d: %d walker(s) have atom pairs below %.4g " "(worst: %s)",
             iteration,
             int(offenders.sum()),
             self._threshold,
@@ -1064,9 +1145,7 @@ class TemperatureCallback:
         self._lag = int(lag)
         self._interval = max(1, int(interval))
         self._kB = float(kB)
-        self._log_alpha = float(
-            np.log((n_live + 1 - n_cull) / (n_live + 1))
-        )
+        self._log_alpha = float(np.log((n_live + 1 - n_cull) / (n_live + 1)))
         self._histories: list[collections.deque] | None = None
 
     def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
@@ -1162,7 +1241,8 @@ class CheckpointCallback:
         path = self.working_dir / f"{self.prefix}.initial.checkpoint.h5"
         state_dict = (
             _ns_state_to_checkpoint_dict(ns_state)
-            if isinstance(ns_state, NSState) else ns_state
+            if isinstance(ns_state, NSState)
+            else ns_state
         )
         save_checkpoint(path, state_dict, self.symbol_map)
 
@@ -1173,7 +1253,8 @@ class CheckpointCallback:
             path = self.working_dir / f"{self.prefix}.checkpoint.h5"
             state_dict = (
                 _ns_state_to_checkpoint_dict(ns_state)
-                if isinstance(ns_state, NSState) else ns_state
+                if isinstance(ns_state, NSState)
+                else ns_state
             )
             save_checkpoint(path, state_dict, self.symbol_map)
 
@@ -1183,7 +1264,8 @@ class CheckpointCallback:
         path = self.working_dir / f"{self.prefix}.final.checkpoint.h5"
         state_dict = (
             _ns_state_to_checkpoint_dict(ns_state)
-            if isinstance(ns_state, NSState) else ns_state
+            if isinstance(ns_state, NSState)
+            else ns_state
         )
         save_checkpoint(path, state_dict, self.symbol_map)
 
@@ -1260,7 +1342,9 @@ class TrajectoryCallback:
             }
             if jnp.any(dead_cell != 0):
                 dead_walker["box"] = dead_cell
-            self.writer.write_dead_point(iteration, dead_walker, float(info["emax"]))
+            self.writer.write_dead_point(
+                iteration, dead_walker, float(info["emax"])
+            )
 
         if self.energy_logger is not None:
             # Write the culled-walker energy and volume so postprocess can
@@ -1274,7 +1358,11 @@ class TrajectoryCallback:
                 volume=dead_v,
             )
 
-        if self.snapshot_interval and iteration > 0 and iteration % self.snapshot_interval == 0:
+        if (
+            self.snapshot_interval
+            and iteration > 0
+            and iteration % self.snapshot_interval == 0
+        ):
             if isinstance(ns_state, NSState):
                 snapshot_dict = _ns_state_to_checkpoint_dict(ns_state)
                 self.writer.write_walker_snapshot(iteration, snapshot_dict)
@@ -1306,8 +1394,12 @@ class BatchedTrajectoryCallback:
         snapshot_interval: int = 100,
     ):
         self.writers = list(writers)
-        self.energy_loggers = list(energy_loggers) if energy_loggers is not None else None
-        if self.energy_loggers is not None and len(self.energy_loggers) != len(self.writers):
+        self.energy_loggers = (
+            list(energy_loggers) if energy_loggers is not None else None
+        )
+        if self.energy_loggers is not None and len(self.energy_loggers) != len(
+            self.writers
+        ):
             raise ValueError(
                 f"BatchedTrajectoryCallback: len(writers)={len(self.writers)} vs "
                 f"len(energy_loggers)={len(self.energy_loggers)}."
@@ -1371,7 +1463,9 @@ class BatchedTrajectoryCallback:
                 if jnp.any(cell_r != 0):
                     dead_walker["box"] = cell_r
                 self.writers[r].write_dead_point(
-                    iteration, dead_walker, float(emax_flat[r]),
+                    iteration,
+                    dead_walker,
+                    float(emax_flat[r]),
                 )
 
         if self.energy_loggers is not None:
@@ -1399,9 +1493,13 @@ class BatchedTrajectoryCallback:
             for r in range(n_runs):
                 snap = {
                     "positions": positions_flat[r],
-                    "types": types_flat[r] if types_flat.ndim >= 2 else types_flat,
+                    "types": types_flat[r]
+                    if types_flat.ndim >= 2
+                    else types_flat,
                     "energies": energies_flat[r],
-                    "cells": cells_flat[r] if cells_flat.ndim >= 3 else cells_flat,
+                    "cells": cells_flat[r]
+                    if cells_flat.ndim >= 3
+                    else cells_flat,
                     "iteration": iteration,
                     "n_dead": iteration,
                 }

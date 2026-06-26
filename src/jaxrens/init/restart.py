@@ -49,6 +49,12 @@ class RestartBundle:
             restored iter via the ``i > 0`` gate so a stale +inf can't
             leak into trial-walker constraints.
         n_dead: Number of dead points stored.
+        step_sizes: Adapted per-move step sizes for this slot's live walkers,
+            shape ``(K, n_moves)``, or ``None`` for legacy checkpoints that
+            pre-date persisting them.  When present, ``init_ns`` overrides the
+            freshly-seeded population step sizes with these so a resumed run
+            continues from the converged step instead of re-running burn-in
+            adaptation from the configured initial step size.
         rng_key_data: Raw uint32 PRNG buffer (output of ``jax.random.key_data``)
             for this slot, or ``None`` for legacy checkpoints that pre-date
             persisting the PRNG state.  ``init_ns`` re-wraps with
@@ -68,6 +74,7 @@ class RestartBundle:
     iteration: int
     emax: float
     n_dead: int
+    step_sizes: jnp.ndarray | None = None
     rng_key_data: np.ndarray | None = None
 
 
@@ -115,9 +122,17 @@ class BatchedRestart:
 
 
 _JNP_FIELDS = (
-    "positions", "types", "energies", "cells",
-    "dead_energies", "dead_positions", "dead_volumes", "live_volumes",
-    "log_evidence", "emax",
+    "positions",
+    "types",
+    "energies",
+    "cells",
+    "step_sizes",
+    "dead_energies",
+    "dead_positions",
+    "dead_volumes",
+    "live_volumes",
+    "log_evidence",
+    "emax",
 )
 
 
@@ -171,11 +186,13 @@ def _build_bundle_from_ckpt(
         # legacy/test fixtures embed them.  Default to None when missing.
         dead_energies = (
             ckpt["dead_energies"][:n_dead]
-            if ckpt.get("dead_energies") is not None else None
+            if ckpt.get("dead_energies") is not None
+            else None
         )
         dead_positions = (
             ckpt["dead_positions"][:n_dead]
-            if ckpt.get("dead_positions") is not None else None
+            if ckpt.get("dead_positions") is not None
+            else None
         )
         dead_volumes: jnp.ndarray | None = None
         if ckpt.get("dead_volumes") is not None:
@@ -183,6 +200,7 @@ def _build_bundle_from_ckpt(
         # ``load_checkpoint`` substitutes ``+inf`` for legacy ckpts missing
         # the emax field, so this is always present.
         emax = float(np.asarray(ckpt["emax"]))
+        step_sizes = ckpt.get("step_sizes")
         rng_key_data = (
             np.asarray(full_rng_data) if full_rng_data is not None else None
         )
@@ -194,6 +212,7 @@ def _build_bundle_from_ckpt(
             iteration=int(ckpt["iteration"]),
             emax=emax,
             n_dead=n_dead,
+            step_sizes=step_sizes,
             rng_key_data=rng_key_data,
         )
     else:
@@ -206,11 +225,13 @@ def _build_bundle_from_ckpt(
         # present: slice leading batch dims with idx, then trim to [:n_dead].
         dead_energies = (
             jnp.asarray(ckpt["dead_energies"])[idx][:n_dead]
-            if ckpt.get("dead_energies") is not None else None
+            if ckpt.get("dead_energies") is not None
+            else None
         )
         dead_positions = (
             jnp.asarray(ckpt["dead_positions"])[idx][:n_dead]
-            if ckpt.get("dead_positions") is not None else None
+            if ckpt.get("dead_positions") is not None
+            else None
         )
         dead_volumes = None
         if ckpt.get("dead_volumes") is not None:
@@ -223,6 +244,14 @@ def _build_bundle_from_ckpt(
         # broadcasts to every replica via the float() cast below.
         emax_arr = np.asarray(ckpt["emax"])
         emax = float(emax_arr[idx]) if emax_arr.ndim > 0 else float(emax_arr)
+
+        # Step sizes for this replica's live walkers, shape (K, n_moves).
+        # Slice the leading batch dims with idx; None for legacy checkpoints.
+        step_sizes = (
+            jnp.asarray(ckpt["step_sizes"])[idx]
+            if ckpt.get("step_sizes") is not None
+            else None
+        )
 
         # rng_key_data: shape (*batch, 2).  Slice the leading batch dims when
         # the saved key matches the topology; otherwise fall back to None so
@@ -243,6 +272,7 @@ def _build_bundle_from_ckpt(
             iteration=iteration,
             emax=emax,
             n_dead=n_dead,
+            step_sizes=step_sizes,
             rng_key_data=rng_key_data,
         )
 
@@ -304,6 +334,7 @@ def load_restart(
         raise FileNotFoundError(f"checkpoint file not found: {path}")
 
     import json
+
     import h5py as _h5py
 
     with _h5py.File(path, "r") as _f:
@@ -399,7 +430,10 @@ def load_restart(
 
         logger.info(
             "Restart loaded from %s: n_dead=%d, iteration=%d, log_Z=%.4f",
-            path, bundle.n_dead, bundle.iteration, bundle.log_evidence,
+            path,
+            bundle.n_dead,
+            bundle.iteration,
+            bundle.log_evidence,
         )
         return walker_set, bundle
 
@@ -414,7 +448,9 @@ def load_restart(
         ]
         logger.info(
             "Restart loaded from %s: %d runs, n_dead=%s",
-            path, saved.n_runs, [b.n_dead for b in bundles],
+            path,
+            saved.n_runs,
+            [b.n_dead for b in bundles],
         )
         return bundles
 
@@ -428,7 +464,10 @@ def load_restart(
         ]
         logger.info(
             "Restart loaded from %s: G=%d, P=%d, n_dead (first run)=%d",
-            path, G, P, bundles_2d[0][0].n_dead,
+            path,
+            G,
+            P,
+            bundles_2d[0][0].n_dead,
         )
         return bundles_2d
 
@@ -466,6 +505,7 @@ def load_restart_batched(path: Path | str) -> BatchedRestart:
         raise FileNotFoundError(f"checkpoint file not found: {path}")
 
     import json
+
     import h5py as _h5py
 
     with _h5py.File(path, "r") as _f:
@@ -557,14 +597,21 @@ def load_restart_batched(path: Path | str) -> BatchedRestart:
         ]
     else:
         bundles_2d = [
-            [_build_bundle_from_ckpt(ckpt, idx=(g, p)) for p in range(n_per_gpu)]
+            [
+                _build_bundle_from_ckpt(ckpt, idx=(g, p))
+                for p in range(n_per_gpu)
+            ]
             for g in range(n_gpu)
         ]
 
     logger.info(
         "Multi-replica restart loaded from %s: n_gpu=%d, n_per_gpu=%d "
         "(n_total=%d), n_dead (first replica)=%d",
-        path, n_gpu, n_per_gpu, n_total, bundles_2d[0][0].n_dead,
+        path,
+        n_gpu,
+        n_per_gpu,
+        n_total,
+        bundles_2d[0][0].n_dead,
     )
 
     return BatchedRestart(
@@ -630,7 +677,11 @@ def infer_restart_shape(
         first = bundle[0]
         if isinstance(first, RestartBundle):
             return "parallel"
-        if isinstance(first, list) and len(first) > 0 and isinstance(first[0], RestartBundle):
+        if (
+            isinstance(first, list)
+            and len(first) > 0
+            and isinstance(first[0], RestartBundle)
+        ):
             return "multi_gpu"
 
     # Empty list is ambiguous; default to parallel to avoid crashing.

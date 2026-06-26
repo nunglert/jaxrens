@@ -9,8 +9,11 @@ Usage:
     result = backend(positions, species, cell, max_neighbors)
     # result.energy = U + P*V
 
-For per-run vmap with different pressures, pass ensemble_params:
+For per-run vmap with different pressures or chemical potentials, pass
+ensemble_params (keys ``"pressure"`` and ``"chemical_potentials"``):
     backend(pos, species, cell, mn, ensemble_params={"pressure": 0.02})
+    backend(pos, species, cell, mn,
+            ensemble_params={"chemical_potentials": mu})  # (n_species,)
 """
 
 from __future__ import annotations
@@ -64,7 +67,10 @@ class EnsembleBackend:
         ensemble terms (PV, μN). Control/diagnostic fields pass through.
         """
         res = self.base(
-            positions, species, cell, max_neighbors,
+            positions,
+            species,
+            cell,
+            max_neighbors,
         )
         U = res.energy
 
@@ -73,7 +79,7 @@ class EnsembleBackend:
         mu = self.chemical_potentials
         if ensemble_params is not None:
             pressure = ensemble_params.get("pressure", pressure)
-            mu = ensemble_params.get("mu", mu)
+            mu = ensemble_params.get("chemical_potentials", mu)
 
         H = U + pressure * get_volume(cell)
 
@@ -105,5 +111,5 @@ def make_ensemble_params(
     """
     params: dict[str, jnp.ndarray] = {"pressure": jnp.asarray(pressure)}
     if chemical_potentials is not None:
-        params["mu"] = jnp.asarray(chemical_potentials)
+        params["chemical_potentials"] = jnp.asarray(chemical_potentials)
     return params

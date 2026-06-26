@@ -11,8 +11,8 @@ import pytest
 
 from jaxrens.backends.base import BackendResult
 from jaxrens.backends.toy import create_harmonic
-from jaxrens.sampling.moves.random_walk import build_kernel as rw_build_kernel
 from jaxrens.sampling.moves.galilean import build_kernel as gmc_build_kernel
+from jaxrens.sampling.moves.random_walk import build_kernel as rw_build_kernel
 from jaxrens.state.mc_state import MCState, make_mc_state_class
 
 # MCState with direction field for galilean tests
@@ -166,7 +166,9 @@ class TestRandomWalkStep:
             n_accepted += int(info.accepted)
 
         rate = n_accepted / n_steps
-        assert 0.1 < rate < 1.0, f"Acceptance rate {rate} out of expected range"
+        assert (
+            0.1 < rate < 1.0
+        ), f"Acceptance rate {rate} out of expected range"
 
     def test_scan_compatible(self, harmonic, positions, types):
         """lax.scan should work with random walk step."""
@@ -202,7 +204,9 @@ class TestGalileanStep:
         assert hasattr(new_state, "direction")
         assert hasattr(info, "accepted")
 
-    def test_direction_initialized_on_first_call(self, harmonic, positions, types):
+    def test_direction_initialized_on_first_call(
+        self, harmonic, positions, types
+    ):
         """Direction should be randomized if initially zero."""
         backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
@@ -257,7 +261,9 @@ class TestGalileanStep:
         assert new_states.energy.shape == (4,)
         assert infos.accepted.shape == (4,)
 
-    def test_reflection_keeps_energy_below_constraint(self, harmonic, positions, types):
+    def test_reflection_keeps_energy_below_constraint(
+        self, harmonic, positions, types
+    ):
         """After GMC step, accepted states should have energy < Emax."""
         backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
@@ -285,7 +291,9 @@ class TestGalileanStep:
             n_accepted += int(info.accepted)
 
         rate = n_accepted / n_steps
-        assert 0.1 < rate <= 1.0, f"Acceptance rate {rate} out of expected range"
+        assert (
+            0.1 < rate <= 1.0
+        ), f"Acceptance rate {rate} out of expected range"
 
     def test_scan_compatible(self, harmonic, positions, types):
         backend = harmonic
@@ -305,9 +313,7 @@ class TestGalileanStep:
         """use_forces=False should still work (random reflection)."""
         backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
-        step = gmc_build_kernel(
-            backend, n_reflect=3, use_forces=False
-        )
+        step = gmc_build_kernel(backend, n_reflect=3, use_forces=False)
 
         key = jax.random.key(0)
         new_state, info = jax.jit(step)(key, state, 10.0)
@@ -327,14 +333,13 @@ class TestGalileanBaldockSemantics:
     """
 
     def test_reject_when_no_path_below_constraint(
-        self, harmonic, positions, types,
+        self,
+        harmonic,
+        positions,
+        types,
     ):
         """With Emax STRICTLY below the initial state.energy, the
-        trajectory cannot end below Emax — must report ``accepted=False``.
-
-        Pre-fix this would have spuriously reported ``accepted=True``
-        because the carry would have held the initial (below-Emax)
-        energy throughout."""
+        trajectory cannot end below Emax — must report ``accepted=False``."""
         backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.5)
         # Emax BELOW state.energy — every reflection step lands at
@@ -354,14 +359,15 @@ class TestGalileanBaldockSemantics:
         # signal here).
 
     def test_accept_advances_through_intermediate_violations(
-        self, harmonic, positions, types,
+        self,
+        harmonic,
+        positions,
+        types,
     ):
         """When ``n_reflect`` is large enough that reflections recover
         the walker, the move accepts AND the final position is NOT the
         initial position (i.e. the trajectory genuinely traversed the
-        violated region rather than rejecting at the first step).
-        Pre-fix this passed by luck (revert + early-Emax-check), but
-        the new semantics make it a meaningful check."""
+        violated region rather than rejecting at the first step)."""
         backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
         step = jax.jit(gmc_build_kernel(backend, n_reflect=5))
@@ -379,17 +385,21 @@ class TestGalileanBaldockSemantics:
                 # inside the scan, then on accept we keep final_pos).
                 # (We can't compare to the per-iter prior here without a
                 # separate carry; use the moved counter as a proxy below.)
-            moved_count += int(not jnp.allclose(last_state.positions, state.positions))
-        assert accept_count > 5, (
-            f"Expected nonzero acceptance under reasonable settings; got {accept_count}/50"
-        )
+            moved_count += int(
+                not jnp.allclose(last_state.positions, state.positions)
+            )
+        assert (
+            accept_count > 5
+        ), f"Expected nonzero acceptance under reasonable settings; got {accept_count}/50"
         # Trajectory must have actually evolved (positions changed from
         # the original) — under the broken revert-on-violation kernel
         # walkers could "accept" with no displacement and this would fail.
         assert moved_count > 0
 
     def test_nan_energy_triggers_reflection_not_silent_reject(
-        self, positions, types,
+        self,
+        positions,
+        types,
     ):
         """A backend that returns NaN at certain configurations must
         not cause the carry to propagate NaN energy through the scan
@@ -410,7 +420,9 @@ class TestGalileanBaldockSemantics:
             return BackendResult(energy=e)
 
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
-        step = jax.jit(gmc_build_kernel(nan_backend, n_reflect=3, use_forces=False))
+        step = jax.jit(
+            gmc_build_kernel(nan_backend, n_reflect=3, use_forces=False)
+        )
         key = jax.random.key(0)
         new_state, info = step(key, state, likelihood_constraint=10.0)
         # Every step NaN-violated → final energy = +inf → accepted=False
@@ -422,12 +434,14 @@ class TestGalileanBaldockSemantics:
         assert float(new_state.energy) == 0.25
 
     def test_final_energy_below_constraint_when_accepted(
-        self, harmonic, positions, types,
+        self,
+        harmonic,
+        positions,
+        types,
     ):
         """When accepted, the stored state.energy must be < Emax.
-        This is the post-fix invariant: accept ⇔ final-state energy
-        below Emax.  Run for many trials to actually exercise the
-        accept path."""
+        Invariant: accept ⇔ final-state energy below Emax.  Run for many
+        trials to actually exercise the accept path."""
         backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.02)
         step = jax.jit(gmc_build_kernel(backend, n_reflect=5))
@@ -442,4 +456,6 @@ class TestGalileanBaldockSemantics:
                     f"Accepted move left state.energy={float(state.energy)} "
                     f"≥ Emax=1.0 — invariant violated"
                 )
-        assert n_accepted > 0  # sanity: the test actually exercised the accept path
+        assert (
+            n_accepted > 0
+        )  # sanity: the test actually exercised the accept path

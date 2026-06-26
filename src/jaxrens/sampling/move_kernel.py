@@ -39,6 +39,14 @@ class MoveKernel:
             always relevant and is excluded from this set. Used by the monitor
             to suppress uninformative zero-columns in the reject breakdown.
             Default is frozenset({"energy"}) — energy-only rejection.
+        mutates: Set of state *aspects* this move writes — a subset of
+            {"positions", "cell", "types"} (see jaxrens.constraints). A
+            configuration constraint gates this move only when the move
+            mutates an aspect the constraint depends on; the pairing is
+            computed once, statically, in ``build_mwg``. The default is the
+            full aspect set, so a move that forgets to declare its mutations
+            is conservatively gated by every constraint (never silently
+            skipped) rather than bypassing one.
     """
 
     name: str
@@ -49,5 +57,12 @@ class MoveKernel:
     step_size_max: float = 10.0
     min_rate: float = 0.25
     max_rate: float = 0.65
-    extra_state_fields: dict[str, tuple[type, Callable]] = field(default_factory=dict)
-    reject_reasons: frozenset[str] = field(default_factory=lambda: frozenset({"energy"}))
+    extra_state_fields: dict[str, tuple[type, Callable]] = field(
+        default_factory=dict
+    )
+    reject_reasons: frozenset[str] = field(
+        default_factory=lambda: frozenset({"energy"})
+    )
+    mutates: frozenset[str] = field(
+        default_factory=lambda: frozenset({"positions", "cell", "types"})
+    )

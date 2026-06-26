@@ -30,6 +30,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.backends.base import BackendResult
+from jaxrens.backends.softcore import DEFAULT_SOFTCORE_KWARGS
 
 logger = logging.getLogger(__name__)
 
@@ -66,21 +67,12 @@ except ImportError:
     _SOFTCORE_AVAILABLE = False
 
 
-DEFAULT_SOFTCORE_KWARGS: dict[str, float] = {
-    "a0": 1.0,
-    "b0": 3.0,
-    "d0": 1.0,
-    "r_core_cut": 1.25,
-    "r_core_switch": 0.75,
-}
-
-
 def _require_neuralil() -> None:
     if not _NEURALIL_AVAILABLE:
         raise ImportError(
-            "NeuralIL is required for the neuralil backend but is not installed. "
-            f"Original import error: {_NEURALIL_IMPORT_ERROR}\n"
-            "Install it with: pip install neuralil"
+            "NeuralIL is required for the neuralil backend but is not installed.\n"
+            "Install it with:  pip install '.[neuralil]'\n"
+            f"Original import error: {_NEURALIL_IMPORT_ERROR}"
         )
 
 
@@ -154,7 +146,7 @@ def _build_dynamics_model(
         raise ImportError(
             "softcore=True requires neuralil.softcore.model, which was not "
             "importable. Update your neuralil install to a version that "
-            "ships the softcore subpackage."
+            "ships the softcore subpackage:  pip install '.[neuralil]'"
         )
 
     descriptor_gen = PowerSpectrumGenerator(

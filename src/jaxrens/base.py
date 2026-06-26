@@ -6,13 +6,12 @@ implements one of these protocols.
 
 from typing import Any, NamedTuple, Protocol
 
-import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
 from jaxrens.types import Box, Params, Positions, Types
-
 
 # ---------------------------------------------------------------------------
 # Move kernel protocol
@@ -27,6 +26,9 @@ class MoveInfo(NamedTuple):
         1 = rejected by likelihood constraint (energy >= emax)
         2 = rejected by cell-geometry constraint (max/min vol, aspect)
         3 = rejected by move-specific prior (e.g. volume V^N factor)
+        4 = rejected by a configuration constraint (e.g. minimum distance);
+            see jaxrens.constraints. Set by the MWG constraint gate, not by
+            the move kernels themselves.
 
     Moves that only reject by the likelihood constraint (random_walk,
     galilean, etc.) may leave ``reject_reason`` at 0 (default) — callers
@@ -92,7 +94,8 @@ class EnergyFn(Protocol):
         types: Types,
         cell: Box | None = None,
         **unused_kwargs: Any,
-    ) -> float: ...
+    ) -> float:
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -105,11 +108,14 @@ class TrajectoryWriter(Protocol):
 
     def write_dead_point(
         self, iteration: int, walker: Any, energy: float
-    ) -> None: ...
+    ) -> None:
+        ...
 
-    def write_walker_snapshot(self, iteration: int, walkers: Any) -> None: ...
+    def write_walker_snapshot(self, iteration: int, walkers: Any) -> None:
+        ...
 
-    def close(self) -> None: ...
+    def close(self) -> None:
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -123,14 +129,16 @@ class NSCallback(Protocol):
     Called at the outer loop boundary (Python level, outside JIT/pmap).
     """
 
-    def on_start(self, ns_state: Any, start_info: dict | None = None) -> None: ...
+    def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
+        ...
 
-    def on_iteration(
-        self, iteration: int, ns_state: Any, info: dict
-    ) -> None: ...
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        ...
 
     def on_dead_point(
         self, iteration: int, dead_walker: Any, energy: float
-    ) -> None: ...
+    ) -> None:
+        ...
 
-    def on_finish(self, ns_state: Any) -> None: ...
+    def on_finish(self, ns_state: Any) -> None:
+        ...

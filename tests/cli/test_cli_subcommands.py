@@ -9,15 +9,12 @@ directly).
 
 from __future__ import annotations
 
-import io
 import json
-import sys
 from pathlib import Path
 
 import pytest
 
 from jaxrens.cli.cli import main
-
 
 _DATA = Path(__file__).parent.parent / "data" / "cli"
 
@@ -70,81 +67,6 @@ class TestPlotErrors:
         assert exc_info.value.code == 2
         err = capsys.readouterr().err
         assert "jaxrens plot:" in err
-
-
-# ---------------------------------------------------------------------------
-# migrate-ns-inp
-# ---------------------------------------------------------------------------
-
-
-_MINIMAL_INP = (
-    "n_walkers = 8\n"
-    "n_iter = 10\n"
-    "energy_calculator = lj\n"
-    "n_atoms = 13\n"
-    "n_gmc_steps = 1\n"
-    "atom_traj_len = 5\n"
-    "start_species = 18\n"
-)
-
-
-class TestMigrateNsInp:
-    def test_stdin_to_stdout(self, monkeypatch, capsys):
-        """Default ``-i -`` reads stdin, default ``-o -`` writes stdout."""
-        monkeypatch.setattr(sys, "stdin", io.StringIO(_MINIMAL_INP))
-        with pytest.raises(SystemExit) as exc_info:
-            main(["migrate-ns-inp"])
-        assert exc_info.value.code == 0
-        out = capsys.readouterr().out
-        # Stdout should be valid YAML containing a run.n_live key (the
-        # migrated form of n_walkers).
-        import yaml as _yaml
-        parsed = _yaml.safe_load(out)
-        assert parsed.get("run", {}).get("n_live") == 8
-        assert parsed.get("run", {}).get("max_iterations") == 10
-
-    def test_file_input_to_file_output(self, tmp_path):
-        inp = tmp_path / "old.inp"
-        inp.write_text(_MINIMAL_INP)
-        out_path = tmp_path / "new.yaml"
-        with pytest.raises(SystemExit) as exc_info:
-            main([
-                "migrate-ns-inp",
-                "-i", str(inp),
-                "-o", str(out_path),
-            ])
-        assert exc_info.value.code == 0
-        assert out_path.exists()
-        import yaml as _yaml
-        parsed = _yaml.safe_load(out_path.read_text())
-        assert parsed["run"]["n_live"] == 8
-
-    def test_validate_success(self, tmp_path, capsys):
-        inp = tmp_path / "old.inp"
-        inp.write_text(_MINIMAL_INP)
-        out_path = tmp_path / "new.yaml"
-        with pytest.raises(SystemExit) as exc_info:
-            main([
-                "migrate-ns-inp",
-                "-i", str(inp),
-                "-o", str(out_path),
-                "--validate",
-            ])
-        assert exc_info.value.code == 0
-        err = capsys.readouterr().err
-        assert "Validation OK" in err
-
-    def test_unknown_keys_hoisted_as_comments(self, tmp_path, capsys, monkeypatch):
-        """A junk key the migrator doesn't recognise lands under
-        ``_unknown`` and is emitted as ``# UNKNOWN: ...`` comments."""
-        text = _MINIMAL_INP + "totally_made_up_key = 99\n"
-        monkeypatch.setattr(sys, "stdin", io.StringIO(text))
-        with pytest.raises(SystemExit) as exc_info:
-            main(["migrate-ns-inp"])
-        assert exc_info.value.code == 0
-        out = capsys.readouterr().out
-        assert "# UNKNOWN" in out
-        assert "totally_made_up_key" in out
 
 
 # ---------------------------------------------------------------------------
@@ -242,11 +164,14 @@ class TestValidateParseOnly:
         """``--parse-only`` returns 0 and prints the parse-only marker
         without touching the resolver."""
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                "validate",
-                "-c", str(_DATA / "minimal.yaml"),
-                "--parse-only",
-            ])
+            main(
+                [
+                    "validate",
+                    "-c",
+                    str(_DATA / "minimal.yaml"),
+                    "--parse-only",
+                ]
+            )
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         assert "parse-only" in out
@@ -254,12 +179,16 @@ class TestValidateParseOnly:
 
     def test_parse_only_set_override(self, capsys):
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                "validate",
-                "-c", str(_DATA / "minimal.yaml"),
-                "--set", "run.n_live=128",
-                "--parse-only",
-            ])
+            main(
+                [
+                    "validate",
+                    "-c",
+                    str(_DATA / "minimal.yaml"),
+                    "--set",
+                    "run.n_live=128",
+                    "--parse-only",
+                ]
+            )
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         assert "n_live=128" in out
@@ -276,6 +205,7 @@ class TestValidateTopologyLines:
         """Force ``_local_device_count`` to 1 so SingleRun fixtures
         actually resolve to SingleRun regardless of the host's GPU count."""
         from jaxrens.cli import resolve as _r
+
         monkeypatch.setattr(_r, "_local_device_count", lambda: 1)
 
     def test_single_run_topology(self, capsys):
@@ -285,6 +215,7 @@ class TestValidateTopologyLines:
         out = capsys.readouterr().out
         assert "OK" in out
         assert "SingleRun" in out
+
     # NOTE: PmapVmapRuns topology line is exercised by
     # ``tests/cli/test_schema.py::TestValidateTopologyLine::
     # test_validate_reports_multi_replica_topology`` which monkeypatches

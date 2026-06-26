@@ -34,6 +34,7 @@ from typing import Any
 import jax.numpy as jnp
 
 from jaxrens.backends.base import BackendResult
+from jaxrens.backends.geometry import pairwise_distances
 
 DEFAULT_SOFTCORE_KWARGS: dict[str, float] = {
     "a0": 1.0,
@@ -54,7 +55,9 @@ def _aux_g(t: jnp.ndarray) -> jnp.ndarray:
 
 
 def _smooth_cutoff(
-    r: jnp.ndarray, r_switch: float, r_cut: float,
+    r: jnp.ndarray,
+    r_switch: float,
+    r_cut: float,
 ) -> jnp.ndarray:
     """Smooth-bump partition-of-unity cutoff.
 
@@ -102,20 +105,7 @@ def _softcore_energy(
     Returns:
         Scalar total soft-core repulsion energy.
     """
-    raw_delta = positions[:, None, :] - positions[None, :, :]
-
-    # Minimum-image displacement when a real cell is present; raw
-    # displacement otherwise. ``safe_cell`` keeps the inverse finite on the
-    # non-periodic branch so the discarded MIC values never poison gradients.
-    periodic = jnp.abs(jnp.linalg.det(cell)) > 1e-10
-    safe_cell = jnp.where(periodic, cell, jnp.eye(3, dtype=cell.dtype))
-    frac = positions @ jnp.linalg.inv(safe_cell)
-    df = frac[:, None, :] - frac[None, :, :]
-    df = df - jnp.round(df)
-    mic_delta = df @ safe_cell
-
-    delta = jnp.where(periodic, mic_delta, raw_delta)
-    r = jnp.linalg.norm(delta, axis=-1)
+    r = pairwise_distances(positions, cell)
 
     # Self-pairs and any spurious near-zeros: push past the cutoff so they
     # contribute exactly zero through the smooth_cutoff factor.
@@ -172,13 +162,20 @@ class SoftCoreBackend:
     ) -> BackendResult:
         """Return the wrapped backend's result with ``E_core`` added to energy."""
         res = self.base(
-            positions, species, cell, max_neighbors,
+            positions,
+            species,
+            cell,
+            max_neighbors,
             ensemble_params=ensemble_params,
         )
         E_core = _softcore_energy(
-            positions, cell,
-            self.a0, self.b0, self.d0,
-            self.r_core_switch, self.r_core_cut,
+            positions,
+            cell,
+            self.a0,
+            self.b0,
+            self.d0,
+            self.r_core_switch,
+            self.r_core_cut,
         )
         return res._replace(energy=res.energy + E_core)
 

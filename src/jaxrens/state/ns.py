@@ -19,35 +19,11 @@ MCState.energy (via EnsembleBackend), and ns_step reads it directly.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
 from typing import Any
 
-import jax
-import jax.numpy as jnp
 from jaxtyping import Array, Float, Int, Key
 
-from jaxrens.state.walker import static_field
-
-
-def _ns_flatten(state: NSState) -> tuple[list, dict]:
-    leaves = []
-    aux = {}
-    for f in dataclasses.fields(state):
-        val = getattr(state, f.name)
-        if f.metadata.get("static", False):
-            aux[f.name] = val
-        else:
-            leaves.append(val)
-    return leaves, aux
-
-
-def _ns_unflatten(aux: dict, leaves: Sequence[Any]) -> NSState:
-    fields = dataclasses.fields(NSState)
-    dynamic_fields = [f for f in fields if not f.metadata.get("static", False)]
-    kwargs = dict(aux)
-    for f, val in zip(dynamic_fields, leaves):
-        kwargs[f.name] = val
-    return NSState(**kwargs)
+from jaxrens.state.walker import register_dataclass_pytree, static_field
 
 
 @dataclasses.dataclass
@@ -104,8 +80,4 @@ class NSState:
         return dataclasses.replace(self, **kwargs)
 
 
-jax.tree_util.register_pytree_node(
-    NSState,
-    _ns_flatten,
-    _ns_unflatten,
-)
+register_dataclass_pytree(NSState)

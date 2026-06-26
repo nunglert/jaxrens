@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.base import MoveInfo
+from jaxrens.constraints.base import ConstraintDescriptor, make_move_gate
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.state.mc_state import make_mc_state_class
 
@@ -35,6 +36,7 @@ from jaxrens.state.mc_state import make_mc_state_class
 def build_mwg(
     backend: Any,
     move_descriptors: list[MoveKernel],
+    constraint_descriptors: tuple[ConstraintDescriptor, ...] = (),
 ) -> tuple[Callable, Callable, list[Callable]]:
     """Build a Metropolis-within-Gibbs sampler from move descriptors.
 
@@ -47,6 +49,12 @@ def build_mwg(
         move_descriptors: List of MoveKernel, each specifying a move
             type with its build_kernel, kwargs, weight, step_size, and
             optional extra_state_fields.
+        constraint_descriptors: Configuration constraints to enforce. Each is
+            paired statically with the moves that can violate it (via
+            ``MoveKernel.mutates`` vs ``ConstraintDescriptor.depends_on``);
+            only intersecting moves get a constraint gate, and moves with no
+            relevant constraint keep the unmodified fast path. Empty by
+            default, so existing callers are unaffected.
 
     Returns:
         (init_fn, step_fn) where:
@@ -82,13 +90,48 @@ def build_mwg(
         for desc in move_descriptors
     ]
 
+    # --- Static constraint-gate per move ---
+    # ``gate`` is None for moves that cannot violate any registered
+    # constraint (mutated aspects disjoint from every constraint's
+    # depends_on); those keep the unmodified fast path with zero added graph.
+    move_gates = [
+        make_move_gate(constraint_descriptors, desc.mutates)
+        for desc in move_descriptors
+    ]
+
     # --- Wrap each step_fn ---
-    def _wrap(raw_fn, move_idx):
+    def _wrap(raw_fn, move_idx, gate):
         def wrapped(state, key: jax.Array, constraint: float | jnp.ndarray):
             # Inject this move's step_size from the per-move array
             state_with_ss = state.set(step_size=state.step_sizes[move_idx])
             new_state, info = raw_fn(key, state_with_ss, constraint)
-            # Track per-move acceptance
+
+            if gate is not None:
+                # Enforce configuration constraints on the proposed config.
+                # The incoming ``state`` is valid by invariant (initial
+                # walkers are checked at setup), so a constraint violation can
+                # only come from this move; revert the physical config to the
+                # pre-move state and flip the acceptance + reject_reason.
+                ok, reason = gate(
+                    new_state.positions, new_state.types, new_state.cell
+                )
+                new_state = new_state.set(
+                    positions=jnp.where(
+                        ok, new_state.positions, state.positions
+                    ),
+                    cell=jnp.where(ok, new_state.cell, state.cell),
+                    types=jnp.where(ok, new_state.types, state.types),
+                    energy=jnp.where(ok, new_state.energy, state.energy),
+                )
+                violated = info.accepted & ~ok
+                info = info._replace(
+                    accepted=info.accepted & ok,
+                    reject_reason=jnp.where(
+                        violated, reason, info.reject_reason
+                    ),
+                )
+
+            # Track per-move acceptance (uses the post-gate acceptance)
             new_state = new_state.set(
                 n_proposed=new_state.n_proposed.at[move_idx].add(1),
                 n_accepted=new_state.n_accepted.at[move_idx].add(
@@ -96,9 +139,12 @@ def build_mwg(
                 ),
             )
             return new_state, info
+
         return wrapped
 
-    wrapped_fns = [_wrap(fn, i) for i, fn in enumerate(raw_step_fns)]
+    wrapped_fns = [
+        _wrap(fn, i, move_gates[i]) for i, fn in enumerate(raw_step_fns)
+    ]
 
     # --- Default step sizes from descriptors ---
     default_step_sizes = jnp.array([d.step_size for d in move_descriptors])
@@ -155,7 +201,9 @@ def build_mwg(
             step_sizes=jnp.asarray(step_sizes),
             n_accepted=jnp.zeros(n_moves, dtype=jnp.int32),
             n_proposed=jnp.zeros(n_moves, dtype=jnp.int32),
-            max_neighbor_count=jnp.asarray(max_neighbor_count_init, dtype=jnp.int32),
+            max_neighbor_count=jnp.asarray(
+                max_neighbor_count_init, dtype=jnp.int32
+            ),
             overflow=jnp.asarray(False),
             ensemble_params=ensemble_params,
             max_neighbors=int(max_neighbors),

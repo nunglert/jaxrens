@@ -32,10 +32,11 @@ from jaxrens.cli.schema.adaptation import (
 )
 from jaxrens.cli.schema.backend import LJBackendSpec
 from jaxrens.cli.schema.cell import CellSpec
-from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
+from jaxrens.cli.schema.ensemble import SemiGrandEnsembleSpec
 from jaxrens.cli.schema.init import InitSpec
 from jaxrens.cli.schema.root import RootSpec
 from jaxrens.cli.schema.termination import IterationTerminationSpec
+from jaxrens.constraints.base import ConstraintDescriptor
 from jaxrens.init.cells import cell_shape_walk, sample_initial_volume
 from jaxrens.init.positions import (
     grid_positions_in_cell,
@@ -198,6 +199,61 @@ class ResolvedInit:
     # of shape ``(n_gpu, n_per_gpu)`` for multi-replica restart; ``None`` when
     # starting fresh.  Consumer (``cli/run.py``) dispatches by isinstance.
     restart_state: RestartBundle | list[list[RestartBundle]] | None = None
+
+
+def _check_initial_constraints(
+    descriptors: tuple[ConstraintDescriptor, ...],
+    resolved_init: ResolvedInit,
+) -> None:
+    """Fail fast if any initial walker violates a configuration constraint.
+
+    The MWG constraint gate assumes every walker entering a step already
+    satisfies the constraints (a move can then only be *blamed* for a new
+    violation). That invariant is established here: a starting configuration
+    that is already illegal is a user error, reported before the run begins.
+    """
+    positions = jnp.asarray(resolved_init.initial_positions)
+    types = jnp.asarray(resolved_init.initial_types)
+    n_live = int(positions.shape[0])
+    cells = resolved_init.initial_cells
+    cells = jnp.zeros((n_live, 3, 3)) if cells is None else jnp.asarray(cells)
+
+    for desc in descriptors:
+        predicate = desc.build(**desc.build_kwargs)
+        valid = jax.vmap(lambda p, c: predicate(p, types, c))(positions, cells)
+        valid = np.asarray(valid)
+        if not valid.all():
+            bad = int(np.argmax(~valid))
+            raise ValueError(
+                f"Initial walker {bad} of {n_live} violates the "
+                f"{desc.name!r} configuration constraint. Adjust the initial "
+                f"configuration (e.g. start_species / start_config_file) or "
+                f"relax the constraint before running."
+            )
+
+
+def _resolve_constraints(
+    root: RootSpec, resolved_init: ResolvedInit
+) -> tuple[ConstraintDescriptor, ...]:
+    """Build constraint descriptors from the config and validate initial state.
+
+    Returns an empty tuple when no constraints are configured (the common
+    case — zero overhead downstream).
+    """
+    if not root.constraints:
+        return ()
+    if resolved_init.symbol_map is None:
+        raise ValueError(
+            "Configuration constraints require a resolved species map, but "
+            "none is available for this init mode. This is a jaxrens "
+            "limitation — please report it."
+        )
+    descriptors = tuple(
+        c.to_descriptor(symbol_map=resolved_init.symbol_map)
+        for c in root.constraints
+    )
+    _check_initial_constraints(descriptors, resolved_init)
+    return descriptors
 
 
 def _build_cells(
@@ -364,6 +420,86 @@ def _validate_cells(
             )
 
 
+def _compute_initial_energies(
+    energy_backend: EnergyBackend,
+    types: jnp.ndarray,
+    batcher: BatchDescriptor,
+    positions: jnp.ndarray,
+    cells: jnp.ndarray,
+    bucket: int,
+    ensemble_params_batched: Any | None,
+) -> jnp.ndarray:
+    """Batched initial-energy evaluation at a fixed neighbor ``bucket``.
+
+    Routes the per-replica energy compute through ``batcher.wrap_for_batch``
+    (SingleRun / PmapVmapRuns) exactly like the surrounding finalize.
+
+    ``ensemble_params_batched`` is an ensemble-agnostic pytree (e.g.
+    ``{"pressure": (*prefix,), "chemical_potentials": (*prefix, n_species)}``)
+    whose leaves carry one entry per replica along the batcher's
+    ``shape_prefix`` axes.  ``jax.vmap``/``pmap`` map those leaves natively, so
+    each replica's per-call ``ensemble_params`` dict flows through to the
+    backend and its initial energy reflects that replica's own P·V and −μ·N
+    terms.  When ``None`` (no ensemble corrections, or the SingleRun path
+    where the backend already closes over its ensemble params) no
+    ``ensemble_params`` kwarg is passed.
+
+    ``bucket`` is the static neighbor-list size to compile at — ``0`` for
+    backends without ``max_neighbors_for``, else the chosen starting bucket.
+    """
+    if ensemble_params_batched is None:
+
+        def per_replica(pos_K, cells_K):
+            return jax.vmap(
+                lambda p, c: energy_backend(p, types, c, bucket)[0]
+            )(pos_K, cells_K)
+
+        return batcher.wrap_for_batch(per_replica)(positions, cells)
+
+    def per_replica_ep(pos_K, cells_K, ep):
+        return jax.vmap(
+            lambda p, c: energy_backend(
+                p,
+                types,
+                c,
+                bucket,
+                ensemble_params=ep,
+            )[0]
+        )(pos_K, cells_K)
+
+    return batcher.wrap_for_batch(per_replica_ep)(
+        positions, cells, ensemble_params_batched
+    )
+
+
+def _stack_ensemble_params(
+    params_per_run: tuple[dict, ...] | list[dict],
+    keys: tuple[str, ...],
+    shape_prefix: tuple[int, ...],
+) -> dict | None:
+    """Stack per-replica ensemble-param dicts into one batched pytree.
+
+    For each key in ``keys`` present in *every* replica dict, stacks the
+    per-replica values along a new leading axis and reshapes to
+    ``shape_prefix + leaf_shape`` so the leaves align with the batcher's
+    replica axes.  Returns ``None`` if no key qualifies (no ensemble
+    corrections to thread).
+
+    Only energy-relevant keys should be passed in ``keys`` — these are the
+    same per-replica dicts the runtime NS loop hands to its ``EnsembleBackend``
+    via ``ensemble_params_per_run``, so resolved initial energies match the
+    runtime by construction.
+    """
+    batched: dict = {}
+    for k in keys:
+        if all(k in p for p in params_per_run):
+            stacked = jnp.stack(
+                [jnp.asarray(p[k]) for p in params_per_run], axis=0
+            )
+            batched[k] = stacked.reshape(shape_prefix + stacked.shape[1:])
+    return batched or None
+
+
 def _finalise_initial_energies_and_counts(
     energy_backend: EnergyBackend | None,
     positions: jnp.ndarray,
@@ -372,7 +508,7 @@ def _finalise_initial_energies_and_counts(
     batcher: BatchDescriptor | None = None,
     ladder: tuple[int, ...] | None = None,
     offset: int = 0,
-    pressures: jnp.ndarray | None = None,
+    ensemble_params_batched: Any | None = None,
 ) -> tuple[jnp.ndarray | None, jnp.ndarray | None]:
     """Compute per-walker initial ``(energies, max_neighbor_counts)``.
 
@@ -407,14 +543,15 @@ def _finalise_initial_energies_and_counts(
     function, not vmap-axis aligned — it's identical across walkers
     and across replicas.
 
-    ``pressures`` (shape ``batcher.shape_prefix``) carries per-replica
-    pressure values for NPT runs.  When supplied with a PmapVmapRuns
-    batcher and an EnsembleBackend, the per-call
-    ``ensemble_params={"pressure": ...}`` kwarg flows through so each
-    replica's initial energy reflects its own P·V term — even though
-    a single EnsembleBackend instance handles all replicas in the
-    consolidated finalize.  When ``None``, the backend's own closured
-    pressure is used (SingleRun path).
+    ``ensemble_params_batched`` is an ensemble-agnostic pytree (leaves
+    shaped ``batcher.shape_prefix + leaf_shape``) carrying per-replica
+    ensemble params — ``pressure`` for NPT, ``chemical_potentials`` for
+    semi-grand μPT, or both.  When supplied with an EnsembleBackend, each
+    replica's initial energy reflects its own P·V and −μ·N terms, matching
+    the runtime NS loop by construction — even though a single
+    EnsembleBackend instance handles all replicas in the consolidated
+    finalize.  When ``None``, no ensemble correction is threaded (the
+    backend's own closured params are used, as on the SingleRun path).
 
     Returns ``(energies, counts)``; either or both may be ``None``.
     """
@@ -463,31 +600,15 @@ def _finalise_initial_energies_and_counts(
             init_bucket,
         )
 
-        if pressures is None:
-
-            def per_replica_energy(pos_K, cells_K):
-                return jax.vmap(
-                    lambda p, c: energy_backend(p, types, c, init_bucket)[0]
-                )(pos_K, cells_K)
-
-            batched_energy = batcher.wrap_for_batch(per_replica_energy)
-            energies = batched_energy(positions, cells)
-        else:
-
-            def per_replica_energy_p(pos_K, cells_K, pressure_scalar):
-                ep = {"pressure": pressure_scalar}
-                return jax.vmap(
-                    lambda p, c: energy_backend(
-                        p,
-                        types,
-                        c,
-                        init_bucket,
-                        ensemble_params=ep,
-                    )[0]
-                )(pos_K, cells_K)
-
-            batched_energy = batcher.wrap_for_batch(per_replica_energy_p)
-            energies = batched_energy(positions, cells, pressures)
+        energies = _compute_initial_energies(
+            energy_backend,
+            types,
+            batcher,
+            positions,
+            cells,
+            init_bucket,
+            ensemble_params_batched,
+        )
         return energies, counts
 
     logger.info(
@@ -499,31 +620,15 @@ def _finalise_initial_energies_and_counts(
         type(batcher).__name__,
     )
 
-    if pressures is None:
-
-        def per_replica_energy_no_nl(pos_K, cells_K):
-            return jax.vmap(lambda p, c: energy_backend(p, types, c, 0)[0])(
-                pos_K, cells_K
-            )
-
-        batched_energy = batcher.wrap_for_batch(per_replica_energy_no_nl)
-        energies = batched_energy(positions, cells)
-    else:
-
-        def per_replica_energy_no_nl_p(pos_K, cells_K, pressure_scalar):
-            ep = {"pressure": pressure_scalar}
-            return jax.vmap(
-                lambda p, c: energy_backend(
-                    p,
-                    types,
-                    c,
-                    0,
-                    ensemble_params=ep,
-                )[0]
-            )(pos_K, cells_K)
-
-        batched_energy = batcher.wrap_for_batch(per_replica_energy_no_nl_p)
-        energies = batched_energy(positions, cells, pressures)
+    energies = _compute_initial_energies(
+        energy_backend,
+        types,
+        batcher,
+        positions,
+        cells,
+        0,
+        ensemble_params_batched,
+    )
     return energies, None
 
 
@@ -805,7 +910,7 @@ def _resolve_init_species(
 
     if init.pos_autoscale_cells:
         logger.warning(
-            "pos_autoscale_cells=True is set but not yet implemented in step 2. "
+            "pos_autoscale_cells=True is set but not yet implemented. "
             "The cell will not be scaled to guarantee minimum atom distances. "
             "Rejection sampling may fail if the cell is too small."
         )
@@ -974,6 +1079,9 @@ class ResolvedConfig:
     initial_walk_config: Any = None
     adaptation_cfg: Any = None
     inter_re_config: Any = None  # InterREConfig | None
+    # Configuration constraints to enforce via the MWG gate. Empty when none
+    # are configured (the common case). See jaxrens.constraints.
+    constraint_descriptors: tuple[ConstraintDescriptor, ...] = ()
     # Batcher describing the (G, P) topology.  ``SingleRun`` when
     # n_total == 1, ``PmapVmapRuns(n_gpu, n_per_gpu)`` otherwise.
     # Consumed uniformly by ``_run_loop``, ``build_adapt_step``,
@@ -1030,6 +1138,7 @@ def _resolve_single_replica(
     # ``ensemble_params`` is passed in by ``resolve`` (the caller already
     # built it via ``root.ensemble.to_ensemble_params(cohort_index=0)``).
     pressure = ensemble_params.get("pressure", None)
+    chemical_potentials = ensemble_params.get("chemical_potentials", None)
 
     seed = root.run.seed
 
@@ -1041,7 +1150,6 @@ def _resolve_single_replica(
         n_extra=root.run.n_extra,
         n_cull=root.run.n_cull,
         seed=seed,
-        pressure=pressure,
     )
 
     backend = root.backend.to_backend_config()
@@ -1059,17 +1167,25 @@ def _resolve_single_replica(
         )
 
     # For initial-energy evaluation, locally wrap with EnsembleBackend so the
-    # resolver's energies match the NS-loop scale (U + P*V for NPT) — without
+    # resolver's energies match the NS-loop scale (U + P*V - μ·N) — without
     # this, walkers are initialized with bare LJ energies while the MWG
     # step_fn returns ensemble-corrected energies, causing systematic
     # emax < new_energy for all cell moves and 100% rejection from the first
     # adapt call.  Discarded after _resolve_init returns; only ``base_backend``
     # crosses the resolver boundary, leaving wrapping to the runtime.
-    if pressure is not None:
+    if pressure is not None or chemical_potentials is not None:
+        import jax.numpy as jnp
+
         from jaxrens.backends.ensemble import EnsembleBackend
 
         init_energy_backend = EnsembleBackend(
-            base_backend, pressure=float(pressure)
+            base_backend,
+            pressure=float(pressure) if pressure is not None else 0.0,
+            chemical_potentials=(
+                jnp.asarray(chemical_potentials, dtype=jnp.float32)
+                if chemical_potentials is not None
+                else None
+            ),
         )
     else:
         init_energy_backend = base_backend
@@ -1169,6 +1285,8 @@ def _resolve_single_replica(
         for m, policy in zip(root.moves, adaptation_policies)
     )
 
+    constraint_descriptors = _resolve_constraints(root, resolved_init)
+
     if shard_n_gpu > 1:
         from jaxrens.sampling.batch_descriptor import ShardedSingleRun
 
@@ -1180,6 +1298,7 @@ def _resolve_single_replica(
         ns=ns,
         moves=moves,
         move_descriptors=move_descriptors,
+        constraint_descriptors=constraint_descriptors,
         backend=backend,
         base_backend=base_backend,
         output=output,
@@ -1228,11 +1347,9 @@ def _derive_replica_axes(
         ValueError: On any inconsistency described above.
     """
     # ---- Gather per-replica axis lengths ------------------------------------
-    pressure_list: list[float] | None = None
-    if isinstance(root.ensemble, NPTEnsembleSpec):
-        plist = root.ensemble._pressure_list()
-        if len(plist) > 1:
-            pressure_list = plist
+    # The ensemble spec owns its own replica axis (NPT pressure list, semi_grand
+    # μ / pressure list); ask it generically rather than special-casing keys.
+    ensemble_cohort = root.ensemble.cohort_size()
 
     comp_targets: list[list[int]] | None = None
     chem_pots: list[list[float]] | None = None
@@ -1240,16 +1357,23 @@ def _derive_replica_axes(
         if root.inter_re.flavor == "xrens":
             comp_targets = list(root.inter_re.composition_targets or [])
         elif root.inter_re.flavor == "semi_grand":
+            # μ may come from the ensemble spec OR inter_re, never both.
+            if isinstance(root.ensemble, SemiGrandEnsembleSpec):
+                raise ValueError(
+                    "Conflicting chemical potentials: both ensemble "
+                    "(type=semi_grand) and inter_re (flavor=semi_grand) specify "
+                    "chemical_potentials. Set them in exactly one place."
+                )
             chem_pots = list(root.inter_re.chemical_potentials or [])
-        elif root.inter_re.flavor == "pressure" and pressure_list is None:
+        elif root.inter_re.flavor == "pressure" and ensemble_cohort <= 1:
             raise ValueError(
                 "inter_re.flavor='pressure' requires a list-valued "
                 "ensemble.pressure with at least 2 entries (one per replica)."
             )
 
     lengths: list[tuple[str, int]] = []
-    if pressure_list is not None:
-        lengths.append(("ensemble.pressure", len(pressure_list)))
+    if ensemble_cohort > 1:
+        lengths.append(("ensemble", ensemble_cohort))
     if comp_targets:
         lengths.append(("inter_re.composition_targets", len(comp_targets)))
     if chem_pots:
@@ -1291,26 +1415,21 @@ def _derive_replica_axes(
     n_per_gpu = n_total // n_gpu
 
     # ---- Build per-replica ensemble_params dicts ----------------------------
-    # Pressures (scalar fallback: if pressure is scalar, broadcast).
-    if pressure_list is not None:
-        pressures = pressure_list
-    elif isinstance(root.ensemble, NPTEnsembleSpec):
-        # Scalar pressure broadcast to all replicas.
-        pressures = root.ensemble._pressure_list() * n_total
-    else:
-        pressures = None
-
-    # For list-valued pressure, honour pressure_units from the spec.
-    if pressures is not None and isinstance(root.ensemble, NPTEnsembleSpec):
-        if root.ensemble.pressure_units == "gpa":
-            _GPA_TO_EVA3 = 0.006241509
-            pressures = [p * _GPA_TO_EVA3 for p in pressures]
-
+    # Start from the ensemble spec's own params (handles pressure-unit
+    # conversion, μ vectors, and scalar→broadcast), then layer on the
+    # inter_re-specific axes.  ``cohort_index`` broadcasts when the ensemble is
+    # scalar (cohort 1) and indexes per-replica when it's a list.
     params_per_run: list[dict] = []
     for r in range(n_total):
-        params: dict = {}
-        if pressures is not None:
-            params["pressure"] = float(pressures[r])
+        cohort_index = r if ensemble_cohort > 1 else 0
+        params: dict = dict(
+            root.ensemble.to_ensemble_params(cohort_index=cohort_index)
+        )
+        # Normalise vector leaves (e.g. chemical_potentials) to device arrays.
+        if "chemical_potentials" in params:
+            params["chemical_potentials"] = jnp.asarray(
+                params["chemical_potentials"], dtype=jnp.float32
+            )
         if comp_targets:
             params["target_composition"] = jnp.asarray(
                 comp_targets[r], dtype=jnp.int32
@@ -1529,20 +1648,21 @@ def _resolve_multi_replica(
         else None
     )
 
-    pressures = jnp.asarray(
-        [
-            float(params_per_run[r].get("pressure", 0.0))
-            for r in range(n_total)
-        ],
-        dtype=jnp.float32,
-    ).reshape(n_gpu, n_per_gpu)
+    # Thread the per-replica ensemble params the runtime NS loop uses
+    # (``ensemble_params_per_run``) into the consolidated initial-energy
+    # compute, so resolved initial energies include the same P·V and −μ·N
+    # terms the EnsembleBackend applies at runtime — matching by construction.
+    # ``EnsembleBackend`` reads exactly these keys; others (e.g.
+    # ``target_composition``) are not energy terms and are not threaded.
+    _ENERGY_KEYS = ("pressure", "chemical_potentials")
+    ensemble_params_batched = _stack_ensemble_params(
+        params_per_run, _ENERGY_KEYS, (n_gpu, n_per_gpu)
+    )
 
-    # Use a single base-or-ensemble backend for the consolidated call.
-    # If any replica has a pressure, all replicas share the same
-    # EnsembleBackend wrapper and per-replica pressure flows through
-    # ``ensemble_params``; otherwise use the raw base backend.
-    any_pressure = any(p.get("pressure") is not None for p in params_per_run)
-    if any_pressure:
+    # If any replica carries an energy-relevant ensemble param, all replicas
+    # share one EnsembleBackend wrapper and their per-replica params flow
+    # through ``ensemble_params``; otherwise use the raw base backend.
+    if ensemble_params_batched is not None:
         finalize_backend = EnsembleBackend(base_backend, pressure=0.0)
     else:
         finalize_backend = base_backend
@@ -1555,7 +1675,7 @@ def _resolve_multi_replica(
         batcher=batcher,
         ladder=tuple(backend_cfg.max_neighbors_list),
         offset=int(backend_cfg.max_neighbors_offset),
-        pressures=pressures if any_pressure else None,
+        ensemble_params_batched=ensemble_params_batched,
     )
 
     # Collapse the (G, P, K, ...) shape back to (n_total, K, ...) so
@@ -1611,7 +1731,6 @@ def _resolve_multi_replica(
         n_extra=root.run.n_extra,
         n_cull=root.run.n_cull,
         seed=root.run.seed,
-        pressure=None,  # per-replica pressure lives in ensemble_params_per_run.
         inter_re=(
             root.inter_re.to_inter_re_config()
             if root.inter_re is not None
@@ -1682,10 +1801,13 @@ def _resolve_multi_replica(
         for m, policy in zip(root.moves, adaptation_policies)
     )
 
+    constraint_descriptors = _resolve_constraints(root, stacked_init)
+
     return ResolvedConfig(
         ns=ns,
         moves=moves,
         move_descriptors=move_descriptors,
+        constraint_descriptors=constraint_descriptors,
         backend=backend_cfg,
         base_backend=base_backend,
         output=output,

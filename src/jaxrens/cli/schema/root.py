@@ -5,12 +5,19 @@ from __future__ import annotations
 import warnings
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from jaxrens.cli.schema.adaptation import AdaptationSpec
 from jaxrens.cli.schema.backend import BackendSpec
 from jaxrens.cli.schema.cell import CellSpec
-from jaxrens.cli.schema.ensemble import EnsembleSpec, NVTEnsembleSpec, NPTEnsembleSpec
+from jaxrens.cli.schema.constraints import ConstraintSpec
+from jaxrens.cli.schema.ensemble import EnsembleSpec, NVTEnsembleSpec
 from jaxrens.cli.schema.init import InitSpec
 from jaxrens.cli.schema.inter_re import InterRESpec
 from jaxrens.cli.schema.moves import MoveSpec
@@ -83,15 +90,13 @@ class RootSpec(BaseModel):
     output: OutputSpec
     termination: list[TerminationSpec] | None = None
     adaptation: AdaptationSpec = Field(default_factory=AdaptationSpec)
-    # ensemble defaults to NVT; NPTEnsembleSpec is synthesized from run.pressure
-    # when no explicit ensemble: key is provided (backward compatibility).
     ensemble: EnsembleSpec = Field(default_factory=NVTEnsembleSpec)
     init: InitSpec = Field(
         default_factory=lambda: InitSpec(start_species="1 1")
     )
     cell: CellSpec = Field(default_factory=CellSpec)
-    # inter_re is optional; None → no replica-exchange swaps (zero overhead).
     inter_re: InterRESpec | None = None
+    constraints: list[ConstraintSpec] = Field(default_factory=list)
 
     @field_validator("moves", mode="before")
     @classmethod
@@ -119,45 +124,6 @@ class RootSpec(BaseModel):
         if isinstance(v, dict):
             return [v]
         return v
-
-    @model_validator(mode="after")
-    def _resolve_legacy_pressure(self) -> "RootSpec":
-        """Synthesize NPTEnsembleSpec from ``run.pressure`` when no ``ensemble:`` key.
-
-        Rules:
-        - If ``run.pressure`` is set AND no explicit ``ensemble:`` was provided
-          (i.e. ensemble is still the NVT default), synthesize NPTEnsembleSpec.
-        - If both ``run.pressure`` is set AND ``ensemble:`` was explicitly provided,
-          raise a ValidationError — the user must pick one.
-        - If neither is set, NVT is used (default behavior, no change).
-
-        Note: ``run.pressure`` is deprecated in favour of ``ensemble:``.
-        Use ``ensemble: {type: npt, pressure: <value>}`` in new configs.
-        """
-        has_legacy_pressure = self.run.pressure is not None
-        # NVTEnsembleSpec is the default_factory default — it's what we see when
-        # the user did NOT provide an explicit ensemble key.
-        ensemble_is_default = isinstance(self.ensemble, NVTEnsembleSpec)
-
-        if has_legacy_pressure and not ensemble_is_default:
-            raise ValueError(
-                "Conflicting ensemble specification: both run.pressure and ensemble: "
-                "are set. Remove run.pressure and use ensemble: exclusively."
-            )
-
-        if has_legacy_pressure and ensemble_is_default:
-            # Synthesize NPT from legacy field; pressure is already in eV/Å³ from
-            # the old convention (NSConfig.pressure stores eV/Å³).
-            object.__setattr__(
-                self,
-                "ensemble",
-                NPTEnsembleSpec(
-                    pressure=self.run.pressure,  # type: ignore[arg-type]
-                    pressure_units="eva3",
-                ),
-            )
-
-        return self
 
     @model_validator(mode="after")
     def _warn_unusual_per_walker_intervals(self) -> "RootSpec":
@@ -192,7 +158,10 @@ class RootSpec(BaseModel):
             )
 
         too_frequent = [
-            ("inter_re.re_interval", self.inter_re.re_interval if self.inter_re else None),
+            (
+                "inter_re.re_interval",
+                self.inter_re.re_interval if self.inter_re else None,
+            ),
             ("output.traj_interval", self.output.traj_interval),
         ]
         for label, value in too_frequent:

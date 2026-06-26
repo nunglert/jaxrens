@@ -37,6 +37,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.sampling.morph import morph_types_to_composition
+from jaxrens.utils.cell import get_volume
 
 # ---------------------------------------------------------------------------
 # SwapKernel abstraction
@@ -224,8 +225,8 @@ class PressureRENSSwap(SwapKernel):
         )
 
         if use_pressure:
-            v_a = _get_volume(proposed["cell_a"])
-            v_b = _get_volume(proposed["cell_b"])
+            v_a = get_volume(proposed["cell_a"])
+            v_b = get_volume(proposed["cell_b"])
             # Stored e_a, e_b are enthalpies at self's pressure (EnsembleBackend
             # adds P_self·V).  Recover U by subtracting self's PV, then re-add
             # at the partner's pressure to get the enthalpy under the receiving
@@ -322,7 +323,7 @@ def perform_swap(
         h_self_b = energies_pair[1] + pressures_pair[1] * volumes_pair[1]
 
         # Fake cell matrices whose determinant equals the supplied volumes.
-        # _get_volume calls jnp.linalg.det, so we need actual (3,3) matrices.
+        # get_volume calls jnp.linalg.det, so we need actual (3,3) matrices.
         # Use a diagonal matrix: det(diag(cbrt(V), cbrt(V), cbrt(V))) = V.
         def _volume_to_cell(v: jnp.ndarray) -> jnp.ndarray:
             side = jnp.cbrt(v)
@@ -353,14 +354,13 @@ def perform_swap(
     )
 
 
-# ---------------------------------------------------------------------------
-# Volume helper
-# ---------------------------------------------------------------------------
-
-
-def _get_volume(cell: jnp.ndarray) -> jnp.ndarray:
-    """Compute volume from cell matrix. cell shape: (3, 3)."""
-    return jnp.abs(jnp.linalg.det(cell))
+def _pad_pairs(pairs, n_valid, max_len):
+    """Pad a (k, 2) pair array to (max_len, 2) and return it with a validity mask."""
+    if pairs.shape[0] < max_len:
+        padding = jnp.zeros((max_len - pairs.shape[0], 2), dtype=pairs.dtype)
+        pairs = jnp.concatenate([pairs, padding], axis=0)
+    mask = jnp.arange(max_len) < n_valid
+    return pairs, mask
 
 
 # ---------------------------------------------------------------------------
@@ -442,16 +442,6 @@ def replica_exchange_step(
                 "n_attempted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
             },
         )
-
-    # Pad pairs arrays to max_pairs with dummy pair (0, 0) and mask
-    def _pad_pairs(pairs, n_valid, max_len):
-        if pairs.shape[0] < max_len:
-            padding = jnp.zeros(
-                (max_len - pairs.shape[0], 2), dtype=pairs.dtype
-            )
-            pairs = jnp.concatenate([pairs, padding], axis=0)
-        mask = jnp.arange(max_len) < n_valid
-        return pairs, mask
 
     even_pairs_padded, even_mask = _pad_pairs(even_pairs, n_even, max_pairs)
     odd_pairs_padded, odd_mask = _pad_pairs(odd_pairs, n_odd, max_pairs)
@@ -544,8 +534,8 @@ def replica_exchange_step(
             if pressures is not None and bxs is not None:
                 p_i = pressures[run_i]
                 p_j = pressures[run_j]
-                v_i = _get_volume(bxs[run_i, wi])
-                v_j = _get_volume(bxs[run_j, wj])
+                v_i = get_volume(bxs[run_i, wi])
+                v_j = get_volume(bxs[run_j, wj])
                 u_i = e_i - p_i * v_i  # recover raw U from stored H_self
                 u_j = e_j - p_j * v_j
                 new_e_into_run_i = (
@@ -962,15 +952,6 @@ def xrens_replica_exchange_step(
                 "n_attempted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
             },
         )
-
-    def _pad_pairs(pairs, n_valid, max_len):
-        if pairs.shape[0] < max_len:
-            padding = jnp.zeros(
-                (max_len - pairs.shape[0], 2), dtype=pairs.dtype
-            )
-            pairs = jnp.concatenate([pairs, padding], axis=0)
-        mask = jnp.arange(max_len) < n_valid
-        return pairs, mask
 
     even_pairs_padded, even_mask = _pad_pairs(even_pairs, n_even, max_pairs)
     odd_pairs_padded, odd_mask = _pad_pairs(odd_pairs, n_odd, max_pairs)
@@ -1490,15 +1471,6 @@ def semi_grand_replica_exchange_step(
                 "n_attempted_per_pair": jnp.zeros(n_pairs, dtype=jnp.int32),
             },
         )
-
-    def _pad_pairs(pairs, n_valid, max_len):
-        if pairs.shape[0] < max_len:
-            padding = jnp.zeros(
-                (max_len - pairs.shape[0], 2), dtype=pairs.dtype
-            )
-            pairs = jnp.concatenate([pairs, padding], axis=0)
-        mask = jnp.arange(max_len) < n_valid
-        return pairs, mask
 
     even_pairs_padded, even_mask = _pad_pairs(even_pairs, n_even, max_pairs)
     odd_pairs_padded, odd_mask = _pad_pairs(odd_pairs, n_odd, max_pairs)

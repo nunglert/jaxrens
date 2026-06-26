@@ -111,6 +111,9 @@ def save_checkpoint(
         if ns_state.get("cells") is not None:
             f.create_dataset("cells", data=_to_np(ns_state["cells"]))
 
+        if ns_state.get("step_sizes") is not None:
+            f.create_dataset("step_sizes", data=_to_np(ns_state["step_sizes"]))
+
         # Dead-point arrays are optional — current `_ns_state_to_checkpoint_dict`
         # omits them entirely (the canonical record lives in `.energies` /
         # `.traj`).  Older callers / tests that still populate them keep
@@ -149,7 +152,9 @@ def save_checkpoint(
                 )
 
         if ns_state.get("live_volumes") is not None:
-            f.create_dataset("live_volumes", data=_to_np(ns_state["live_volumes"]))
+            f.create_dataset(
+                "live_volumes", data=_to_np(ns_state["live_volumes"])
+            )
 
         # log_evidence may be batched — store as dataset when ndim >= 1.
         _store_field(f, "log_evidence", ns_state["log_evidence"])
@@ -182,7 +187,8 @@ def save_checkpoint(
             import jax.random as _jr  # lazy — save path is already jax-using
 
             f.create_dataset(
-                "rng_key_data", data=np.asarray(_jr.key_data(ns_state["rng_key"]))
+                "rng_key_data",
+                data=np.asarray(_jr.key_data(ns_state["rng_key"])),
             )
 
         if symbol_map is not None:
@@ -202,11 +208,13 @@ def _read_field(f: h5py.File, key: str) -> np.ndarray | int | float:
     Returns a numpy array (dataset) or a Python scalar (attr).
     """
     if key in f:
-        return f[key][()]   # numpy array, shape preserved
+        return f[key][()]  # numpy array, shape preserved
     elif key in f.attrs:
         return f.attrs[key]  # scalar attr
     else:
-        raise KeyError(f"Field '{key}' not found in checkpoint (neither dataset nor attr).")
+        raise KeyError(
+            f"Field '{key}' not found in checkpoint (neither dataset nor attr)."
+        )
 
 
 def load_checkpoint(path: Path | str) -> dict:
@@ -243,17 +251,19 @@ def load_checkpoint(path: Path | str) -> dict:
         types = np.asarray(f["types"][()])
         energies = np.asarray(f["energies"][()])
         cells = np.asarray(f["cells"][()]) if "cells" in f else None
+        step_sizes = (
+            np.asarray(f["step_sizes"][()]) if "step_sizes" in f else None
+        )
 
-        # dead_* are optional in the new HDF5 format (the canonical record
-        # lives in `.energies` / `.traj`).  Treat missing fields as empty
-        # so callers that only need live state work transparently; callers
-        # that rely on dead-point data should source it from the streamed
-        # files (see ``postprocess.Monitor.from_directory``).
         dead_energies_raw = (
-            np.asarray(f["dead_energies"][()]) if "dead_energies" in f else None
+            np.asarray(f["dead_energies"][()])
+            if "dead_energies" in f
+            else None
         )
         dead_positions_raw = (
-            np.asarray(f["dead_positions"][()]) if "dead_positions" in f else None
+            np.asarray(f["dead_positions"][()])
+            if "dead_positions" in f
+            else None
         )
 
         # log_evidence: stored as dataset (batched) or attr (scalar).
@@ -274,8 +284,12 @@ def load_checkpoint(path: Path | str) -> dict:
         n_dead_raw = _read_field(f, "n_dead")
         n_walkers = int(f.attrs["n_walkers"])
 
-        dead_volumes_raw = np.asarray(f["dead_volumes"][()]) if "dead_volumes" in f else None
-        live_volumes = np.asarray(f["live_volumes"][()]) if "live_volumes" in f else None
+        dead_volumes_raw = (
+            np.asarray(f["dead_volumes"][()]) if "dead_volumes" in f else None
+        )
+        live_volumes = (
+            np.asarray(f["live_volumes"][()]) if "live_volumes" in f else None
+        )
 
         # Raw PRNG state (uint32 buffer).  ``jax.random.wrap_key_data`` is
         # the inverse of the ``key_data`` call in save_checkpoint and is
@@ -301,10 +315,13 @@ def load_checkpoint(path: Path | str) -> dict:
             # Legacy format: pad dead arrays to a comfortable size for callers
             # that previously relied on padded shapes.
             max_dead = max(n_dead * 2, 50000)
-            dead_energies = np.full(max_dead, np.inf, dtype=dead_energies_raw.dtype)
+            dead_energies = np.full(
+                max_dead, np.inf, dtype=dead_energies_raw.dtype
+            )
             dead_energies[:n_dead] = dead_energies_raw
             dead_positions = np.zeros(
-                (max_dead, *positions.shape[1:]), dtype=dead_positions_raw.dtype,
+                (max_dead, *positions.shape[1:]),
+                dtype=dead_positions_raw.dtype,
             )
             dead_positions[:n_dead] = dead_positions_raw
             if dead_volumes_raw is not None:
@@ -314,17 +331,22 @@ def load_checkpoint(path: Path | str) -> dict:
                 dead_volumes = None
     else:
         # Batched run: return stored arrays directly (no padding).
-        n_dead = n_dead_np          # shape (n_runs,) or (G, P)
-        iteration = iteration_np    # shape (n_runs,) or (G, P)
+        n_dead = n_dead_np  # shape (n_runs,) or (G, P)
+        iteration = iteration_np  # shape (n_runs,) or (G, P)
         dead_energies = dead_energies_raw
         dead_positions = dead_positions_raw
         dead_volumes = dead_volumes_raw
 
-    _iter_log = int(np.asarray(iteration_raw).flat[0]) if np.asarray(iteration_raw).size > 0 else -1
+    _iter_log = (
+        int(np.asarray(iteration_raw).flat[0])
+        if np.asarray(iteration_raw).size > 0
+        else -1
+    )
     logger.info("Checkpoint loaded from %s (iteration %s)", path, _iter_log)
 
     emax = (
-        np.asarray(emax_raw) if emax_raw is not None
+        np.asarray(emax_raw)
+        if emax_raw is not None
         else np.asarray(np.inf, dtype=np.float32)
     )
 
@@ -333,6 +355,7 @@ def load_checkpoint(path: Path | str) -> dict:
         "types": types,
         "energies": energies,
         "cells": cells,
+        "step_sizes": step_sizes,
         "dead_energies": dead_energies,
         "dead_positions": dead_positions,
         "dead_volumes": dead_volumes,

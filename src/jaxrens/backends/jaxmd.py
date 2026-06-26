@@ -77,8 +77,9 @@ except ImportError as exc:
 def _require_jaxmd() -> None:
     if not _JAXMD_AVAILABLE:
         raise ImportError(
-            f"jax-md is required for the JaxMDBackend but not installed: "
-            f"{_JAXMD_IMPORT_ERROR}"
+            "jax-md is required for the JaxMDBackend but is not installed.\n"
+            "Install it with:  pip install '.[jaxmd]'\n"
+            f"Original import error: {_JAXMD_IMPORT_ERROR}"
         )
 
 
@@ -233,7 +234,8 @@ def _build_displacement_fn(periodic: bool) -> Any:
     """
     if periodic:
         disp_fn, _ = _jmd_space.periodic_general(
-            jnp.eye(3), fractional_coordinates=True,
+            jnp.eye(3),
+            fractional_coordinates=True,
         )
         return disp_fn
     disp_fn, _ = _jmd_space.free()
@@ -291,8 +293,19 @@ def _resolve_tersoff_params(
 # Minimal element → Z map covering the elements Tersoff parameter files
 # in the wild target (Si, C, Ge, plus a few extras).  Extend as needed.
 _ELEMENT_TO_Z: dict[str, int] = {
-    "H": 1, "C": 6, "N": 7, "O": 8, "Al": 13, "Si": 14, "P": 15, "S": 16,
-    "Ti": 22, "Cu": 29, "Ge": 32, "As": 33, "Ga": 31,
+    "H": 1,
+    "C": 6,
+    "N": 7,
+    "O": 8,
+    "Al": 13,
+    "Si": 14,
+    "P": 15,
+    "S": 16,
+    "Ti": 22,
+    "Cu": 29,
+    "Ge": 32,
+    "As": 33,
+    "Ga": 31,
 }
 
 
@@ -327,13 +340,16 @@ def create_jaxmd(
 
     if potential == "tersoff":
         params, atomic_numbers = _resolve_tersoff_params(
-            tersoff_params, tersoff_params_file,
+            tersoff_params,
+            tersoff_params_file,
         )
         energy_fn = _jmd_energy.tersoff(disp_fn, params)
         r_cutoff = float(params[0]["R"]) + float(params[0]["D"])
         logger.info(
             "JaxMDBackend created: tersoff, periodic=%s, r_cutoff=%.3f, Z=%s",
-            periodic, r_cutoff, atomic_numbers,
+            periodic,
+            r_cutoff,
+            atomic_numbers,
         )
         return JaxMDBackend(
             energy_fn=energy_fn,
@@ -354,9 +370,12 @@ def create_jaxmd(
         with open(eam_params_file) as f:
             element_line = f.read().split("\n")[3].split()
         with open(eam_params_file) as f:
-            charge_fn, embedding_fn, pairwise_fn, r_cutoff = (
-                _jmd_energy.load_lammps_eam_parameters(f)
-            )
+            (
+                charge_fn,
+                embedding_fn,
+                pairwise_fn,
+                r_cutoff,
+            ) = _jmd_energy.load_lammps_eam_parameters(f)
         # DYNAMO setfl line 4: "<n_elements> <El1> <El2> ...".
         # For single-element, n_elements=1 and the symbol is the second
         # token.
@@ -374,11 +393,16 @@ def create_jaxmd(
                 f"extend `_ELEMENT_TO_Z` in jaxmd.py."
             )
         energy_fn = _jmd_energy.eam(
-            disp_fn, charge_fn, embedding_fn, pairwise_fn,
+            disp_fn,
+            charge_fn,
+            embedding_fn,
+            pairwise_fn,
         )
         logger.info(
             "JaxMDBackend created: eam, periodic=%s, r_cutoff=%.3f, Z=(%d,)",
-            periodic, r_cutoff, z,
+            periodic,
+            r_cutoff,
+            z,
         )
         return JaxMDBackend(
             energy_fn=energy_fn,

@@ -1,17 +1,9 @@
-"""Resolver-layer tests extracted from test_schema.py.
+"""Resolver-layer tests.
 
 Covers: resolve(), _resolve_init(), to_descriptor(), to_move_config(),
 to_backend_config(), build_backend(), to_criterion(), to_ensemble_params(),
-adapt overlay logic, cohort expansion, full-config resolver, and
-TestInitSpecResolver (Part A and Part B, Mode B resolver tests).
-
-All classes that were renamed to avoid collisions are documented below:
-- TestInitSpecResolver (first occurrence, line 1705 of original test_schema.py)
-  -> kept as TestInitSpecResolverPartA (resolver unit tests for Part A init)
-- TestInitSpecResolver (second occurrence, line 2080 of original test_schema.py)
-  -> TestInitSpecResolverPartB, minus the two E2E tests:
-       test_start_species_e2e_run_ns   -> kept in test_init_positions.py
-       test_mode_b_end_to_end_jit      -> kept in test_init_structure.py
+adapt overlay logic, cohort expansion, full-config resolver, and InitSpec
+resolution (Part A and Part B, Mode B resolver tests).
 """
 
 from __future__ import annotations
@@ -141,7 +133,6 @@ class TestResolve:
             seed=0,
             convergence_threshold=0.1,
             n_cull=1,
-            pressure=None,
         )
         expected_move = MoveConfig(
             move_type="random_walk",
@@ -753,21 +744,9 @@ class TestEnsembleResolver:
             "pressure"
         ] == pytest.approx(2.0 * _GPA_TO_EVA3)
 
-    def test_legacy_pressure_resolver_synthesizes_correct_ensemble_params(
-        self,
-    ):
-        d = _minimal_dict()
-        d["run"]["pressure"] = 0.03
-        root = RootSpec.model_validate(d)
-        resolved = resolve(root)
-        assert resolved.ensemble_params_per_run[0][
-            "pressure"
-        ] == pytest.approx(0.03)
-        assert resolved.ns.pressure == pytest.approx(0.03)
-
 
 # ---------------------------------------------------------------------------
-# Multi-replica resolver tests (yaml-fixture subset from former TestCohortExpansion)
+# Multi-replica resolver tests
 # ---------------------------------------------------------------------------
 
 
@@ -897,11 +876,10 @@ class TestExtendedOutputResolve:
         resolved = resolve(RootSpec.model_validate(d))
         assert resolved.output.snapshot_clean is True
 
-    def test_wrap_atoms_is_wired_no_longer_deferred(self, caplog):
-        """``wrap_atoms`` was previously a deferred field that only warned.
-        It is now wired through OutputConfig → ExtxyzTrajectoryWriter, so
-        setting it must NOT emit a deferred-field warning and must land on
-        ``ResolvedConfig.output.wrap_atoms``.
+    def test_wrap_atoms_is_wired(self, caplog):
+        """``wrap_atoms`` is wired through OutputConfig → the trajectory
+        writers, so setting it must NOT emit a deferred-field warning and must
+        land on ``ResolvedConfig.output.wrap_atoms``.
         """
         import logging
 
@@ -915,7 +893,7 @@ class TestExtendedOutputResolve:
 
 
 # ---------------------------------------------------------------------------
-# Full config fixture — resolver tests (split from TestFullConfigFixture)
+# Full config fixture — resolver tests
 # ---------------------------------------------------------------------------
 
 
@@ -940,16 +918,12 @@ class TestFullConfigResolver:
 
 
 # ---------------------------------------------------------------------------
-# 31. InitSpec resolver — Part A (renamed from first TestInitSpecResolver)
+# InitSpec resolver — Part A
 # ---------------------------------------------------------------------------
 
 
 class TestInitSpecResolverPartA:
-    """Tests for _resolve_init and ResolvedInit (Part A resolver).
-
-    Renamed from TestInitSpecResolver (line 1705 of original test_schema.py)
-    to avoid collision with the second TestInitSpecResolver class.
-    """
+    """Tests for _resolve_init and ResolvedInit (Part A resolver)."""
 
     def test_start_species_produces_resolved_init(self):
         from jaxrens.cli.resolve import ResolvedInit, _resolve_init
@@ -1054,19 +1028,12 @@ class TestInitSpecResolverPartA:
 
 
 # ---------------------------------------------------------------------------
-# Part B resolver tests (renamed from second TestInitSpecResolver, line 2080)
-# E2E tests were moved:
-#   test_start_species_e2e_run_ns  -> test_init_positions.py
-#   test_mode_b_end_to_end_jit     -> test_init_structure.py
+# InitSpec resolver — Part B
 # ---------------------------------------------------------------------------
 
 
 class TestInitSpecResolverPartB:
-    """Resolver unit tests for Part B (species/cell/grid resolver logic).
-
-    Renamed from second TestInitSpecResolver (line 2080) to avoid collision
-    with TestInitSpecResolverPartA above.
-    """
+    """Resolver unit tests for Part B (species/cell/grid resolver logic)."""
 
     def test_start_species_cells_shape(self):
         root = RootSpec.model_validate(_species_dict(n_atoms=2, n_live=6))

@@ -52,6 +52,7 @@ from jaxrens.backends._graph_neighbors import (
     _supercell_edges,
 )
 from jaxrens.backends.base import BackendResult
+from jaxrens.utils.cell import wrap_positions
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +70,9 @@ except ImportError as exc:
 def _require_nequix() -> None:
     if not _NEQUIX_AVAILABLE:
         raise ImportError(
-            f"nequix is required for the Nequix backend but not installed: "
-            f"{_NEQUIX_IMPORT_ERROR}"
+            "nequix is required for the Nequix backend but is not installed.\n"
+            "Install it with:  pip install '.[nequix]'\n"
+            f"Original import error: {_NEQUIX_IMPORT_ERROR}"
         )
 
 
@@ -107,9 +109,7 @@ def _compute_energy_only(
 
     # Centre → neighbor-at-image vector.  See module docstring for the
     # convention reconciliation between _supercell_edges and nequix.
-    displacements = (
-        padded_pos[receivers] - padded_pos[senders] + shifts
-    )
+    displacements = padded_pos[receivers] - padded_pos[senders] + shifts
 
     # Swap senders/receivers for nequix's message-direction convention:
     # nequix aggregates messages at `receivers`, and we want them
@@ -179,21 +179,30 @@ class NequixBackend:
         n_atoms = positions.shape[0]
         max_edges = n_atoms * max_neighbors
 
+        positions = wrap_positions(positions, cell)
+
         # Substitute a large dummy cell when the user passed cell == 0
         # (non-periodic systems).  Same trick as the NeuralIL backend —
         # ensures _supercell_edges has a well-defined image geometry.
         safe_cell = jnp.where(
-            jnp.trace(cell) == 0, 1000.0 * jnp.eye(3), cell,
+            jnp.trace(cell) == 0,
+            1000.0 * jnp.eye(3),
+            cell,
         )
 
-        senders, receivers, shifts, _, overflow, true_max_per_atom = (
-            _supercell_edges(
-                positions,
-                safe_cell,
-                self.r_cutoff,
-                max_edges,
-                self._image_offsets,
-            )
+        (
+            senders,
+            receivers,
+            shifts,
+            _,
+            overflow,
+            true_max_per_atom,
+        ) = _supercell_edges(
+            positions,
+            safe_cell,
+            self.r_cutoff,
+            max_edges,
+            self._image_offsets,
         )
 
         energy = _compute_energy_only(
@@ -241,10 +250,12 @@ def _resolve_model_path(model_name_or_path: str) -> str:
         if not cache_path.exists():
             logger.info(
                 "Downloading nequix model %s to %s",
-                model_name_or_path, cache_path,
+                model_name_or_path,
+                cache_path,
             )
             urllib.request.urlretrieve(
-                NequixCalculator.URLS[model_name_or_path], cache_path,
+                NequixCalculator.URLS[model_name_or_path],
+                cache_path,
             )
         return str(cache_path)
     raise FileNotFoundError(
@@ -278,9 +289,7 @@ def create_nequix(
     """
     _require_nequix()
     if checkpoint_path is None:
-        raise ValueError(
-            "checkpoint_path is required for the Nequix backend"
-        )
+        raise ValueError("checkpoint_path is required for the Nequix backend")
 
     path = _resolve_model_path(checkpoint_path)
     model, config = load_model(path, kernel=False)
@@ -293,5 +302,7 @@ def create_nequix(
     )
 
     return NequixBackend(
-        model=model, config=config, supercell_trafo=supercell_trafo,
+        model=model,
+        config=config,
+        supercell_trafo=supercell_trafo,
     )

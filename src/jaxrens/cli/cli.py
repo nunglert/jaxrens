@@ -130,11 +130,17 @@ def _run_single(resolved, *, writer_mode: str = "w") -> None:
         symbol_map=resolved.init.symbol_map,
         restart_state=resolved.init.restart_state,
         move_descriptors=list(resolved.move_descriptors),
+        constraint_descriptors=resolved.constraint_descriptors,
         initial_walk_config=resolved.initial_walk_config,
         adaptation_config=resolved.adaptation_cfg,
         termination_criteria=list(resolved.termination),
         base_backend=resolved.base_backend,
         writer_mode=writer_mode,
+        ensemble_params=(
+            resolved.ensemble_params_per_run[0]
+            if resolved.ensemble_params_per_run
+            else None
+        ),
     )
 
 
@@ -441,80 +447,6 @@ def _cmd_plot(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_migrate_ns_inp(args: argparse.Namespace) -> int:
-    """Migrate an old ns.inp file to jaxrens YAML format.
-
-    Reads key=value lines from *args.input* (file path or stdin), converts
-    them via ``migrate_ns_inp``, and writes YAML to *args.output* (file path
-    or stdout).  All warnings/info go to stderr so that a shell redirect of
-    stdout captures clean YAML.
-
-    If ``--validate`` is passed, the migrated YAML is round-tripped through
-    ``RootSpec.model_validate``; any validation error is printed to stderr
-    and the command returns exit code 1.
-    """
-    import io
-    import tempfile
-
-    from jaxrens.cli.migrate import migrate_ns_inp
-    from jaxrens.cli.parser import parse_input_file
-
-    # Read input ----------------------------------------------------------
-    if args.input == "-":
-        raw_text = sys.stdin.read()
-        # parse_input_file needs a file; write to a temp file.
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".inp", delete=False
-        ) as tmp:
-            tmp.write(raw_text)
-            tmp_path = tmp.name
-        raw = parse_input_file(tmp_path)
-        import os
-
-        os.unlink(tmp_path)
-    else:
-        raw = parse_input_file(args.input)
-
-    # Migrate -------------------------------------------------------------
-    result = migrate_ns_inp(raw)
-    cfg_dict: dict[str, Any] = result["config"]
-    logs: list[dict[str, str]] = result["logs"]
-
-    # Emit diagnostics to stderr ------------------------------------------
-    for entry in logs:
-        print(f"[{entry['level']}] {entry['message']}", file=sys.stderr)
-
-    # Build YAML, hoisting _unknown keys as comments ----------------------
-    unknown: dict[str, str] = cfg_dict.pop("_unknown", {})
-
-    yaml_text = yaml.dump(cfg_dict, default_flow_style=False, sort_keys=False)
-
-    if unknown:
-        comment_lines = ["# UNKNOWN keys from old ns.inp — review manually:"]
-        for k, v in unknown.items():
-            comment_lines.append(f"# UNKNOWN: {k}={v}")
-        yaml_text = "\n".join(comment_lines) + "\n" + yaml_text
-
-    # Write output --------------------------------------------------------
-    if args.output == "-":
-        sys.stdout.write(yaml_text)
-    else:
-        Path(args.output).write_text(yaml_text)
-
-    # Optional validation round-trip --------------------------------------
-    if args.validate:
-        from jaxrens.cli.schema import RootSpec
-
-        try:
-            RootSpec.model_validate(yaml.safe_load(yaml_text))
-        except Exception as exc:
-            print(f"Validation failed: {exc}", file=sys.stderr)
-            return 1
-        print("Validation OK", file=sys.stderr)
-
-    return 0
-
-
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -608,35 +540,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "dump-schema", help="Print the JSON schema for RootSpec."
     )
     p_dump.add_argument("--format", choices=["json"], default="json")
-
-    # -- migrate-ns-inp --
-    p_mig = sub.add_parser(
-        "migrate-ns-inp",
-        help="Convert an old ns.inp key=value file to jaxrens YAML format.",
-    )
-    p_mig.add_argument(
-        "-i",
-        "--input",
-        default="-",
-        metavar="INPUT.inp",
-        help="Path to the old ns.inp file (default: stdin).",
-    )
-    p_mig.add_argument(
-        "-o",
-        "--output",
-        default="-",
-        metavar="OUTPUT.yaml",
-        help="Path for the output YAML file (default: stdout).",
-    )
-    p_mig.add_argument(
-        "--validate",
-        action="store_true",
-        default=False,
-        help=(
-            "After migrating, round-trip through RootSpec.model_validate and "
-            "exit non-zero if validation fails."
-        ),
-    )
 
     # -- plot --
     p_plot = sub.add_parser(
@@ -867,7 +770,6 @@ def main(argv: list[str] | None = None) -> None:
         "run": _cmd_run,
         "validate": _cmd_validate,
         "dump-schema": _cmd_dump_schema,
-        "migrate-ns-inp": _cmd_migrate_ns_inp,
         "plot": _cmd_plot,
         "annotate-uncertainty": _cmd_annotate_uncertainty,
     }

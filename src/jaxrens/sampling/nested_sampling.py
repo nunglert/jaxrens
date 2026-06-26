@@ -23,9 +23,18 @@ from jaxtyping import Array, Float, Int, Key
 
 from jaxrens.base import NSCallback
 from jaxrens.sampling.adaptation.manager import build_adapt_step
-from jaxrens.sampling.batch_descriptor import PmapVmapRuns, ShardedSingleRun, SingleRun, VmapRuns
+from jaxrens.sampling.batch_descriptor import (
+    PmapVmapRuns,
+    ShardedSingleRun,
+    SingleRun,
+    VmapRuns,
+)
 from jaxrens.sampling.inter_re_manager import InterREManager
-from jaxrens.sampling.moves.replica_exchange import PressureRENSSwap, SemiGrandSwap, XRENSSwap
+from jaxrens.sampling.moves.replica_exchange import (
+    PressureRENSSwap,
+    SemiGrandSwap,
+    XRENSSwap,
+)
 from jaxrens.sampling.run_loop import (
     _bump_cumulative_counters,
     _dispatch_callbacks,
@@ -199,7 +208,9 @@ def init_ns(
 
     # Broadcast types if not batched
     if types.ndim == 1:
-        types_batched = jnp.broadcast_to(types[None, :], (n_walkers, types.shape[0]))
+        types_batched = jnp.broadcast_to(
+            types[None, :], (n_walkers, types.shape[0])
+        )
     else:
         types_batched = types
 
@@ -215,11 +226,21 @@ def init_ns(
             ensemble_params=ensemble_params,
             max_neighbors=max_neighbors,
             max_neighbor_count_init=(
-                int(max_neighbor_counts[i]) if max_neighbor_counts is not None else 0
+                int(max_neighbor_counts[i])
+                if max_neighbor_counts is not None
+                else 0
             ),
         )
         walkers.append(w)
     population = jax.tree.map(lambda *xs: jnp.stack(xs), *walkers)
+
+    if (
+        restart_state is not None
+        and getattr(restart_state, "step_sizes", None) is not None
+    ):
+        population = population.set(
+            step_sizes=jnp.asarray(restart_state.step_sizes)
+        )
 
     if restart_state is None:
         # ``dtype=jnp.float32`` removes the weak_type that ``jnp.array(<py float>)``
@@ -243,7 +264,7 @@ def init_ns(
         # If the checkpoint persisted the PRNG buffer, resume the saved
         # stream instead of using the caller-supplied (config-seed-derived)
         # key.  Legacy checkpoints without a saved key fall through to the
-        # caller's rng_key (the pre-fix behaviour, which silently reseeded).
+        # caller's rng_key.
         if rs.rng_key_data is not None:
             rng_key = jax.random.wrap_key_data(jnp.asarray(rs.rng_key_data))
 
@@ -259,8 +280,12 @@ def init_ns(
 
     logger.debug(
         "NS state initialized: %d walkers, energy range [%.4g, %.4g]%s",
-        n_walkers, float(jnp.min(energies)), float(jnp.max(energies)),
-        f" (restart from iteration {restart_state.iteration})" if restart_state is not None else "",
+        n_walkers,
+        float(jnp.min(energies)),
+        float(jnp.max(energies)),
+        f" (restart from iteration {restart_state.iteration})"
+        if restart_state is not None
+        else "",
     )
     return state
 
@@ -306,11 +331,13 @@ def ns_step(
     # depends on all three.  pytree structure changes show up as
     # different total leaf counts.
     _leaves_flat, _tdef = jax.tree_util.tree_flatten(ns_state)
+
     def _fmt(v):
         return (
             f"{getattr(v, 'shape', '?')}:{getattr(v, 'dtype', type(v).__name__)}"
             f"{'(weak)' if getattr(v, 'weak_type', False) else ''}"
         )
+
     _leaf_str = "  ".join(_fmt(v) for v in _leaves_flat)
     logger.info(
         "ns_step tracing: pop_shape=%s  max_neighbors=%d  n_mcmc=%d  "
@@ -329,7 +356,8 @@ def ns_step(
     # 1. Find worst walker (highest potential)
     key, key_worst = jax.random.split(key)
     worst_idx, potential_max = _find_worst_walker(
-        potentials, rng_key=key_worst,
+        potentials,
+        rng_key=key_worst,
     )
 
     # 2. Identify dead point.  We no longer write it onto NSState — the
@@ -376,8 +404,11 @@ def ns_step(
     )
     # Write clone into population at worst_idx (before walking)
     pop = jax.tree.map(
-        lambda pop_field, clone_field: pop_field.at[worst_idx].set(clone_field),
-        pop, clone,
+        lambda pop_field, clone_field: pop_field.at[worst_idx].set(
+            clone_field
+        ),
+        pop,
+        clone,
     )
 
     # 5. Gather walkers to walk: worst_idx (the clone) + n_extra survivors.
@@ -386,7 +417,11 @@ def ns_step(
     # silently overwriting the clone source).
     if n_extra > 0:
         extra_indices = _get_extra_indices(
-            worst_idx, clone_idx, n_walkers, n_extra, key_extra,
+            worst_idx,
+            clone_idx,
+            n_walkers,
+            n_extra,
+            key_extra,
         )
         walk_indices = jnp.concatenate([worst_idx[None], extra_indices])
     else:
@@ -397,7 +432,9 @@ def ns_step(
 
     # 6. Run MCMC chains in parallel via vmap(lax.scan)
     chain_keys = jax.random.split(key_mcmc, n_walk)
-    all_mcmc_keys = jax.vmap(lambda k: jax.random.split(k, n_mcmc_steps))(chain_keys)
+    all_mcmc_keys = jax.vmap(lambda k: jax.random.split(k, n_mcmc_steps))(
+        chain_keys
+    )
 
     def run_one_chain(walker, chain_keys):
         # Bucket convention for reject_reason_counts_per_move:
@@ -410,11 +447,15 @@ def ns_step(
         def scan_body(state, step_key):
             new_state, info = step_fn(step_key, state, potential_max)
             # Per-move accepted count: scatter accepted flag onto move_idx
-            n_acc = jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(
-                info.accepted.astype(jnp.int32)
+            n_acc = (
+                jnp.zeros(n_moves, dtype=jnp.int32)
+                .at[info.move_idx]
+                .add(info.accepted.astype(jnp.int32))
             )
             # Per-move proposed count: always +1 for this move
-            n_prop = jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(1)
+            n_prop = (
+                jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(1)
+            )
             # Per-move reject-reason bucket: index into (move_idx, reason)
             # reason=0 means accepted, so accepted moves go into bucket 0.
             # Gate rejected moves: non-cell moves leave reject_reason at default
@@ -422,42 +463,71 @@ def ns_step(
             # into bucket 1 (energy). This preserves the invariant
             # rr[:, 0] == n_accepted_per_move without touching move kernels.
             scatter_col = jnp.where(
-                info.accepted, jnp.int32(0), jnp.maximum(info.reject_reason, jnp.int32(1))
+                info.accepted,
+                jnp.int32(0),
+                jnp.maximum(info.reject_reason, jnp.int32(1)),
             )
-            rr_counts = jnp.zeros((n_moves, 4), dtype=jnp.int32).at[
-                info.move_idx, scatter_col
-            ].add(1)
+            rr_counts = (
+                jnp.zeros((n_moves, 4), dtype=jnp.int32)
+                .at[info.move_idx, scatter_col]
+                .add(1)
+            )
             # Per-move energy evaluation counters
-            n_evals = jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(
-                jnp.int32(info.n_evaluations)
+            n_evals = (
+                jnp.zeros(n_moves, dtype=jnp.int32)
+                .at[info.move_idx]
+                .add(jnp.int32(info.n_evaluations))
             )
-            n_grad_evals = jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(
-                jnp.int32(info.n_grad_evaluations)
+            n_grad_evals = (
+                jnp.zeros(n_moves, dtype=jnp.int32)
+                .at[info.move_idx]
+                .add(jnp.int32(info.n_grad_evaluations))
             )
-            return new_state, (info.accepted, n_acc, n_prop, rr_counts, n_evals, n_grad_evals)
+            return new_state, (
+                info.accepted,
+                n_acc,
+                n_prop,
+                rr_counts,
+                n_evals,
+                n_grad_evals,
+            )
 
-        final, (accepted_arr, n_acc_arr, n_prop_arr, rr_arr, n_evals_arr, n_grad_evals_arr) = jax.lax.scan(
-            scan_body, walker, chain_keys
-        )
+        final, (
+            accepted_arr,
+            n_acc_arr,
+            n_prop_arr,
+            rr_arr,
+            n_evals_arr,
+            n_grad_evals_arr,
+        ) = jax.lax.scan(scan_body, walker, chain_keys)
         # Sum over the scan axis (n_mcmc_steps)
         return (
             final,
             jnp.sum(accepted_arr),
-            jnp.sum(n_acc_arr, axis=0),        # (n_moves,)
-            jnp.sum(n_prop_arr, axis=0),        # (n_moves,)
-            jnp.sum(rr_arr, axis=0),            # (n_moves, 4)
-            jnp.sum(n_evals_arr, axis=0),       # (n_moves,)
+            jnp.sum(n_acc_arr, axis=0),  # (n_moves,)
+            jnp.sum(n_prop_arr, axis=0),  # (n_moves,)
+            jnp.sum(rr_arr, axis=0),  # (n_moves, 4)
+            jnp.sum(n_evals_arr, axis=0),  # (n_moves,)
             jnp.sum(n_grad_evals_arr, axis=0),  # (n_moves,)
         )
 
-    finals, acc_counts, chain_n_acc, chain_n_prop, chain_rr, chain_n_evals, chain_n_grad_evals = jax.vmap(
-        run_one_chain
-    )(walk_batch, all_mcmc_keys)
+    (
+        finals,
+        acc_counts,
+        chain_n_acc,
+        chain_n_prop,
+        chain_rr,
+        chain_n_evals,
+        chain_n_grad_evals,
+    ) = jax.vmap(run_one_chain)(walk_batch, all_mcmc_keys)
 
     # 7. Scatter walked walkers back into population
     new_pop = jax.tree.map(
-        lambda pop_field, walked_field: pop_field.at[walk_indices].set(walked_field),
-        pop, finals,
+        lambda pop_field, walked_field: pop_field.at[walk_indices].set(
+            walked_field
+        ),
+        pop,
+        finals,
     )
 
     # 8. Build new state — algorithm fields only; dead-point history is
@@ -477,11 +547,11 @@ def ns_step(
     total_steps = n_walk * n_mcmc_steps
     # Aggregate per-move counters across all walked walkers (vmap axis 0).
     # chain_n_acc / chain_n_prop / chain_rr have shape (n_walk, n_moves[, 4]).
-    agg_n_accepted = jnp.sum(chain_n_acc, axis=0)          # (n_moves,)
-    agg_n_proposed = jnp.sum(chain_n_prop, axis=0)         # (n_moves,)
-    agg_rr_counts = jnp.sum(chain_rr, axis=0)              # (n_moves, 4)
-    agg_n_evals = jnp.sum(chain_n_evals, axis=0)           # (n_moves,)
-    agg_n_grad_evals = jnp.sum(chain_n_grad_evals, axis=0) # (n_moves,)
+    agg_n_accepted = jnp.sum(chain_n_acc, axis=0)  # (n_moves,)
+    agg_n_proposed = jnp.sum(chain_n_prop, axis=0)  # (n_moves,)
+    agg_rr_counts = jnp.sum(chain_rr, axis=0)  # (n_moves, 4)
+    agg_n_evals = jnp.sum(chain_n_evals, axis=0)  # (n_moves,)
+    agg_n_grad_evals = jnp.sum(chain_n_grad_evals, axis=0)  # (n_moves,)
 
     info = {
         "emax": potential_max,
@@ -501,12 +571,12 @@ def ns_step(
         # Bucket convention: reject_reason_counts_per_move[:, 0] = accepted,
         #   [:, 1] = energy reject, [:, 2] = cell reject, [:, 3] = prior reject.
         # Each row sums to n_proposed_per_move for that move.
-        "n_accepted_per_move": agg_n_accepted,               # (n_moves,) int32
-        "n_proposed_per_move": agg_n_proposed,               # (n_moves,) int32
-        "reject_reason_counts_per_move": agg_rr_counts,       # (n_moves, 4) int32
+        "n_accepted_per_move": agg_n_accepted,  # (n_moves,) int32
+        "n_proposed_per_move": agg_n_proposed,  # (n_moves,) int32
+        "reject_reason_counts_per_move": agg_rr_counts,  # (n_moves, 4) int32
         # Energy evaluation counters (summed over walkers and chain steps).
-        "n_evaluations_per_move": agg_n_evals,               # (n_moves,) int32
-        "n_grad_evaluations_per_move": agg_n_grad_evals,     # (n_moves,) int32
+        "n_evaluations_per_move": agg_n_evals,  # (n_moves,) int32
+        "n_grad_evaluations_per_move": agg_n_grad_evals,  # (n_moves,) int32
     }
     return new_ns_state, info
 
@@ -569,11 +639,13 @@ def ns_step_sharded(
     """
     # Fires once per cache miss; same rationale as in ``ns_step`` above.
     _leaves_flat, _tdef = jax.tree_util.tree_flatten(ns_state)
+
     def _fmt(v):
         return (
             f"{getattr(v, 'shape', '?')}:{getattr(v, 'dtype', type(v).__name__)}"
             f"{'(weak)' if getattr(v, 'weak_type', False) else ''}"
         )
+
     _leaf_str = "  ".join(_fmt(v) for v in _leaves_flat)
     logger.info(
         "ns_step_sharded tracing: pop_shape=%s  max_neighbors=%d  "
@@ -590,12 +662,16 @@ def ns_step_sharded(
 
     # Per-device shape (compile-time static).
     K_per_gpu = pop_local.energy.shape[0]
-    n_walkers_global = ns_state.n_walkers  # = G * K_per_gpu (set by init_ns_sharded)
+    n_walkers_global = (
+        ns_state.n_walkers
+    )  # = G * K_per_gpu (set by init_ns_sharded)
 
     # Materialise the full population on every device.  Each leaf
     # arrives at shape (G, K_per_gpu, ...); reshape to (K_total, ...).
     def _gather_then_flatten(x):
-        gathered = jax.lax.all_gather(x, axis_name="shard")  # (G, K_per_gpu, ...)
+        gathered = jax.lax.all_gather(
+            x, axis_name="shard"
+        )  # (G, K_per_gpu, ...)
         return gathered.reshape((-1,) + x.shape[1:])
 
     pop_global = jax.tree.map(_gather_then_flatten, pop_local)
@@ -604,7 +680,8 @@ def ns_step_sharded(
     # 1. Find worst walker on the global population (same on every shard).
     key, key_worst = jax.random.split(key)
     worst_idx, potential_max = _find_worst_walker(
-        potentials_global, rng_key=key_worst,
+        potentials_global,
+        rng_key=key_worst,
     )
 
     # 2. Dead-point info — extracted from the global gathered pop.
@@ -618,9 +695,12 @@ def ns_step_sharded(
     )
 
     # 3. Update evidence (uses global walker count).
-    log_weight = -ns_state.iteration / n_walkers_global + jnp.log(1.0 / n_walkers_global)
+    log_weight = -ns_state.iteration / n_walkers_global + jnp.log(
+        1.0 / n_walkers_global
+    )
     log_evidence = jnp.logaddexp(
-        ns_state.log_evidence, log_weight + (-potential_max),
+        ns_state.log_evidence,
+        log_weight + (-potential_max),
     )
 
     # 4. Clone random survivor — same RNG on every shard → same global idx.
@@ -638,7 +718,9 @@ def ns_step_sharded(
     )
     # Write clone into pop_global at worst_idx (before walking).
     pop_global = jax.tree.map(
-        lambda x, c: x.at[worst_idx].set(c), pop_global, clone,
+        lambda x, c: x.at[worst_idx].set(c),
+        pop_global,
+        clone,
     )
 
     # 5. Gather walkers to walk: worst (clone) + n_extra survivors.
@@ -646,7 +728,11 @@ def ns_step_sharded(
     # excluded so the extras pool can't include the clone source.
     if n_extra > 0:
         extra_indices = _get_extra_indices(
-            worst_idx, clone_idx, n_walkers_global, n_extra, key_extra,
+            worst_idx,
+            clone_idx,
+            n_walkers_global,
+            n_extra,
+            key_extra,
         )
         walk_indices = jnp.concatenate([worst_idx[None], extra_indices])
     else:
@@ -657,7 +743,7 @@ def ns_step_sharded(
 
     # 6. Run the MCMC chains, DISTRIBUTED across shards.
     #
-    # The clone + n_extra survivor walks are independent, so each shard walks 
+    # The clone + n_extra survivor walks are independent, so each shard walks
     # only its ~n_walk/G slice and the small
     # final walker states + per-chain counters are all_gathered back.
     # Chain i always consumes chain_keys[i] regardless of which shard runs
@@ -665,14 +751,16 @@ def ns_step_sharded(
     # -> same sequence); only the model-eval work is divided G ways.
     n_gpu = n_walkers_global // K_per_gpu
     chain_keys = jax.random.split(key_mcmc, n_walk)
-    all_mcmc_keys = jax.vmap(lambda k: jax.random.split(k, n_mcmc_steps))(chain_keys)
+    all_mcmc_keys = jax.vmap(lambda k: jax.random.split(k, n_mcmc_steps))(
+        chain_keys
+    )
 
     # Pad the chain set up to a multiple of G so every shard gets an
     # equal, statically-shaped slice (pmap requires identical per-device
     # shapes).  ``pad_idx`` wraps around (mod n_walk) so it is safe even
     # when n_walk < G; the padding chains are walked but discarded after
     # the gather (only n_padded - n_walk < G of them — a bounded tail).
-    n_per_shard = -(-n_walk // n_gpu)        # ceil(n_walk / G)
+    n_per_shard = -(-n_walk // n_gpu)  # ceil(n_walk / G)
     n_padded = n_per_shard * n_gpu
     pad_idx = jnp.arange(n_padded) % n_walk
     walk_batch_p = jax.tree.map(lambda x: x[pad_idx], walk_batch)
@@ -692,29 +780,56 @@ def ns_step_sharded(
         # bucket convention on reject_reason_counts_per_move.
         def scan_body(state, step_key):
             new_state, info = step_fn(step_key, state, potential_max)
-            n_acc = jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(
-                info.accepted.astype(jnp.int32),
+            n_acc = (
+                jnp.zeros(n_moves, dtype=jnp.int32)
+                .at[info.move_idx]
+                .add(
+                    info.accepted.astype(jnp.int32),
+                )
             )
-            n_prop = jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(1)
+            n_prop = (
+                jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(1)
+            )
             scatter_col = jnp.where(
-                info.accepted, jnp.int32(0),
+                info.accepted,
+                jnp.int32(0),
                 jnp.maximum(info.reject_reason, jnp.int32(1)),
             )
-            rr_counts = jnp.zeros((n_moves, 4), dtype=jnp.int32).at[
-                info.move_idx, scatter_col
-            ].add(1)
-            n_evals = jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(
-                jnp.int32(info.n_evaluations),
+            rr_counts = (
+                jnp.zeros((n_moves, 4), dtype=jnp.int32)
+                .at[info.move_idx, scatter_col]
+                .add(1)
             )
-            n_grad_evals = jnp.zeros(n_moves, dtype=jnp.int32).at[info.move_idx].add(
-                jnp.int32(info.n_grad_evaluations),
+            n_evals = (
+                jnp.zeros(n_moves, dtype=jnp.int32)
+                .at[info.move_idx]
+                .add(
+                    jnp.int32(info.n_evaluations),
+                )
+            )
+            n_grad_evals = (
+                jnp.zeros(n_moves, dtype=jnp.int32)
+                .at[info.move_idx]
+                .add(
+                    jnp.int32(info.n_grad_evaluations),
+                )
             )
             return new_state, (
-                info.accepted, n_acc, n_prop, rr_counts, n_evals, n_grad_evals,
+                info.accepted,
+                n_acc,
+                n_prop,
+                rr_counts,
+                n_evals,
+                n_grad_evals,
             )
 
         final, (
-            accepted_arr, n_acc_arr, n_prop_arr, rr_arr, n_evals_arr, n_grad_evals_arr,
+            accepted_arr,
+            n_acc_arr,
+            n_prop_arr,
+            rr_arr,
+            n_evals_arr,
+            n_grad_evals_arr,
         ) = jax.lax.scan(scan_body, walker, chain_keys)
         return (
             final,
@@ -727,8 +842,13 @@ def ns_step_sharded(
         )
 
     (
-        local_finals, local_acc, local_n_acc, local_n_prop, local_rr,
-        local_n_evals, local_n_grad,
+        local_finals,
+        local_acc,
+        local_n_acc,
+        local_n_prop,
+        local_rr,
+        local_n_evals,
+        local_n_grad,
     ) = jax.vmap(run_one_chain)(local_batch, local_keys)
 
     # Gather every per-chain result to the full (padded) chain set on every
@@ -736,7 +856,7 @@ def ns_step_sharded(
     # (final walker states + per-move counters), so the gather is cheap
     # relative to the model evals we just distributed.
     def _gather_chains(x):
-        g = jax.lax.all_gather(x, axis_name="shard")     # (G, n_per_shard, ...)
+        g = jax.lax.all_gather(x, axis_name="shard")  # (G, n_per_shard, ...)
         return g.reshape((n_padded,) + x.shape[1:])[:n_walk]
 
     finals = jax.tree.map(_gather_chains, local_finals)
@@ -752,7 +872,9 @@ def ns_step_sharded(
     # because every shard now holds the same gathered updates; each slice
     # differs only in *which* of the (G, K_per_gpu) rows it owns.
     new_pop_global = jax.tree.map(
-        lambda x, w: x.at[walk_indices].set(w), pop_global, finals,
+        lambda x, w: x.at[walk_indices].set(w),
+        pop_global,
+        finals,
     )
 
     def _slice_my_shard(x):
@@ -802,7 +924,9 @@ def ns_step_sharded(
 # ---------------------------------------------------------------------------
 
 
-def _ns_state_to_result_dict(ns_state: NSState, n_dead: int | jnp.ndarray = 0) -> dict:
+def _ns_state_to_result_dict(
+    ns_state: NSState, n_dead: int | jnp.ndarray = 0
+) -> dict:
     """Convert NSState to a result dict (live-walker state + scalars only).
 
     Dead-point history is *not* in the return value — it's persisted to disk
@@ -897,7 +1021,9 @@ def run_ns(
     if not ladder:
         raise ValueError("max_neighbors_list must be non-empty.")
     starting_bucket = _choose_starting_bucket(
-        initial_max_neighbor_counts, ladder, max_neighbors_offset,
+        initial_max_neighbor_counts,
+        ladder,
+        max_neighbors_offset,
     )
 
     if per_move_fns is not None:
@@ -908,7 +1034,12 @@ def run_ns(
         n_moves = 1
 
     ns_state = init_ns(
-        init_fn, positions, types, energies, cells, rng_key,
+        init_fn,
+        positions,
+        types,
+        energies,
+        cells,
+        rng_key,
         step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params=ensemble_params,
         restart_state=restart_state,
@@ -920,7 +1051,10 @@ def run_ns(
 
     logger.info(
         "Starting NS run: %d walkers, %s atoms, max_iter=%s, n_mcmc=%d",
-        n_walkers, n_atoms, max_iterations, n_mcmc_steps,
+        n_walkers,
+        n_atoms,
+        max_iterations,
+        n_mcmc_steps,
     )
 
     batcher = SingleRun()
@@ -967,7 +1101,8 @@ def run_ns(
 
     logger.info(
         "NS complete: %d dead points, log_Z=%.4f",
-        int(ns_state.iteration), float(ns_state.log_evidence),
+        int(ns_state.iteration),
+        float(ns_state.log_evidence),
     )
 
     for cb in callbacks:
@@ -1031,13 +1166,19 @@ def init_ns_parallel(
         rs = restart_states[i] if restart_states is not None else None
         run_state = init_ns(
             init_fn,
-            positions[i], run_types, energies[i],
+            positions[i],
+            run_types,
+            energies[i],
             cells[i] if cells is not None else None,
-            rng_keys[i], step_sizes, ep,
+            rng_keys[i],
+            step_sizes,
+            ep,
             restart_state=rs,
             max_neighbors=max_neighbors,
             max_neighbor_counts=(
-                max_neighbor_counts[i] if max_neighbor_counts is not None else None
+                max_neighbor_counts[i]
+                if max_neighbor_counts is not None
+                else None
             ),
         )
         runs.append(run_state)
@@ -1135,11 +1276,18 @@ def run_ns_parallel(
     if not ladder:
         raise ValueError("max_neighbors_list must be non-empty.")
     starting_bucket = _choose_starting_bucket(
-        initial_max_neighbor_counts, ladder, max_neighbors_offset,
+        initial_max_neighbor_counts,
+        ladder,
+        max_neighbors_offset,
     )
 
     ns_states = init_ns_parallel(
-        init_fn, positions, types, energies, cells, rng_keys,
+        init_fn,
+        positions,
+        types,
+        energies,
+        cells,
+        rng_keys,
         step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params_per_run=ensemble_params_per_run,
         restart_states=restart_states,
@@ -1149,7 +1297,11 @@ def run_ns_parallel(
 
     logger.info(
         "Starting parallel NS: %d runs, %d walkers, max_iter=%s, n_mcmc=%d, n_extra=%d",
-        n_runs, n_walkers, max_iterations, n_mcmc_steps, n_extra,
+        n_runs,
+        n_walkers,
+        max_iterations,
+        n_mcmc_steps,
+        n_extra,
     )
 
     batcher = VmapRuns(n_runs=n_runs)
@@ -1168,6 +1320,7 @@ def run_ns_parallel(
     inter_re_mgr = None
     if inter_re_config is not None:
         from jaxrens.state.config import InterREConfig
+
         cfg: InterREConfig = inter_re_config
         if cfg.flavor == "pressure":
             swap_kernel = PressureRENSSwap()
@@ -1185,19 +1338,32 @@ def run_ns_parallel(
             # walkers produces shape (n_walkers, n_species) rather than (n_species, n_walkers).
             if ensemble_params_per_run is None:
                 ensemble_params_per_run = [
-                    {"target_composition": jnp.array(cfg.composition_targets[i], dtype=jnp.int32)}
+                    {
+                        "target_composition": jnp.array(
+                            cfg.composition_targets[i], dtype=jnp.int32
+                        )
+                    }
                     for i in range(n_runs)
                 ]
             else:
                 ensemble_params_per_run = [
-                    dict(ensemble_params_per_run[i],
-                         target_composition=jnp.array(cfg.composition_targets[i], dtype=jnp.int32))
+                    dict(
+                        ensemble_params_per_run[i],
+                        target_composition=jnp.array(
+                            cfg.composition_targets[i], dtype=jnp.int32
+                        ),
+                    )
                     for i in range(n_runs)
                 ]
             # Re-initialize with updated ensemble_params_per_run now that we've
             # injected target_composition. Re-run init_ns_parallel.
             ns_states = init_ns_parallel(
-                init_fn, positions, types, energies, cells, rng_keys,
+                init_fn,
+                positions,
+                types,
+                energies,
+                cells,
+                rng_keys,
                 step_sizes=jnp.full(n_moves, initial_step_size),
                 ensemble_params_per_run=ensemble_params_per_run,
                 restart_states=restart_states,
@@ -1216,18 +1382,31 @@ def run_ns_parallel(
             # InterREManager can extract them from ns_state.population.ensemble_params.
             if ensemble_params_per_run is None:
                 ensemble_params_per_run = [
-                    {"chemical_potentials": jnp.array(cfg.chemical_potentials[i], dtype=jnp.float32)}
+                    {
+                        "chemical_potentials": jnp.array(
+                            cfg.chemical_potentials[i], dtype=jnp.float32
+                        )
+                    }
                     for i in range(n_runs)
                 ]
             else:
                 ensemble_params_per_run = [
-                    dict(ensemble_params_per_run[i],
-                         chemical_potentials=jnp.array(cfg.chemical_potentials[i], dtype=jnp.float32))
+                    dict(
+                        ensemble_params_per_run[i],
+                        chemical_potentials=jnp.array(
+                            cfg.chemical_potentials[i], dtype=jnp.float32
+                        ),
+                    )
                     for i in range(n_runs)
                 ]
             # Re-initialize with updated ensemble_params_per_run.
             ns_states = init_ns_parallel(
-                init_fn, positions, types, energies, cells, rng_keys,
+                init_fn,
+                positions,
+                types,
+                energies,
+                cells,
+                rng_keys,
                 step_sizes=jnp.full(n_moves, initial_step_size),
                 ensemble_params_per_run=ensemble_params_per_run,
                 restart_states=restart_states,
@@ -1249,7 +1428,9 @@ def run_ns_parallel(
 
     # Per-run PRNG keys used during adaptation (independent of ns_states.rng_key).
     # _run_loop will consume and advance these via adapt_step.
-    adapt_keys = jax.vmap(lambda k: jax.random.split(k)[0])(rng_keys)  # (n_runs,)
+    adapt_keys = jax.vmap(lambda k: jax.random.split(k)[0])(
+        rng_keys
+    )  # (n_runs,)
 
     ns_states, adapt_keys, _cumulative = _run_loop(
         batcher=batcher,
@@ -1285,7 +1466,9 @@ def run_ns_parallel(
     for r in range(n_runs):
         logger.info(
             "Run %d complete: %d dead points, log_Z=%.4f",
-            r, int(ns_states.iteration[r]), float(ns_states.log_evidence[r]),
+            r,
+            int(ns_states.iteration[r]),
+            float(ns_states.log_evidence[r]),
         )
 
     # Dead-point history is persisted to disk by the callbacks; not in
@@ -1360,18 +1543,25 @@ def init_ns_multi_gpu(
         """If arr has a (G, P) leading prefix, merge to (G*P)."""
         if arr is None:
             return arr
-        if arr.ndim >= 2 and arr.shape[0] == n_gpu and arr.shape[1] == n_per_gpu:
+        if (
+            arr.ndim >= 2
+            and arr.shape[0] == n_gpu
+            and arr.shape[1] == n_per_gpu
+        ):
             return arr.reshape((n_total,) + arr.shape[2:])
         return arr
 
-    positions_flat = _flatten_leading(positions)   # (G*P, K, A, 3)
-    energies_flat = _flatten_leading(energies)      # (G*P, K)
+    positions_flat = _flatten_leading(positions)  # (G*P, K, A, 3)
+    energies_flat = _flatten_leading(energies)  # (G*P, K)
     cells_flat = _flatten_leading(cells) if cells is not None else None
     mnc_flat = (
         _flatten_leading(max_neighbor_counts)
-        if max_neighbor_counts is not None else None
+        if max_neighbor_counts is not None
+        else None
     )
-    rng_keys_flat = rng_keys.reshape(n_total) if rng_keys.ndim == 2 else rng_keys
+    rng_keys_flat = (
+        rng_keys.reshape(n_total) if rng_keys.ndim == 2 else rng_keys
+    )
 
     # Flatten restart_states from (G, P) nested list to flat list of G*P.
     rs_flat: list | None = None
@@ -1382,8 +1572,13 @@ def init_ns_multi_gpu(
 
     # Build flat (G*P, ...) NSState via init_ns_parallel.
     flat_states = init_ns_parallel(
-        init_fn, positions_flat, types, energies_flat, cells_flat,
-        rng_keys_flat, step_sizes,
+        init_fn,
+        positions_flat,
+        types,
+        energies_flat,
+        cells_flat,
+        rng_keys_flat,
+        step_sizes,
         ensemble_params_per_run=ensemble_params_per_run,
         restart_states=rs_flat,
         max_neighbors=max_neighbors,
@@ -1482,11 +1677,14 @@ def init_ns_sharded(
         positions_flat = positions.reshape((K,) + positions.shape[2:])
         energies_flat = energies.reshape(K)
         cells_flat = (
-            cells.reshape((K,) + cells.shape[2:]) if cells is not None else None
+            cells.reshape((K,) + cells.shape[2:])
+            if cells is not None
+            else None
         )
         mnc_flat = (
             max_neighbor_counts.reshape(K)
-            if max_neighbor_counts is not None else None
+            if max_neighbor_counts is not None
+            else None
         )
     else:
         K = positions.shape[0]
@@ -1504,9 +1702,16 @@ def init_ns_sharded(
 
     # Build the single-replica NSState.
     flat_state = init_ns(
-        init_fn, positions_flat, types, energies_flat, cells_flat,
-        rng_key, step_sizes=step_sizes, ensemble_params=ensemble_params,
-        restart_state=restart_state, max_neighbors=max_neighbors,
+        init_fn,
+        positions_flat,
+        types,
+        energies_flat,
+        cells_flat,
+        rng_key,
+        step_sizes=step_sizes,
+        ensemble_params=ensemble_params,
+        restart_state=restart_state,
+        max_neighbors=max_neighbors,
         max_neighbor_counts=mnc_flat,
     )
 
@@ -1665,7 +1870,9 @@ def run_ns_multi_gpu(
         n_moves = 1
 
     # Flatten rng_keys to (G*P,) for init.
-    rng_keys_flat = rng_keys.reshape(n_total) if rng_keys.ndim == 2 else rng_keys
+    rng_keys_flat = (
+        rng_keys.reshape(n_total) if rng_keys.ndim == 2 else rng_keys
+    )
 
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
@@ -1673,22 +1880,33 @@ def run_ns_multi_gpu(
     logger.debug(
         "[stage] run_ns_multi_gpu: choose_starting_bucket "
         "(initial_max_neighbor_counts shape=%s, ladder=%s, offset=%d)",
-        None if initial_max_neighbor_counts is None
+        None
+        if initial_max_neighbor_counts is None
         else initial_max_neighbor_counts.shape,
-        ladder, max_neighbors_offset,
+        ladder,
+        max_neighbors_offset,
     )
     starting_bucket = _choose_starting_bucket(
-        initial_max_neighbor_counts, ladder, max_neighbors_offset,
+        initial_max_neighbor_counts,
+        ladder,
+        max_neighbors_offset,
     )
     logger.debug(
-        "[stage] run_ns_multi_gpu: starting_bucket=%d", starting_bucket,
+        "[stage] run_ns_multi_gpu: starting_bucket=%d",
+        starting_bucket,
     )
 
     # Initialize (G, P, ...) state via init_ns_multi_gpu.
     logger.debug("[stage] run_ns_multi_gpu: init_ns_multi_gpu — starting")
     ns_states = init_ns_multi_gpu(
-        init_fn, positions, types, energies, cells,
-        rng_keys_flat, n_gpu, n_per_gpu,
+        init_fn,
+        positions,
+        types,
+        energies,
+        cells,
+        rng_keys_flat,
+        n_gpu,
+        n_per_gpu,
         step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params_per_run=ensemble_params_per_run,
         restart_states=restart_states,
@@ -1705,7 +1923,13 @@ def run_ns_multi_gpu(
     logger.info(
         "Starting multi-GPU NS: n_gpu=%d, n_per_gpu=%d (%d total runs), "
         "n_walkers=%d, max_iter=%s, n_mcmc=%d, n_extra=%d",
-        n_gpu, n_per_gpu, n_total, n_walkers, max_iterations, n_mcmc_steps, n_extra,
+        n_gpu,
+        n_per_gpu,
+        n_total,
+        n_walkers,
+        max_iterations,
+        n_mcmc_steps,
+        n_extra,
     )
 
     if batcher is None:
@@ -1732,6 +1956,7 @@ def run_ns_multi_gpu(
     inter_re_mgr = None
     if inter_re_config is not None:
         from jaxrens.state.config import InterREConfig
+
         cfg: InterREConfig = inter_re_config
         if cfg.flavor == "pressure":
             swap_kernel_mg = PressureRENSSwap()
@@ -1748,19 +1973,33 @@ def run_ns_multi_gpu(
             n_total_runs = n_gpu * n_per_gpu
             if ensemble_params_per_run is None:
                 ensemble_params_per_run = [
-                    {"target_composition": jnp.array(cfg.composition_targets[i], dtype=jnp.int32)}
+                    {
+                        "target_composition": jnp.array(
+                            cfg.composition_targets[i], dtype=jnp.int32
+                        )
+                    }
                     for i in range(n_total_runs)
                 ]
             else:
                 ensemble_params_per_run = [
-                    dict(ensemble_params_per_run[i],
-                         target_composition=jnp.array(cfg.composition_targets[i], dtype=jnp.int32))
+                    dict(
+                        ensemble_params_per_run[i],
+                        target_composition=jnp.array(
+                            cfg.composition_targets[i], dtype=jnp.int32
+                        ),
+                    )
                     for i in range(n_total_runs)
                 ]
             # Re-initialize with updated ensemble_params_per_run.
             ns_states = init_ns_multi_gpu(
-                init_fn, positions, types, energies, cells,
-                rng_keys_flat, n_gpu, n_per_gpu,
+                init_fn,
+                positions,
+                types,
+                energies,
+                cells,
+                rng_keys_flat,
+                n_gpu,
+                n_per_gpu,
                 step_sizes=jnp.full(n_moves, initial_step_size),
                 ensemble_params_per_run=ensemble_params_per_run,
                 restart_states=restart_states,
@@ -1778,18 +2017,32 @@ def run_ns_multi_gpu(
             n_total_runs = n_gpu * n_per_gpu
             if ensemble_params_per_run is None:
                 ensemble_params_per_run = [
-                    {"chemical_potentials": jnp.array(cfg.chemical_potentials[i], dtype=jnp.float32)}
+                    {
+                        "chemical_potentials": jnp.array(
+                            cfg.chemical_potentials[i], dtype=jnp.float32
+                        )
+                    }
                     for i in range(n_total_runs)
                 ]
             else:
                 ensemble_params_per_run = [
-                    dict(ensemble_params_per_run[i],
-                         chemical_potentials=jnp.array(cfg.chemical_potentials[i], dtype=jnp.float32))
+                    dict(
+                        ensemble_params_per_run[i],
+                        chemical_potentials=jnp.array(
+                            cfg.chemical_potentials[i], dtype=jnp.float32
+                        ),
+                    )
                     for i in range(n_total_runs)
                 ]
             ns_states = init_ns_multi_gpu(
-                init_fn, positions, types, energies, cells,
-                rng_keys_flat, n_gpu, n_per_gpu,
+                init_fn,
+                positions,
+                types,
+                energies,
+                cells,
+                rng_keys_flat,
+                n_gpu,
+                n_per_gpu,
                 step_sizes=jnp.full(n_moves, initial_step_size),
                 ensemble_params_per_run=ensemble_params_per_run,
                 restart_states=restart_states,
@@ -1850,7 +2103,9 @@ def run_ns_multi_gpu(
         for p in range(n_per_gpu):
             logger.debug(
                 "GPU %d run %d complete: %d dead points, log_Z=%.4f",
-                g, p, int(ns_states.iteration[g, p]),
+                g,
+                p,
+                int(ns_states.iteration[g, p]),
                 float(ns_states.log_evidence[g, p]),
             )
 
@@ -1866,9 +2121,9 @@ def run_ns_multi_gpu(
         "types": pop.types,
         "energies": pop.energy,
         "cells": pop.cell,
-        "log_evidence": ns_states.log_evidence,    # (G, P)
-        "iteration": ns_states.iteration,           # (G, P)
-        "n_dead": ns_states.iteration,              # (G, P) — same as iteration
+        "log_evidence": ns_states.log_evidence,  # (G, P)
+        "iteration": ns_states.iteration,  # (G, P)
+        "n_dead": ns_states.iteration,  # (G, P) — same as iteration
         "n_walkers": n_walkers,
         "n_gpu": n_gpu,
         "n_per_gpu": n_per_gpu,
@@ -1985,13 +2240,20 @@ def run_ns_sharded(
     if not ladder:
         raise ValueError("max_neighbors_list must be non-empty.")
     starting_bucket = _choose_starting_bucket(
-        initial_max_neighbor_counts, ladder, max_neighbors_offset,
+        initial_max_neighbor_counts,
+        ladder,
+        max_neighbors_offset,
     )
 
     # Build sharded NSState.
     logger.debug("[stage] run_ns_sharded: init_ns_sharded — starting")
     ns_state = init_ns_sharded(
-        init_fn, positions, types, energies, cells, rng_key,
+        init_fn,
+        positions,
+        types,
+        energies,
+        cells,
+        rng_key,
         n_gpu=n_gpu,
         step_sizes=jnp.full(n_moves, initial_step_size),
         ensemble_params=ensemble_params,
@@ -2009,8 +2271,12 @@ def run_ns_sharded(
     logger.info(
         "Starting sharded-single NS: n_gpu=%d, n_walkers=%d "
         "(K_per_gpu=%d), max_iter=%s, n_mcmc=%d, n_extra=%d",
-        n_gpu, n_walkers, n_walkers // n_gpu,
-        max_iterations, n_mcmc_steps, n_extra,
+        n_gpu,
+        n_walkers,
+        n_walkers // n_gpu,
+        max_iterations,
+        n_mcmc_steps,
+        n_extra,
     )
 
     if batcher is None:
@@ -2065,7 +2331,7 @@ def run_ns_sharded(
     # same scalar values, so take [0] for the final scalar.
     remaining_potentials = ns_state.population.energy  # (G, K_per_gpu)
     log_remaining_mass = -ns_state.iteration / n_walkers  # (G,)
-    log_avg_likelihood = -jnp.mean(remaining_potentials)   # scalar (global)
+    log_avg_likelihood = -jnp.mean(remaining_potentials)  # scalar (global)
     ns_state = ns_state.set(
         log_evidence=jnp.logaddexp(
             ns_state.log_evidence,
@@ -2077,7 +2343,8 @@ def run_ns_sharded(
     final_log_z = float(ns_state.log_evidence[0])
     logger.debug(
         "Sharded NS complete: %d dead points, log_Z=%.4f",
-        final_iter, final_log_z,
+        final_iter,
+        final_log_z,
     )
 
     # Finish callbacks (notably the final checkpoint) must see the gathered
@@ -2092,12 +2359,12 @@ def run_ns_sharded(
 
     pop = ns_state.population
     return {
-        "positions": pop.positions,   # (G, K_per_gpu, n_atoms, 3)
+        "positions": pop.positions,  # (G, K_per_gpu, n_atoms, 3)
         "types": pop.types,
-        "energies": pop.energy,       # (G, K_per_gpu)
+        "energies": pop.energy,  # (G, K_per_gpu)
         "cells": pop.cell,
-        "log_evidence": ns_state.log_evidence,   # (G,) — identical entries
-        "iteration": ns_state.iteration,          # (G,)
+        "log_evidence": ns_state.log_evidence,  # (G,) — identical entries
+        "iteration": ns_state.iteration,  # (G,)
         "n_dead": ns_state.iteration,
         "n_walkers": n_walkers,
         "n_gpu": n_gpu,

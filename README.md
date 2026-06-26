@@ -2,6 +2,8 @@
 
 [![codecov](https://codecov.io/github/nunglert/jaxrens/graph/badge.svg?token=KY8R8JZ9FC)](https://codecov.io/github/nunglert/jaxrens)
 [![CI](https://github.com/nunglert/jaxrens/actions/workflows/ci.yml/badge.svg)](https://github.com/nunglert/jaxrens/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-latest-blue)](https://nunglert.github.io/jaxrens/)
+
 
 JAX-based nested sampling for atomistic systems — multi-GPU parallel replicas,
 pressure / composition / semi-grand inter-replica exchange (RENS / XRENS /
@@ -21,7 +23,8 @@ Three-level parallelism (`pmap(vmap(vmap(...)))`) with data shaped
 Pluggable energy backends: Lennard-Jones (incl. per-species LJ tables),
 [MACE-JAX](https://github.com/nunglert/mace-jax), [NeuralIL](https://github.com/nunglert/neuralil-jaxrens),
 [nequix](https://github.com/atomicarchitects/nequix), and toy potentials.
-NPT supported via an `EnsembleBackend` PV-term wrapper.
+NPT and semi-grand μPT supported via an `EnsembleBackend` wrapper that adds
+the `P·V` and `−μ·N` terms.
 
 ## Install
 
