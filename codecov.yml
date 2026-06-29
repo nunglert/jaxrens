@@ -1,0 +1,26 @@
+# Codecov policy, made explicit so the CI pass/fail gate is version-controlled
+# and reviewable rather than relying on Codecov's (drifting) hidden defaults.
+#
+# Tone matches the deliberately lax pytest gate in full-suite.yml
+# (--cov-fail-under=50): coverage here is a guard-rail, not a hard quality bar.
+# The "ratchet" idea is standard practice: don't demand the whole repo be
+# well-covered, but do expect *new* code (the patch) to be reasonably tested.
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto      # never fall below current project coverage...
+        threshold: 1%     # ...but tolerate ~1% noise (rounding / flaky lines).
+    patch:
+      default:
+        target: 80%       # new lines in a PR should be mostly covered...
+        threshold: 5%     # ...with slack for unavoidable defensive branches.
+
+ignore:
+  - "tests/**"
+  - "docs/**"
+
+comment:
+  layout: "reach, diff, files"
+  require_changes: true   # only post a PR comment when coverage actually moves

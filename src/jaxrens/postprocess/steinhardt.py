@@ -30,7 +30,6 @@ opt those explicit wide dtypes in for the scope of the computation via
 from __future__ import annotations
 
 import functools
-import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,8 +40,6 @@ import jax.numpy as jnp
 import numpy as np
 
 from jaxrens._jax_init import allow_explicit_x64
-
-logger = logging.getLogger(__name__)
 
 
 def _factorial(n: int) -> float:
@@ -374,14 +371,8 @@ def annotate_trajectory_steinhardt(
     if not ls:
         raise ValueError("annotate_steinhardt needs at least one l value.")
 
+    # ``index=":"`` always yields a list; ASE raises on an empty file.
     frames = ase_read(str(traj_path), index=":")
-    if not isinstance(frames, list):
-        frames = [frames]
-    if not frames:
-        logger.warning(
-            "annotate_steinhardt: %s has no frames; skipping.", traj_path
-        )
-        return traj_path
 
     # Build the static tables once and reuse them across all frames.
     tables = {l: (build_solidr_table(l), build_wigner_triples(l)) for l in ls}
