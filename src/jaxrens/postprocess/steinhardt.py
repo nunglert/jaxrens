@@ -30,14 +30,19 @@ opt those explicit wide dtypes in for the scope of the computation via
 from __future__ import annotations
 
 import functools
+import logging
 import math
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from jaxrens._jax_init import allow_explicit_x64
+
+logger = logging.getLogger(__name__)
 
 
 def _factorial(n: int) -> float:
@@ -313,3 +318,98 @@ def calc_qw(atoms, l, r_cut, r_cut_min=0.0, device=None):
         l, vectors, centers, n_atoms, table, triples, device=device
     )
     return np.asarray(q), np.asarray(w)
+
+
+# ---------------------------------------------------------------------------
+# Post-hoc trajectory annotation
+# ---------------------------------------------------------------------------
+
+_EXTXYZ_SUFFIXES = (".extxyz", ".xyz")
+
+
+def _annotated_path(path: Path) -> Path:
+    return path.parent / (path.stem + ".annotated" + path.suffix)
+
+
+def annotate_trajectory_steinhardt(
+    traj_path: str | Path,
+    ls: Sequence[int],
+    r_cut: float,
+    *,
+    r_cut_min: float = 0.0,
+    in_place: bool = False,
+    device=None,
+) -> Path:
+    """Annotate an extxyz trajectory with per-atom Steinhardt q_l / w_l.
+
+    For every frame and every degree ``l`` in ``ls`` the per-atom order
+    parameters are computed with :func:`calc_qw` and attached as extxyz
+    columns ``q<l>`` / ``w<l>`` (QUIP naming), with the per-frame means stored
+    in ``atoms.info`` as ``q<l>_mean`` / ``w<l>_mean``.  Frames may have
+    different atom counts -- each is evaluated independently.
+
+    Args:
+        traj_path: Path to an extxyz (``.extxyz`` / ``.xyz``) trajectory.
+        ls: Bond-order degrees to compute (even values in practice, e.g.
+            ``(4, 6)``).
+        r_cut: Neighbour cutoff in Angstrom.
+        r_cut_min: Lower neighbour cutoff in Angstrom (drops near neighbours).
+        in_place: If True, overwrite the input; else write a sibling
+            ``*.annotated.<ext>`` (default).
+        device: Optional JAX device to pin the work to.
+
+    Returns:
+        Path to the annotated file.
+    """
+    from ase.io import read as ase_read
+    from ase.io import write as ase_write
+
+    traj_path = Path(traj_path)
+    if traj_path.suffix.lower() not in _EXTXYZ_SUFFIXES:
+        raise ValueError(
+            f"annotate_steinhardt supports extxyz trajectories "
+            f"({'/'.join(_EXTXYZ_SUFFIXES)}); got {traj_path.suffix!r}."
+        )
+    ls = [int(x) for x in ls]
+    if not ls:
+        raise ValueError("annotate_steinhardt needs at least one l value.")
+
+    frames = ase_read(str(traj_path), index=":")
+    if not isinstance(frames, list):
+        frames = [frames]
+    if not frames:
+        logger.warning(
+            "annotate_steinhardt: %s has no frames; skipping.", traj_path
+        )
+        return traj_path
+
+    # Build the static tables once and reuse them across all frames.
+    tables = {l: (build_solidr_table(l), build_wigner_triples(l)) for l in ls}
+    for atoms in frames:
+        n_atoms = len(atoms)
+        for l in ls:
+            table, triples = tables[l]
+            centers, vectors = neighbour_edges(atoms, r_cut, r_cut_min)
+            if len(centers) == 0:
+                q = np.zeros(n_atoms)
+                w = np.zeros(n_atoms)
+            else:
+                q, w = qw_from_edges(
+                    l,
+                    vectors,
+                    centers,
+                    n_atoms,
+                    table,
+                    triples,
+                    device=device,
+                )
+                q = np.asarray(q)
+                w = np.asarray(w)
+            atoms.new_array(f"q{l}", q)
+            atoms.new_array(f"w{l}", w)
+            atoms.info[f"q{l}_mean"] = float(q.mean())
+            atoms.info[f"w{l}_mean"] = float(w.mean())
+
+    out_path = traj_path if in_place else _annotated_path(traj_path)
+    ase_write(str(out_path), frames)
+    return out_path

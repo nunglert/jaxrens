@@ -21,9 +21,12 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from ase.io import read
+from ase.io import read, write
 
-from jaxrens.postprocess import calc_qw
+from jaxrens.postprocess.steinhardt import (
+    annotate_trajectory_steinhardt,
+    calc_qw,
+)
 
 _DATA = Path(__file__).parent.parent / "data" / "postprocess" / "steinhardt"
 _MANIFEST = json.loads((_DATA / "get_qw_reference.json").read_text())
@@ -60,3 +63,58 @@ def test_calc_qw_matches_get_qw(case, frame_index):
         np.testing.assert_allclose(
             w[w_defined], w_ref[w_defined], atol=_TOL, rtol=0.0
         )
+
+
+# ---------------------------------------------------------------------------
+# Post-hoc trajectory annotation
+# ---------------------------------------------------------------------------
+
+
+def _write_multiframe_extxyz(path):
+    """A 3-frame fcc-Cu trajectory (read from shipped reference inputs)."""
+    frames = read(_DATA / "multiframe.xyz", index=":")
+    write(str(path), frames)
+    return frames
+
+
+class TestAnnotateTrajectory:
+    def test_writes_qw_arrays_and_means(self, tmp_path):
+        path = tmp_path / "run.traj.extxyz"
+        frames = _write_multiframe_extxyz(path)
+
+        out = annotate_trajectory_steinhardt(path, [4, 6], r_cut=3.2)
+        assert out.name == "run.traj.annotated.extxyz"
+
+        annotated = read(str(out), index=":")
+        assert len(annotated) == len(frames)
+        for src, atoms in zip(frames, annotated):
+            for l in (4, 6):
+                q_ref, w_ref = calc_qw(src, l, 3.2)
+                # per-atom columns round-trip through extxyz
+                np.testing.assert_allclose(
+                    atoms.get_array(f"q{l}"), q_ref, atol=1e-6, rtol=0.0
+                )
+                np.testing.assert_allclose(
+                    atoms.get_array(f"w{l}"), w_ref, atol=1e-6, rtol=0.0
+                )
+                # per-frame summaries land in info
+                assert atoms.info[f"q{l}_mean"] == pytest.approx(
+                    q_ref.mean(), abs=1e-6
+                )
+
+    def test_in_place_overwrites_original(self, tmp_path):
+        path = tmp_path / "run.traj.extxyz"
+        _write_multiframe_extxyz(path)
+
+        out = annotate_trajectory_steinhardt(
+            path, [6], r_cut=3.2, in_place=True
+        )
+        assert out == path
+        for atoms in read(str(path), index=":"):
+            assert "q6" in atoms.arrays
+
+    def test_rejects_non_extxyz(self, tmp_path):
+        path = tmp_path / "run.traj.h5"
+        path.write_bytes(b"not really h5")
+        with pytest.raises(ValueError, match="extxyz"):
+            annotate_trajectory_steinhardt(path, [6], r_cut=3.2)

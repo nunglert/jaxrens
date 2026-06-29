@@ -613,6 +613,52 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Frames per batched evaluation (bounds memory).  Default 64.",
     )
 
+    # -- annotate-steinhardt --
+    p_stein = sub.add_parser(
+        "annotate-steinhardt",
+        help=(
+            "Post-hoc: annotate a trajectory with per-atom Steinhardt "
+            "bond-orientational order parameters (q_l / w_l)."
+        ),
+    )
+    p_stein.add_argument(
+        "--traj",
+        required=True,
+        metavar="FILE",
+        help="Trajectory to annotate (.extxyz/.xyz).",
+    )
+    p_stein.add_argument(
+        "--l",
+        dest="ls",
+        required=True,
+        type=int,
+        nargs="+",
+        metavar="L",
+        help="Bond-order degree(s), even in practice, e.g. --l 4 6.",
+    )
+    p_stein.add_argument(
+        "--r-cut",
+        required=True,
+        type=float,
+        metavar="R",
+        help="Neighbour cutoff in Angstrom.",
+    )
+    p_stein.add_argument(
+        "--r-cut-min",
+        type=float,
+        default=0.0,
+        metavar="R",
+        help="Lower neighbour cutoff in Angstrom.  Default 0.",
+    )
+    p_stein.add_argument(
+        "--in-place",
+        action="store_true",
+        help=(
+            "Edit the trajectory in place instead of writing "
+            "*.annotated.<ext>."
+        ),
+    )
+
     return parser
 
 
@@ -759,6 +805,25 @@ def _cmd_annotate_uncertainty(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_annotate_steinhardt(args: argparse.Namespace) -> int:
+    """Standalone post-hoc Steinhardt order-parameter annotation."""
+    from jaxrens.postprocess.steinhardt import annotate_trajectory_steinhardt
+
+    try:
+        out = annotate_trajectory_steinhardt(
+            args.traj,
+            args.ls,
+            args.r_cut,
+            r_cut_min=args.r_cut_min,
+            in_place=args.in_place,
+        )
+    except ValueError as exc:
+        print(f"jaxrens annotate-steinhardt: {exc}", file=sys.stderr)
+        return 2
+    print(f"Wrote Steinhardt annotation: {out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point registered via ``[project.scripts]``."""
     from pydantic import ValidationError
@@ -772,6 +837,7 @@ def main(argv: list[str] | None = None) -> None:
         "dump-schema": _cmd_dump_schema,
         "plot": _cmd_plot,
         "annotate-uncertainty": _cmd_annotate_uncertainty,
+        "annotate-steinhardt": _cmd_annotate_steinhardt,
     }
     handler = dispatch[args.command]
     try:
