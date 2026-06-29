@@ -13,9 +13,12 @@ sys.path.insert(0, os.path.abspath("../src"))
 # so point there explicitly before the build starts.
 try:
     import pypandoc as _pypandoc  # type: ignore[import-not-found]
+
     _pandoc_path = _pypandoc.get_pandoc_path()
     _pandoc_dir = os.path.dirname(_pandoc_path)
-    os.environ["PATH"] = os.pathsep.join([_pandoc_dir, os.environ.get("PATH", "")])
+    os.environ["PATH"] = os.pathsep.join(
+        [_pandoc_dir, os.environ.get("PATH", "")]
+    )
 except Exception:
     pass
 
@@ -146,7 +149,13 @@ html_theme_options = {
     "source_repository": "https://github.com/nunglert/jaxrens",
     "source_branch": "main",
     "source_directory": "docs/",
+    # Vivid wordmark reads on both backgrounds; same file for both variants.
+    "light_logo": "jaxrens_logo.svg",
+    "dark_logo": "jaxrens_logo.svg",
+    # Logo is a wordmark, so drop the redundant "jaxrens" text under it.
+    "sidebar_hide_name": True,
 }
+html_favicon = "_static/favicon.png"
 html_show_sphinx = False
 html_show_sourcelink = False
 html_title = "jaxrens"

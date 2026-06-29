@@ -11,8 +11,22 @@ jaxrens represents positions, cells and energies in float32 throughout and
 ``init/cells.py::cell_shape_walk``) assume it.  We default to float32 but
 honour an explicit ``JAX_ENABLE_X64`` opt-in (with a warning) for users who
 deliberately want double precision.
+
+Two independent JAX knobs make up the precision policy:
+
+* ``jax_enable_x64`` -- whether the *default* float dtype is 64-bit.  jaxrens
+  pins this ``False`` so the sampling pipeline stays float32.
+* ``jax_explicit_x64_dtypes`` -- what happens when code *explicitly* asks for
+  float64 while ``jax_enable_x64`` is off.  We pin it to ``"warn"`` (truncate
+  to float32 + ``UserWarning``) so a stray float64 in the sampling code is a
+  loud tripwire.  Post-processing that genuinely needs double precision (e.g.
+  the Steinhardt order parameters, whose spherical-harmonic sums lose all
+  signal in float32) opts in for the scope of its computation via the
+  ``allow_explicit_x64()`` context manager below -- defaults stay float32, so
+  the sampling pipeline is untouched.
 """
 
+import contextlib
 import os
 import tempfile
 import warnings
@@ -35,6 +49,11 @@ def _configure_x64() -> None:
     raw = os.environ.get("JAX_ENABLE_X64", "")
     enable = raw.strip().lower() in ("1", "true", "yes")
     jax.config.update("jax_enable_x64", enable)
+    # Pin the explicit-float64 policy to a loud tripwire for the sampling code;
+    # post-processing opts into 64-bit locally via ``allow_explicit_x64()``.
+    # (No-op once x64 is on outright -- explicit float64 is honoured then.)
+    if not enable:
+        jax.config.update("jax_explicit_x64_dtypes", "warn")
     if enable:
         warnings.warn(
             f"jaxrens: JAX_ENABLE_X64={raw!r} enables 64-bit (double) "
@@ -45,6 +64,29 @@ def _configure_x64() -> None:
             RuntimeWarning,
             stacklevel=2,
         )
+
+
+@contextlib.contextmanager
+def allow_explicit_x64():
+    """Honour explicit float64 / complex128 dtypes for the enclosed block.
+
+    jaxrens keeps ``jax_enable_x64`` off and the explicit-x64 policy at
+    ``"warn"`` so the sampling pipeline stays float32 and any stray float64
+    there is flagged.  Post-processing that legitimately needs double precision
+    wraps its computation in this context manager: explicitly-requested
+    float64/complex128 arrays are honoured inside, while *default* float dtypes
+    remain float32 (so float32 code paths are unaffected), and the previous
+    policy is restored on exit -- leaving no global precision state behind.
+
+    Idempotent and re-entrant (nesting restores the outer policy).  No-op when
+    ``jax_enable_x64`` is already on, since float64 is honoured outright then.
+    """
+    prev = jax.config.jax_explicit_x64_dtypes
+    jax.config.update("jax_explicit_x64_dtypes", "allow")
+    try:
+        yield
+    finally:
+        jax.config.update("jax_explicit_x64_dtypes", prev)
 
 
 def _check_tmpdir_writable() -> None:
@@ -93,9 +135,7 @@ def _warn_if_cpu_only() -> None:
     if any(d.platform == "gpu" for d in devices):
         return
     detail = (
-        f" (JAX_PLATFORMS={platforms_env!r})"
-        if platforms_env == "cpu"
-        else ""
+        f" (JAX_PLATFORMS={platforms_env!r})" if platforms_env == "cpu" else ""
     )
     warnings.warn(
         f"jaxrens is running on CPU{detail}.  The project is only CI-tested "

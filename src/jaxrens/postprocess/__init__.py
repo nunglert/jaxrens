@@ -15,6 +15,7 @@ from jaxrens.postprocess.plotting import (
     plot_re_acceptance_stacked,
     plot_step_sizes,
 )
+from jaxrens.postprocess.steinhardt import calc_qw, qw_from_edges
 from jaxrens.postprocess.thermodynamics import (
     calc_log_weights,
     calc_log_weights_live,
@@ -41,6 +42,9 @@ __all__ = [
     "plot_re_acceptance",
     "plot_re_acceptance_stacked",
     "plot_step_sizes",
+    # Steinhardt order parameters
+    "calc_qw",
+    "qw_from_edges",
     # Thermodynamics
     "calc_log_weights",
     "calc_log_weights_live",

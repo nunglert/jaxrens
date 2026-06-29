@@ -31,6 +31,12 @@ dev/install
 dev/contributing
 ```
 
+<!-- ```{image} _static/jaxrens_logo.svg
+:alt: jaxrens
+:width: 480px
+:align: center
+``` -->
+
 # jaxrens documentation
 
 **Date**: {sub-ref}`today`
