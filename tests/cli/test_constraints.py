@@ -121,6 +121,49 @@ def test_initial_violation_fails_fast():
         _resolve(constraints=[{"type": "minimum_distance", "d_min": 1000.0}])
 
 
+def test_check_initial_constraints_handles_multi_replica_layout():
+    """``_check_initial_constraints`` must accept the 4D stacked layout.
+
+    The multi-replica resolver stacks walkers as ``(n_total, K, n_atoms, 3)``
+    (and cells as ``(n_total, K, 3, 3)``), whereas the single-replica path is
+    3D. A single vmap over axis 0 leaves the cell batched and breaks
+    ``pairwise_distances`` broadcasting; the function must flatten the leading
+    replica/live axes first. Covers both a valid stack and a violating one.
+    """
+    import jax.numpy as jnp
+
+    from jaxrens.cli.resolve import ResolvedInit, _check_initial_constraints
+    from jaxrens.constraints.min_distance import min_distance_descriptor
+
+    desc = min_distance_descriptor(
+        np.full((1, 1), 1.7, dtype=np.float32), type_dependent=False
+    )
+    n_total, K, n_atoms = 2, 4, 2
+    types = jnp.zeros((n_atoms,), dtype=jnp.int32)
+    cells = jnp.broadcast_to(jnp.eye(3) * 10.0, (n_total, K, 3, 3))
+
+    # Atoms 2 A apart (> 1.7 floor) -> all walkers valid.
+    ok = jnp.broadcast_to(
+        jnp.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
+        (n_total, K, n_atoms, 3),
+    )
+    _check_initial_constraints(
+        (desc,),
+        ResolvedInit(ok, types, cells, None, symbol_map={0: "H"}),
+    )  # must not raise
+
+    # Atoms 1 A apart (< 1.7 floor) -> fails fast.
+    bad = jnp.broadcast_to(
+        jnp.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        (n_total, K, n_atoms, 3),
+    )
+    with pytest.raises(ValueError, match="violates the 'minimum_distance'"):
+        _check_initial_constraints(
+            (desc,),
+            ResolvedInit(bad, types, cells, None, symbol_map={0: "H"}),
+        )
+
+
 def test_end_to_end_run_with_active_constraint(tmp_path):
     """A full NS run with a live minimum-distance gate completes cleanly.
 

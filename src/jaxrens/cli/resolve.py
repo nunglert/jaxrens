@@ -214,9 +214,21 @@ def _check_initial_constraints(
     """
     positions = jnp.asarray(resolved_init.initial_positions)
     types = jnp.asarray(resolved_init.initial_types)
-    n_live = int(positions.shape[0])
+    # The multi-replica path stacks walkers as ``(n_total, K, n_atoms, 3)``
+    # while the single-replica path is already ``(n_live, n_atoms, 3)``.
+    # Collapse any leading replica/live axes into one flat walker axis so a
+    # single vmap feeds the predicate per-walker ``(n_atoms, 3)`` / ``(3, 3)``
+    # arrays in both layouts (otherwise the cell stays batched and
+    # ``pairwise_distances`` fails to broadcast).
+    n_atoms = positions.shape[-2]
+    positions = positions.reshape(-1, n_atoms, 3)
+    n_walkers = int(positions.shape[0])
     cells = resolved_init.initial_cells
-    cells = jnp.zeros((n_live, 3, 3)) if cells is None else jnp.asarray(cells)
+    cells = (
+        jnp.zeros((n_walkers, 3, 3))
+        if cells is None
+        else jnp.asarray(cells).reshape(n_walkers, 3, 3)
+    )
 
     for desc in descriptors:
         predicate = desc.build(**desc.build_kwargs)
@@ -225,7 +237,7 @@ def _check_initial_constraints(
         if not valid.all():
             bad = int(np.argmax(~valid))
             raise ValueError(
-                f"Initial walker {bad} of {n_live} violates the "
+                f"Initial walker {bad} of {n_walkers} violates the "
                 f"{desc.name!r} configuration constraint. Adjust the initial "
                 f"configuration (e.g. start_species / start_config_file) or "
                 f"relax the constraint before running."
