@@ -911,6 +911,7 @@ def _resolve_init_species(
             n_atoms=n_atoms,
             max_volume_per_atom=cell_cfg.max_volume_per_atom,
             flat_V_prior=cell_cfg.flat_V_prior,
+            min_volume_per_atom=cell_cfg.effective_initial_min_volume_per_atom,
         )
     )
     cubic_cell = jnp.eye(3, dtype=jnp.float32) * lc

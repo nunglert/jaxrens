@@ -12,7 +12,6 @@ import jax.numpy as jnp
 from jaxrens.init.cells import cell_shape_walk, sample_initial_volume
 from jaxrens.utils.cell import get_volume
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -43,10 +42,12 @@ class TestSampleInitialVolume:
         v_max = n_atoms * max_vpa
         keys = _batch_keys(1000, base=1)
         samples = jax.vmap(
-            lambda k: sample_initial_volume(k, n_atoms, max_vpa, flat_V_prior=True)
+            lambda k: sample_initial_volume(
+                k, n_atoms, max_vpa, flat_V_prior=True
+            )
         )(keys)
         # Corresponding volumes
-        volumes = samples ** 3
+        volumes = samples**3
         assert jnp.all(volumes >= 0.0)
         assert jnp.all(volumes <= v_max + 1e-5)
 
@@ -56,15 +57,21 @@ class TestSampleInitialVolume:
         v_max = float(n_atoms * max_vpa)
         keys = _batch_keys(2000, base=2)
         samples = jax.vmap(
-            lambda k: sample_initial_volume(k, n_atoms, max_vpa, flat_V_prior=True)
+            lambda k: sample_initial_volume(
+                k, n_atoms, max_vpa, flat_V_prior=True
+            )
         )(keys)
-        volumes = samples ** 3
+        volumes = samples**3
         # Split into 5 bins; each should hold roughly 400 samples (±30%)
         bin_edges = jnp.linspace(0.0, v_max, 6)
         for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
             count = jnp.sum((volumes >= lo) & (volumes < hi))
-            assert count > 200, f"Bin [{lo:.1f}, {hi:.1f}) too empty: {int(count)}"
-            assert count < 600, f"Bin [{lo:.1f}, {hi:.1f}) too full: {int(count)}"
+            assert (
+                count > 200
+            ), f"Bin [{lo:.1f}, {hi:.1f}) too empty: {int(count)}"
+            assert (
+                count < 600
+            ), f"Bin [{lo:.1f}, {hi:.1f}) too full: {int(count)}"
 
     def test_vn_prior_formula_fixed_values(self):
         """Verify V^N formula against hand computation for a few fixed U values."""
@@ -74,7 +81,7 @@ class TestSampleInitialVolume:
         v_max = float(n_atoms * max_vpa)
 
         for u_val in [0.1, 0.5, 0.9]:
-            expected = float(v_max * u_val ** exponent) ** (1.0 / 3.0)
+            expected = float(v_max * u_val**exponent) ** (1.0 / 3.0)
 
             key = jax.random.key(42)
             # Manually pass a key that we know will produce u_val.
@@ -82,22 +89,106 @@ class TestSampleInitialVolume:
             # patching through a simple test: re-derive from the output.
             # Easier: directly test the formula by constructing a fake uniform.
             # We test: given the formula, does our impl match?
-            lc = float(sample_initial_volume(
-                jax.random.key(99), n_atoms=n_atoms, max_volume_per_atom=max_vpa,
-                flat_V_prior=False
-            ))
+            lc = float(
+                sample_initial_volume(
+                    jax.random.key(99),
+                    n_atoms=n_atoms,
+                    max_volume_per_atom=max_vpa,
+                    flat_V_prior=False,
+                )
+            )
             # We can't control the exact U, but we can re-derive what U was
             # from a flat-V sample and compare both modes for consistency.
             # For a deterministic formula check: inject U via a known key.
             # Verify against the formula by computing expected from actual U:
             u_actual = float(
-                jax.random.uniform(jax.random.key(99), shape=(), dtype=jnp.float32)
+                jax.random.uniform(
+                    jax.random.key(99), shape=(), dtype=jnp.float32
+                )
             )
-            expected_from_key = (v_max * u_actual ** exponent) ** (1.0 / 3.0)
-            assert abs(lc - expected_from_key) < 1e-4, (
-                f"V^N formula mismatch: got {lc}, expected {expected_from_key}"
-            )
+            expected_from_key = (v_max * u_actual**exponent) ** (1.0 / 3.0)
+            assert (
+                abs(lc - expected_from_key) < 1e-4
+            ), f"V^N formula mismatch: got {lc}, expected {expected_from_key}"
             break  # one fixed key is enough to validate the formula
+
+    def test_flat_prior_respects_min_floor(self):
+        n_atoms = 4
+        min_vpa = 30.0
+        max_vpa = 50.0
+        v_lo = n_atoms * min_vpa
+        v_hi = n_atoms * max_vpa
+        keys = _batch_keys(1000, base=11)
+        samples = jax.vmap(
+            lambda k: sample_initial_volume(
+                k,
+                n_atoms,
+                max_vpa,
+                flat_V_prior=True,
+                min_volume_per_atom=min_vpa,
+            )
+        )(keys)
+        volumes = samples**3
+        assert jnp.all(volumes >= v_lo - 1e-3)
+        assert jnp.all(volumes <= v_hi + 1e-3)
+
+    def test_vn_prior_respects_min_floor(self):
+        n_atoms = 8
+        min_vpa = 30.0
+        max_vpa = 50.0
+        v_lo = n_atoms * min_vpa
+        v_hi = n_atoms * max_vpa
+        keys = _batch_keys(1000, base=12)
+        samples = jax.vmap(
+            lambda k: sample_initial_volume(
+                k,
+                n_atoms,
+                max_vpa,
+                flat_V_prior=False,
+                min_volume_per_atom=min_vpa,
+            )
+        )(keys)
+        volumes = samples**3
+        assert jnp.all(volumes >= v_lo - 1e-3)
+        assert jnp.all(volumes <= v_hi + 1e-3)
+
+    def test_min_floor_zero_matches_legacy(self):
+        # min_volume_per_atom=0.0 (the default) must reproduce the old draw.
+        n_atoms = 6
+        max_vpa = 50.0
+        for flat in (True, False):
+            key = jax.random.key(123)
+            legacy = sample_initial_volume(
+                key,
+                n_atoms=n_atoms,
+                max_volume_per_atom=max_vpa,
+                flat_V_prior=flat,
+            )
+            explicit = sample_initial_volume(
+                key,
+                n_atoms=n_atoms,
+                max_volume_per_atom=max_vpa,
+                flat_V_prior=flat,
+                min_volume_per_atom=0.0,
+            )
+            assert jnp.allclose(legacy, explicit)
+
+    def test_vn_prior_large_n_atoms_stable(self):
+        # Large n_atoms with a nonzero floor must not overflow/NaN: the
+        # v_lo**(N+1) / v_hi**(N+1) form would blow up in float32.
+        keys = _batch_keys(256, base=13)
+        samples = jax.vmap(
+            lambda k: sample_initial_volume(
+                k,
+                n_atoms=64,
+                max_volume_per_atom=1e4,
+                flat_V_prior=False,
+                min_volume_per_atom=100.0,
+            )
+        )(keys)
+        volumes = samples**3
+        assert jnp.all(jnp.isfinite(volumes))
+        assert jnp.all(volumes >= 64 * 100.0 - 1.0)
 
     def test_n_atoms_1_no_nan(self):
         key = jax.random.key(3)
@@ -108,14 +199,18 @@ class TestSampleInitialVolume:
     def test_jit(self):
         key = jax.random.key(4)
         jit_fn = jax.jit(
-            lambda k: sample_initial_volume(k, n_atoms=4, max_volume_per_atom=50.0)
+            lambda k: sample_initial_volume(
+                k, n_atoms=4, max_volume_per_atom=50.0
+            )
         )
         result = jit_fn(key)
         assert jnp.isfinite(result)
 
     def test_vmap_over_keys(self):
         keys = _batch_keys(8, base=5)
-        fn = lambda k: sample_initial_volume(k, n_atoms=4, max_volume_per_atom=50.0)
+        fn = lambda k: sample_initial_volume(
+            k, n_atoms=4, max_volume_per_atom=50.0
+        )
         results = jax.vmap(fn)(keys)
         assert results.shape == (8,)
         assert jnp.all(jnp.isfinite(results))
@@ -128,9 +223,17 @@ class TestSampleInitialVolume:
 # ---------------------------------------------------------------------------
 
 
-def _run_walk(key, cell=None, n_steps=50, step_size_shear=0.05,
-              step_size_stretch=0.05, min_aspect=0.3, n_atoms=4,
-              max_vpa=100.0, min_vpa=1.0):
+def _run_walk(
+    key,
+    cell=None,
+    n_steps=50,
+    step_size_shear=0.05,
+    step_size_stretch=0.05,
+    min_aspect=0.3,
+    n_atoms=4,
+    max_vpa=100.0,
+    min_vpa=1.0,
+):
     if cell is None:
         cell = _CUBIC_CELL
     return cell_shape_walk(
@@ -152,9 +255,9 @@ class TestCellShapeWalk:
         initial_vol = float(get_volume(_CUBIC_CELL))
         final_cell, n_accepted = _run_walk(key, n_steps=50)
         final_vol = float(get_volume(final_cell))
-        assert abs(final_vol - initial_vol) < 1e-4, (
-            f"Volume changed: {initial_vol} -> {final_vol}"
-        )
+        assert (
+            abs(final_vol - initial_vol) < 1e-4
+        ), f"Volume changed: {initial_vol} -> {final_vol}"
 
     def test_zero_step_size_cell_unchanged(self):
         key = jax.random.key(11)
@@ -172,8 +275,11 @@ class TestCellShapeWalk:
         key = jax.random.key(12)
         # Use non-zero step sizes so proposals actually differ from the input
         final_cell, n_accepted = _run_walk(
-            key, n_steps=30, step_size_shear=0.1, step_size_stretch=0.1,
-            min_aspect=1.0
+            key,
+            n_steps=30,
+            step_size_shear=0.1,
+            step_size_stretch=0.1,
+            min_aspect=1.0,
         )
         assert int(n_accepted) == 0
         assert jnp.allclose(final_cell, _CUBIC_CELL, atol=1e-5)
@@ -181,16 +287,17 @@ class TestCellShapeWalk:
     def test_reasonable_acceptance_rate(self):
         key = jax.random.key(13)
         _, n_accepted = _run_walk(
-            key, n_steps=100, step_size_shear=0.05, step_size_stretch=0.05,
-            min_aspect=0.2
+            key,
+            n_steps=100,
+            step_size_shear=0.05,
+            step_size_stretch=0.05,
+            min_aspect=0.2,
         )
         assert int(n_accepted) > 0, "Expected some proposals to be accepted"
 
     def test_jit(self):
         key = jax.random.key(14)
-        jit_fn = jax.jit(
-            lambda k: _run_walk(k, n_steps=20)
-        )
+        jit_fn = jax.jit(lambda k: _run_walk(k, n_steps=20))
         final_cell, n_accepted = jit_fn(key)
         assert final_cell.shape == (3, 3)
         assert jnp.isfinite(n_accepted)

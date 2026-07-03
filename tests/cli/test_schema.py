@@ -1007,6 +1007,33 @@ class TestCellSpec:
         assert cfg.min_volume_per_atom == pytest.approx(1.0)
         assert cfg.min_aspect_ratio == pytest.approx(0.8)
         assert cfg.flat_V_prior is False
+        # Unset initial floor falls back to the sampling constraint.
+        assert cfg.initial_min_volume_per_atom is None
+        assert cfg.effective_initial_min_volume_per_atom == pytest.approx(1.0)
+
+    def test_initial_min_volume_decoupled_from_constraint(self):
+        from jaxrens.cli.schema.cell import CellSpec
+
+        cfg = CellSpec(
+            min_volume_per_atom=1.0, initial_min_volume_per_atom=20.0
+        )
+        # The init floor is independent of the (smaller) sampling constraint.
+        assert cfg.min_volume_per_atom == pytest.approx(1.0)
+        assert cfg.effective_initial_min_volume_per_atom == pytest.approx(20.0)
+
+    def test_initial_min_volume_rejects_negative(self):
+        from jaxrens.cli.schema.cell import CellSpec
+
+        with pytest.raises(ValueError, match="must be >= 0"):
+            CellSpec(initial_min_volume_per_atom=-1.0)
+
+    def test_initial_min_volume_rejects_above_max(self):
+        from jaxrens.cli.schema.cell import CellSpec
+
+        with pytest.raises(ValueError, match="exceeds"):
+            CellSpec(
+                max_volume_per_atom=50.0, initial_min_volume_per_atom=60.0
+            )
 
     def test_custom_values_accepted(self):
         from jaxrens.cli.schema.cell import CellSpec
