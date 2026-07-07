@@ -190,7 +190,7 @@ class ResolvedInit:
     """
 
     initial_positions: Any  # shape: (n_live, n_atoms, 3) or None
-    initial_types: Any  # shape: (n_atoms,) dtype int32 or None
+    initial_types: Any  # shape: (n_live, n_atoms) dtype int32 or None
     initial_cells: Any  # shape: (n_live, 3, 3) or None
     initial_energies: Any  # shape: (n_live,) or None — None until evaluated
     initial_max_neighbor_counts: Any = None  # shape: (n_live,) int32 or None
@@ -220,7 +220,7 @@ def _check_initial_constraints(
 
     for desc in descriptors:
         predicate = desc.build(**desc.build_kwargs)
-        valid = jax.vmap(lambda p, c: predicate(p, types, c))(positions, cells)
+        valid = jax.vmap(lambda p, t, c: predicate(p, t, c))(positions, types, cells)
         valid = np.asarray(valid)
         if not valid.all():
             bad = int(np.argmax(~valid))
@@ -449,26 +449,26 @@ def _compute_initial_energies(
     """
     if ensemble_params_batched is None:
 
-        def per_replica(pos_K, cells_K):
+        def per_replica(pos_K, types_K, cells_K):
             return jax.vmap(
-                lambda p, c: energy_backend(p, types, c, bucket)[0]
-            )(pos_K, cells_K)
+                lambda p, t, c: energy_backend(p, t, c, bucket)[0]
+            )(pos_K, types_K, cells_K)
 
-        return batcher.wrap_for_batch(per_replica)(positions, cells)
+        return batcher.wrap_for_batch(per_replica)(positions, types, cells)
 
-    def per_replica_ep(pos_K, cells_K, ep):
+    def per_replica_ep(pos_K, types_K, cells_K, ep):
         return jax.vmap(
-            lambda p, c: energy_backend(
+            lambda p, t, c: energy_backend(
                 p,
-                types,
+                t,
                 c,
                 bucket,
                 ensemble_params=ep,
             )[0]
-        )(pos_K, cells_K)
+        )(pos_K, types_K, cells_K)
 
     return batcher.wrap_for_batch(per_replica_ep)(
-        positions, cells, ensemble_params_batched
+        positions, types, cells, ensemble_params_batched
     )
 
 
@@ -539,9 +539,12 @@ def _finalise_initial_energies_and_counts(
     bucket is irrelevant and ``max_neighbors=0`` is passed through;
     ``counts`` is returned as ``None``.
 
-    ``types`` (shape ``(N,)``) is closed over by the per-replica
-    function, not vmap-axis aligned — it's identical across walkers
-    and across replicas.
+    ``types`` (shape ``(K, N)`` per replica) is vmap-axis aligned with
+    ``positions`` / ``cells``: the per-replica function maps it over the
+    walker axis alongside them. Fixed-composition runs carry the same
+    row for every walker (the broadcast in ``_resolve_init_*``), but the
+    per-walker axis is still present so composition-changing ensembles
+    (semi-grand / alchemical) fit the same contract.
 
     ``ensemble_params_batched`` is an ensemble-agnostic pytree (leaves
     shaped ``batcher.shape_prefix + leaf_shape``) carrying per-replica
@@ -802,11 +805,11 @@ def _resolve_init(
     if cell_cfg is None:
         cell_cfg = CellSpec()
 
-    if init.start_walker_set is not None:
-        return _resolve_init_walker_set(init, cell_cfg, n_live)
-
     if init.restart_file is not None:
         return _resolve_init_restart(init, cell_cfg, n_live)
+
+    if init.start_walker_set is not None:
+        return _resolve_init_walker_set(init, cell_cfg, n_live)
 
     if init.start_config_file is not None:
         return _resolve_init_config_file(
@@ -946,12 +949,14 @@ def _resolve_init_species(
             energy_backend,
         )
 
+    initial_types_broadcast = jnp.broadcast_to(initial_types[None], (n_live, n_atoms))
+
     # Energies and neighbor counts are computed once at the correct
     # bucket size by the caller via ``_finalise_initial_energies_and_counts``
     # — this helper returns structural-init only.
     return ResolvedInit(
         initial_positions=initial_positions,
-        initial_types=initial_types,
+        initial_types=initial_types_broadcast,
         initial_cells=initial_cells,
         initial_energies=None,
         initial_max_neighbor_counts=None,
@@ -1017,9 +1022,12 @@ def _resolve_init_config_file(
             energy_backend,
         )
 
+
+    initial_types_broadcast = jnp.broadcast_to(types_single[None], (n_live, n_atoms))
+
     return ResolvedInit(
         initial_positions=initial_positions,
-        initial_types=types_single,
+        initial_types=initial_types_broadcast,
         initial_cells=initial_cells,
         initial_energies=None,
         initial_max_neighbor_counts=None,
@@ -1629,8 +1637,10 @@ def _resolve_multi_replica(
         if per_run_init[0].initial_cells is not None
         else None
     )
-    # Types are identical across replicas (same start_species).
-    initial_types = per_run_init[0].initial_types
+    # This allows for varying types across replicas.
+    initial_types = jnp.stack(
+        [x.initial_types for x in per_run_init], axis=0
+    )
 
     # --- Consolidated finalize on stacked (G, P, K, ...) arrays -----------
     # Reshape (n_total, K, ...) → (G, P, K, ...) and run a single
@@ -1645,6 +1655,12 @@ def _resolve_multi_replica(
     reshaped_cells = (
         initial_cells.reshape(n_gpu, n_per_gpu, K_axis, 3, 3)
         if initial_cells is not None
+        else None
+    )
+
+    reshaped_types = (
+        initial_types.reshape(n_gpu, n_per_gpu, K_axis, n_atoms)
+        if initial_types is not None
         else None
     )
 
@@ -1670,7 +1686,7 @@ def _resolve_multi_replica(
     initial_energies, initial_counts = _finalise_initial_energies_and_counts(
         finalize_backend,
         reshaped_positions,
-        initial_types,
+        reshaped_types,
         reshaped_cells,
         batcher=batcher,
         ladder=tuple(backend_cfg.max_neighbors_list),
@@ -1687,6 +1703,12 @@ def _resolve_multi_replica(
         if reshaped_cells is not None
         else None
     )
+    initial_types = (
+        reshaped_types.reshape(n_total, K_axis, n_atoms)
+        if reshaped_types is not None
+        else None
+    )
+
     if initial_energies is not None:
         initial_energies = initial_energies.reshape(n_total, K_axis)
     if initial_counts is not None:

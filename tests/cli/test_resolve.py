@@ -905,7 +905,7 @@ class TestFullConfigResolver:
         resolved = resolve(root)
         assert isinstance(resolved, ResolvedConfig)
         assert resolved.init.initial_positions.shape == (20, 2, 3)
-        assert resolved.init.initial_types.shape == (2,)
+        assert resolved.init.initial_types.shape == (20, 2)
 
     def test_minimal_yaml_still_resolves_backward_compat(self):
         """Existing minimal fixture still resolves after step-6 additions."""
@@ -914,7 +914,7 @@ class TestFullConfigResolver:
         root = RootSpec.model_validate(raw)
         resolved = resolve(root)
         assert isinstance(resolved, ResolvedConfig)
-        assert resolved.init.initial_types.shape == (1,)
+        assert resolved.init.initial_types.shape == (20, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -949,7 +949,9 @@ class TestInitSpecResolverPartA:
 
         cfg = InitSpec(start_species="14 2, 8 1")
         result = _resolve_init(cfg, n_live=5, seed=1)
-        assert result.initial_types.shape == (3,)
+        # initial_types carries a leading n_live axis (per-walker), matching
+        # positions / cells; fixed-composition runs repeat the same row.
+        assert result.initial_types.shape == (5, 3)
         assert result.initial_types.dtype == jnp.int32
 
     def test_start_species_n_atoms_matches_counts(self):
@@ -1405,7 +1407,10 @@ class TestBackendAwareSpeciesMapping:
         )
         # Sorted unique Z = [8, 22, 38] → 0-based indices [0, 1, 2].
         # types_list order is sorted-by-Z: O O O Ti Sr → idx [0,0,0,1,2].
-        assert list(map(int, result.initial_types)) == [0, 0, 0, 1, 2]
+        # initial_types is (n_live, n_atoms); every walker shares the row.
+        assert result.initial_types.shape == (2, 5)
+        assert list(map(int, result.initial_types[0])) == [0, 0, 0, 1, 2]
+        assert bool((result.initial_types == result.initial_types[0]).all())
         assert result.symbol_map == {0: "O", 1: "Ti", 2: "Sr"}
 
     def test_backend_z_table_overrides_mapping(self):
@@ -1426,7 +1431,9 @@ class TestBackendAwareSpeciesMapping:
             energy_backend=backend,
         )
         # Z=8→idx 7 (O), Z=22→idx 21 (Ti), Z=38→idx 37 (Sr).
-        assert list(map(int, result.initial_types)) == [7, 7, 7, 21, 37]
+        assert result.initial_types.shape == (2, 5)
+        assert list(map(int, result.initial_types[0])) == [7, 7, 7, 21, 37]
+        assert bool((result.initial_types == result.initial_types[0]).all())
         assert result.symbol_map == {7: "O", 21: "Ti", 37: "Sr"}
 
     def test_missing_z_in_backend_table_raises(self):
@@ -1465,7 +1472,9 @@ class TestBackendAwareSpeciesMapping:
             seed=0,
             energy_backend=wrapped,
         )
-        assert list(map(int, result.initial_types)) == [7, 7, 7, 21, 37]
+        assert result.initial_types.shape == (2, 5)
+        assert list(map(int, result.initial_types[0])) == [7, 7, 7, 21, 37]
+        assert bool((result.initial_types == result.initial_types[0]).all())
 
 
 class _BucketRecordingBackend:
@@ -1518,7 +1527,10 @@ class TestFinaliseInitialBucketChoice:
         import jax.numpy as jnp
 
         positions = jnp.zeros((n_walkers, n_atoms, 3), dtype=jnp.float32)
-        types = jnp.zeros((n_atoms,), dtype=jnp.int32)
+        # types carries the per-walker leading axis (n_walkers, n_atoms) —
+        # the finalize seam vmaps it over the walker axis alongside
+        # positions / cells.
+        types = jnp.zeros((n_walkers, n_atoms), dtype=jnp.int32)
         cells = jnp.broadcast_to(
             jnp.eye(3, dtype=jnp.float32) * 10.0, (n_walkers, 3, 3)
         )
