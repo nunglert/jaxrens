@@ -839,7 +839,7 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
     # before invoking this function.
 
     n_live = ns.n_live
-    positions = resolved.init.initial_presolved.init.ositions  # (n_total, K, A, 3)
+    positions = resolved.init.initial_positions  # (n_total, K, A, 3)
     types = resolved.init.initial_types  # (A,)
     cells = resolved.init.initial_cells  # (n_total, K, 3, 3) | None
     energies = resolved.init.initial_energies  # (n_total, K)

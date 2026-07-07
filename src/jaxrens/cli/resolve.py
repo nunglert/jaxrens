@@ -220,7 +220,7 @@ def _check_initial_constraints(
 
     for desc in descriptors:
         predicate = desc.build(**desc.build_kwargs)
-        valid = jax.vmap(lambda p, c: predicate(p, types, c))(positions, cells)
+        valid = jax.vmap(lambda p, t, c: predicate(p, t, c))(positions, types, cells)
         valid = np.asarray(valid)
         if not valid.all():
             bad = int(np.argmax(~valid))
@@ -946,12 +946,14 @@ def _resolve_init_species(
             energy_backend,
         )
 
+    initial_types_broadcast = jnp.broadcast_to(initial_types[None], (n_live, n_atoms))
+
     # Energies and neighbor counts are computed once at the correct
     # bucket size by the caller via ``_finalise_initial_energies_and_counts``
     # — this helper returns structural-init only.
     return ResolvedInit(
         initial_positions=initial_positions,
-        initial_types=initial_types,
+        initial_types=initial_types_broadcast,
         initial_cells=initial_cells,
         initial_energies=None,
         initial_max_neighbor_counts=None,
@@ -1017,9 +1019,12 @@ def _resolve_init_config_file(
             energy_backend,
         )
 
+
+    initial_types_broadcast = jnp.broadcast_to(types_single[None], (n_live, n_atoms))
+
     return ResolvedInit(
         initial_positions=initial_positions,
-        initial_types=types_single,
+        initial_types=initial_types_broadcast,
         initial_cells=initial_cells,
         initial_energies=None,
         initial_max_neighbor_counts=None,
@@ -1629,8 +1634,10 @@ def _resolve_multi_replica(
         if per_run_init[0].initial_cells is not None
         else None
     )
-    # Types are identical across replicas (same start_species).
-    initial_types = per_run_init[0].initial_types
+    # This allows for varying types across replicas.
+    initial_types = jnp.stack(
+        [x.initial_types for x in per_run_init], axis=0
+    )
 
     # --- Consolidated finalize on stacked (G, P, K, ...) arrays -----------
     # Reshape (n_total, K, ...) → (G, P, K, ...) and run a single
@@ -1645,6 +1652,12 @@ def _resolve_multi_replica(
     reshaped_cells = (
         initial_cells.reshape(n_gpu, n_per_gpu, K_axis, 3, 3)
         if initial_cells is not None
+        else None
+    )
+
+    reshaped_types = (
+        initial_types.reshape(n_gpu, n_per_gpu, K_axis, n_atoms)
+        if initial_types is not None
         else None
     )
 
@@ -1670,7 +1683,7 @@ def _resolve_multi_replica(
     initial_energies, initial_counts = _finalise_initial_energies_and_counts(
         finalize_backend,
         reshaped_positions,
-        initial_types,
+        reshaped_types,
         reshaped_cells,
         batcher=batcher,
         ladder=tuple(backend_cfg.max_neighbors_list),
@@ -1687,6 +1700,12 @@ def _resolve_multi_replica(
         if reshaped_cells is not None
         else None
     )
+    initial_types = (
+        reshaped_types.reshape(n_total, K_axis, n_atoms)
+        if reshaped_types is not None
+        else None
+    )
+
     if initial_energies is not None:
         initial_energies = initial_energies.reshape(n_total, K_axis)
     if initial_counts is not None:
