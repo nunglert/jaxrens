@@ -190,7 +190,7 @@ class ResolvedInit:
     """
 
     initial_positions: Any  # shape: (n_live, n_atoms, 3) or None
-    initial_types: Any  # shape: (n_atoms,) dtype int32 or None
+    initial_types: Any  # shape: (n_live, n_atoms) dtype int32 or None
     initial_cells: Any  # shape: (n_live, 3, 3) or None
     initial_energies: Any  # shape: (n_live,) or None — None until evaluated
     initial_max_neighbor_counts: Any = None  # shape: (n_live,) int32 or None
@@ -539,9 +539,12 @@ def _finalise_initial_energies_and_counts(
     bucket is irrelevant and ``max_neighbors=0`` is passed through;
     ``counts`` is returned as ``None``.
 
-    ``types`` (shape ``(N,)``) is closed over by the per-replica
-    function, not vmap-axis aligned — it's identical across walkers
-    and across replicas.
+    ``types`` (shape ``(K, N)`` per replica) is vmap-axis aligned with
+    ``positions`` / ``cells``: the per-replica function maps it over the
+    walker axis alongside them. Fixed-composition runs carry the same
+    row for every walker (the broadcast in ``_resolve_init_*``), but the
+    per-walker axis is still present so composition-changing ensembles
+    (semi-grand / alchemical) fit the same contract.
 
     ``ensemble_params_batched`` is an ensemble-agnostic pytree (leaves
     shaped ``batcher.shape_prefix + leaf_shape``) carrying per-replica
