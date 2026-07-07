@@ -839,7 +839,7 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
     # before invoking this function.
 
     n_live = ns.n_live
-    positions = resolved.init.initial_positions  # (n_total, K, A, 3)
+    positions = resolved.init.initial_presolved.init.ositions  # (n_total, K, A, 3)
     types = resolved.init.initial_types  # (A,)
     cells = resolved.init.initial_cells  # (n_total, K, 3, 3) | None
     energies = resolved.init.initial_energies  # (n_total, K)
@@ -1319,7 +1319,11 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
 
     # --- Burn-in (sharded) -------------------------------------------------
     burn_in_cfg = resolved.initial_walk_config
-    do_burn_in = burn_in_cfg is not None and burn_in_cfg.n_walks > 0
+    do_burn_in = (
+        burn_in_cfg is not None
+        and burn_in_cfg.n_walks > 0
+        and resolved.init.restart_state is None
+    )
     initial_max_neighbor_counts = resolved.init.initial_max_neighbor_counts
     if do_burn_in:
         from jaxrens.init.burn_in import initial_walk
@@ -1629,6 +1633,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
         max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
         batcher=batcher,
+        restart_state=resolved.init.restart_state,
         **full_auto_kwargs,
     )
 

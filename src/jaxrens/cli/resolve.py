@@ -449,26 +449,26 @@ def _compute_initial_energies(
     """
     if ensemble_params_batched is None:
 
-        def per_replica(pos_K, cells_K):
+        def per_replica(pos_K, types_K, cells_K):
             return jax.vmap(
-                lambda p, c: energy_backend(p, types, c, bucket)[0]
-            )(pos_K, cells_K)
+                lambda p, t, c: energy_backend(p, t, c, bucket)[0]
+            )(pos_K, types_K, cells_K)
 
-        return batcher.wrap_for_batch(per_replica)(positions, cells)
+        return batcher.wrap_for_batch(per_replica)(positions, types, cells)
 
-    def per_replica_ep(pos_K, cells_K, ep):
+    def per_replica_ep(pos_K, types_K, cells_K, ep):
         return jax.vmap(
-            lambda p, c: energy_backend(
+            lambda p, t, c: energy_backend(
                 p,
-                types,
+                t,
                 c,
                 bucket,
                 ensemble_params=ep,
             )[0]
-        )(pos_K, cells_K)
+        )(pos_K, types_K, cells_K, ep)
 
     return batcher.wrap_for_batch(per_replica_ep)(
-        positions, cells, ensemble_params_batched
+        positions, types, cells, ensemble_params_batched
     )
 
 
@@ -802,11 +802,11 @@ def _resolve_init(
     if cell_cfg is None:
         cell_cfg = CellSpec()
 
-    if init.start_walker_set is not None:
-        return _resolve_init_walker_set(init, cell_cfg, n_live)
-
     if init.restart_file is not None:
         return _resolve_init_restart(init, cell_cfg, n_live)
+
+    if init.start_walker_set is not None:
+        return _resolve_init_walker_set(init, cell_cfg, n_live)
 
     if init.start_config_file is not None:
         return _resolve_init_config_file(

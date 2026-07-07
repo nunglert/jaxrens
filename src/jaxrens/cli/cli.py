@@ -254,13 +254,21 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # Auto-discovery: pick a checkpoint and inject it into the resolved
         # init slot.  Downstream Mode-D logic in the resolver kicks in as
         # if the user had set ``init.restart_file`` explicitly.
+        # All other init Modes are discarded.
         chosen = discover_checkpoint(
             root.output.working_dir,
             root.output.out_file_prefix,
         )
         root = root.model_copy(
             update={
-                "init": root.init.model_copy(update={"restart_file": chosen})
+                "init": root.init.model_copy(
+                    update={
+                        "restart_file": chosen,
+                        "start_walker_set": None,
+                        "start_species": None,
+                        "start_config_file": None,
+                    }
+                ),
             },
         )
 
