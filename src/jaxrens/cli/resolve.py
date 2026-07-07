@@ -465,7 +465,7 @@ def _compute_initial_energies(
                 bucket,
                 ensemble_params=ep,
             )[0]
-        )(pos_K, types_K, cells_K, ep)
+        )(pos_K, types_K, cells_K)
 
     return batcher.wrap_for_batch(per_replica_ep)(
         positions, types, cells, ensemble_params_batched
