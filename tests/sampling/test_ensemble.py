@@ -198,6 +198,10 @@ class TestInitialEnergyEnsembleThreading:
         )
         cells = jnp.tile(5.0 * jnp.eye(3), (n_runs, K, 1, 1))
         types = jnp.array([0, 1], dtype=jnp.int32)  # N = [1, 1]
+        # The finalize seam maps types over the batcher's (n_runs,) axis and
+        # the walker axis, so it needs the full (n_runs, K, n_atoms) shape —
+        # matching what the multi-replica resolver actually produces.
+        types_batched = jnp.broadcast_to(types, (n_runs, K, n_atoms))
 
         # Distinct μ per replica → distinct −μ·N shift per run.
         mu = jnp.array([[1.0, 2.0], [0.5, 0.5]], dtype=jnp.float32)
@@ -206,7 +210,7 @@ class TestInitialEnergyEnsembleThreading:
         energies, counts = _finalise_initial_energies_and_counts(
             backend,
             positions,
-            types,
+            types_batched,
             cells,
             batcher=VmapRuns(n_runs),
             ensemble_params_batched=ep_batched,
@@ -234,11 +238,14 @@ class TestInitialEnergyEnsembleThreading:
         )
         cells = jnp.tile(5.0 * jnp.eye(3), (n_runs, K, 1, 1))
         types = jnp.array([0, 1], dtype=jnp.int32)
+        # (n_runs, K, n_atoms) — aligned with the batcher's (n_runs,) prefix
+        # and the per-walker axis the finalize seam vmaps over.
+        types_batched = jnp.broadcast_to(types, (n_runs, K, n_atoms))
 
         energies, counts = _finalise_initial_energies_and_counts(
             base,
             positions,
-            types,
+            types_batched,
             cells,
             batcher=VmapRuns(n_runs),
             ensemble_params_batched=None,

@@ -9,6 +9,34 @@ The version is derived from git tags by `setuptools-scm` (tag `v0.1.0` →
 version `0.1.0`). To cut a release: add a dated section below, merge to `main`,
 then `git tag -a vX.Y.Z`.
 
+## [0.2.1] — 2026-07-07
+
+Bug-fix release for the restart and sharded / multi-replica start paths. No
+new features or config changes.
+
+### Fixed
+- **Restart now takes precedence over other init modes.** An auto-discovered
+  checkpoint (or an explicit `init.restart_file`) could be shadowed when a
+  `start_walker_set` / `start_species` / `start_config_file` was also present:
+  the resolver checked `start_walker_set` before `restart_file`, and checkpoint
+  auto-discovery injected `restart_file` without clearing the competing init
+  fields. A resumed run could silently re-initialise from scratch instead of
+  from the checkpoint. Restart is now resolved first, and auto-discovery clears
+  the other init modes.
+- **Sharded runs no longer re-run initial burn-in on restart.**
+  `run_sharded_from_config` executed the burn-in walk unconditionally, throwing
+  away the checkpointed walkers' equilibration. Burn-in is now skipped when a
+  restart state is present, and the restart state is threaded through to the
+  sharded run.
+- **Correct initial energies and constraint checks on the batched paths.**
+  `initial_types` is now carried as a per-walker `(n_live, n_atoms)` array
+  throughout the resolver; the initial-energy finalize seam and the
+  initial-constraint check map it over the walker (and replica) axes alongside
+  positions/cells instead of closing over a single shared `(n_atoms,)` vector.
+  This fixes `vmap`/`pmap` rank errors in the multi-replica and sharded
+  initial-energy compute and lets composition vary per replica (semi-grand μPT
+  / alchemical).
+
 ## [0.2.0] — 2026-06-25
 
 Adds composable constraints and a semi-grand μPT ensemble, fixes a periodic
