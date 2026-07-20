@@ -219,9 +219,13 @@ def _check_initial_constraints(
     # Collapse any leading replica/live axes into one flat walker axis so a
     # single vmap feeds the predicate per-walker ``(n_atoms, 3)`` / ``(3, 3)``
     # arrays in both layouts (otherwise the cell stays batched and
-    # ``pairwise_distances`` fails to broadcast).
+    # ``pairwise_distances`` fails to broadcast).  ``types`` carries the same
+    # leading axes (batched ``(n_total, K, n_atoms)`` / ``(n_live, n_atoms)``
+    # since the ResolvedInit types contract became per-walker) and must be
+    # flattened the same way, or vmap sees mismatched mapped-axis sizes.
     n_atoms = positions.shape[-2]
     positions = positions.reshape(-1, n_atoms, 3)
+    types = types.reshape(-1, n_atoms)
     n_walkers = int(positions.shape[0])
     cells = resolved_init.initial_cells
     cells = (
@@ -232,7 +236,9 @@ def _check_initial_constraints(
 
     for desc in descriptors:
         predicate = desc.build(**desc.build_kwargs)
-        valid = jax.vmap(lambda p, t, c: predicate(p, t, c))(positions, types, cells)
+        valid = jax.vmap(lambda p, t, c: predicate(p, t, c))(
+            positions, types, cells
+        )
         valid = np.asarray(valid)
         if not valid.all():
             bad = int(np.argmax(~valid))
@@ -962,7 +968,9 @@ def _resolve_init_species(
             energy_backend,
         )
 
-    initial_types_broadcast = jnp.broadcast_to(initial_types[None], (n_live, n_atoms))
+    initial_types_broadcast = jnp.broadcast_to(
+        initial_types[None], (n_live, n_atoms)
+    )
 
     # Energies and neighbor counts are computed once at the correct
     # bucket size by the caller via ``_finalise_initial_energies_and_counts``
@@ -1035,8 +1043,9 @@ def _resolve_init_config_file(
             energy_backend,
         )
 
-
-    initial_types_broadcast = jnp.broadcast_to(types_single[None], (n_live, n_atoms))
+    initial_types_broadcast = jnp.broadcast_to(
+        types_single[None], (n_live, n_atoms)
+    )
 
     return ResolvedInit(
         initial_positions=initial_positions,
@@ -1651,9 +1660,7 @@ def _resolve_multi_replica(
         else None
     )
     # This allows for varying types across replicas.
-    initial_types = jnp.stack(
-        [x.initial_types for x in per_run_init], axis=0
-    )
+    initial_types = jnp.stack([x.initial_types for x in per_run_init], axis=0)
 
     # --- Consolidated finalize on stacked (G, P, K, ...) arrays -----------
     # Reshape (n_total, K, ...) → (G, P, K, ...) and run a single
