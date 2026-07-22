@@ -20,6 +20,33 @@ _DATA = Path(__file__).parent.parent / "data" / "cli"
 
 
 # ---------------------------------------------------------------------------
+# --version
+# ---------------------------------------------------------------------------
+
+
+class TestVersion:
+    @pytest.mark.parametrize("flag", ["--version", "-V"])
+    def test_prints_version_and_exits_zero(self, flag, capsys):
+        from jaxrens import __version__
+
+        with pytest.raises(SystemExit) as exc_info:
+            main([flag])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert "jaxrens" in out
+        assert __version__ in out
+        # Runtime deps are reported too (read from metadata, JAX not imported).
+        assert "jax" in out
+        assert "python" in out
+
+    def test_version_output_is_plain_when_not_a_tty(self, capsys):
+        """capsys is not a TTY, so no ANSI escape codes should leak."""
+        with pytest.raises(SystemExit):
+            main(["--version"])
+        assert "\x1b[" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # dump-schema
 # ---------------------------------------------------------------------------
 

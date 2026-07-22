@@ -28,3 +28,5 @@
 - ship a jax-mace foundation model? or maybe even the utils to pull and convert? So it becomes more plug and play 
 
 - jaxrens --version in CLI
+
+- move steinhardt (with tests) to remote_handler
