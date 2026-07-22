@@ -1242,9 +1242,6 @@ def _resolve_single_replica(
         collision_check_interval=int(root.output.collision_check_interval),
         wrap_atoms=bool(root.output.wrap_atoms),
         snapshot_clean=bool(root.output.snapshot_clean),
-        write_uncertainty=bool(root.output.write_uncertainty),
-        write_force_uncertainty=bool(root.output.write_force_uncertainty),
-        uncertainty_in_place=bool(root.output.uncertainty_in_place),
     )
 
     # Build termination criteria.  ``IterationTermination`` is only added
@@ -1804,9 +1801,6 @@ def _resolve_multi_replica(
         collision_check_interval=int(root.output.collision_check_interval),
         wrap_atoms=bool(root.output.wrap_atoms),
         snapshot_clean=bool(root.output.snapshot_clean),
-        write_uncertainty=bool(root.output.write_uncertainty),
-        write_force_uncertainty=bool(root.output.write_force_uncertainty),
-        uncertainty_in_place=bool(root.output.uncertainty_in_place),
     )
 
     # Same termination logic as the single-run path: default to PriorMass

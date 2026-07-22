@@ -706,53 +706,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output PNG path.  Default: sibling <stem>.<kind>.png.",
     )
 
-    # -- annotate-uncertainty --
-    p_unc = sub.add_parser(
-        "annotate-uncertainty",
-        help=(
-            "Post-hoc: annotate a written NS trajectory with committee "
-            "energy/force uncertainty (ns_energy_std / ns_force_std)."
-        ),
-    )
-    p_unc.add_argument(
-        "--traj",
-        required=True,
-        metavar="FILE",
-        help="Trajectory to annotate (.extxyz/.xyz/.h5/.hdf5).",
-    )
-    p_unc.add_argument(
-        "--model",
-        required=True,
-        metavar="PICKLE",
-        help="NeuralIL ensemble model pickle (the committee).",
-    )
-    p_unc.add_argument(
-        "--supercell",
-        nargs=3,
-        type=int,
-        default=[1, 1, 1],
-        metavar=("A", "B", "C"),
-        help="Supercell transform passed to the backend.  Default 1 1 1.",
-    )
-    p_unc.add_argument(
-        "--no-forces",
-        action="store_false",
-        dest="forces",
-        help="Only compute energy uncertainty (skip the force jacobian).",
-    )
-    p_unc.add_argument(
-        "--in-place",
-        action="store_true",
-        help="Edit the trajectory in place instead of writing *.annotated.<ext>.",
-    )
-    p_unc.add_argument(
-        "--chunk-size",
-        type=int,
-        default=64,
-        metavar="N",
-        help="Frames per batched evaluation (bounds memory).  Default 64.",
-    )
-
     return parser
 
 
@@ -870,35 +823,6 @@ def _format_validation_error(exc: Any, config_path: str) -> str:
     return "\n".join(lines)
 
 
-def _cmd_annotate_uncertainty(args: argparse.Namespace) -> int:
-    """Standalone post-hoc committee-uncertainty annotation of a trajectory."""
-    from jaxrens.backends.base import get_committee_backend
-    from jaxrens.backends.neuralil import create_neuralil
-    from jaxrens.postprocess.uncertainty import annotate_trajectory_uncertainty
-
-    backend = create_neuralil(
-        pickle_file=args.model,
-        supercell_trafo=tuple(args.supercell),
-    )
-    committee = get_committee_backend(backend)
-    if committee is None:
-        print(
-            "jaxrens: the provided model is not an NN committee (ensemble); "
-            "committee uncertainty requires an ensemble model.",
-            file=sys.stderr,
-        )
-        return 2
-    out = annotate_trajectory_uncertainty(
-        args.traj,
-        committee,
-        with_forces=args.forces,
-        in_place=args.in_place,
-        chunk_size=args.chunk_size,
-    )
-    print(f"Wrote committee-uncertainty annotation: {out}")
-    return 0
-
-
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point registered via ``[project.scripts]``."""
     from pydantic import ValidationError
@@ -911,7 +835,6 @@ def main(argv: list[str] | None = None) -> None:
         "validate": _cmd_validate,
         "dump-schema": _cmd_dump_schema,
         "plot": _cmd_plot,
-        "annotate-uncertainty": _cmd_annotate_uncertainty,
     }
     from jaxrens.cli.style import style
 

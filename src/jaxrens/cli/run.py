@@ -258,80 +258,6 @@ def setup_mwg(
     return build_mwg(backend, descriptors)
 
 
-def _annotation_chunk_size(n_extra: int, batcher: Any = None) -> int:
-    """Frames per batched committee-uncertainty eval = the NS per-device walk batch.
-
-    Reuses the simultaneous-walker batch that the GPU already compiled and ran
-    during sampling — ``(1 + n_extra)`` walkers per run × runs-per-device —
-    rather than an arbitrary constant, so the post-run committee re-evaluation
-    inherits a known-good memory footprint.  ``runs-per-device`` is the trailing
-    ``shape_prefix`` axis of the batcher (``n_per_gpu`` for pmap+vmap,
-    ``n_runs`` for vmap-only, ``1`` for a single run / no batcher).
-    """
-    runs_per_device = 1
-    prefix = (
-        getattr(batcher, "shape_prefix", ()) if batcher is not None else ()
-    )
-    if prefix:
-        runs_per_device = int(prefix[-1])
-    return max(1, (1 + int(n_extra)) * runs_per_device)
-
-
-def _maybe_annotate_uncertainty(
-    output_config: Any,
-    backend: Any,
-    traj_paths: list,
-    chunk_size: int = 64,
-) -> None:
-    """Post-run step: annotate written trajectories with committee uncertainty.
-
-    No-op unless ``output_config.write_uncertainty`` is set and the backend is
-    an NN committee (ensemble).  Runs after the NS loop returns and the writers
-    have flushed/closed — the backend and GPU are still warm, so no model
-    reload.  A non-committee backend warns and skips.  Any failure here is
-    logged but never fails an otherwise-complete run.  ``chunk_size`` is the
-    per-batch frame count (default mirrors the NS per-device walk batch; see
-    :func:`_annotation_chunk_size`).
-    """
-    if not getattr(output_config, "write_uncertainty", False):
-        return
-    if getattr(output_config, "format", "none") == "none":
-        return
-
-    from jaxrens.backends.base import get_committee_backend
-
-    committee = get_committee_backend(backend)
-    if committee is None:
-        logger.warning(
-            "output.write_uncertainty=True but the backend is not an NN "
-            "committee (ensemble); skipping committee-uncertainty annotation."
-        )
-        return
-
-    from jaxrens.postprocess.uncertainty import annotate_trajectory_uncertainty
-
-    with_forces = bool(getattr(output_config, "write_force_uncertainty", True))
-    in_place = bool(getattr(output_config, "uncertainty_in_place", False))
-    for traj_path in traj_paths:
-        if traj_path is None or not Path(traj_path).exists():
-            continue
-        try:
-            out = annotate_trajectory_uncertainty(
-                traj_path,
-                committee,
-                with_forces=with_forces,
-                in_place=in_place,
-                chunk_size=chunk_size,
-            )
-            logger.info("Committee-uncertainty annotation written: %s", out)
-        except Exception as exc:  # noqa: BLE001 -- must not fail the run
-            logger.warning(
-                "Committee-uncertainty annotation failed for %s: %s",
-                traj_path,
-                exc,
-            )
-
-
 def run_from_config(
     ns_config: NSConfig,
     move_config: MoveConfig | list[MoveConfig],
@@ -746,13 +672,6 @@ def run_from_config(
         max_neighbors_shrink_dwell=backend_config.max_neighbors_shrink_dwell,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
         **full_auto_kwargs,
-    )
-
-    _maybe_annotate_uncertainty(
-        output_config,
-        backend,
-        [getattr(writer, "path", None)],
-        chunk_size=_annotation_chunk_size(ns_config.n_extra),
     )
 
     return result
@@ -1245,15 +1164,6 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
         **full_auto_kwargs,
     )
 
-    _maybe_annotate_uncertainty(
-        resolved.output,
-        backend,
-        [getattr(w, "path", None) for w in writers],
-        chunk_size=_annotation_chunk_size(
-            resolved.ns.n_extra, resolved.batcher
-        ),
-    )
-
     return result
 
 
@@ -1635,15 +1545,6 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
         batcher=batcher,
         restart_state=resolved.init.restart_state,
         **full_auto_kwargs,
-    )
-
-    _maybe_annotate_uncertainty(
-        resolved.output,
-        backend,
-        [getattr(writer, "path", None)],
-        chunk_size=_annotation_chunk_size(
-            resolved.ns.n_extra, resolved.batcher
-        ),
     )
 
     return result

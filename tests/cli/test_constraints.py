@@ -139,7 +139,14 @@ def test_check_initial_constraints_handles_multi_replica_layout():
         np.full((1, 1), 1.7, dtype=np.float32), type_dependent=False
     )
     n_total, K, n_atoms = 2, 4, 2
-    types = jnp.zeros((n_atoms,), dtype=jnp.int32)
+    types = jnp.zeros(
+        (
+            n_total,
+            K,
+            n_atoms,
+        ),
+        dtype=jnp.int32,
+    )
     cells = jnp.broadcast_to(jnp.eye(3) * 10.0, (n_total, K, 3, 3))
 
     # Atoms 2 A apart (> 1.7 floor) -> all walkers valid.
