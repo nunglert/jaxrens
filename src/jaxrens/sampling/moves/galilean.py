@@ -36,12 +36,15 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float, Key
 
 from jaxrens.backends.base import eval_energy_and_forces
 from jaxrens.base import MoveInfo
 
 
-def _random_direction(key: jax.Array, shape: tuple) -> jnp.ndarray:
+def _random_direction(
+    key: Key[Array, ""], shape: tuple
+) -> Float[Array, "N 3"]:
     """Generate a random unit direction vector."""
     d = jax.random.normal(key, shape)
     norm = jnp.sqrt(jnp.sum(d**2))
@@ -49,10 +52,10 @@ def _random_direction(key: jax.Array, shape: tuple) -> jnp.ndarray:
 
 
 def _perturb_direction(
-    key: jax.Array,
-    direction: jnp.ndarray,
+    key: Key[Array, ""],
+    direction: Float[Array, "N 3"],
     perturb_angle: float = 0.1,
-) -> jnp.ndarray:
+) -> Float[Array, "N 3"]:
     """Perturb a direction vector by a small random angle."""
     noise = perturb_angle * jax.random.normal(key, direction.shape)
     new_dir = direction + noise

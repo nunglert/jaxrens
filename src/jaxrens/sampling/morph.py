@@ -18,14 +18,16 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 from jax import lax
-
+from jaxtyping import Array, Int, Key
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _counts_from_types(types: jnp.ndarray, n_species: int) -> jnp.ndarray:
+def _counts_from_types(
+    types: Int[Array, "N"], n_species: int
+) -> Int[Array, "n_species"]:
     """Count atoms per species.
 
     Args:
@@ -44,11 +46,11 @@ def _counts_from_types(types: jnp.ndarray, n_species: int) -> jnp.ndarray:
 
 
 def morph_types_to_composition(
-    rng_key: jax.Array,
-    types: jnp.ndarray,
-    target_composition: jnp.ndarray,
+    rng_key: Key[Array, ""],
+    types: Int[Array, "N"],
+    target_composition: Int[Array, "n_species"],
     n_species: int,
-) -> jnp.ndarray:
+) -> Int[Array, "N"]:
     """Deterministically relabel atom types to match `target_composition`.
 
     Uses random selection to pick which existing atoms get relabeled so the

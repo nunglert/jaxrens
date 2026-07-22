@@ -26,6 +26,7 @@ from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float, Int, Key
 
 from jaxrens.base import MoveInfo
 from jaxrens.constraints.base import ConstraintDescriptor, make_move_gate
@@ -101,7 +102,9 @@ def build_mwg(
 
     # --- Wrap each step_fn ---
     def _wrap(raw_fn, move_idx, gate):
-        def wrapped(state, key: jax.Array, constraint: float | jnp.ndarray):
+        def wrapped(
+            state, key: Key[Array, ""], constraint: float | Float[Array, ""]
+        ):
             # Inject this move's step_size from the per-move array
             state_with_ss = state.set(step_size=state.step_sizes[move_idx])
             new_state, info = raw_fn(key, state_with_ss, constraint)
@@ -152,15 +155,15 @@ def build_mwg(
     # --- init_fn ---
 
     def init_fn(
-        positions: jnp.ndarray,
-        types: jnp.ndarray,
-        energy: float | jnp.ndarray,
-        cell: jnp.ndarray | None = None,
-        step_sizes: jnp.ndarray | None = None,
-        step_size: float | jnp.ndarray | None = None,
+        positions: Float[Array, "*B N 3"],
+        types: Int[Array, "*B N"],
+        energy: float | Float[Array, "*B"],
+        cell: Float[Array, "*B 3 3"] | None = None,
+        step_sizes: Float[Array, "n_moves"] | None = None,
+        step_size: float | Float[Array, ""] | None = None,
         ensemble_params: dict | None = None,
         max_neighbors: int = 0,
-        max_neighbor_count_init: int | jnp.ndarray = 0,
+        max_neighbor_count_init: int | Int[Array, "*B"] = 0,
     ) -> Any:  # returns MCStateClass instance
         """Create initial MCState from walker data.
 
@@ -218,9 +221,9 @@ def build_mwg(
     # --- step_fn ---
 
     def step_fn(
-        rng_key: jax.Array,
+        rng_key: Key[Array, ""],
         state: Any,
-        likelihood_constraint: float | jnp.ndarray,
+        likelihood_constraint: float | Float[Array, ""],
     ) -> tuple[Any, MoveInfo]:
         """One MWG step: randomly select a move and execute it."""
         key_select, key_move = jax.random.split(rng_key)

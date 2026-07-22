@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 
 import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float, Int
 
 from jaxrens.state.walker import register_dataclass_pytree, static_field
 
@@ -63,18 +64,21 @@ def make_mc_state_class(extra_fields: dict[str, type] | None = None) -> type:
     if cache_key in _MC_STATE_CACHE:
         return _MC_STATE_CACHE[cache_key]
 
-    # Core fields — always present
+    # Core fields — always present.  Shapes carry an optional batch prefix
+    # ``*B`` because the MWG sampler vmaps/pmaps a single-walker MCState (see
+    # ``jaxrens.state.walker`` for the same convention).
     core = [
-        ("positions", jnp.ndarray),
-        ("types", jnp.ndarray),
-        ("energy", jnp.ndarray),
-        ("cell", jnp.ndarray),
-        ("step_size", jnp.ndarray),
-        ("step_sizes", jnp.ndarray),
-        ("n_accepted", jnp.ndarray),
-        ("n_proposed", jnp.ndarray),
-        ("max_neighbor_count", jnp.ndarray),  # actual max neighbors observed
-        ("overflow", jnp.ndarray),  # bool — any overflow detected
+        ("positions", Float[Array, "*B N 3"]),
+        ("types", Int[Array, "*B N"]),
+        ("energy", Float[Array, "*B"]),
+        ("cell", Float[Array, "*B 3 3"]),
+        ("step_size", Float[Array, "*B"]),
+        ("step_sizes", Float[Array, "*B n_moves"]),
+        ("n_accepted", Int[Array, "*B n_moves"]),
+        ("n_proposed", Int[Array, "*B n_moves"]),
+        # actual max neighbors observed
+        ("max_neighbor_count", Int[Array, "*B"]),
+        ("overflow", Bool[Array, "*B"]),  # any overflow detected
         (
             "ensemble_params",
             dict,
