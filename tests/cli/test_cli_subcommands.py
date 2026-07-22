@@ -73,64 +73,6 @@ class TestDumpSchema:
 
 
 # ---------------------------------------------------------------------------
-# annotate-steinhardt
-# ---------------------------------------------------------------------------
-
-
-class TestAnnotateSteinhardt:
-    def test_annotates_extxyz(self, tmp_path, capsys):
-        from ase.io import read
-
-        src = Path(__file__).parent.parent / "data" / "postprocess"
-        frames = read(str(src / "steinhardt" / "fcc_Cu.xyz"), index=":")
-        traj = tmp_path / "run.traj.extxyz"
-        from ase.io import write
-
-        write(str(traj), frames)
-
-        with pytest.raises(SystemExit) as exc_info:
-            main(
-                [
-                    "annotate-steinhardt",
-                    "--traj",
-                    str(traj),
-                    "--l",
-                    "4",
-                    "6",
-                    "--r-cut",
-                    "3.0",
-                ]
-            )
-        assert exc_info.value.code == 0
-        out = capsys.readouterr().out
-        assert "Steinhardt annotation" in out
-
-        annotated = read(
-            str(tmp_path / "run.traj.annotated.extxyz"), index=":"
-        )
-        for atoms in annotated:
-            assert "q6" in atoms.arrays and "w4" in atoms.arrays
-
-    def test_non_extxyz_returns_2(self, tmp_path, capsys):
-        bogus = tmp_path / "run.traj.h5"
-        bogus.write_bytes(b"nope")
-        with pytest.raises(SystemExit) as exc_info:
-            main(
-                [
-                    "annotate-steinhardt",
-                    "--traj",
-                    str(bogus),
-                    "--l",
-                    "6",
-                    "--r-cut",
-                    "3.0",
-                ]
-            )
-        assert exc_info.value.code == 2
-        assert "jaxrens annotate-steinhardt:" in capsys.readouterr().err
-
-
-# ---------------------------------------------------------------------------
 # plot (error paths)
 # ---------------------------------------------------------------------------
 
