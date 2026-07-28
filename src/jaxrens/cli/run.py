@@ -81,11 +81,12 @@ def configure_file_logging(
     level: str,
     mode: str = "w",
 ) -> None:
-    """Attach file + stderr handlers to the ``jaxrens`` logger.
+    """Attach a file handler to the ``jaxrens`` logger.
 
-    Always writes INFO+ to ``<working_dir>/<prefix>.log`` and mirrors
-    INFO+ to stderr.  If ``level`` is ``debug``, additionally writes
-    DEBUG+ to ``<working_dir>/<prefix>.debug.log``.
+    Writes to a single ``<working_dir>/<prefix>.log``.  The threshold
+    follows ``level``: INFO+ normally, DEBUG+ when ``level`` is ``debug``
+    (so debug output lands in the same file — there is no separate
+    ``.debug.log``).
 
     ``mode`` mirrors the ``writer_mode`` plumbed through to the I/O
     writers: ``"w"`` on a fresh run, ``"a"`` on restart so the prior
@@ -105,26 +106,17 @@ def configure_file_logging(
             root.removeHandler(h)
             h.close()
 
-    info_h = logging.FileHandler(working_dir / f"{prefix}.log", mode=mode)
-    info_h.setLevel(logging.INFO)
-    info_h.setFormatter(logging.Formatter(_LOG_FORMAT))
-    info_h._jaxrens_managed = True  # type: ignore[attr-defined]
-    root.addHandler(info_h)
+    file_h = logging.FileHandler(working_dir / f"{prefix}.log", mode=mode)
+    file_h.setLevel(logging.DEBUG if level == "debug" else logging.INFO)
+    file_h.setFormatter(logging.Formatter(_LOG_FORMAT))
+    file_h._jaxrens_managed = True  # type: ignore[attr-defined]
+    root.addHandler(file_h)
 
     # stream_h = logging.StreamHandler(sys.stderr)
     # stream_h.setLevel(logging.INFO)
     # stream_h.setFormatter(logging.Formatter(_LOG_FORMAT))
     # stream_h._jaxrens_managed = True  # type: ignore[attr-defined]
     # root.addHandler(stream_h)
-
-    if level == "debug":
-        debug_h = logging.FileHandler(
-            working_dir / f"{prefix}.debug.log", mode=mode
-        )
-        debug_h.setLevel(logging.DEBUG)
-        debug_h.setFormatter(logging.Formatter(_LOG_FORMAT))
-        debug_h._jaxrens_managed = True  # type: ignore[attr-defined]
-        root.addHandler(debug_h)
 
 
 def _barrier(label: str, *arrays: Any) -> None:
@@ -133,8 +125,8 @@ def _barrier(label: str, *arrays: Any) -> None:
     Use as a stage boundary in the multi-GPU dispatcher: any OOM during the
     just-completed stage's compile/execute will surface inside this call,
     not deferred to the next materialisation point.  No-op for non-array
-    inputs and ``None``.  Only emits at DEBUG level — zero cost when the
-    debug log handler is not attached.
+    inputs and ``None``.  Only emits at DEBUG level — zero cost when DEBUG
+    logging is not enabled.
     """
     if not logger.isEnabledFor(logging.DEBUG):
         return

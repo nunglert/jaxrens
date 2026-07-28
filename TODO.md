@@ -17,10 +17,6 @@
 
 - re_stats plot in CLI is outdated
 
-- Do we carefully obey a walker state contract? Check this. We shouldnt switch arbitrarily between dict and WalkerState
-
-- debug.log is not really used, mostly redundant
-
 - better OOM errors. E.g. in the burn-in phase "Decrease walker_batch_size", in ns_loop "Decrease n_extra", ...
 
 - ship a jax-mace foundation model? or maybe even the utils to pull and convert? So it becomes more plug and play 
