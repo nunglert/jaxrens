@@ -23,6 +23,4 @@
 
 - better OOM errors. E.g. in the burn-in phase "Decrease walker_batch_size", in ns_loop "Decrease n_extra", ...
 
-- jaxtyping in replica exchange manager
-
 - ship a jax-mace foundation model? or maybe even the utils to pull and convert? So it becomes more plug and play 

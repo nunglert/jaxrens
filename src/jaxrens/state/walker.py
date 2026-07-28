@@ -11,7 +11,7 @@ K=n_walkers. The pytree registration ensures vmap/pmap work transparently.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import jax
@@ -101,6 +101,40 @@ class WalkerState:
     def set(self, **kwargs: Any) -> WalkerState:
         """Functional update: return a new WalkerState with specified fields replaced."""
         return dataclasses.replace(self, **kwargs)
+
+    @classmethod
+    def from_record(
+        cls,
+        record: Mapping[str, Any],
+        *,
+        n_atoms: int | None = None,
+    ) -> WalkerState:
+        """Build a single-walker ``WalkerState`` from a loose serialization dict.
+
+        The in-memory walker contract *is* this dataclass; on-disk artifacts and
+        the callback boundary use plain dicts.  This classmethod is the single
+        place that maps those loose keys back to the typed form, so callers stop
+        hand-unpacking ``walker["positions"]`` alongside ``walker.positions``.
+
+        The unit cell is read from ``cell`` or its on-disk alias ``box`` (the
+        extxyz/HDF5 writers emit ``box``).  Arrays are coerced to JAX arrays so
+        the result satisfies the dataclass's jaxtyped field contract regardless
+        of whether the record carried numpy or jax arrays.
+
+        Single walker only — for a batched population record use
+        :func:`jaxrens.io.formats.iter_walker_states`.
+        """
+        positions = jnp.asarray(record["positions"])
+        cell = record.get("cell")
+        if cell is None:
+            cell = record.get("box")
+        return cls(
+            positions=positions,
+            types=jnp.asarray(record["types"]),
+            energy=jnp.asarray(record["energy"]),
+            cell=None if cell is None else jnp.asarray(cell),
+            n_atoms=int(positions.shape[0]) if n_atoms is None else n_atoms,
+        )
 
 
 # Register as JAX pytree

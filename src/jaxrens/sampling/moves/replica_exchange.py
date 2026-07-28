@@ -52,6 +52,26 @@ class SwapKernel(ABC):
     :meth:`accept` (decide whether to accept it).  The split keeps the
     proposal logic (which may involve backend energy evaluations for XRENS)
     separate from the deterministic acceptance check.
+
+    Swap-state contract (deliberately *not* ``WalkerState``)
+    -------------------------------------------------------
+    ``propose``/``accept`` speak a small, JIT-internal *pair* protocol, not the
+    single-walker ``WalkerState`` pytree used everywhere else:
+
+    * ``state_a`` / ``state_b`` are loose dicts with keys ``'positions'``,
+      ``'types'``, ``'energy'``, ``'cell'`` — and are intentionally **partial**:
+      ``PressureRENSSwap`` and the ``perform_swap`` back-compat shim pass
+      ``energy``-only states (optionally with a synthetic ``cell``) because a
+      plain energy/enthalpy comparison needs nothing more.
+    * ``proposed`` carries *both* replicas' results under ``_a``/``_b``-suffixed
+      keys (``'positions_a'``, ``'cell_b'``, …) — a paired structure with no
+      single-walker analogue.
+
+    These dicts never touch disk and are consumed only within the vmapped swap
+    kernels, so they are kept as plain dicts by design; forcing ``WalkerState``
+    here would break the partial-state and paired-result cases.  Disk/callback
+    serialization is a separate concern handled by ``io.formats`` (see its
+    module docstring).
     """
 
     @abstractmethod

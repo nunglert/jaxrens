@@ -194,7 +194,7 @@ class TestVmap:
         n_replicas, n_atoms, n_species = 4, 12, 3
 
         # Build per-replica keys, types, targets
-        keys = jax.random.split(key, n_replicas * 3).reshape(n_replicas, 3, 2)
+        keys = jax.random.split(key, n_replicas * 3).reshape(n_replicas, 3)
         types_batch = jax.vmap(lambda k: make_types(k, n_atoms, n_species))(
             keys[:, 0]
         )
@@ -222,7 +222,7 @@ class TestVmap:
         key = jax.random.key(11)
         n_replicas, n_atoms, n_species = 3, 10, 2
 
-        keys = jax.random.split(key, n_replicas * 3).reshape(n_replicas, 3, 2)
+        keys = jax.random.split(key, n_replicas * 3).reshape(n_replicas, 3)
         types_batch = jax.vmap(lambda k: make_types(k, n_atoms, n_species))(
             keys[:, 0]
         )

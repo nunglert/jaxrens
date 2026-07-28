@@ -940,20 +940,22 @@ def _ns_state_to_result_dict(
     here as a small scalar / batched scalar for log lines and for
     interactive callers that just want the count.
     """
+    from jaxrens.io.formats import population_record
+
     pop = ns_state.population
     ep = pop.ensemble_params if hasattr(pop, "ensemble_params") else {}
     is_npt = isinstance(ep, dict) and "pressure" in ep
-    result = {
-        "positions": pop.positions,
-        "types": pop.types,
-        "energies": pop.energy,
-        "cells": pop.cell,
-        "log_evidence": ns_state.log_evidence,
-        "iteration": int(ns_state.iteration),
-        "n_dead": n_dead,
-        "n_walkers": ns_state.n_walkers,
-        "rng_key": ns_state.rng_key,
-    }
+    result = population_record(
+        pop.positions,
+        pop.types,
+        pop.energy,
+        pop.cell,
+        log_evidence=ns_state.log_evidence,
+        iteration=int(ns_state.iteration),
+        n_dead=n_dead,
+        n_walkers=ns_state.n_walkers,
+        rng_key=ns_state.rng_key,
+    )
     if is_npt:
         result["live_volumes"] = jax.vmap(get_volume)(pop.cell)
     else:

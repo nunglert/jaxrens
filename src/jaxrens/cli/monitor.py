@@ -17,7 +17,9 @@ import jax.numpy as jnp
 import numpy as np
 
 import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
+from jaxrens.io.formats import population_record
 from jaxrens.state.ns import NSState
+from jaxrens.state.walker import WalkerState
 from jaxrens.utils.cell import get_volume
 
 logger = logging.getLogger(__name__)
@@ -69,18 +71,18 @@ def _ns_state_to_checkpoint_dict(ns_state: NSState) -> dict:
     # field for backward compat with consumers that read it.
     n_dead = iteration
 
-    result = {
-        "positions": pop.positions,
-        "types": pop.types,
-        "energies": pop.energy,
-        "cells": pop.cell,
-        "step_sizes": pop.step_sizes,
-        "log_evidence": ns_state.log_evidence,
-        "iteration": iteration,
-        "emax": ns_state.emax,
-        "n_dead": n_dead,
-        "n_walkers": ns_state.n_walkers,
-    }
+    result = population_record(
+        pop.positions,
+        pop.types,
+        pop.energy,
+        pop.cell,
+        step_sizes=pop.step_sizes,
+        log_evidence=ns_state.log_evidence,
+        iteration=iteration,
+        emax=ns_state.emax,
+        n_dead=n_dead,
+        n_walkers=ns_state.n_walkers,
+    )
     if is_npt:
         # Vectorized volume: vmap over all leading axes by flattening then reshape.
         cell = pop.cell
@@ -1335,13 +1337,18 @@ class TrajectoryCallback:
         dead_cell = dead_ws.cell
 
         if iteration % self.traj_interval == 0:
-            dead_walker = {
-                "positions": dead_ws.positions,
-                "types": dead_ws.types,
-                "energy": float(info.get("emax", 0)),
-            }
-            if jnp.any(dead_cell != 0):
-                dead_walker["box"] = dead_cell
+            # Emax is the culled walker's energy under the NS contour; carry it
+            # on the WalkerState so the writer records the contour value.  Drop
+            # a degenerate (all-zero) cell to None so it serializes as
+            # non-periodic, matching the previous dict-with-optional-box path.
+            cell = (
+                dead_cell
+                if dead_cell is not None and jnp.any(dead_cell != 0)
+                else None
+            )
+            dead_walker = dead_ws.set(
+                energy=jnp.asarray(info.get("emax", 0.0)), cell=cell
+            )
             self.writer.write_dead_point(
                 iteration, dead_walker, float(info["emax"])
             )
@@ -1451,17 +1458,21 @@ class BatchedTrajectoryCallback:
         dead_pos_flat = np.asarray(flatten(dead_ws.positions))
         dead_types_flat = np.asarray(flatten(dead_ws.types))
         dead_cell_flat = np.asarray(flatten(dead_ws.cell))
+        n_atoms = int(dead_pos_flat.shape[1])
 
         if iteration % self.traj_interval == 0:
             for r in range(n_runs):
                 cell_r = dead_cell_flat[r]
-                dead_walker = {
-                    "positions": dead_pos_flat[r],
-                    "types": dead_types_flat[r],
-                    "energy": float(emax_flat[r]),
-                }
-                if jnp.any(cell_r != 0):
-                    dead_walker["box"] = cell_r
+                # Build the per-replica dead walker as a typed WalkerState
+                # (jnp arrays satisfy the jaxtyped fields).  A degenerate
+                # all-zero cell serializes as non-periodic (cell=None).
+                dead_walker = WalkerState(
+                    positions=jnp.asarray(dead_pos_flat[r]),
+                    types=jnp.asarray(dead_types_flat[r]),
+                    energy=jnp.asarray(emax_flat[r]),
+                    cell=jnp.asarray(cell_r) if np.any(cell_r != 0) else None,
+                    n_atoms=n_atoms,
+                )
                 self.writers[r].write_dead_point(
                     iteration,
                     dead_walker,
@@ -1491,18 +1502,14 @@ class BatchedTrajectoryCallback:
             types_flat = flatten(pop.types)
             cells_flat = flatten(pop.cell)
             for r in range(n_runs):
-                snap = {
-                    "positions": positions_flat[r],
-                    "types": types_flat[r]
-                    if types_flat.ndim >= 2
-                    else types_flat,
-                    "energies": energies_flat[r],
-                    "cells": cells_flat[r]
-                    if cells_flat.ndim >= 3
-                    else cells_flat,
-                    "iteration": iteration,
-                    "n_dead": iteration,
-                }
+                snap = population_record(
+                    positions_flat[r],
+                    types_flat[r] if types_flat.ndim >= 2 else types_flat,
+                    energies_flat[r],
+                    cells_flat[r] if cells_flat.ndim >= 3 else cells_flat,
+                    iteration=iteration,
+                    n_dead=iteration,
+                )
                 self.writers[r].write_walker_snapshot(iteration, snap)
 
     def on_finish(self, ns_state: Any) -> None:

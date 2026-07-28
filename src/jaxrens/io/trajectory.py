@@ -34,19 +34,22 @@ def _wrap_positions_np(positions: Any, cell: Any) -> np.ndarray:
 
 
 def _wrapped_walker(walker: Any, wrap: bool) -> Any:
-    """Return *walker* with positions wrapped into its own ``box``.
+    """Return a ``WalkerState`` with positions wrapped into its own cell.
 
-    Only dict walkers carrying a periodic ``box`` are wrapped (the shape the
-    writers emit); anything else passes through unchanged.  Returns a shallow
-    copy so the caller's walker is not mutated.
+    Normalizes *walker* to a ``WalkerState`` first, so both typed walkers and
+    loose dicts are handled on one path.  A no-op (aside from normalization)
+    when wrapping is off or the walker is non-periodic/degenerate.  Returns a
+    new ``WalkerState``; the caller's walker is not mutated.
     """
-    if not wrap or not isinstance(walker, dict) or walker.get("box") is None:
+    import jax.numpy as jnp
+
+    from jaxrens.io.formats import ensure_walker_state
+
+    walker = ensure_walker_state(walker)
+    if not wrap or walker.cell is None:
         return walker
-    wrapped = dict(walker)
-    wrapped["positions"] = _wrap_positions_np(
-        walker["positions"], walker["box"]
-    )
-    return wrapped
+    wrapped_pos = _wrap_positions_np(walker.positions, walker.cell)
+    return walker.set(positions=jnp.asarray(wrapped_pos))
 
 
 class ExtxyzTrajectoryWriter:
@@ -103,21 +106,10 @@ class ExtxyzTrajectoryWriter:
         snapshot_path = self.path.with_suffix(f".snap.{iteration}.extxyz")
         from ase.io import write as ase_write
 
-        from jaxrens.io.formats import walker_to_ase_atoms
-
-        positions = np.asarray(walkers["positions"])
-        types = np.asarray(walkers["types"])
-        energies = np.asarray(walkers["energies"])
+        from jaxrens.io.formats import iter_walker_states, walker_to_ase_atoms
 
         atoms_list = []
-        for i in range(positions.shape[0]):
-            w = {
-                "positions": positions[i],
-                "types": types[i],
-                "energy": energies[i],
-            }
-            if walkers.get("cells") is not None:
-                w["box"] = np.asarray(walkers["cells"])[i]
+        for i, w in enumerate(iter_walker_states(walkers)):
             atoms = walker_to_ase_atoms(w, self.symbol_map)
             if self.wrap and any(atoms.get_pbc()):
                 atoms.wrap()
@@ -197,7 +189,7 @@ class H5TrajectoryWriter:
         grp.attrs["energy"] = energy
 
     def write_walker_snapshot(self, iteration: int, walkers: Any) -> None:
-        from jaxrens.io.formats import walker_to_h5_group
+        from jaxrens.io.formats import iter_walker_states, walker_to_h5_group
 
         grp_name = f"snapshot_{iteration}"
         grp = self._file.create_group(grp_name)
@@ -207,21 +199,10 @@ class H5TrajectoryWriter:
         # one subgroup per walker, mirroring the extxyz writer's per-frame
         # dump.  ``walker_to_h5_group`` is the same helper used for dead
         # points, so snapshots round-trip via ``h5_group_to_walker``.
-        positions = np.asarray(walkers["positions"])
-        types = np.asarray(walkers["types"])
-        energies = np.asarray(walkers["energies"])
-        cells = walkers.get("cells")
-        cells = np.asarray(cells) if cells is not None else None
-        grp.attrs["n_walkers"] = positions.shape[0]
+        walkers_list = list(iter_walker_states(walkers))
+        grp.attrs["n_walkers"] = len(walkers_list)
 
-        for i in range(positions.shape[0]):
-            w = {
-                "positions": positions[i],
-                "types": types[i],
-                "energy": energies[i],
-            }
-            if cells is not None:
-                w["box"] = cells[i]
+        for i, w in enumerate(walkers_list):
             walker_to_h5_group(
                 grp.create_group(f"walker_{i}"), _wrapped_walker(w, self.wrap)
             )
