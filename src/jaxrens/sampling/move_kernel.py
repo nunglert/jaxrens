@@ -18,7 +18,7 @@ class MoveKernel:
     Attributes:
         name: Human-readable label (e.g. "random_walk", "volume").
         build_kernel: Reference to the module's build_kernel function.
-            Signature: build_kernel(energy_fn, params, \*\*kernel_kwargs)
+            Signature: build_kernel(energy_fn, params, ``**kernel_kwargs``)
             -> step_fn(rng_key, state, likelihood_constraint) -> (state, MoveInfo)
         kernel_kwargs: Extra keyword arguments forwarded to build_kernel
             (e.g. n_reflect for Galilean, n_atoms for volume).

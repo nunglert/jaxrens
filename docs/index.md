@@ -11,6 +11,7 @@ myst:
 user/introduction
 user/overview
 user/mace_models
+user/troubleshooting
 tutorials/index
 ```
 

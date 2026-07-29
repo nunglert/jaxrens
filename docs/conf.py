@@ -135,6 +135,12 @@ autodoc_pydantic_field_doc_policy = "docstring"
 # tutorial outputs (e.g. JAXRENS_DOCS_EXECUTE=auto sphinx-build …).
 nbsphinx_execute = os.environ.get("JAXRENS_DOCS_EXECUTE", "never")
 nbsphinx_allow_errors = False
+# Pygments lexer for code cells.  nbsphinx normally reads the language from the
+# notebook's ``language_info`` metadata, but the tutorials are generated from
+# ``examples/tutorials/*.py`` via jupytext, which strips notebook metadata — so
+# without this the cells fall back to the ``'none'`` lexer (no highlighting).
+# ``ipython3`` highlights Python plus IPython magics.
+nbsphinx_codecell_lexer = "ipython3"
 
 
 python_use_unqualified_type_names = True

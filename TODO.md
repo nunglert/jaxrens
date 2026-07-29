@@ -16,7 +16,3 @@
 - trial_batch_size in auto stepsize handler? Did we resolve that problem?
 
 - re_stats plot in CLI is outdated
-
-- better OOM errors. E.g. in the burn-in phase "Decrease walker_batch_size", in ns_loop "Decrease n_extra", ...
-
-- ship a jax-mace foundation model? or maybe even the utils to pull and convert? So it becomes more plug and play 
