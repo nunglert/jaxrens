@@ -631,9 +631,6 @@ def run_from_config(
         )
         full_auto_kwargs = dict(
             per_move_fns=per_move_fns,
-            move_descriptors=list(move_descriptors)
-            if move_descriptors is not None
-            else None,
             adjust_interval=adaptation_config.adjust_interval,
             adjust_n_samples=adaptation_config.adjust_n_samples,
             adjust_max_rounds=adaptation_config.adjust_max_rounds,
@@ -663,6 +660,13 @@ def run_from_config(
         max_neighbors_offset=backend_config.max_neighbors_offset,
         max_neighbors_shrink_dwell=backend_config.max_neighbors_shrink_dwell,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
+        # Passed unconditionally (not only under full_auto) so run_ns always
+        # knows the real move count.  Otherwise n_moves falls back to 1 and the
+        # population's per-move step_sizes are built as (K, 1), which mismatches
+        # the always-wired adaptation logger's (n_runs, n_moves) baseline row.
+        move_descriptors=list(move_descriptors)
+        if move_descriptors is not None
+        else None,
         **full_auto_kwargs,
     )
 
