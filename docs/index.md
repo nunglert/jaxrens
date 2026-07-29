@@ -10,7 +10,8 @@ myst:
 
 user/introduction
 user/overview
-<!-- tutorials/index -->
+user/mace_models
+tutorials/index
 ```
 
 ```{toctree}

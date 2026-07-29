@@ -165,6 +165,11 @@ intersphinx_mapping = {
     "python": ("https://docs.python.org/3.11", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
     "jax": ("https://docs.jax.dev/en/latest/", None),
-    "ase": ("https://wiki.fysik.dtu.dk/ase/", None),
     "pydantic": ("https://docs.pydantic.dev/latest/", None),
+    # ASE intentionally omitted: the docs moved to ase-lib.org and no
+    # longer publish a reachable ``objects.inv`` (the old
+    # wiki.fysik.dtu.dk URL 404s). Nothing in these docs uses ``:ase:``
+    # cross-refs, so the mapping was dead weight that only produced a
+    # "failed to reach inventory" warning on every build. Re-add with a
+    # working inventory URL if ASE cross-refs are ever needed.
 }

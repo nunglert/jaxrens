@@ -4,6 +4,11 @@ Tests supercell edge finding (no model needed) and full backend
 integration (requires test fixture from save_mace_test_fixture.py).
 """
 
+import importlib.util
+import os
+import socket
+import subprocess
+import sys
 from pathlib import Path
 
 import jax
@@ -24,6 +29,31 @@ mace_required = pytest.mark.skipif(
 )
 
 FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "mace_mp_small"
+
+
+def _mace_torch_available() -> bool:
+    """True if the torch-side converter dependency (``mace``) is importable."""
+    return importlib.util.find_spec("mace") is not None
+
+
+def _visible_gpu_count() -> int:
+    """Count GPUs via ``nvidia-smi -L`` (0 if none / unavailable)."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "-L"], text=True, stderr=subprocess.DEVNULL
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return 0
+    return sum(1 for line in out.splitlines() if line.startswith("GPU "))
+
+
+def _host_reachable(host: str = "github.com", port: int = 443) -> bool:
+    """True if a TCP connect to *host:port* succeeds within 5 s."""
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            return True
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +204,149 @@ class TestSupercellEdges:
                 dist < r_cutoff
             ), f"Edge {i}: dist={dist} >= r_cutoff={r_cutoff}"
             assert dist > 1e-10, f"Edge {i}: self-interaction"
+
+
+# ---------------------------------------------------------------------------
+# create_mace path dispatch (no model / GPU needed)
+# ---------------------------------------------------------------------------
+
+
+class TestCreateMaceDispatch:
+    """create_mace routes by path suffix without touching the heavy loaders.
+
+    Both loaders are stubbed to raise a marker so the test asserts *which*
+    branch was taken, independent of mace-jax being installed or a GPU being
+    reachable.
+    """
+
+    class _Reached(Exception):
+        def __init__(self, which):
+            self.which = which
+
+    @pytest.fixture
+    def stubbed(self, monkeypatch):
+        import jaxrens.backends.mace as mace_mod
+
+        monkeypatch.setattr(mace_mod, "_require_mace", lambda: None)
+
+        def _bundle_stub(*args, **kwargs):
+            raise self._Reached("bundle")
+
+        def _pickle_stub(*args, **kwargs):
+            raise self._Reached("pickle")
+
+        monkeypatch.setattr(
+            mace_mod, "load_model_bundle", _bundle_stub, raising=False
+        )
+        monkeypatch.setattr(mace_mod, "create_mace_from_pickle", _pickle_stub)
+        return mace_mod
+
+    def test_pkl_routes_to_pickle_loader(self, stubbed):
+        with pytest.raises(self._Reached) as exc:
+            stubbed.create_mace(model_path="/some/model_bundle.pkl")
+        assert exc.value.which == "pickle"
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/some/bundle_dir",
+            "/some/config.json",
+            "/some/params.msgpack",
+            "/some/medium-0b3-jax.npz",
+            "/some/model.ckpt",
+        ],
+    )
+    def test_non_pkl_routes_to_bundle_loader(self, stubbed, path):
+        with pytest.raises(self._Reached) as exc:
+            stubbed.create_mace(model_path=path)
+        assert exc.value.which == "bundle"
+
+    def test_missing_path_raises(self, stubbed):
+        with pytest.raises(ValueError, match="model_path is required"):
+            stubbed.create_mace(model_path=None)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end conversion loop (download -> convert -> load)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.mace
+@pytest.mark.heavy
+class TestConversionRoundtrip:
+    """Close the loop: ``mace-jax-from-torch`` downloads + converts the
+    ``small`` mp foundation model, and jaxrens' ``create_mace`` loads the
+    emitted output.
+
+    Opt-in (``mace`` + ``heavy``) and network-bound.  Downloads a *fresh* copy
+    of the torch checkpoint into a throwaway ``XDG_CACHE_HOME`` so it never
+    reads or writes the user's ``~/.cache/mace``.  Needs the mace-torch
+    converter, a GPU (cuequivariance dlopens ``libcuda`` at import time), and
+    outbound HTTPS to github.com; skips cleanly when any is missing.
+    """
+
+    def test_download_convert_load(self, tmp_path):
+        if not is_available():
+            pytest.skip("mace-jax not installed")
+        if not _mace_torch_available():
+            pytest.skip("mace-torch (the converter) not installed")
+        if _visible_gpu_count() == 0:
+            pytest.skip("no GPU: cuequivariance needs libcuda at import time")
+        if not _host_reachable("github.com"):
+            pytest.skip(
+                "no network route to github.com for the model download"
+            )
+
+        import certifi
+
+        # Force a genuine fresh download into scratch; leave ~/.cache/mace alone.
+        cache = tmp_path / "xdg_cache"
+        cache.mkdir()
+        env = dict(os.environ)
+        env["XDG_CACHE_HOME"] = str(cache)
+        env[
+            "SSL_CERT_FILE"
+        ] = certifi.where()  # this box has no default CA path
+        env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
+        out_npz = tmp_path / "small-jax.npz"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mace_jax.cli.mace_jax_from_torch",
+                "--foundation",
+                "mp",
+                "--model-name",
+                "small",
+                "--output",
+                str(out_npz),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert proc.returncode == 0, f"converter failed:\n{proc.stderr}"
+
+        # CLI emits msgpack params (.npz, despite the name) + a sibling config
+        # (.json); create_mace resolves the pair from the .npz path.
+        out_json = out_npz.with_suffix(".json")
+        assert out_npz.exists(), proc.stderr
+        assert out_json.exists(), proc.stderr
+        # It really downloaded — the throwaway cache is now populated.
+        assert any(
+            cache.glob("mace/*model")
+        ), "nothing landed in the fresh cache"
+
+        from jaxrens.backends.mace import create_mace
+
+        backend = create_mace(
+            model_path=str(out_npz), supercell_trafo=(4, 4, 4)
+        )
+        assert backend.r_cutoff > 0
+        assert backend.num_species > 0
+        assert len(backend.atomic_numbers) == backend.num_species
 
 
 # ---------------------------------------------------------------------------

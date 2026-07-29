@@ -56,6 +56,17 @@ docs = [
     "plotly>=5.20",
 ]
 
+# Torch-side tooling to convert a Torch MACE model into a JAX bundle.
+# Only needed at convert time; the runtime MACE backend is torch-free.
+mace-convert = [
+    "jaxrens[mace]",
+    "mace-torch>=0.3.16",   # provides the `mace` module the converter imports
+]
+
+# Every optional backend plus the torch->JAX MACE conversion tooling, in one
+# install.  Excludes the contributor-only ``dev`` / ``docs`` extras.
+all = ["jaxrens[neuralil,mace,nequix,jaxmd,mace-convert]"]
+
 [project.scripts]
 jaxrens = "jaxrens.cli.cli:main"
 

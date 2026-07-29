@@ -10,3 +10,4 @@ them and renders the output inline.
    :maxdepth: 1
 
    00_first_run
+   01_mace_run

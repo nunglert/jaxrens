@@ -19,9 +19,24 @@ pyyaml, and the dev tooling (`pytest`, `pytest-xdist`).
 
 ### MACE-JAX
 
+The `[mace]` extra installs the **runtime** MACE backend — everything
+needed to *load and evaluate* a converted JAX model:
+
 ```bash
 pip install -e ".[dev,mace]"
 ```
+
+To also **convert** a Torch MACE checkpoint (or download + convert a
+foundation model) into a JAX model, add the `[mace-convert]` extra,
+which pulls the Torch-side `mace-torch` package the converter imports:
+
+```bash
+pip install -e ".[dev,mace-convert]"
+```
+
+`[all]` installs every optional backend plus the conversion tooling in
+one shot. See the {doc}`../user/mace_models` guide for the full
+download → convert → run workflow.
 
 The upstream `ACEsuit/mace-jax` package at the time of writing has
 two packaging bugs:
@@ -34,8 +49,8 @@ two packaging bugs:
   `cuequivariance-ops-torch-cu12`).
 
 jaxrens' `pyproject.toml` pins a patched fork
-(`nunglert/mace-jax@fix_install`) that resolves both. If upstream
-lands the fixes, the pin can drop back to `ACEsuit/mace-jax@main`.
+(`nunglert/mace-jax@fixes`) that resolves both. If upstream lands the
+fixes, the pin can drop back to `ACEsuit/mace-jax@main`.
 
 ### NeuralIL
 
