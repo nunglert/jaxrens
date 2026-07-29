@@ -237,7 +237,7 @@ def setup_mwg(
         move_configs: Single ``MoveConfig`` or list of ``MoveConfig`` objects.
             For move types that require ``n_atoms`` or ``n_species``
             (volume, shear, stretch, single_atom_sweep, alchemical_morph)
-            use ``build_mwg`` directly with pre-built ``MoveKernel``s.
+            use ``build_mwg`` directly with pre-built ``MoveKernel`` instances.
         backend: EnergyBackend instance.
 
     Returns:

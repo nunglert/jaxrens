@@ -38,7 +38,7 @@ class BackendResult(NamedTuple):
     leave it at its sentinel default (``0`` / ``False``); fields they never
     produce stay ``None``.
 
-    Fields:
+    Attributes:
         energy: Total potential energy. Shape ``*B`` (scalar per walker).
         forces: ``-dE/dx`` atomic forces, shape ``*B N 3``. ``None`` on the
             energy-only ``__call__`` path; populated by ``energy_and_forces``.

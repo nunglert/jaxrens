@@ -3,14 +3,16 @@
 Adds thermodynamic potential terms (PV, μN) to the raw backend energy.
 The wrapped backend satisfies the same EnergyBackend protocol.
 
-Usage:
+Usage::
+
     base = HarmonicBackend(k=1.0)
     backend = EnsembleBackend(base, pressure=0.01)
     result = backend(positions, species, cell, max_neighbors)
     # result.energy = U + P*V
 
 For per-run vmap with different pressures or chemical potentials, pass
-ensemble_params (keys ``"pressure"`` and ``"chemical_potentials"``):
+``ensemble_params`` (keys ``"pressure"`` and ``"chemical_potentials"``)::
+
     backend(pos, species, cell, mn, ensemble_params={"pressure": 0.02})
     backend(pos, species, cell, mn,
             ensemble_params={"chemical_potentials": mu})  # (n_species,)

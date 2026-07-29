@@ -134,7 +134,11 @@ class InterREManager:
         Returns:
             True when a swap should be attempted.
         """
-        return self._re_interval > 0 and iteration > 0 and iteration % self._re_interval == 0
+        return (
+            self._re_interval > 0
+            and iteration > 0
+            and iteration % self._re_interval == 0
+        )
 
     @property
     def is_active(self) -> bool:
@@ -168,12 +172,7 @@ class InterREManager:
             Tuple ``(new_ns_state, swap_stats, new_rng_key)`` where:
 
             * ``new_ns_state``: Updated ``NSState`` after swaps.
-            * ``swap_stats``: Dict with keys
-              ``{"n_swap_pairs_attempted": int,
-                 "n_swap_pairs_accepted": int,
-                 "acceptance_rate": float,
-                 "n_energy_evals": int,
-                 "n_grad_evals": int}``.
+            * ``swap_stats``: Dict with keys ``{"n_swap_pairs_attempted": int, "n_swap_pairs_accepted": int, "acceptance_rate": float, "n_energy_evals": int, "n_grad_evals": int}``.
               All zeros for ``SingleRun`` (no-op).
             * ``new_rng_key``: Advanced PRNG key carry (scalar).
         """
@@ -185,7 +184,9 @@ class InterREManager:
         rng_key, swap_key = jax.random.split(rng_key)
 
         if isinstance(self._batcher, PmapVmapRuns):
-            new_ns_state, swap_stats = self._apply_pmap_vmap(ns_state, swap_key)
+            new_ns_state, swap_stats = self._apply_pmap_vmap(
+                ns_state, swap_key
+            )
         else:
             # VmapRuns
             new_ns_state, swap_stats = self._apply_vmap(ns_state, swap_key)
@@ -228,13 +229,22 @@ class InterREManager:
 
         if self._is_xrens:
             # XRENS path: requires composition_targets and backend.
-            def _xrens_swap_fn(rng_key, positions, types, energies, cells,
-                               emax, pressures, composition_targets):
+            def _xrens_swap_fn(
+                rng_key,
+                positions,
+                types,
+                energies,
+                cells,
+                emax,
+                pressures,
+                composition_targets,
+            ):
                 # Cache-miss tracing log (fires only on first trace per signature).
                 logger.info(
                     "inter_re tracing: flavor=xrens  pop_shape=%s  "
                     "n_swap_cycles=%d",
-                    positions.shape, int(n_swap_cycles),
+                    positions.shape,
+                    int(n_swap_cycles),
                 )
                 return xrens_replica_exchange_step(
                     rng_key=rng_key,
@@ -249,15 +259,25 @@ class InterREManager:
                     pressures=pressures,
                     n_swap_cycles=n_swap_cycles,
                 )
+
             jit_vmap = jax.jit(_xrens_swap_fn)
         elif self._is_semi_grand:
             # Semi-grand path: requires chemical_potentials; zero backend calls.
-            def _sg_swap_fn(rng_key, positions, types, energies, cells,
-                            emax, pressures, chemical_potentials):
+            def _sg_swap_fn(
+                rng_key,
+                positions,
+                types,
+                energies,
+                cells,
+                emax,
+                pressures,
+                chemical_potentials,
+            ):
                 logger.info(
                     "inter_re tracing: flavor=semi_grand  pop_shape=%s  "
                     "n_swap_cycles=%d",
-                    positions.shape, int(n_swap_cycles),
+                    positions.shape,
+                    int(n_swap_cycles),
                 )
                 return semi_grand_replica_exchange_step(
                     rng_key=rng_key,
@@ -271,13 +291,18 @@ class InterREManager:
                     pressures=pressures,
                     n_swap_cycles=n_swap_cycles,
                 )
+
             jit_vmap = jax.jit(_sg_swap_fn)
         else:
-            def _swap_fn(rng_key, positions, types, energies, cells, emax, pressures):
+
+            def _swap_fn(
+                rng_key, positions, types, energies, cells, emax, pressures
+            ):
                 logger.info(
                     "inter_re tracing: flavor=pressure  pop_shape=%s  "
                     "n_swap_cycles=%d",
-                    positions.shape, int(n_swap_cycles),
+                    positions.shape,
+                    int(n_swap_cycles),
                 )
                 return replica_exchange_step(
                     rng_key=rng_key,
@@ -290,161 +315,217 @@ class InterREManager:
                     n_swap_cycles=n_swap_cycles,
                     swap_kernel=kernel,
                 )
+
             jit_vmap = jax.jit(_swap_fn)
 
         # Build pmap version: each device receives its own shard (P, K, ...).
         # We use lax.all_gather to replicate across devices, swap on the full
         # population, then slice back the device's shard.
         if self._is_xrens:
-            def _pmap_body(rng_key_per_device, pos, typ, ene, bxs, em, pres, comp_targets):
+
+            def _pmap_body(
+                rng_key_per_device, pos, typ, ene, bxs, em, pres, comp_targets
+            ):
                 full_pos = jax.lax.all_gather(pos, axis_name="gpu", axis=0)
                 full_typ = jax.lax.all_gather(typ, axis_name="gpu", axis=0)
                 full_ene = jax.lax.all_gather(ene, axis_name="gpu", axis=0)
-                full_em  = jax.lax.all_gather(em,  axis_name="gpu", axis=0)
+                full_em = jax.lax.all_gather(em, axis_name="gpu", axis=0)
                 full_bxs = (
                     jax.lax.all_gather(bxs, axis_name="gpu", axis=0)
-                    if bxs is not None else None
+                    if bxs is not None
+                    else None
                 )
                 full_pres = (
                     jax.lax.all_gather(pres, axis_name="gpu", axis=0)
-                    if pres is not None else None
+                    if pres is not None
+                    else None
                 )
-                full_comp = jax.lax.all_gather(comp_targets, axis_name="gpu", axis=0)
+                full_comp = jax.lax.all_gather(
+                    comp_targets, axis_name="gpu", axis=0
+                )
 
                 G, P = full_pos.shape[0], full_pos.shape[1]
                 gp = G * P
-                flat_pos  = full_pos.reshape((gp,) + full_pos.shape[2:])
-                flat_typ  = full_typ.reshape((gp,) + full_typ.shape[2:])
-                flat_ene  = full_ene.reshape((gp,) + full_ene.shape[2:])
-                flat_em   = full_em.reshape((gp,))
-                flat_bxs  = full_bxs.reshape((gp,) + full_bxs.shape[2:]) if full_bxs is not None else None
-                flat_pres = full_pres.reshape((gp,)) if full_pres is not None else None
+                flat_pos = full_pos.reshape((gp,) + full_pos.shape[2:])
+                flat_typ = full_typ.reshape((gp,) + full_typ.shape[2:])
+                flat_ene = full_ene.reshape((gp,) + full_ene.shape[2:])
+                flat_em = full_em.reshape((gp,))
+                flat_bxs = (
+                    full_bxs.reshape((gp,) + full_bxs.shape[2:])
+                    if full_bxs is not None
+                    else None
+                )
+                flat_pres = (
+                    full_pres.reshape((gp,)) if full_pres is not None else None
+                )
                 flat_comp = full_comp.reshape((gp,) + full_comp.shape[2:])
 
-                new_pos_flat, new_typ_flat, new_ene_flat, new_bxs_flat, swap_info = (
-                    xrens_replica_exchange_step(
-                        rng_key=rng_key_per_device,
-                        all_positions=flat_pos,
-                        all_types=flat_typ,
-                        all_energies=flat_ene,
-                        all_cells=flat_bxs,
-                        all_emax=flat_em,
-                        composition_targets=flat_comp,
-                        backend=backend,
-                        xrens_kernel=kernel,
-                        pressures=flat_pres,
-                        n_swap_cycles=n_swap_cycles,
-                    )
+                (
+                    new_pos_flat,
+                    new_typ_flat,
+                    new_ene_flat,
+                    new_bxs_flat,
+                    swap_info,
+                ) = xrens_replica_exchange_step(
+                    rng_key=rng_key_per_device,
+                    all_positions=flat_pos,
+                    all_types=flat_typ,
+                    all_energies=flat_ene,
+                    all_cells=flat_bxs,
+                    all_emax=flat_em,
+                    composition_targets=flat_comp,
+                    backend=backend,
+                    xrens_kernel=kernel,
+                    pressures=flat_pres,
+                    n_swap_cycles=n_swap_cycles,
                 )
 
                 new_pos_full = new_pos_flat.reshape(full_pos.shape)
                 new_typ_full = new_typ_flat.reshape(full_typ.shape)
                 new_ene_full = new_ene_flat.reshape(full_ene.shape)
                 new_bxs_full = (
-                    new_bxs_flat.reshape(full_bxs.shape) if new_bxs_flat is not None else None
+                    new_bxs_flat.reshape(full_bxs.shape)
+                    if new_bxs_flat is not None
+                    else None
                 )
 
                 dev_idx = jax.lax.axis_index("gpu")
                 shard_pos = new_pos_full[dev_idx]
                 shard_typ = new_typ_full[dev_idx]
                 shard_ene = new_ene_full[dev_idx]
-                shard_bxs = new_bxs_full[dev_idx] if new_bxs_full is not None else None
+                shard_bxs = (
+                    new_bxs_full[dev_idx] if new_bxs_full is not None else None
+                )
                 return shard_pos, shard_typ, shard_ene, shard_bxs, swap_info
 
         elif self._is_semi_grand:
-            def _pmap_body(rng_key_per_device, pos, typ, ene, bxs, em, pres, chem_pots):
+
+            def _pmap_body(
+                rng_key_per_device, pos, typ, ene, bxs, em, pres, chem_pots
+            ):
                 full_pos = jax.lax.all_gather(pos, axis_name="gpu", axis=0)
                 full_typ = jax.lax.all_gather(typ, axis_name="gpu", axis=0)
                 full_ene = jax.lax.all_gather(ene, axis_name="gpu", axis=0)
-                full_em  = jax.lax.all_gather(em,  axis_name="gpu", axis=0)
+                full_em = jax.lax.all_gather(em, axis_name="gpu", axis=0)
                 full_bxs = (
                     jax.lax.all_gather(bxs, axis_name="gpu", axis=0)
-                    if bxs is not None else None
+                    if bxs is not None
+                    else None
                 )
                 full_pres = (
                     jax.lax.all_gather(pres, axis_name="gpu", axis=0)
-                    if pres is not None else None
+                    if pres is not None
+                    else None
                 )
-                full_chem = jax.lax.all_gather(chem_pots, axis_name="gpu", axis=0)
+                full_chem = jax.lax.all_gather(
+                    chem_pots, axis_name="gpu", axis=0
+                )
 
                 G, P = full_pos.shape[0], full_pos.shape[1]
                 gp = G * P
-                flat_pos  = full_pos.reshape((gp,) + full_pos.shape[2:])
-                flat_typ  = full_typ.reshape((gp,) + full_typ.shape[2:])
-                flat_ene  = full_ene.reshape((gp,) + full_ene.shape[2:])
-                flat_em   = full_em.reshape((gp,))
-                flat_bxs  = full_bxs.reshape((gp,) + full_bxs.shape[2:]) if full_bxs is not None else None
-                flat_pres = full_pres.reshape((gp,)) if full_pres is not None else None
+                flat_pos = full_pos.reshape((gp,) + full_pos.shape[2:])
+                flat_typ = full_typ.reshape((gp,) + full_typ.shape[2:])
+                flat_ene = full_ene.reshape((gp,) + full_ene.shape[2:])
+                flat_em = full_em.reshape((gp,))
+                flat_bxs = (
+                    full_bxs.reshape((gp,) + full_bxs.shape[2:])
+                    if full_bxs is not None
+                    else None
+                )
+                flat_pres = (
+                    full_pres.reshape((gp,)) if full_pres is not None else None
+                )
                 flat_chem = full_chem.reshape((gp,) + full_chem.shape[2:])
 
-                new_pos_flat, new_typ_flat, new_ene_flat, new_bxs_flat, swap_info = (
-                    semi_grand_replica_exchange_step(
-                        rng_key=rng_key_per_device,
-                        all_positions=flat_pos,
-                        all_types=flat_typ,
-                        all_energies=flat_ene,
-                        all_cells=flat_bxs,
-                        all_emax=flat_em,
-                        chemical_potentials=flat_chem,
-                        semi_grand_kernel=kernel,
-                        pressures=flat_pres,
-                        n_swap_cycles=n_swap_cycles,
-                    )
+                (
+                    new_pos_flat,
+                    new_typ_flat,
+                    new_ene_flat,
+                    new_bxs_flat,
+                    swap_info,
+                ) = semi_grand_replica_exchange_step(
+                    rng_key=rng_key_per_device,
+                    all_positions=flat_pos,
+                    all_types=flat_typ,
+                    all_energies=flat_ene,
+                    all_cells=flat_bxs,
+                    all_emax=flat_em,
+                    chemical_potentials=flat_chem,
+                    semi_grand_kernel=kernel,
+                    pressures=flat_pres,
+                    n_swap_cycles=n_swap_cycles,
                 )
 
                 new_pos_full = new_pos_flat.reshape(full_pos.shape)
                 new_typ_full = new_typ_flat.reshape(full_typ.shape)
                 new_ene_full = new_ene_flat.reshape(full_ene.shape)
                 new_bxs_full = (
-                    new_bxs_flat.reshape(full_bxs.shape) if new_bxs_flat is not None else None
+                    new_bxs_flat.reshape(full_bxs.shape)
+                    if new_bxs_flat is not None
+                    else None
                 )
 
                 dev_idx = jax.lax.axis_index("gpu")
                 shard_pos = new_pos_full[dev_idx]
                 shard_typ = new_typ_full[dev_idx]
                 shard_ene = new_ene_full[dev_idx]
-                shard_bxs = new_bxs_full[dev_idx] if new_bxs_full is not None else None
+                shard_bxs = (
+                    new_bxs_full[dev_idx] if new_bxs_full is not None else None
+                )
                 return shard_pos, shard_typ, shard_ene, shard_bxs, swap_info
 
         else:
+
             def _pmap_body(rng_key_per_device, pos, typ, ene, bxs, em, pres):
                 # Inside pmap each shard has shape (P, K, ...).
                 # all_gather collects all G shards → (G, P, K, ...) on each device.
                 full_pos = jax.lax.all_gather(pos, axis_name="gpu", axis=0)
                 full_typ = jax.lax.all_gather(typ, axis_name="gpu", axis=0)
                 full_ene = jax.lax.all_gather(ene, axis_name="gpu", axis=0)
-                full_em  = jax.lax.all_gather(em,  axis_name="gpu", axis=0)
+                full_em = jax.lax.all_gather(em, axis_name="gpu", axis=0)
                 full_bxs = (
                     jax.lax.all_gather(bxs, axis_name="gpu", axis=0)
-                    if bxs is not None else None
+                    if bxs is not None
+                    else None
                 )
                 full_pres = (
                     jax.lax.all_gather(pres, axis_name="gpu", axis=0)
-                    if pres is not None else None
+                    if pres is not None
+                    else None
                 )
 
                 # Flatten (G, P, K, ...) → (G*P, K, ...) for the swap function.
                 G, P = full_pos.shape[0], full_pos.shape[1]
                 gp = G * P
-                flat_pos  = full_pos.reshape((gp,) + full_pos.shape[2:])
-                flat_typ  = full_typ.reshape((gp,) + full_typ.shape[2:])
-                flat_ene  = full_ene.reshape((gp,) + full_ene.shape[2:])
-                flat_em   = full_em.reshape((gp,))
-                flat_bxs  = full_bxs.reshape((gp,) + full_bxs.shape[2:]) if full_bxs is not None else None
-                flat_pres = full_pres.reshape((gp,)) if full_pres is not None else None
+                flat_pos = full_pos.reshape((gp,) + full_pos.shape[2:])
+                flat_typ = full_typ.reshape((gp,) + full_typ.shape[2:])
+                flat_ene = full_ene.reshape((gp,) + full_ene.shape[2:])
+                flat_em = full_em.reshape((gp,))
+                flat_bxs = (
+                    full_bxs.reshape((gp,) + full_bxs.shape[2:])
+                    if full_bxs is not None
+                    else None
+                )
+                flat_pres = (
+                    full_pres.reshape((gp,)) if full_pres is not None else None
+                )
 
-                new_pos_flat, new_typ_flat, new_ene_flat, new_bxs_flat, swap_info = (
-                    replica_exchange_step(
-                        rng_key=rng_key_per_device,
-                        all_positions=flat_pos,
-                        all_types=flat_typ,
-                        all_energies=flat_ene,
-                        all_cells=flat_bxs,
-                        all_emax=flat_em,
-                        pressures=flat_pres,
-                        n_swap_cycles=n_swap_cycles,
-                        swap_kernel=kernel,
-                    )
+                (
+                    new_pos_flat,
+                    new_typ_flat,
+                    new_ene_flat,
+                    new_bxs_flat,
+                    swap_info,
+                ) = replica_exchange_step(
+                    rng_key=rng_key_per_device,
+                    all_positions=flat_pos,
+                    all_types=flat_typ,
+                    all_energies=flat_ene,
+                    all_cells=flat_bxs,
+                    all_emax=flat_em,
+                    pressures=flat_pres,
+                    n_swap_cycles=n_swap_cycles,
+                    swap_kernel=kernel,
                 )
 
                 # Reshape back and take this device's shard.
@@ -452,14 +533,18 @@ class InterREManager:
                 new_typ_full = new_typ_flat.reshape(full_typ.shape)
                 new_ene_full = new_ene_flat.reshape(full_ene.shape)
                 new_bxs_full = (
-                    new_bxs_flat.reshape(full_bxs.shape) if new_bxs_flat is not None else None
+                    new_bxs_flat.reshape(full_bxs.shape)
+                    if new_bxs_flat is not None
+                    else None
                 )
 
                 dev_idx = jax.lax.axis_index("gpu")
-                shard_pos  = new_pos_full[dev_idx]
-                shard_typ  = new_typ_full[dev_idx]
-                shard_ene  = new_ene_full[dev_idx]
-                shard_bxs  = new_bxs_full[dev_idx] if new_bxs_full is not None else None
+                shard_pos = new_pos_full[dev_idx]
+                shard_typ = new_typ_full[dev_idx]
+                shard_ene = new_ene_full[dev_idx]
+                shard_bxs = (
+                    new_bxs_full[dev_idx] if new_bxs_full is not None else None
+                )
 
                 return shard_pos, shard_typ, shard_ene, shard_bxs, swap_info
 
@@ -486,12 +571,12 @@ class InterREManager:
             ``SemiGrandSwap`` mode is active.
         """
         pop = ns_state.population
-        emax = ns_state.emax        # (*shape_prefix,)
+        emax = ns_state.emax  # (*shape_prefix,)
 
-        positions = pop.positions   # (*shape_prefix, K, n_atoms, 3)
-        types = pop.types           # varies
-        energies = pop.energy       # (*shape_prefix, K)
-        cells = pop.cell            # (*shape_prefix, K, 3, 3)
+        positions = pop.positions  # (*shape_prefix, K, n_atoms, 3)
+        types = pop.types  # varies
+        energies = pop.energy  # (*shape_prefix, K)
+        cells = pop.cell  # (*shape_prefix, K, 3, 3)
 
         # Pressures, composition_targets, chemical_potentials: extract from
         # ensemble_params.  After vmapping init_ns, per-replica scalar values
@@ -501,7 +586,9 @@ class InterREManager:
         n_prefix = len(self._batcher.shape_prefix)
         walker_axis = self._batcher.walker_axis
 
-        def _drop_walker_axis_if_present(arr: jnp.ndarray, has_vector: bool) -> jnp.ndarray:
+        def _drop_walker_axis_if_present(
+            arr: jnp.ndarray, has_vector: bool
+        ) -> jnp.ndarray:
             target_ndim = n_prefix + (1 if has_vector else 0)
             if arr.ndim == target_ndim + 1:
                 return jnp.take(arr, 0, axis=walker_axis)
@@ -517,37 +604,58 @@ class InterREManager:
                 if arr.ndim == 0:
                     # Scalar pressure — replicate across all replicas.
                     pressures = jnp.broadcast_to(
-                        arr, self._batcher.shape_prefix or (1,),
+                        arr,
+                        self._batcher.shape_prefix or (1,),
                     )
                 else:
-                    pressures = _drop_walker_axis_if_present(arr, has_vector=False)
+                    pressures = _drop_walker_axis_if_present(
+                        arr, has_vector=False
+                    )
 
             if "target_composition" in ep and self._is_xrens:
                 tc_arr = jnp.asarray(ep["target_composition"], dtype=jnp.int32)
                 composition_targets = _drop_walker_axis_if_present(
-                    tc_arr, has_vector=True,
+                    tc_arr,
+                    has_vector=True,
                 )
 
             if "chemical_potentials" in ep and self._is_semi_grand:
-                cp_arr = jnp.asarray(ep["chemical_potentials"], dtype=jnp.float32)
+                cp_arr = jnp.asarray(
+                    ep["chemical_potentials"], dtype=jnp.float32
+                )
                 chemical_potentials = _drop_walker_axis_if_present(
-                    cp_arr, has_vector=True,
+                    cp_arr,
+                    has_vector=True,
                 )
 
         return (
-            positions, types, energies, cells, emax,
-            pressures, composition_targets, chemical_potentials,
+            positions,
+            types,
+            energies,
+            cells,
+            emax,
+            pressures,
+            composition_targets,
+            chemical_potentials,
         )
 
-    def _apply_vmap(self, ns_state: NSState, swap_key: Key[Array, ""]) -> tuple[NSState, SwapStats]:
+    def _apply_vmap(
+        self, ns_state: NSState, swap_key: Key[Array, ""]
+    ) -> tuple[NSState, SwapStats]:
         """Apply swap pass for VmapRuns descriptor.
 
         State population has shape ``(n_runs, K, ...)``.
         """
-        (positions, types, energies, cells, emax,
-         pressures, composition_targets, chemical_potentials) = (
-            self._extract_swap_inputs(ns_state)
-        )
+        (
+            positions,
+            types,
+            energies,
+            cells,
+            emax,
+            pressures,
+            composition_targets,
+            chemical_potentials,
+        ) = self._extract_swap_inputs(ns_state)
 
         if self._is_xrens:
             if composition_targets is None:
@@ -556,9 +664,21 @@ class InterREManager:
                     "for every run. Ensure composition_targets were injected at "
                     "init time via ensemble_params_per_run."
                 )
-            new_pos, new_types, new_ene, new_cells, swap_info = self._jit_vmap_swap(
-                swap_key, positions, types, energies, cells, emax,
-                pressures, composition_targets,
+            (
+                new_pos,
+                new_types,
+                new_ene,
+                new_cells,
+                swap_info,
+            ) = self._jit_vmap_swap(
+                swap_key,
+                positions,
+                types,
+                energies,
+                cells,
+                emax,
+                pressures,
+                composition_targets,
             )
         elif self._is_semi_grand:
             if chemical_potentials is None:
@@ -567,12 +687,30 @@ class InterREManager:
                     "for every run. Ensure chemical_potentials were injected at "
                     "init time via ensemble_params_per_run."
                 )
-            new_pos, new_types, new_ene, new_cells, swap_info = self._jit_vmap_swap(
-                swap_key, positions, types, energies, cells, emax,
-                pressures, chemical_potentials,
+            (
+                new_pos,
+                new_types,
+                new_ene,
+                new_cells,
+                swap_info,
+            ) = self._jit_vmap_swap(
+                swap_key,
+                positions,
+                types,
+                energies,
+                cells,
+                emax,
+                pressures,
+                chemical_potentials,
             )
         else:
-            new_pos, new_types, new_ene, new_cells, swap_info = self._jit_vmap_swap(
+            (
+                new_pos,
+                new_types,
+                new_ene,
+                new_cells,
+                swap_info,
+            ) = self._jit_vmap_swap(
                 swap_key, positions, types, energies, cells, emax, pressures
             )
 
@@ -586,7 +724,9 @@ class InterREManager:
         stats = self._build_stats(swap_info)
         return new_ns_state, stats
 
-    def _apply_pmap_vmap(self, ns_state: NSState, swap_key: Key[Array, ""]) -> tuple[NSState, SwapStats]:
+    def _apply_pmap_vmap(
+        self, ns_state: NSState, swap_key: Key[Array, ""]
+    ) -> tuple[NSState, SwapStats]:
         """Apply swap pass for PmapVmapRuns descriptor.
 
         Population has shape ``(G, P, K, ...)``.  Uses ``lax.all_gather``
@@ -596,43 +736,81 @@ class InterREManager:
         The same code runs unconditionally for all n_gpu values so that
         multi-GPU correctness can be tested without a fork.
         """
-        (positions, types, energies, cells, emax,
-         pressures, composition_targets, chemical_potentials) = (
-            self._extract_swap_inputs(ns_state)
-        )
+        (
+            positions,
+            types,
+            energies,
+            cells,
+            emax,
+            pressures,
+            composition_targets,
+            chemical_potentials,
+        ) = self._extract_swap_inputs(ns_state)
         G = self._batcher.n_gpu
 
         # Broadcast the same rng_key to all devices so every device makes
         # identical swap decisions (deterministic = same output on all devices).
-        per_device_key = jnp.broadcast_to(swap_key[None], (G,) + swap_key.shape)
+        per_device_key = jnp.broadcast_to(
+            swap_key[None], (G,) + swap_key.shape
+        )
 
         if self._is_xrens:
             if composition_targets is None:
                 raise ValueError(
                     "XRENSSwap requires 'target_composition' in ensemble_params."
                 )
-            new_pos, new_types, new_ene, new_cells_out, swap_info_sharded = (
-                self._jit_pmap_swap(
-                    per_device_key, positions, types, energies, cells, emax,
-                    pressures, composition_targets,
-                )
+            (
+                new_pos,
+                new_types,
+                new_ene,
+                new_cells_out,
+                swap_info_sharded,
+            ) = self._jit_pmap_swap(
+                per_device_key,
+                positions,
+                types,
+                energies,
+                cells,
+                emax,
+                pressures,
+                composition_targets,
             )
         elif self._is_semi_grand:
             if chemical_potentials is None:
                 raise ValueError(
                     "SemiGrandSwap requires 'chemical_potentials' in ensemble_params."
                 )
-            new_pos, new_types, new_ene, new_cells_out, swap_info_sharded = (
-                self._jit_pmap_swap(
-                    per_device_key, positions, types, energies, cells, emax,
-                    pressures, chemical_potentials,
-                )
+            (
+                new_pos,
+                new_types,
+                new_ene,
+                new_cells_out,
+                swap_info_sharded,
+            ) = self._jit_pmap_swap(
+                per_device_key,
+                positions,
+                types,
+                energies,
+                cells,
+                emax,
+                pressures,
+                chemical_potentials,
             )
         else:
-            new_pos, new_types, new_ene, new_cells_out, swap_info_sharded = (
-                self._jit_pmap_swap(
-                    per_device_key, positions, types, energies, cells, emax, pressures
-                )
+            (
+                new_pos,
+                new_types,
+                new_ene,
+                new_cells_out,
+                swap_info_sharded,
+            ) = self._jit_pmap_swap(
+                per_device_key,
+                positions,
+                types,
+                energies,
+                cells,
+                emax,
+                pressures,
             )
 
         new_pop = ns_state.population.set(
@@ -649,10 +827,14 @@ class InterREManager:
             "n_accepted": swap_info_sharded["n_accepted"][0],
             "n_attempted": swap_info_sharded["n_attempted"][0],
             "n_accepted_per_pair": swap_info_sharded["n_accepted_per_pair"][0],
-            "n_attempted_per_pair": swap_info_sharded["n_attempted_per_pair"][0],
+            "n_attempted_per_pair": swap_info_sharded["n_attempted_per_pair"][
+                0
+            ],
         }
         if "n_energy_evals" in swap_info_sharded:
-            device0_info["n_energy_evals"] = swap_info_sharded["n_energy_evals"][0]
+            device0_info["n_energy_evals"] = swap_info_sharded[
+                "n_energy_evals"
+            ][0]
         stats = self._build_stats(device0_info)
         return new_ns_state, stats
 
@@ -672,7 +854,11 @@ class InterREManager:
         n_att = int(jnp.asarray(swap_info["n_attempted"]))
         n_acc = int(jnp.asarray(swap_info["n_accepted"]))
         rate = n_acc / max(n_att, 1)
-        n_evals = int(jnp.asarray(swap_info["n_energy_evals"])) if "n_energy_evals" in swap_info else 0
+        n_evals = (
+            int(jnp.asarray(swap_info["n_energy_evals"]))
+            if "n_energy_evals" in swap_info
+            else 0
+        )
         # Per-pair arrays — host-side numpy copies for downstream
         # logging.  Always present in swap_info post-2026-05 kernel
         # extension; defensively zero-filled for legacy callers.
@@ -680,11 +866,13 @@ class InterREManager:
         n_att_pp = swap_info.get("n_attempted_per_pair")
         n_acc_pp = (
             np.asarray(n_acc_pp, dtype=np.int32)
-            if n_acc_pp is not None else np.zeros(0, dtype=np.int32)
+            if n_acc_pp is not None
+            else np.zeros(0, dtype=np.int32)
         )
         n_att_pp = (
             np.asarray(n_att_pp, dtype=np.int32)
-            if n_att_pp is not None else np.zeros(0, dtype=np.int32)
+            if n_att_pp is not None
+            else np.zeros(0, dtype=np.int32)
         )
         return {
             "n_swap_pairs_attempted": n_att,

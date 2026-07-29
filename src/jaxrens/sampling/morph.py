@@ -4,13 +4,6 @@ Provides `morph_types_to_composition`: deterministic label relabeling
 that reshuffles an existing types array to match a target composition.
 JIT/vmap/pmap safe; no Python-level indexing on traced values.
 
-Ported from jaxnest (jaxns-devAS/src/jaxnest/replica_exchange.py, ~line 697)
-with the following changes:
-  - legacy jaxnest's split-float trick is not ported; jaxrens uses plain int32/float32.
-  - `_choose_k_without_replacement` helper not ported (unused in morph kernel).
-  - `_counts_from_types` flattened to module level.
-  - Public signature follows jaxrens snake_case conventions.
-  - `n_species` is a static int (determines scan lengths; must be Python int).
 """
 
 from __future__ import annotations
@@ -59,8 +52,8 @@ def morph_types_to_composition(
 
     Algorithm (scan over species, no dynamic indexing):
       1. Compute delta = target_composition - current_composition per species.
-      2. For each donor species d (delta[d] < 0): draw |delta[d]| random atom
-         indices among {i | types[i] == d} using uniform scores + top_k.
+      2. For each donor species d (delta[d] < 0): draw ``|delta[d]|`` random atom
+         indices among ``{i | types[i] == d}`` using uniform scores + top_k.
          Collect all chosen donor indices into a fixed-size buffer (length
          n_atoms) in scan order.
       3. Fill a parallel receiver-label buffer: for each receiver species r

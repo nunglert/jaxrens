@@ -1808,8 +1808,7 @@ def run_ns_multi_gpu(
             can identify the batch shape via ``info["_batcher"].is_batched``.
             ``log_evidence`` in the associated ``NSState`` has shape ``(G, P)``.
         termination_criteria: Optional.  Defaults to
-            ``[IterationTermination(max_iterations),
-               PriorMassTermination(n_walkers, convergence_threshold)]``.
+            ``[IterationTermination(max_iterations), PriorMassTermination(n_walkers, convergence_threshold)]``.
         ensemble_params_per_run: Flat list of ``G*P`` dicts, or ``None``.
         per_move_fns: Per-move step functions for bisection adaptation.
         move_descriptors: ``MoveKernel`` descriptors carrying rate bounds + max ss.

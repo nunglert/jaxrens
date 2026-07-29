@@ -1,6 +1,6 @@
 """Unified backend loader.
 
-load_backend(backend_type, **kwargs) -> EnergyBackend
+``load_backend(backend_type, **kwargs) -> EnergyBackend``
 
 Single entry point for all energy backends.
 """

@@ -6,7 +6,7 @@ the learned potential can become attractive or NaN. During nested sampling
 at high pressure or with aggressive cell moves walkers can drift into such
 configurations and irreversibly collapse atoms onto each other.
 
-This wrapper adds a parameter-free repulsive Morse term
+This wrapper adds a parameter-free repulsive Morse term::
 
     phi(r) = d0 * exp(-2 * a0 * (r - b0))
 
@@ -18,7 +18,8 @@ Cartesian distances for non-periodic systems. MIC is single-image — no
 supercell expansion — which is exact as long as ``r_cut`` stays below half
 the shortest cell vector.
 
-Usage:
+Usage::
+
     base = MACEBackend(...)
     backend = SoftCoreBackend(base)                          # defaults
     H = EnsembleBackend(backend, pressure=P)                  # NPT stack
@@ -36,6 +37,9 @@ import jax.numpy as jnp
 from jaxrens.backends.base import BackendResult
 from jaxrens.backends.geometry import pairwise_distances
 
+#: Default soft-core Morse parameters (``a0``, ``b0``, ``d0``, ``r_core_cut``,
+#: ``r_core_switch``) used when a backend enables soft-core repulsion without
+#: overriding them.
 DEFAULT_SOFTCORE_KWARGS: dict[str, float] = {
     "a0": 1.0,
     "b0": 3.0,

@@ -97,8 +97,7 @@ class SwapKernel(ABC):
         Returns:
             Tuple ``(proposed, n_energy_evals, n_grad_evals)`` where
             ``proposed`` is a dict with keys
-            ``{'positions_a', 'positions_b', 'cell_a', 'cell_b',
-               'energy_a', 'energy_b', 'types_a', 'types_b'}``,
+            ``{'positions_a', 'positions_b', 'cell_a', 'cell_b', 'energy_a', 'energy_b', 'types_a', 'types_b'}``,
             and the two integers count backend calls made.
         """
 
@@ -148,7 +147,8 @@ class PressureRENSSwap(SwapKernel):
 
     For simple energy-based RE (``volumes``/``pressures`` not provided in
     the proposed dict or set to ``None``), falls back to direct energy
-    comparison:
+    comparison::
+
         E_A < Emax_j AND E_B < Emax_i
     """
 
@@ -779,13 +779,11 @@ class XRENSSwap(SwapKernel):
             ensemble_params_b: Same structure as ``ensemble_params_a``.
             rng_key: JAX PRNG key; split internally for the two morphs.
             backend: Energy/force callable with signature
-                ``backend(positions, types, cell, max_neighbors, ensemble_params)
-                -> (energy, n_evals, overflow)``.
+                ``backend(positions, types, cell, max_neighbors, ensemble_params) -> (energy, n_evals, overflow)``.
 
         Returns:
             ``(proposed, 2, 0)`` where ``proposed`` is a dict with keys
-            ``{'positions_a', 'cell_a', 'types_a', 'energy_a',
-               'positions_b', 'cell_b', 'types_b', 'energy_b'}``.
+            ``{'positions_a', 'cell_a', 'types_a', 'energy_a', 'positions_b', 'cell_b', 'types_b', 'energy_b'}``.
 
         Raises:
             ValueError: If ``target_composition`` is missing from either
@@ -1323,8 +1321,7 @@ class SemiGrandSwap(SwapKernel):
 
         Returns:
             ``(proposed, 0, 0)`` where ``proposed`` is a dict with keys
-            ``{'positions_a', 'cell_a', 'types_a', 'energy_a',
-               'positions_b', 'cell_b', 'types_b', 'energy_b'}``.
+            ``{'positions_a', 'cell_a', 'types_a', 'energy_a', 'positions_b', 'cell_b', 'types_b', 'energy_b'}``.
             ``energy_a`` = ``state_a.energy + μ_A · N_A - μ_B · N_A``
             (= ``U_A - μ_B · N_A``).
             ``energy_b`` = ``state_b.energy + μ_B · N_B - μ_A · N_B``

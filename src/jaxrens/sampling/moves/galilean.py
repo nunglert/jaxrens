@@ -9,6 +9,7 @@ Algorithm per NS step (Baldock semantics — mirrors
 
 1. Initialize or perturb the velocity direction.
 2. For each of ``n_reflect`` iterations:
+
    a. Step: ``new_pos = pos + step_size * direction``.  Position always
       advances — even into the violated region.
    b. Evaluate energy at ``new_pos``.  NaN energies are coerced to
@@ -16,6 +17,7 @@ Algorithm per NS step (Baldock semantics — mirrors
       ``mcmc.py:788-792``).
    c. If ``new_energy >= Emax``: reflect direction off the constraint
       surface using forces: ``direction -= 2 * (F_hat . direction) * F_hat``.
+
 3. Accept iff the trajectory's *final* energy is below ``Emax`` — i.e.
    the walker has exited the violated region by the last step.  Reject
    reverts to the initial position and flips the direction.

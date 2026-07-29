@@ -4,7 +4,8 @@ Assembles multiple move types into a single step function that dispatches
 via lax.switch. The MCState class is built dynamically from the move
 descriptors — only fields needed by the active moves are included.
 
-Usage:
+Usage::
+
     backend = HarmonicBackend(k=1.0)
     init_fn, step_fn, per_move_fns = build_mwg(backend, [
         MoveKernel("random_walk", random_walk.build_kernel, weight=7),

@@ -56,7 +56,8 @@ class AdaptationLog:
         n_runs:              number of parallel runs (1 for single-run)
         n_moves:             number of move types
         adjustment_stats:    dict of per-adjust-call diagnostics, or None for v1/v2 files.
-            Keys (all arrays shaped (n_entries, n_runs, n_moves) unless noted):
+            Keys (all arrays shaped (n_entries, n_runs, n_moves) unless noted)::
+
               - "n_rounds"            int32
               - "converged"           bool
               - "cap_hits"            int32
@@ -152,8 +153,8 @@ class AdaptationLogger(BufferedH5Logger):
             acceptance_rates: same shape rules as step_sizes.
             adjustment_stats: optional dict of per-adjust-call diagnostics.
                 Keys: "n_rounds", "converged", "cap_hits", "floor_hits",
-                      "bracket_detected" (all shape (n_runs, n_moves) or (n_moves,)),
-                      "reject_reason_counts" (shape (n_runs, n_moves, 4) or (n_moves, 4)).
+                "bracket_detected" (all shape (n_runs, n_moves) or (n_moves,)),
+                "reject_reason_counts" (shape (n_runs, n_moves, 4) or (n_moves, 4)).
                 If None, no adjustment_stats group is written (v1 behaviour).
             n_evaluations:    optional shape (n_runs, n_moves) or (n_moves,) int64.
                 Total backend calls per iter per move. When provided (together with

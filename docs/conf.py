@@ -173,3 +173,55 @@ intersphinx_mapping = {
     # "failed to reach inventory" warning on every build. Re-add with a
     # working inventory URL if ASE cross-refs are ever needed.
 }
+
+
+# ---------------------------------------------------------------------------
+# autodoc cleanups (see setup())
+# ---------------------------------------------------------------------------
+
+_BUILTIN_DICT_DOC_MARKER = "dict() -> new empty dictionary"
+
+
+def _clean_autodoc_docstring(app, what, name, obj, options, lines):
+    """Fix two autodoc rendering artefacts that emit invalid reST.
+
+    1. A module-level constant re-exported into another module (e.g.
+       ``DEFAULT_SOFTCORE_KWARGS`` imported into ``backends.neuralil``) has no
+       docstring in the importing module, so ``.. autodata::`` falls back to
+       the builtin ``dict.__doc__`` — which is not valid reST and triggers
+       "Unexpected indentation" / "Inline strong" warnings.  Replace it.
+
+    2. jaxtyping shape annotations (``Float[Array, "*B N 3"]``) reach the
+       napoleon-generated ``:type:`` / ``:vartype:`` / ``:rtype:`` fields with
+       a bare ``*`` batch prefix, which docutils misreads as an unterminated
+       emphasis marker.  Escape the asterisks in those type fields.
+
+    Connected at priority > 500 so it runs *after* napoleon has converted the
+    Google-style sections into field lists.
+    """
+    if (
+        what == "data"
+        and lines
+        and _BUILTIN_DICT_DOC_MARKER in "\n".join(lines)
+    ):
+        lines[:] = [
+            f"Re-exported constant; see :data:`{name}`.",
+            "",
+        ]
+        return
+
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if (
+            stripped.startswith(":type ")
+            or stripped.startswith(":vartype ")
+            or stripped.startswith(":rtype:")
+        ):
+            lines[i] = line.replace("*", "\\*")
+
+
+def setup(app):
+    app.connect(
+        "autodoc-process-docstring", _clean_autodoc_docstring, priority=600
+    )
+    return {"parallel_read_safe": True, "parallel_write_safe": True}
