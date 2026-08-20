@@ -34,6 +34,49 @@ import warnings
 import jax
 
 
+def _configure_xla_flags() -> None:
+    """Pin the XLA GEMM/conv autotuning level via ``XLA_FLAGS`` before backend init.
+
+    XLA's default GPU autotuning (``--xla_gpu_autotune_level=4``) probes
+    candidate GEMM / convolution kernels at compile time.  On this project's
+    multi-GPU L40S nodes -- especially under ``jaxrens run --n-gpus N``, where
+    several processes autotune the same node concurrently -- that probe can
+    hang the compile *indefinitely* (a liveness failure, not just a slowdown).
+    We therefore default the level to ``0`` (autotuning off): slightly slower
+    kernels, but compiles that reliably finish.
+
+    Override with ``JAXRENS_XLA_AUTOTUNE=<0..4>`` (e.g. ``=4`` to restore XLA's
+    stock autotuning on a box where it behaves).  If you have already set
+    ``xla_gpu_autotune_level`` yourself in ``XLA_FLAGS``, we leave it untouched.
+
+    Mechanism: this is an XLA compiler flag, *not* a ``jax.config`` knob -- only
+    the ``XLA_FLAGS`` env var is read, and only when the GPU backend is created
+    (the first ``jax.devices()`` / jit).  So this must run before that, which it
+    does: it is invoked at import, ahead of the ``jax.devices()`` call in
+    ``_warn_if_cpu_only``.  Reliable for ``jaxrens run`` (jaxrens is the first
+    thing to touch the backend); in a session where you have already
+    initialised JAX before importing jaxrens it is a no-op for that process.
+    """
+    existing = os.environ.get("XLA_FLAGS", "")
+    if "xla_gpu_autotune_level" in existing:
+        return  # user set it explicitly -- don't second-guess.
+    raw = os.environ.get("JAXRENS_XLA_AUTOTUNE", "0").strip()
+    try:
+        level = int(raw)
+        if not 0 <= level <= 4:
+            raise ValueError
+    except ValueError:
+        warnings.warn(
+            f"jaxrens: ignoring invalid JAXRENS_XLA_AUTOTUNE={raw!r} "
+            f"(expected an integer 0-4); using the jaxrens default of 0.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        level = 0
+    flag = f"--xla_gpu_autotune_level={level}"
+    os.environ["XLA_FLAGS"] = f"{existing} {flag}".strip()
+
+
 def _configure_x64() -> None:
     """Default JAX to float32; honour an explicit x64 opt-in with a warning.
 
@@ -148,6 +191,7 @@ def _warn_if_cpu_only() -> None:
     )
 
 
+_configure_xla_flags()  # must precede GPU backend init (first jax.devices/jit)
 _configure_x64()  # must precede any JAX op — always runs
 
 # The TMPDIR + CPU checks are about *executing* JAX work.  Commands that
