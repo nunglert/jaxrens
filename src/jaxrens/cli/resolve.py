@@ -1304,7 +1304,11 @@ def _resolve_single_replica(
     moves = tuple(m.to_move_config() for m in root.moves)
     move_descriptors = tuple(
         _dc.replace(
-            m.to_descriptor(n_atoms=n_atoms, cell_cfg=root.cell),
+            m.to_descriptor(
+                n_atoms=n_atoms,
+                cell_cfg=root.cell,
+                symbol_map=resolved_init.symbol_map,
+            ),
             min_rate=policy.min_rate,
             max_rate=policy.max_rate,
             step_size_max=policy.step_size_max,
@@ -1829,7 +1833,11 @@ def _resolve_multi_replica(
     moves = tuple(m.to_move_config() for m in root.moves)
     move_descriptors = tuple(
         _dc.replace(
-            m.to_descriptor(n_atoms=n_atoms, cell_cfg=root.cell),
+            m.to_descriptor(
+                n_atoms=n_atoms,
+                cell_cfg=root.cell,
+                symbol_map=stacked_init.symbol_map,
+            ),
             min_rate=policy.min_rate,
             max_rate=policy.max_rate,
             step_size_max=policy.step_size_max,
