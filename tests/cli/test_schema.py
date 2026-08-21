@@ -36,6 +36,7 @@ from jaxrens.cli.schema.moves import (
     SingleAtomMoveSpec,
     SingleAtomSwapMoveSpec,
     SingleAtomSweepMoveSpec,
+    SpeciesSwapMoveSpec,
     StretchMoveSpec,
     VolumeMoveSpec,
 )
@@ -420,6 +421,11 @@ class TestDiscriminatedUnion:
             ({"type": "single_atom"}, SingleAtomMoveSpec),
             ({"type": "single_atom_sweep"}, SingleAtomSweepMoveSpec),
             ({"type": "single_atom_swap"}, SingleAtomSwapMoveSpec),
+            ({"type": "species_swap"}, SpeciesSwapMoveSpec),
+            (
+                {"type": "species_swap", "species": ["Ge", "Si"]},
+                SpeciesSwapMoveSpec,
+            ),
             ({"type": "volume"}, VolumeMoveSpec),
             ({"type": "shear"}, ShearMoveSpec),
             ({"type": "stretch"}, StretchMoveSpec),

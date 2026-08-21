@@ -23,6 +23,7 @@ from jaxrens.sampling.moves import (
     shear,
     single_atom,
     stretch,
+    swap,
     volume,
 )
 from jaxrens.state.config import MoveConfig
@@ -42,6 +43,7 @@ MoveType = Literal[
     "single_atom",
     "single_atom_sweep",
     "single_atom_swap",
+    "species_swap",
     "volume",
     "shear",
     "stretch",
@@ -376,6 +378,110 @@ class SingleAtomSwapMoveSpec(BaseMoveSpec):
         return frozenset({"types"})
 
 
+class SpeciesSwapMoveSpec(BaseMoveSpec):
+    """Exchange the identities of two atoms of *different* species.
+
+    Supersedes ``single_atom_swap``, which draws two atoms uniformly and
+    discards the draw after the energy call when they share a species.  This
+    spec's kernel draws an unlike pair by construction, so no evaluation is
+    wasted and the acceptance rate is not capped by the composition.  Prefer
+    it for any new config; ``single_atom_swap`` is kept for compatibility.
+
+    ``species`` restricts the exchange to the named elements::
+
+        moves:
+          - {type: species_swap, weight: 2}                 # any unlike pair
+          - {type: species_swap, species: [Ge, Si]}         # Ge <-> Si only
+
+    A scoped move needs at least two distinct elements — a one-element scope
+    has nothing to exchange and is rejected at parse time rather than
+    becoming a silent no-op.
+
+    The kernel ignores ``step_size`` (a swap has no continuous magnitude), so
+    the inherited ``step_size`` / ``target_acceptance`` fields do nothing
+    here.
+    """
+
+    type: Literal["species_swap"] = "species_swap"
+    species: tuple[str, ...] | None = None
+
+    @field_validator("species", mode="before")
+    @classmethod
+    def _wrap_bare_symbol(cls, v: Any) -> Any:
+        """Accept ``species: [Ge, Si]``; reject the bare-symbol shorthand.
+
+        ``species: Ge`` is meaningful for ``gmc`` (scope the move to one
+        sublattice) but not for a swap, which needs two species to exchange.
+        Rejecting it here — rather than letting ``swap.build_kernel`` raise
+        much later — puts the error on the YAML key that caused it.
+        """
+        if isinstance(v, str):
+            raise ValueError(
+                f"species_swap species must name at least two elements to "
+                f"exchange, got the single element {v!r}. Use "
+                f"'species: [{v}, <other>]', or drop the key to allow every "
+                f"unlike pair."
+            )
+        return v
+
+    @field_validator("species")
+    @classmethod
+    def _require_two_distinct(cls, v: Any) -> Any:
+        """A swap scope needs two distinct elements; one is a silent no-op."""
+        if v is not None and len(set(v)) < 2:
+            raise ValueError(
+                f"species_swap species={tuple(v)} names {len(set(v))} "
+                f"distinct element(s); at least two are needed for a swap."
+            )
+        return v
+
+    def _build_kernel(self) -> Callable:
+        return swap.build_kernel
+
+    def _mutates(self) -> frozenset[str]:
+        return frozenset({"types"})
+
+    def _effective_name(self) -> str:
+        """Auto-name scoped moves so they stay distinguishable downstream.
+
+        Same rationale as ``GMCMoveSpec._effective_name``: move names key the
+        monitor columns, the adaptation diagnostics, and
+        ``adaptation.resolve_for`` overrides.
+        """
+        if self.name is not None:
+            return self.name
+        if self.species:
+            return "species_swap_" + "_".join(self.species)
+        return self.type
+
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        symbol_map: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        if symbol_map is None:
+            raise ValueError(
+                "SpeciesSwapMoveSpec requires symbol_map to be provided by "
+                "the resolver (it fixes both the number of species and the "
+                "symbol -> type-code mapping). Build descriptors via "
+                "ResolvedConfig.move_descriptors rather than "
+                "setup_mwg()/MoveConfig, which carry no species information."
+            )
+        kwargs: dict[str, Any] = {"n_species": len(symbol_map)}
+        if self.species:
+            code_of = {sym: code for code, sym in symbol_map.items()}
+            unknown = [s for s in self.species if s not in code_of]
+            if unknown:
+                raise ValueError(
+                    f"species_swap species {unknown} not present in the "
+                    f"system (symbols: {sorted(code_of)}). A scoped swap "
+                    f"whose element is absent would never accept."
+                )
+            kwargs["species"] = tuple(code_of[s] for s in self.species)
+        return kwargs
+
+
 class VolumeMoveSpec(BaseMoveSpec):
     type: Literal["volume"] = "volume"
 
@@ -529,6 +635,7 @@ MoveSpec = Annotated[
         SingleAtomMoveSpec,
         SingleAtomSweepMoveSpec,
         SingleAtomSwapMoveSpec,
+        SpeciesSwapMoveSpec,
         VolumeMoveSpec,
         ShearMoveSpec,
         StretchMoveSpec,
