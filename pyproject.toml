@@ -99,4 +99,5 @@ markers = [
     "nequix: marks tests that exercise the nequix backend; opt-in only via '-m nequix' (needs nequix package + bundled or path-loaded model)",
     "jaxmd: marks tests that exercise the jax-md backend (Tersoff/EAM); opt-in only via '-m jaxmd' (needs jax-md package)",
     "lj: marks tests that exercise the built-in Lennard-Jones backend (no optional dependency; runs by default)",
+    "lj: marks tests that exercise the built-in Lennard-Jones backend (no optional dependency; runs by default)",
 ]
