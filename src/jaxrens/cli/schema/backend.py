@@ -10,15 +10,21 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from jaxrens.backends.base import EnergyBackend
 from jaxrens.state.config import BackendConfig
 
-
 # ---------------------------------------------------------------------------
 # Soft-core wrapper spec
 # ---------------------------------------------------------------------------
+
 
 class SoftCoreSpec(BaseModel):
     """Fixed repulsive Morse soft-core wrapper.
@@ -51,6 +57,7 @@ class SoftCoreSpec(BaseModel):
 # ---------------------------------------------------------------------------
 # Base spec
 # ---------------------------------------------------------------------------
+
 
 class BaseBackendSpec(BaseModel):
     """Fields shared by every backend type."""
@@ -92,7 +99,11 @@ class BaseBackendSpec(BaseModel):
     @classmethod
     def _ladder_is_sorted_and_positive(cls, v: list[int]) -> list[int]:
         if len(v) == 0:
-            raise ValueError("max_neighbors_list must be non-empty.")
+            raise ValueError(
+                "backend.max_neighbors_list is empty. It is the neighbour-"
+                "list capacity ladder the run climbs on overflow, so it needs "
+                "at least one entry, e.g. max_neighbors_list: [64, 96, 128]."
+            )
         if any(x <= 0 for x in v):
             raise ValueError(
                 f"max_neighbors_list entries must be positive, got {v}."
@@ -148,12 +159,14 @@ class BaseBackendSpec(BaseModel):
 # Concrete specs — toy backends
 # ---------------------------------------------------------------------------
 
+
 class HarmonicBackendSpec(BaseBackendSpec):
     type: Literal["harmonic"] = "harmonic"
     k: float = 1.0
 
     def build_backend(self) -> EnergyBackend:
         from jaxrens.backends.toy import create_harmonic
+
         return create_harmonic(k=self.k)
 
 
@@ -164,6 +177,7 @@ class DoubleWellBackendSpec(BaseBackendSpec):
 
     def build_backend(self) -> EnergyBackend:
         from jaxrens.backends.toy import create_double_well
+
         return create_double_well(a=self.a, b=self.b)
 
 
@@ -174,12 +188,14 @@ class GaussianMixtureBackendSpec(BaseBackendSpec):
 
     def build_backend(self) -> EnergyBackend:
         from jaxrens.backends.toy import create_gaussian_mixture
+
         return create_gaussian_mixture(centers=self.centers, sigma=self.sigma)
 
 
 # ---------------------------------------------------------------------------
 # Concrete specs — production backends
 # ---------------------------------------------------------------------------
+
 
 class LJBackendSpec(BaseBackendSpec):
     type: Literal["lj"] = "lj"
@@ -197,6 +213,7 @@ class LJBackendSpec(BaseBackendSpec):
 
     def build_backend(self) -> EnergyBackend:
         from jaxrens.backends.lj import create_lj
+
         return create_lj(
             epsilon=self.epsilon,
             sigma=self.sigma,
@@ -243,6 +260,7 @@ class NeuralILBackendSpec(BaseBackendSpec):
 
     def build_backend(self) -> EnergyBackend:
         from jaxrens.backends.neuralil import create_neuralil
+
         return create_neuralil(
             pickle_file=self.checkpoint_path,
             supercell_trafo=self.supercell_trafo,
@@ -261,6 +279,7 @@ class MACEBackendSpec(BaseBackendSpec):
 
     def build_backend(self) -> EnergyBackend:
         from jaxrens.backends.mace import create_mace
+
         return create_mace(
             model_path=self.checkpoint_path,
             supercell_trafo=self.supercell_trafo,
@@ -279,6 +298,7 @@ class NequixBackendSpec(BaseBackendSpec):
 
     def build_backend(self) -> EnergyBackend:
         from jaxrens.backends.nequix import create_nequix
+
         return create_nequix(
             checkpoint_path=self.checkpoint_path,
             supercell_trafo=self.supercell_trafo,
@@ -329,10 +349,11 @@ class JaxMDBackendSpec(BaseBackendSpec):
                 )
         elif self.potential == "eam":
             if self.eam_params_file is None:
-                raise ValueError(
-                    "potential='eam' requires `eam_params_file`."
-                )
-            if self.tersoff_params is not None or self.tersoff_params_file is not None:
+                raise ValueError("potential='eam' requires `eam_params_file`.")
+            if (
+                self.tersoff_params is not None
+                or self.tersoff_params_file is not None
+            ):
                 raise ValueError(
                     "Tersoff fields must be unset when potential='eam'."
                 )
@@ -354,6 +375,7 @@ class JaxMDBackendSpec(BaseBackendSpec):
 
     def build_backend(self) -> EnergyBackend:
         from jaxrens.backends.jaxmd import create_jaxmd
+
         return create_jaxmd(
             potential=self.potential,
             periodic=self.periodic,

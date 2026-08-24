@@ -86,7 +86,7 @@ class TestXRENSProposeMorphedTypes:
             species_weights=[1.0, 2.0][:n_species]
         )
         kernel = XRENSSwap(n_species=n_species)
-        key = jax.random.PRNGKey(seed)
+        key = jax.random.key(seed)
         k1, k2, morph_key = jax.random.split(key, 3)
 
         # Initial types: all species 0 for A, all species 1 for B (if 2 species).
@@ -154,7 +154,7 @@ class TestXRENSProposeMorphedTypes:
         """After propose, positions_a should be the original B positions."""
         backend = SpeciesHarmonicBackend([1.0, 2.0])
         kernel = XRENSSwap(n_species=2)
-        key = jax.random.PRNGKey(7)
+        key = jax.random.key(7)
         k1, k2, mkey = jax.random.split(key, 3)
 
         pos_a = jax.random.normal(k1, (4, 3))
@@ -341,7 +341,7 @@ class TestNSpeciesMismatch:
         """
         kernel = XRENSSwap(n_species=3)  # expects 3-element targets
         backend = SpeciesHarmonicBackend([1.0, 2.0, 3.0])
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         n_atoms = 6
         types_a = jnp.array([0, 1, 2, 0, 1, 2], dtype=jnp.int32)
         types_b = jnp.array([0, 0, 0, 1, 1, 1], dtype=jnp.int32)
@@ -492,7 +492,7 @@ class TestXRENSEndToEnd:
         backend = SpeciesHarmonicBackend([1.0, 1.5])
         kernel = XRENSSwap(n_species=n_species)
 
-        key = jax.random.PRNGKey(99)
+        key = jax.random.key(99)
         k1, k2 = jax.random.split(key)
         positions = (
             jax.random.normal(k1, (n_runs, n_walkers, n_atoms, 3)) * 0.1
@@ -540,7 +540,7 @@ class TestXRENSEndToEnd:
         backend = SpeciesHarmonicBackend([1.0, 2.0])
         kernel = XRENSSwap(n_species=n_species)
 
-        key = jax.random.PRNGKey(10)
+        key = jax.random.key(10)
         k1, k2 = jax.random.split(key)
         positions = (
             jax.random.normal(k1, (n_runs, n_walkers, n_atoms, 3)) * 0.1
@@ -598,7 +598,7 @@ class TestXRENSSingleRunSkip:
         backend = SpeciesHarmonicBackend([1.0, 2.0])
         kernel = XRENSSwap(n_species=n_species)
 
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         positions = (
             jax.random.normal(key, (n_runs, n_walkers, n_atoms, 3)) * 0.1
         )

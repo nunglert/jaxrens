@@ -9,19 +9,25 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from jaxrens.sampling.moves.shear import _build_shear_cell
 from jaxrens.utils.cell import get_volume, min_aspect_ratio
-
 
 # ---------------------------------------------------------------------------
 # Pure stretch proposal (mirrors stretch.py kernel logic, without MCState)
 # ---------------------------------------------------------------------------
 
-_AXIS_PAIRS = jnp.array([[0, 1], [0, 2], [1, 2]])
+# NumPy (not jnp): a module-level ``jnp.array`` executes a JAX op at import
+# time and brings up a backend.  Converted with ``jnp.asarray`` at the use site
+# instead, where it folds into the traced constant — a plain numpy array cannot
+# be indexed by a tracer.  Same rationale as ``MoveInfo``'s defaults.
+_AXIS_PAIRS = np.array([[0, 1], [0, 2], [1, 2]])
 
 
-def _propose_stretch(cell: jnp.ndarray, key: jax.Array, step_size: float) -> jnp.ndarray:
+def _propose_stretch(
+    cell: jnp.ndarray, key: jax.Array, step_size: float
+) -> jnp.ndarray:
     """Propose a volume-preserving stretch of `cell`.
 
     Selects a random axis pair (i, j), scales axis i by exp(rv) and axis j by
@@ -38,14 +44,16 @@ def _propose_stretch(cell: jnp.ndarray, key: jax.Array, step_size: float) -> jnp
     """
     k1, k2 = jax.random.split(key)
     pair_idx = jax.random.randint(k1, (), 0, 3)
-    axes = _AXIS_PAIRS[pair_idx]
+    axes = jnp.asarray(_AXIS_PAIRS)[pair_idx]
     i, j = axes[0], axes[1]
     rv = step_size * jax.random.normal(k2)
     diag = jnp.ones(3).at[i].set(jnp.exp(rv)).at[j].set(jnp.exp(-rv))
     return cell @ jnp.diag(diag)
 
 
-def _propose_shear(cell: jnp.ndarray, key: jax.Array, step_size: float) -> jnp.ndarray:
+def _propose_shear(
+    cell: jnp.ndarray, key: jax.Array, step_size: float
+) -> jnp.ndarray:
     """Propose a volume-preserving shear of `cell`.
 
     Selects a random cell vector index (0, 1, or 2) and displaces it within the
@@ -76,22 +84,30 @@ def sample_initial_volume(
     n_atoms: int,
     max_volume_per_atom: float,
     flat_V_prior: bool = False,
+    min_volume_per_atom: float = 0.0,
 ) -> jnp.ndarray:
     """Sample an initial cell edge length (cubic cell) from the NS volume prior.
 
     Returns the scalar edge length `lc` such that cell = lc * I_3.
 
+    The draw is over the volume interval [V_lo, V_hi], with
+    V_lo = n_atoms * min_volume_per_atom and V_hi = n_atoms * max_volume_per_atom.
+    ``min_volume_per_atom`` is the *initial* volume floor: it lets walkers start
+    on a low-density grid, decoupled from the sampling-constraint floor.  The
+    default of 0.0 reproduces the historical unbounded-below behaviour.
+
     Two prior modes:
 
     flat_V_prior=True:
-        V ~ Uniform(0, n_atoms * max_volume_per_atom).  The edge length is
-        lc = V ** (1/3).
+        V ~ Uniform(V_lo, V_hi).  The edge length is lc = V ** (1/3).
 
     flat_V_prior=False (legacy default, pymatnest convention):
-        lc = (n_atoms * max_volume_per_atom * U ** (1 / (n_atoms + 1))) ** (1/3)
-        where U ~ Uniform(0, 1).  The exponent 1/(N+1) biases the prior toward
-        smaller volumes; this matches the pymatnest / jaxnest convention used in
-        randomization.py::create_random_initialise_cell (lines 218-225).
+        V drawn with density proportional to V^N (N = n_atoms) truncated to
+        [V_lo, V_hi], biasing toward larger volumes; this matches the pymatnest
+        / jaxnest convention used in
+        randomization.py::create_random_initialise_cell (lines 218-225).  With
+        V_lo = 0 this reduces to
+        lc = (V_hi * U ** (1 / (n_atoms + 1))) ** (1/3), U ~ Uniform(0, 1).
 
     Args:
         key: JAX PRNG key.
@@ -99,16 +115,26 @@ def sample_initial_volume(
         max_volume_per_atom: Upper bound on volume per atom (Angstrom^3 or similar).
         flat_V_prior: If True, draw from a flat volume prior; otherwise use the
             V^N biased prior.
+        min_volume_per_atom: Lower bound on the initial volume per atom. Defaults
+            to 0.0 (no floor).
 
     Returns:
         Scalar (0-d) jnp.ndarray: the cubic cell edge length lc.
     """
     u = jax.random.uniform(key, shape=(), dtype=jnp.float32)
-    v_max = float(n_atoms) * max_volume_per_atom
+    v_hi = float(n_atoms) * max_volume_per_atom
+    v_lo = float(n_atoms) * min_volume_per_atom
 
-    lc_flat = (v_max * u) ** (1.0 / 3.0)
-    # 1/(n_atoms+1) exponent: biases toward smaller volumes per pymatnest convention
-    lc_vn = (v_max * u ** (1.0 / float(n_atoms + 1))) ** (1.0 / 3.0)
+    lc_flat = (v_lo + u * (v_hi - v_lo)) ** (1.0 / 3.0)
+
+    # V^N prior truncated to [v_lo, v_hi], via inverse-CDF of density ~ V^N.
+    # Factor out v_hi**p to stay numerically stable: v_lo**p / v_hi**p would
+    # overflow float32 for the (n_atoms + 1) exponent.  ratio in [0, 1].
+    p = float(n_atoms + 1)
+    ratio = (v_lo / v_hi) if v_hi > 0.0 else 0.0
+    a = ratio**p
+    v_vn = v_hi * (a + u * (1.0 - a)) ** (1.0 / p)
+    lc_vn = v_vn ** (1.0 / 3.0)
 
     return jnp.where(flat_V_prior, lc_flat, lc_vn)
 
@@ -161,8 +187,12 @@ def cell_shape_walk(
 
         step_type = jax.random.randint(choose_key, (), 0, 2)
 
-        new_cell_shear = _propose_shear(current_cell, propose_key, step_size_shear)
-        new_cell_stretch = _propose_stretch(current_cell, propose_key, step_size_stretch)
+        new_cell_shear = _propose_shear(
+            current_cell, propose_key, step_size_shear
+        )
+        new_cell_stretch = _propose_stretch(
+            current_cell, propose_key, step_size_stretch
+        )
 
         proposed_cell = jax.lax.cond(
             step_type == 0,
@@ -187,5 +217,7 @@ def cell_shape_walk(
         return accepted_cell, new_acc, loop_key
 
     init_state = (cell, jnp.int32(0), key)
-    final_cell, n_accepted, _ = jax.lax.fori_loop(0, n_steps, _body, init_state)
+    final_cell, n_accepted, _ = jax.lax.fori_loop(
+        0, n_steps, _body, init_state
+    )
     return final_cell, n_accepted

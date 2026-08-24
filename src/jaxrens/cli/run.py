@@ -81,11 +81,12 @@ def configure_file_logging(
     level: str,
     mode: str = "w",
 ) -> None:
-    """Attach file + stderr handlers to the ``jaxrens`` logger.
+    """Attach a file handler to the ``jaxrens`` logger.
 
-    Always writes INFO+ to ``<working_dir>/<prefix>.log`` and mirrors
-    INFO+ to stderr.  If ``level`` is ``debug``, additionally writes
-    DEBUG+ to ``<working_dir>/<prefix>.debug.log``.
+    Writes to a single ``<working_dir>/<prefix>.log``.  The threshold
+    follows ``level``: INFO+ normally, DEBUG+ when ``level`` is ``debug``
+    (so debug output lands in the same file — there is no separate
+    ``.debug.log``).
 
     ``mode`` mirrors the ``writer_mode`` plumbed through to the I/O
     writers: ``"w"`` on a fresh run, ``"a"`` on restart so the prior
@@ -105,26 +106,17 @@ def configure_file_logging(
             root.removeHandler(h)
             h.close()
 
-    info_h = logging.FileHandler(working_dir / f"{prefix}.log", mode=mode)
-    info_h.setLevel(logging.INFO)
-    info_h.setFormatter(logging.Formatter(_LOG_FORMAT))
-    info_h._jaxrens_managed = True  # type: ignore[attr-defined]
-    root.addHandler(info_h)
+    file_h = logging.FileHandler(working_dir / f"{prefix}.log", mode=mode)
+    file_h.setLevel(logging.DEBUG if level == "debug" else logging.INFO)
+    file_h.setFormatter(logging.Formatter(_LOG_FORMAT))
+    file_h._jaxrens_managed = True  # type: ignore[attr-defined]
+    root.addHandler(file_h)
 
     # stream_h = logging.StreamHandler(sys.stderr)
     # stream_h.setLevel(logging.INFO)
     # stream_h.setFormatter(logging.Formatter(_LOG_FORMAT))
     # stream_h._jaxrens_managed = True  # type: ignore[attr-defined]
     # root.addHandler(stream_h)
-
-    if level == "debug":
-        debug_h = logging.FileHandler(
-            working_dir / f"{prefix}.debug.log", mode=mode
-        )
-        debug_h.setLevel(logging.DEBUG)
-        debug_h.setFormatter(logging.Formatter(_LOG_FORMAT))
-        debug_h._jaxrens_managed = True  # type: ignore[attr-defined]
-        root.addHandler(debug_h)
 
 
 def _barrier(label: str, *arrays: Any) -> None:
@@ -133,8 +125,8 @@ def _barrier(label: str, *arrays: Any) -> None:
     Use as a stage boundary in the multi-GPU dispatcher: any OOM during the
     just-completed stage's compile/execute will surface inside this call,
     not deferred to the next materialisation point.  No-op for non-array
-    inputs and ``None``.  Only emits at DEBUG level — zero cost when the
-    debug log handler is not attached.
+    inputs and ``None``.  Only emits at DEBUG level — zero cost when DEBUG
+    logging is not enabled.
     """
     if not logger.isEnabledFor(logging.DEBUG):
         return
@@ -192,12 +184,10 @@ def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
     descriptors via ``ResolvedConfig.move_descriptors`` instead.
     """
     from jaxrens.cli.schema.moves import (
-        AlchemicalShiftMoveSpec,
         GMCMoveSpec,
         HMCMoveSpec,
         RandomWalkMoveSpec,
         SingleAtomMoveSpec,
-        SingleAtomSwapMoveSpec,
     )
 
     _SIMPLE_SPEC_MAP: dict[str, Any] = {
@@ -206,8 +196,6 @@ def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
         "gmc": GMCMoveSpec,
         "hmc": HMCMoveSpec,
         "single_atom": SingleAtomMoveSpec,
-        "single_atom_swap": SingleAtomSwapMoveSpec,
-        "alchemical_shift": AlchemicalShiftMoveSpec,
     }
 
     spec_cls = _SIMPLE_SPEC_MAP.get(mc.move_type)
@@ -215,7 +203,7 @@ def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
         raise ValueError(
             f"Unknown move type: {mc.move_type!r}. "
             f"Available via MoveConfig: {list(_SIMPLE_SPEC_MAP)}. "
-            f"For volume/shear/stretch/single_atom_sweep/alchemical_morph use "
+            f"For volume/shear/stretch/single_atom_sweep/alchemical_morph/species_swap use "
             f"ResolvedConfig.move_descriptors (they require n_atoms/n_species)."
         )
 
@@ -245,7 +233,7 @@ def setup_mwg(
         move_configs: Single ``MoveConfig`` or list of ``MoveConfig`` objects.
             For move types that require ``n_atoms`` or ``n_species``
             (volume, shear, stretch, single_atom_sweep, alchemical_morph)
-            use ``build_mwg`` directly with pre-built ``MoveKernel``s.
+            use ``build_mwg`` directly with pre-built ``MoveKernel`` instances.
         backend: EnergyBackend instance.
 
     Returns:
@@ -256,80 +244,6 @@ def setup_mwg(
 
     descriptors = [_move_config_to_descriptor(mc) for mc in move_configs]
     return build_mwg(backend, descriptors)
-
-
-def _annotation_chunk_size(n_extra: int, batcher: Any = None) -> int:
-    """Frames per batched committee-uncertainty eval = the NS per-device walk batch.
-
-    Reuses the simultaneous-walker batch that the GPU already compiled and ran
-    during sampling — ``(1 + n_extra)`` walkers per run × runs-per-device —
-    rather than an arbitrary constant, so the post-run committee re-evaluation
-    inherits a known-good memory footprint.  ``runs-per-device`` is the trailing
-    ``shape_prefix`` axis of the batcher (``n_per_gpu`` for pmap+vmap,
-    ``n_runs`` for vmap-only, ``1`` for a single run / no batcher).
-    """
-    runs_per_device = 1
-    prefix = (
-        getattr(batcher, "shape_prefix", ()) if batcher is not None else ()
-    )
-    if prefix:
-        runs_per_device = int(prefix[-1])
-    return max(1, (1 + int(n_extra)) * runs_per_device)
-
-
-def _maybe_annotate_uncertainty(
-    output_config: Any,
-    backend: Any,
-    traj_paths: list,
-    chunk_size: int = 64,
-) -> None:
-    """Post-run step: annotate written trajectories with committee uncertainty.
-
-    No-op unless ``output_config.write_uncertainty`` is set and the backend is
-    an NN committee (ensemble).  Runs after the NS loop returns and the writers
-    have flushed/closed — the backend and GPU are still warm, so no model
-    reload.  A non-committee backend warns and skips.  Any failure here is
-    logged but never fails an otherwise-complete run.  ``chunk_size`` is the
-    per-batch frame count (default mirrors the NS per-device walk batch; see
-    :func:`_annotation_chunk_size`).
-    """
-    if not getattr(output_config, "write_uncertainty", False):
-        return
-    if getattr(output_config, "format", "none") == "none":
-        return
-
-    from jaxrens.backends.base import get_committee_backend
-
-    committee = get_committee_backend(backend)
-    if committee is None:
-        logger.warning(
-            "output.write_uncertainty=True but the backend is not an NN "
-            "committee (ensemble); skipping committee-uncertainty annotation."
-        )
-        return
-
-    from jaxrens.postprocess.uncertainty import annotate_trajectory_uncertainty
-
-    with_forces = bool(getattr(output_config, "write_force_uncertainty", True))
-    in_place = bool(getattr(output_config, "uncertainty_in_place", False))
-    for traj_path in traj_paths:
-        if traj_path is None or not Path(traj_path).exists():
-            continue
-        try:
-            out = annotate_trajectory_uncertainty(
-                traj_path,
-                committee,
-                with_forces=with_forces,
-                in_place=in_place,
-                chunk_size=chunk_size,
-            )
-            logger.info("Committee-uncertainty annotation written: %s", out)
-        except Exception as exc:  # noqa: BLE001 -- must not fail the run
-            logger.warning(
-                "Committee-uncertainty annotation failed for %s: %s",
-                traj_path,
-                exc,
-            )
 
 
 def run_from_config(
@@ -713,9 +627,6 @@ def run_from_config(
         )
         full_auto_kwargs = dict(
             per_move_fns=per_move_fns,
-            move_descriptors=list(move_descriptors)
-            if move_descriptors is not None
-            else None,
             adjust_interval=adaptation_config.adjust_interval,
             adjust_n_samples=adaptation_config.adjust_n_samples,
             adjust_max_rounds=adaptation_config.adjust_max_rounds,
@@ -745,14 +656,14 @@ def run_from_config(
         max_neighbors_offset=backend_config.max_neighbors_offset,
         max_neighbors_shrink_dwell=backend_config.max_neighbors_shrink_dwell,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
+        # Passed unconditionally (not only under full_auto) so run_ns always
+        # knows the real move count.  Otherwise n_moves falls back to 1 and the
+        # population's per-move step_sizes are built as (K, 1), which mismatches
+        # the always-wired adaptation logger's (n_runs, n_moves) baseline row.
+        move_descriptors=list(move_descriptors)
+        if move_descriptors is not None
+        else None,
         **full_auto_kwargs,
-    )
-
-    _maybe_annotate_uncertainty(
-        output_config,
-        backend,
-        [getattr(writer, "path", None)],
-        chunk_size=_annotation_chunk_size(ns_config.n_extra),
     )
 
     return result
@@ -1245,15 +1156,6 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
         **full_auto_kwargs,
     )
 
-    _maybe_annotate_uncertainty(
-        resolved.output,
-        backend,
-        [getattr(w, "path", None) for w in writers],
-        chunk_size=_annotation_chunk_size(
-            resolved.ns.n_extra, resolved.batcher
-        ),
-    )
-
     return result
 
 
@@ -1635,15 +1537,6 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
         batcher=batcher,
         restart_state=resolved.init.restart_state,
         **full_auto_kwargs,
-    )
-
-    _maybe_annotate_uncertainty(
-        resolved.output,
-        backend,
-        [getattr(writer, "path", None)],
-        chunk_size=_annotation_chunk_size(
-            resolved.ns.n_extra, resolved.batcher
-        ),
     )
 
     return result

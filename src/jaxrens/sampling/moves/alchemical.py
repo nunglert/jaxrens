@@ -1,9 +1,8 @@
 """Alchemical move kernels for nested sampling.
 
 - build_morph_kernel: change one atom's species (semi-grand-canonical)
-- build_shift_kernel: random translation of all atoms (rigid shift)
 
-Single-walker functions, designed for pmap(vmap(vmap(...))) wrapping.
+Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations
@@ -13,9 +12,17 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from jaxrens.base import MoveInfo
+from jaxrens.sampling.base import MoveInfo
+from jaxrens.unvalidated import unvalidated
 
 
+@unvalidated(
+    concern=("no production NS run has used this move."),
+    since="0.2.2",
+    clears_when=(
+        "Production sGC runs delivering correct physics for a binary system."
+    ),
+)
 def build_morph_kernel(backend: Any, n_species: int):
     """Build an atom morph kernel.
 
@@ -58,54 +65,6 @@ def build_morph_kernel(backend: Any, n_species: int):
 
         new_state = state.set(
             types=jnp.where(accepted, new_types, state.types),
-            energy=jnp.where(accepted, new_energy, state.energy),
-            max_neighbor_count=jnp.maximum(state.max_neighbor_count, count),
-            overflow=state.overflow | overflow,
-        )
-
-        info = MoveInfo(
-            accepted=accepted,
-            log_likelihood=-new_state.energy,
-            n_evaluations=1,
-        )
-
-        return new_state, info
-
-    return step
-
-
-def build_shift_kernel(backend: Any):
-    """Build a random shift kernel.
-
-    Applies a uniform random translation to all atoms simultaneously.
-
-    Args:
-        backend: EnergyBackend instance.
-
-    Returns:
-        step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
-    """
-
-    def step(rng_key, state, likelihood_constraint):
-        shift = state.step_size * jax.random.normal(rng_key, (3,))
-        new_positions = state.positions + shift[None, :]
-
-        result = backend(
-            new_positions,
-            state.types,
-            state.cell,
-            state.max_neighbors,
-            ensemble_params=state.ensemble_params,
-        )
-        new_energy, count, overflow = (
-            result.energy,
-            result.max_neighbor_count,
-            result.overflow,
-        )
-        accepted = new_energy < likelihood_constraint
-
-        new_state = state.set(
-            positions=jnp.where(accepted, new_positions, state.positions),
             energy=jnp.where(accepted, new_energy, state.energy),
             max_neighbor_count=jnp.maximum(state.max_neighbor_count, count),
             overflow=state.overflow | overflow,

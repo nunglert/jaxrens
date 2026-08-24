@@ -35,8 +35,10 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Bool, Float, Int, Key
 
 from jaxrens.sampling.morph import morph_types_to_composition
+from jaxrens.unvalidated import unvalidated
 from jaxrens.utils.cell import get_volume
 
 # ---------------------------------------------------------------------------
@@ -51,6 +53,26 @@ class SwapKernel(ABC):
     :meth:`accept` (decide whether to accept it).  The split keeps the
     proposal logic (which may involve backend energy evaluations for XRENS)
     separate from the deterministic acceptance check.
+
+    Swap-state contract (deliberately *not* ``WalkerState``)
+    -------------------------------------------------------
+    ``propose``/``accept`` speak a small, JIT-internal *pair* protocol, not the
+    single-walker ``WalkerState`` pytree used everywhere else:
+
+    * ``state_a`` / ``state_b`` are loose dicts with keys ``'positions'``,
+      ``'types'``, ``'energy'``, ``'cell'`` — and are intentionally **partial**:
+      ``PressureRENSSwap`` and the ``perform_swap`` back-compat shim pass
+      ``energy``-only states (optionally with a synthetic ``cell``) because a
+      plain energy/enthalpy comparison needs nothing more.
+    * ``proposed`` carries *both* replicas' results under ``_a``/``_b``-suffixed
+      keys (``'positions_a'``, ``'cell_b'``, …) — a paired structure with no
+      single-walker analogue.
+
+    These dicts never touch disk and are consumed only within the vmapped swap
+    kernels, so they are kept as plain dicts by design; forcing ``WalkerState``
+    here would break the partial-state and paired-result cases.  Disk/callback
+    serialization is a separate concern handled by ``io.formats`` (see its
+    module docstring).
     """
 
     @abstractmethod
@@ -60,9 +82,9 @@ class SwapKernel(ABC):
         state_b: Any,
         ensemble_params_a: Any,
         ensemble_params_b: Any,
-        rng_key: jax.Array,
+        rng_key: Key[Array, ""],
         backend: Any,
-    ) -> tuple[Any, int, int]:
+    ) -> tuple[dict[str, Any], int, int]:
         """Produce swap candidate states plus evaluation counts.
 
         Args:
@@ -76,20 +98,19 @@ class SwapKernel(ABC):
         Returns:
             Tuple ``(proposed, n_energy_evals, n_grad_evals)`` where
             ``proposed`` is a dict with keys
-            ``{'positions_a', 'positions_b', 'cell_a', 'cell_b',
-               'energy_a', 'energy_b', 'types_a', 'types_b'}``,
+            ``{'positions_a', 'positions_b', 'cell_a', 'cell_b', 'energy_a', 'energy_b', 'types_a', 'types_b'}``,
             and the two integers count backend calls made.
         """
 
     @abstractmethod
     def accept(
         self,
-        proposed: Any,
-        emax_a: jnp.ndarray,
-        emax_b: jnp.ndarray,
+        proposed: dict[str, Any],
+        emax_a: Float[Array, ""],
+        emax_b: Float[Array, ""],
         ensemble_params_a: Any,
         ensemble_params_b: Any,
-    ) -> jnp.ndarray:
+    ) -> Bool[Array, ""]:
         """Decide whether to accept the proposed swap.
 
         Args:
@@ -127,7 +148,8 @@ class PressureRENSSwap(SwapKernel):
 
     For simple energy-based RE (``volumes``/``pressures`` not provided in
     the proposed dict or set to ``None``), falls back to direct energy
-    comparison:
+    comparison::
+
         E_A < Emax_j AND E_B < Emax_i
     """
 
@@ -137,9 +159,9 @@ class PressureRENSSwap(SwapKernel):
         state_b: Any,
         ensemble_params_a: Any,
         ensemble_params_b: Any,
-        rng_key: jax.Array,
+        rng_key: Key[Array, ""],
         backend: Any,
-    ) -> tuple[Any, int, int]:
+    ) -> tuple[dict[str, Any], int, int]:
         """Identity proposal: return the walker pair as-is with zero eval counts.
 
         Args:
@@ -170,12 +192,12 @@ class PressureRENSSwap(SwapKernel):
 
     def accept(
         self,
-        proposed: Any,
-        emax_a: jnp.ndarray,
-        emax_b: jnp.ndarray,
+        proposed: dict[str, Any],
+        emax_a: Float[Array, ""],
+        emax_b: Float[Array, ""],
         ensemble_params_a: Any,
         ensemble_params_b: Any,
-    ) -> jnp.ndarray:
+    ) -> Bool[Array, ""]:
         """Enthalpy-based acceptance check (or simple energy check without pressure).
 
         ``proposed['energy_a']`` and ``proposed['energy_b']`` are interpreted as
@@ -247,7 +269,7 @@ class PressureRENSSwap(SwapKernel):
 # ---------------------------------------------------------------------------
 
 
-def get_swap_pairs(n_runs: int, phase: int) -> jnp.ndarray:
+def get_swap_pairs(n_runs: int, phase: int) -> Int[Array, "n_pairs 2"]:
     """Get non-overlapping swap pairs for replica exchange.
 
     Phase 0 (even): [(0,1), (2,3), (4,5), ...]
@@ -278,11 +300,11 @@ _PRESSURE_RENS_SWAP_INSTANCE = PressureRENSSwap()
 
 
 def perform_swap(
-    energies_pair: jnp.ndarray,
-    emax_pair: jnp.ndarray,
-    volumes_pair: jnp.ndarray | None = None,
-    pressures_pair: jnp.ndarray | None = None,
-) -> jnp.ndarray:
+    energies_pair: Float[Array, "2"],
+    emax_pair: Float[Array, "2"],
+    volumes_pair: Float[Array, "2"] | None = None,
+    pressures_pair: Float[Array, "2"] | None = None,
+) -> Bool[Array, ""]:
     """Decide whether to accept a replica exchange swap.
 
     .. deprecated::
@@ -325,7 +347,7 @@ def perform_swap(
         # Fake cell matrices whose determinant equals the supplied volumes.
         # get_volume calls jnp.linalg.det, so we need actual (3,3) matrices.
         # Use a diagonal matrix: det(diag(cbrt(V), cbrt(V), cbrt(V))) = V.
-        def _volume_to_cell(v: jnp.ndarray) -> jnp.ndarray:
+        def _volume_to_cell(v: Float[Array, ""]) -> Float[Array, "3 3"]:
             side = jnp.cbrt(v)
             return jnp.diag(jnp.array([side, side, side]))
 
@@ -354,7 +376,9 @@ def perform_swap(
     )
 
 
-def _pad_pairs(pairs, n_valid, max_len):
+def _pad_pairs(
+    pairs: Int[Array, "k 2"], n_valid: int, max_len: int
+) -> tuple[Int[Array, "max_len 2"], Bool[Array, "max_len"]]:
     """Pad a (k, 2) pair array to (max_len, 2) and return it with a validity mask."""
     if pairs.shape[0] < max_len:
         padding = jnp.zeros((max_len - pairs.shape[0], 2), dtype=pairs.dtype)
@@ -369,16 +393,22 @@ def _pad_pairs(pairs, n_valid, max_len):
 
 
 def replica_exchange_step(
-    rng_key: jax.Array,
-    all_positions: jnp.ndarray,
-    all_types: jnp.ndarray,
-    all_energies: jnp.ndarray,
-    all_cells: jnp.ndarray | None,
-    all_emax: jnp.ndarray,
-    pressures: jnp.ndarray | None = None,
+    rng_key: Key[Array, ""],
+    all_positions: Float[Array, "R K N 3"],
+    all_types: Int[Array, "R K N"] | Int[Array, "R N"],
+    all_energies: Float[Array, "R K"],
+    all_cells: Float[Array, "R K 3 3"] | None,
+    all_emax: Float[Array, "R"],
+    pressures: Float[Array, "R"] | None = None,
     n_swap_cycles: int = 1,
     swap_kernel: SwapKernel | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, dict]:
+) -> tuple[
+    Float[Array, "R K N 3"],
+    Int[Array, "R K N"] | Int[Array, "R N"],
+    Float[Array, "R K"],
+    Float[Array, "R K 3 3"] | None,
+    dict,
+]:
     """Perform replica exchange across P parallel runs.
 
     .. note::
@@ -723,6 +753,13 @@ class XRENSSwap(SwapKernel):
             the length of each ``target_composition`` array passed at call time.
     """
 
+    @unvalidated(
+        concern=("no production NS run has used this move."),
+        since="0.2.2",
+        clears_when=(
+            "Production runs delivering correct physics for a binary system."
+        ),
+    )
     def __init__(self, n_species: int) -> None:
         if not isinstance(n_species, int) or n_species < 1:
             raise ValueError(
@@ -736,9 +773,9 @@ class XRENSSwap(SwapKernel):
         state_b: Any,
         ensemble_params_a: Any,
         ensemble_params_b: Any,
-        rng_key: jax.Array,
+        rng_key: Key[Array, ""],
         backend: Any,
-    ) -> tuple[Any, int, int]:
+    ) -> tuple[dict[str, Any], int, int]:
         """Morph types and re-evaluate energies for both replicas.
 
         Args:
@@ -750,13 +787,11 @@ class XRENSSwap(SwapKernel):
             ensemble_params_b: Same structure as ``ensemble_params_a``.
             rng_key: JAX PRNG key; split internally for the two morphs.
             backend: Energy/force callable with signature
-                ``backend(positions, types, cell, max_neighbors, ensemble_params)
-                -> (energy, n_evals, overflow)``.
+                ``backend(positions, types, cell, max_neighbors, ensemble_params) -> (energy, n_evals, overflow)``.
 
         Returns:
             ``(proposed, 2, 0)`` where ``proposed`` is a dict with keys
-            ``{'positions_a', 'cell_a', 'types_a', 'energy_a',
-               'positions_b', 'cell_b', 'types_b', 'energy_b'}``.
+            ``{'positions_a', 'cell_a', 'types_a', 'energy_a', 'positions_b', 'cell_b', 'types_b', 'energy_b'}``.
 
         Raises:
             ValueError: If ``target_composition`` is missing from either
@@ -843,12 +878,12 @@ class XRENSSwap(SwapKernel):
 
     def accept(
         self,
-        proposed: Any,
-        emax_a: jnp.ndarray,
-        emax_b: jnp.ndarray,
+        proposed: dict[str, Any],
+        emax_a: Float[Array, ""],
+        emax_b: Float[Array, ""],
         ensemble_params_a: Any,
         ensemble_params_b: Any,
-    ) -> jnp.ndarray:
+    ) -> Bool[Array, ""]:
         """Direct enthalpy threshold check on the morphed + re-evaluated energies.
 
         ``propose`` already threaded each receiving run's ensemble_params into
@@ -881,18 +916,24 @@ class XRENSSwap(SwapKernel):
 
 
 def xrens_replica_exchange_step(
-    rng_key: jax.Array,
-    all_positions: jnp.ndarray,
-    all_types: jnp.ndarray,
-    all_energies: jnp.ndarray,
-    all_cells: jnp.ndarray | None,
-    all_emax: jnp.ndarray,
-    composition_targets: jnp.ndarray,
+    rng_key: Key[Array, ""],
+    all_positions: Float[Array, "R K N 3"],
+    all_types: Int[Array, "R K N"],
+    all_energies: Float[Array, "R K"],
+    all_cells: Float[Array, "R K 3 3"] | None,
+    all_emax: Float[Array, "R"],
+    composition_targets: Int[Array, "R n_species"],
     backend: Any,
     xrens_kernel: XRENSSwap,
-    pressures: jnp.ndarray | None = None,
+    pressures: Float[Array, "R"] | None = None,
     n_swap_cycles: int = 1,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, dict]:
+) -> tuple[
+    Float[Array, "R K N 3"],
+    Int[Array, "R K N"],
+    Float[Array, "R K"],
+    Float[Array, "R K 3 3"] | None,
+    dict,
+]:
     """Perform XRENS (composition-morphing) replica exchange across P parallel runs.
 
     Unlike :func:`replica_exchange_step` (identity proposal), each swap here
@@ -1265,9 +1306,9 @@ class SemiGrandSwap(SwapKernel):
         state_b: Any,
         ensemble_params_a: Any,
         ensemble_params_b: Any,
-        rng_key: jax.Array,
+        rng_key: Key[Array, ""],
         backend: Any,
-    ) -> tuple[Any, int, int]:
+    ) -> tuple[dict[str, Any], int, int]:
         """Compute grand-canonical energies under swapped μ assignments.
 
         Positions, cells, and types are copied through unchanged.  The
@@ -1288,8 +1329,7 @@ class SemiGrandSwap(SwapKernel):
 
         Returns:
             ``(proposed, 0, 0)`` where ``proposed`` is a dict with keys
-            ``{'positions_a', 'cell_a', 'types_a', 'energy_a',
-               'positions_b', 'cell_b', 'types_b', 'energy_b'}``.
+            ``{'positions_a', 'cell_a', 'types_a', 'energy_a', 'positions_b', 'cell_b', 'types_b', 'energy_b'}``.
             ``energy_a`` = ``state_a.energy + μ_A · N_A - μ_B · N_A``
             (= ``U_A - μ_B · N_A``).
             ``energy_b`` = ``state_b.energy + μ_B · N_B - μ_A · N_B``
@@ -1360,12 +1400,12 @@ class SemiGrandSwap(SwapKernel):
 
     def accept(
         self,
-        proposed: Any,
-        emax_a: jnp.ndarray,
-        emax_b: jnp.ndarray,
+        proposed: dict[str, Any],
+        emax_a: Float[Array, ""],
+        emax_b: Float[Array, ""],
         ensemble_params_a: Any,
         ensemble_params_b: Any,
-    ) -> jnp.ndarray:
+    ) -> Bool[Array, ""]:
         """Accept iff grand-canonical energies are below Emax on both sides.
 
         ``proposed['energy_a']`` and ``proposed['energy_b']`` are already the
@@ -1396,17 +1436,23 @@ class SemiGrandSwap(SwapKernel):
 
 
 def semi_grand_replica_exchange_step(
-    rng_key: jax.Array,
-    all_positions: jnp.ndarray,
-    all_types: jnp.ndarray,
-    all_energies: jnp.ndarray,
-    all_cells: jnp.ndarray | None,
-    all_emax: jnp.ndarray,
-    chemical_potentials: jnp.ndarray,
-    semi_grand_kernel: "SemiGrandSwap",
-    pressures: jnp.ndarray | None = None,
+    rng_key: Key[Array, ""],
+    all_positions: Float[Array, "R K N 3"],
+    all_types: Int[Array, "R K N"],
+    all_energies: Float[Array, "R K"],
+    all_cells: Float[Array, "R K 3 3"] | None,
+    all_emax: Float[Array, "R"],
+    chemical_potentials: Float[Array, "R n_species"],
+    semi_grand_kernel: SemiGrandSwap,
+    pressures: Float[Array, "R"] | None = None,
     n_swap_cycles: int = 1,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray | None, dict]:
+) -> tuple[
+    Float[Array, "R K N 3"],
+    Int[Array, "R K N"],
+    Float[Array, "R K"],
+    Float[Array, "R K 3 3"] | None,
+    dict,
+]:
     """Perform semi-grand (μVT/μPT) replica exchange across P parallel runs.
 
     Swaps chemical-potential *assignments* between pairs of runs.  Positions,

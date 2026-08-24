@@ -21,7 +21,6 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float, Int, Key
 
-from jaxrens.base import NSCallback
 from jaxrens.sampling.adaptation.manager import build_adapt_step
 from jaxrens.sampling.batch_descriptor import (
     PmapVmapRuns,
@@ -36,6 +35,7 @@ from jaxrens.sampling.moves.replica_exchange import (
     XRENSSwap,
 )
 from jaxrens.sampling.run_loop import (
+    NSCallback,
     _bump_cumulative_counters,
     _dispatch_callbacks,
     _gather_sharded_ns_state,
@@ -940,20 +940,22 @@ def _ns_state_to_result_dict(
     here as a small scalar / batched scalar for log lines and for
     interactive callers that just want the count.
     """
+    from jaxrens.io.formats import population_record
+
     pop = ns_state.population
     ep = pop.ensemble_params if hasattr(pop, "ensemble_params") else {}
     is_npt = isinstance(ep, dict) and "pressure" in ep
-    result = {
-        "positions": pop.positions,
-        "types": pop.types,
-        "energies": pop.energy,
-        "cells": pop.cell,
-        "log_evidence": ns_state.log_evidence,
-        "iteration": int(ns_state.iteration),
-        "n_dead": n_dead,
-        "n_walkers": ns_state.n_walkers,
-        "rng_key": ns_state.rng_key,
-    }
+    result = population_record(
+        pop.positions,
+        pop.types,
+        pop.energy,
+        pop.cell,
+        log_evidence=ns_state.log_evidence,
+        iteration=int(ns_state.iteration),
+        n_dead=n_dead,
+        n_walkers=ns_state.n_walkers,
+        rng_key=ns_state.rng_key,
+    )
     if is_npt:
         result["live_volumes"] = jax.vmap(get_volume)(pop.cell)
     else:
@@ -976,7 +978,7 @@ def run_ns(
     convergence_threshold: float = 0.1,
     initial_step_size: float = 0.1,
     target_acceptance: float = 0.5,
-    callbacks: list[Any] | None = None,
+    callbacks: list[NSCallback] | None = None,
     termination_criteria: list[TerminationCriterion] | None = None,
     ensemble_params: dict | None = None,
     per_move_fns: list[Callable] | None = None,
@@ -1019,7 +1021,11 @@ def run_ns(
             termination_criteria.append(IterationTermination(max_iterations))
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
-        raise ValueError("max_neighbors_list must be non-empty.")
+        raise ValueError(
+            "max_neighbors_list is empty. It is the neighbour-list capacity "
+            "ladder the run escalates through on overflow, so it needs at "
+            "least one entry, e.g. max_neighbors_list=[64, 96, 128]."
+        )
     starting_bucket = _choose_starting_bucket(
         initial_max_neighbor_counts,
         ladder,
@@ -1212,7 +1218,7 @@ def run_ns_parallel(
     restart_states: list | None = None,
     inter_re_config=None,
     backend=None,
-    callbacks: list | None = None,
+    callbacks: list[NSCallback] | None = None,
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
@@ -1274,7 +1280,11 @@ def run_ns_parallel(
 
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
-        raise ValueError("max_neighbors_list must be non-empty.")
+        raise ValueError(
+            "max_neighbors_list is empty. It is the neighbour-list capacity "
+            "ladder the run escalates through on overflow, so it needs at "
+            "least one entry, e.g. max_neighbors_list=[64, 96, 128]."
+        )
     starting_bucket = _choose_starting_bucket(
         initial_max_neighbor_counts,
         ladder,
@@ -1757,7 +1767,7 @@ def run_ns_multi_gpu(
     convergence_threshold: float = 0.1,
     initial_step_size: float = 0.1,
     target_acceptance: float = 0.5,
-    callbacks: list[Any] | None = None,
+    callbacks: list[NSCallback] | None = None,
     termination_criteria: list[TerminationCriterion] | None = None,
     ensemble_params_per_run: list[dict] | None = None,
     per_move_fns: list[Callable] | None = None,
@@ -1806,8 +1816,7 @@ def run_ns_multi_gpu(
             can identify the batch shape via ``info["_batcher"].is_batched``.
             ``log_evidence`` in the associated ``NSState`` has shape ``(G, P)``.
         termination_criteria: Optional.  Defaults to
-            ``[IterationTermination(max_iterations),
-               PriorMassTermination(n_walkers, convergence_threshold)]``.
+            ``[IterationTermination(max_iterations), PriorMassTermination(n_walkers, convergence_threshold)]``.
         ensemble_params_per_run: Flat list of ``G*P`` dicts, or ``None``.
         per_move_fns: Per-move step functions for bisection adaptation.
         move_descriptors: ``MoveKernel`` descriptors carrying rate bounds + max ss.
@@ -1834,9 +1843,17 @@ def run_ns_multi_gpu(
         callbacks = []
 
     if n_gpu < 1:
-        raise ValueError(f"n_gpu must be >= 1, got {n_gpu}")
+        raise ValueError(
+            f"n_gpu must be >= 1, got {n_gpu}. It is the number of devices "
+            f"to shard the walker population across; use 1 for a "
+            f"single-device run."
+        )
     if n_per_gpu < 1:
-        raise ValueError(f"n_per_gpu must be >= 1, got {n_per_gpu}")
+        raise ValueError(
+            f"n_per_gpu must be >= 1, got {n_per_gpu}. It is the number of "
+            f"independent NS runs placed on each device, so every device "
+            f"needs at least one."
+        )
     n_available = len(jax.devices())
     if n_gpu > n_available:
         raise ValueError(
@@ -1876,7 +1893,11 @@ def run_ns_multi_gpu(
 
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
-        raise ValueError("max_neighbors_list must be non-empty.")
+        raise ValueError(
+            "max_neighbors_list is empty. It is the neighbour-list capacity "
+            "ladder the run escalates through on overflow, so it needs at "
+            "least one entry, e.g. max_neighbors_list=[64, 96, 128]."
+        )
     logger.debug(
         "[stage] run_ns_multi_gpu: choose_starting_bucket "
         "(initial_max_neighbor_counts shape=%s, ladder=%s, offset=%d)",
@@ -2152,7 +2173,7 @@ def run_ns_sharded(
     convergence_threshold: float = 0.1,
     initial_step_size: float = 0.1,
     target_acceptance: float = 0.5,
-    callbacks: list[Any] | None = None,
+    callbacks: list[NSCallback] | None = None,
     termination_criteria: list[TerminationCriterion] | None = None,
     ensemble_params: dict | None = None,
     per_move_fns: list[Callable] | None = None,
@@ -2199,7 +2220,11 @@ def run_ns_sharded(
         callbacks = []
 
     if n_gpu < 1:
-        raise ValueError(f"n_gpu must be >= 1, got {n_gpu}")
+        raise ValueError(
+            f"n_gpu must be >= 1, got {n_gpu}. It is the number of devices "
+            f"to shard the walker population across; use 1 for a "
+            f"single-device run."
+        )
     n_available = len(jax.local_devices())
     if n_gpu > n_available:
         raise ValueError(
@@ -2238,7 +2263,11 @@ def run_ns_sharded(
 
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
-        raise ValueError("max_neighbors_list must be non-empty.")
+        raise ValueError(
+            "max_neighbors_list is empty. It is the neighbour-list capacity "
+            "ladder the run escalates through on overflow, so it needs at "
+            "least one entry, e.g. max_neighbors_list=[64, 96, 128]."
+        )
     starting_bucket = _choose_starting_bucket(
         initial_max_neighbor_counts,
         ladder,

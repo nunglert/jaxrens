@@ -5,7 +5,6 @@ displacing all atoms simultaneously has low acceptance.
 
 - build_kernel: move one random atom per step
 - build_sweep_kernel: sweep through all atoms sequentially via lax.scan
-- build_swap_kernel: swap species of two random atoms (multi-component)
 
 Single-walker functions, designed for pmap(vmap(vmap(...))) wrapping.
 """
@@ -17,7 +16,8 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from jaxrens.base import MoveInfo
+from jaxrens.sampling.base import MoveInfo
+from jaxrens.unvalidated import unvalidated
 
 
 def build_kernel(backend: Any):
@@ -68,6 +68,11 @@ def build_kernel(backend: Any):
     return step
 
 
+@unvalidated(
+    concern=("no production NS run has used this move."),
+    since="0.2.2",
+    clears_when=("Benchmark e.g. on LJ comparing with GMC/random walk"),
+)
 def build_sweep_kernel(backend: Any, n_atoms: int):
     """Build a single-atom sweep kernel.
 
@@ -142,60 +147,6 @@ def build_sweep_kernel(backend: Any, n_atoms: int):
             accepted=n_accepted > 0,
             log_likelihood=-new_state.energy,
             n_evaluations=n_atoms,
-        )
-
-        return new_state, info
-
-    return step
-
-
-def build_swap_kernel(backend: Any):
-    """Build a single-atom species swap kernel.
-
-    Selects two atoms of different species and swaps their types.
-
-    Args:
-        backend: EnergyBackend instance.
-
-    Returns:
-        step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
-    """
-
-    def step(rng_key, state, likelihood_constraint):
-        key_a, key_b = jax.random.split(rng_key)
-
-        n_atoms = state.positions.shape[0]
-        idx_a = jax.random.randint(key_a, (), 0, n_atoms)
-        idx_b = jax.random.randint(key_b, (), 0, n_atoms)
-
-        type_a = state.types[idx_a]
-        type_b = state.types[idx_b]
-        new_types = state.types.at[idx_a].set(type_b).at[idx_b].set(type_a)
-
-        result = backend(
-            state.positions,
-            new_types,
-            state.cell,
-            state.max_neighbors,
-            ensemble_params=state.ensemble_params,
-        )
-
-        different_species = type_a != type_b
-        accepted = (result.energy < likelihood_constraint) & different_species
-
-        new_state = state.set(
-            types=jnp.where(accepted, new_types, state.types),
-            energy=jnp.where(accepted, result.energy, state.energy),
-            max_neighbor_count=jnp.maximum(
-                state.max_neighbor_count, result.max_neighbor_count
-            ),
-            overflow=state.overflow | result.overflow,
-        )
-
-        info = MoveInfo(
-            accepted=accepted,
-            log_likelihood=-new_state.energy,
-            n_evaluations=1,
         )
 
         return new_state, info

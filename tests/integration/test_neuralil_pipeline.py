@@ -9,7 +9,7 @@ build, model-pickle load, the resolver's pre-NS energy eval, the bucketed
 Skipped when:
 
 * ``neuralil`` is not importable.
-* The ``tests/fixtures/neuralil_tiny`` model pickle is missing.
+* The ``tests/_assets/models/neuralil_tiny`` model pickle is missing.
 
 Sized for the integration tier: two-pressure multi-run (``[0.0, 1.0]`` GPa)
 routed through ``run_multi_gpu_from_config``; CPU-runnable (pmap-on-one-device
@@ -34,8 +34,12 @@ import yaml
 
 from . import multi_gpu_n_devices
 
-
-_FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "neuralil_tiny"
+_FIXTURE = (
+    Path(__file__).resolve().parent.parent
+    / "_assets"
+    / "models"
+    / "neuralil_tiny"
+)
 _MODEL_PKL = _FIXTURE / "model.pkl"
 
 
@@ -139,12 +143,10 @@ def test_neuralil_full_pipeline(tmp_path: Path) -> None:
     """
     pytest.importorskip("neuralil")
 
-    from jaxrens.cli.resolve import (
-        resolve,
-    )
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
+    from jaxrens.cli.resolve import resolve
     from jaxrens.cli.run import run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
 
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["backend"]["checkpoint_path"] = str(_MODEL_PKL)
@@ -154,9 +156,9 @@ def test_neuralil_full_pipeline(tmp_path: Path) -> None:
     resolved = resolve(root)
 
     # Two-pressure list → multi-run dispatcher.
-    assert isinstance(resolved.batcher, PmapVmapRuns), (
-        "Two-pressure config should route through the multi-GPU dispatcher."
-    )
+    assert isinstance(
+        resolved.batcher, PmapVmapRuns
+    ), "Two-pressure config should route through the multi-GPU dispatcher."
 
     run_multi_gpu_from_config(resolved)
 
@@ -170,12 +172,12 @@ def test_neuralil_full_pipeline(tmp_path: Path) -> None:
     for r in range(n_total):
         energies_path = out / f"neuralil_smoke.run{r:02d}.energies"
         traj_path = out / f"neuralil_smoke.run{r:02d}.traj.extxyz"
-        assert energies_path.exists(), (
-            f"missing per-replica energy log: {energies_path}"
-        )
-        assert traj_path.exists(), (
-            f"missing per-replica trajectory: {traj_path}"
-        )
+        assert (
+            energies_path.exists()
+        ), f"missing per-replica energy log: {energies_path}"
+        assert (
+            traj_path.exists()
+        ), f"missing per-replica trajectory: {traj_path}"
         log = EnergyLogger.read(energies_path)
         assert log.energies.shape == (5,), (
             f"{energies_path.name}: expected 5 data entries, "
@@ -199,7 +201,11 @@ def test_neuralil_full_pipeline(tmp_path: Path) -> None:
     # Live walkers retained their (G, P, n_walkers, n_atoms, 3) layout.
     saved_positions = np.asarray(state["positions"])
     assert saved_positions.shape == (
-        resolved.ns.n_gpu, resolved.ns.n_per_gpu, 4, 8, 3,
+        resolved.ns.n_gpu,
+        resolved.ns.n_per_gpu,
+        4,
+        8,
+        3,
     )
 
 
@@ -305,12 +311,10 @@ def test_neuralil_multi_gpu_pipeline(tmp_path: Path) -> None:
     """
     pytest.importorskip("neuralil")
 
-    from jaxrens.cli.resolve import (
-        resolve,
-    )
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
+    from jaxrens.cli.resolve import resolve
     from jaxrens.cli.run import run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
 
     n_gpu = multi_gpu_n_devices()
     n_total = n_gpu * 2
@@ -497,9 +501,9 @@ def test_neuralil_sharded_multi_gpu_pipeline(tmp_path: Path) -> None:
     assert traj_path.exists(), f"missing trajectory: {traj_path}"
 
     log = EnergyLogger.read(energies_path)
-    assert log.energies.shape == (5,), (
-        f"expected 5 dead-point energies, got {log.energies.shape}"
-    )
+    assert log.energies.shape == (
+        5,
+    ), f"expected 5 dead-point energies, got {log.energies.shape}"
 
     # Dead-point trajectory: one frame per iteration, each the full 8-atom
     # gathered walker.  Before the sharded dead_walker fix this write crashed
@@ -520,10 +524,14 @@ def test_neuralil_sharded_multi_gpu_pipeline(tmp_path: Path) -> None:
 
     state = load_checkpoint(final_ckpt)
     log_z = np.asarray(state["log_evidence"])
-    assert log_z.size == 1, f"expected scalar log_evidence, got shape {log_z.shape}"
+    assert (
+        log_z.size == 1
+    ), f"expected scalar log_evidence, got shape {log_z.shape}"
     assert np.all(np.isfinite(log_z)), f"log_evidence not finite: {log_z}"
 
     saved_positions = np.asarray(state["positions"])
-    assert saved_positions.shape == (8, 8, 3), (
-        f"expected gathered (K=8, n_atoms=8, 3), got {saved_positions.shape}"
-    )
+    assert saved_positions.shape == (
+        8,
+        8,
+        3,
+    ), f"expected gathered (K=8, n_atoms=8, 3), got {saved_positions.shape}"

@@ -56,6 +56,17 @@ docs = [
     "plotly>=5.20",
 ]
 
+# Torch-side tooling to convert a Torch MACE model into a JAX bundle.
+# Only needed at convert time; the runtime MACE backend is torch-free.
+mace-convert = [
+    "jaxrens[mace]",
+    "mace-torch>=0.3.16",   # provides the `mace` module the converter imports
+]
+
+# Every optional backend plus the torch->JAX MACE conversion tooling, in one
+# install.  Excludes the contributor-only ``dev`` / ``docs`` extras.
+all = ["jaxrens[neuralil,mace,nequix,jaxmd,mace-convert]"]
+
 [project.scripts]
 jaxrens = "jaxrens.cli.cli:main"
 
@@ -72,6 +83,13 @@ fallback_version = "0.0.0"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-m 'not heavy and not mace and not neuralil and not nequix and not jaxmd and not multi_gpu' --jaxtyping-packages=jaxrens.state,jaxrens.sampling,beartype.beartype"
+# Unvalidated-feature markers (jaxrens.unvalidated) fire whenever a test
+# exercises a marked path, which unit tests do constantly -- and a passing
+# unit test does NOT clear the marker, since the marker is about production
+# runs.  Silence the category suite-wide; markers are cleared by hand.
+filterwarnings = [
+    "ignore::jaxrens.unvalidated.UnvalidatedFeatureWarning",
+]
 markers = [
     "heavy: marks tests as heavy/slow (run with '-m heavy' or '-m \"\"' to include)",
     "gpu: marks tests requiring GPU",
@@ -80,4 +98,6 @@ markers = [
     "neuralil: marks tests that exercise the NeuralIL backend; opt-in only via '-m neuralil' (needs neuralil)",
     "nequix: marks tests that exercise the nequix backend; opt-in only via '-m nequix' (needs nequix package + bundled or path-loaded model)",
     "jaxmd: marks tests that exercise the jax-md backend (Tersoff/EAM); opt-in only via '-m jaxmd' (needs jax-md package)",
+    "lj: marks tests that exercise the built-in Lennard-Jones backend (no optional dependency; runs by default)",
+    "lj: marks tests that exercise the built-in Lennard-Jones backend (no optional dependency; runs by default)",
 ]

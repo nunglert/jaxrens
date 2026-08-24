@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -51,7 +52,14 @@ try:
     from mace_jax.tools.bundle import load_model_bundle
 
     _MACE_JAX_AVAILABLE = True
-except ImportError as exc:
+# OSError, not just ImportError: an optional backend can install cleanly
+# and still fail to load at import time when a native library is missing
+# (mace-jax dlopens libcue_ops.so, which needs libcuda.so.1).  Catching
+# only ImportError lets that escape and take down every importer of this
+# module -- including the default test suite, which deselects the backend
+# but still collects it.  Anything else still propagates, so a real bug in
+# the backend is not silently downgraded to "unavailable".
+except (ImportError, OSError) as exc:
     _MACE_IMPORT_ERROR = str(exc)
 
 
@@ -276,10 +284,23 @@ def create_mace(
     supercell_trafo: tuple[int, int, int] = (2, 2, 2),
     **kwargs: Any,
 ) -> MACEBackend:
-    """Create a MACE-JAX energy backend from a model bundle.
+    """Create a MACE-JAX energy backend from any supported model file.
 
-    Loads a pre-trained MACE model from a bundle directory
-    (config.json + params.msgpack) or a .ckpt checkpoint file.
+    Single front door for every on-disk shape a converted MACE model can take.
+    Dispatches by path so callers (and the YAML ``checkpoint_path``) never have
+    to know which container they hold:
+
+    - ``.pkl`` — a ``{graphdef, state, ...}`` pickle (see
+      :func:`create_mace_from_pickle`); the only shape that stores the split
+      module directly rather than config + msgpack params.
+    - everything else — handed to mace-jax's ``load_model_bundle``, which
+      already accepts a **bundle directory** (``config.json`` +
+      ``params.msgpack``), a loose ``config.json`` / ``params.msgpack`` pair
+      (pass either file), a ``.ckpt`` orbax checkpoint, and the
+      ``mace-jax-from-torch`` output (a msgpack blob named ``<name>-jax.npz``
+      with a sibling ``<name>-jax.json``; pass the ``.npz``).  Note the
+      converter's ``.npz`` is msgpack, not a numpy archive, and only resolves
+      when its same-stem ``.json`` sits next to it.
 
     The backend always runs in float32.  mace-jax's bundle loader toggles
     ``jax_enable_x64`` based on the ``dtype`` passed to ``load_model_bundle``;
@@ -287,7 +308,9 @@ def create_mace(
     are all float32 by construction) doesn't get silently promoted.
 
     Args:
-        model_path: Path to model bundle directory or checkpoint file.
+        model_path: Path to a model bundle directory, ``config.json`` /
+            ``params.msgpack`` / ``.npz`` params file, ``.ckpt`` checkpoint, or
+            ``.pkl`` graphdef+state pickle.
         supercell_trafo: (sc_a, sc_b, sc_c) supercell expansion for
             neighbor finding. Must satisfy min(cell_diag * sc) >= 2 * r_cutoff.
 
@@ -297,7 +320,19 @@ def create_mace(
     _require_mace()
 
     if model_path is None:
-        raise ValueError("model_path is required for the MACE backend.")
+        raise ValueError(
+            "model_path is required for the MACE backend. Point it at a "
+            "converted JAX bundle directory or a .pkl produced by the "
+            "torch->JAX converter (see the mace-convert extra)."
+        )
+
+    # The .pkl shape stores graphdef+state directly and can't go through
+    # load_model_bundle (which rebuilds the module from a config); route it
+    # to the pickle loader so YAML ``checkpoint_path`` accepts it too.
+    if Path(model_path).suffix == ".pkl":
+        return create_mace_from_pickle(
+            model_path, supercell_trafo=supercell_trafo
+        )
 
     bundle = load_model_bundle(model_path, dtype="float32")
 
@@ -342,7 +377,10 @@ def create_mace_from_pickle(
     """Create a MACE backend from a pickle file with graphdef + state.
 
     This is the simplest loading path — avoids config serialization issues.
-    Use save_mace_test_fixture.py to generate the pickle.
+    Use save_mace_test_fixture.py to generate the pickle.  :func:`create_mace`
+    dispatches ``.pkl`` paths here, so a pickle also works from the YAML
+    ``checkpoint_path``; call this directly only when you already know the
+    format.
 
     Args:
         pickle_path: Path to model_bundle.pkl.

@@ -13,7 +13,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from jaxrens.base import MoveInfo
+from jaxrens.sampling.base import MoveInfo
 
 
 def build_kernel(backend: Any):

@@ -23,6 +23,8 @@ import pytest
 
 from jaxrens.backends.neuralil import _NEURALIL_IMPORT_ERROR, is_available
 
+pytestmark = pytest.mark.neuralil
+
 neuralil_required = pytest.mark.skipif(
     not is_available(),
     reason=f"NeuralIL not installed: {_NEURALIL_IMPORT_ERROR}",

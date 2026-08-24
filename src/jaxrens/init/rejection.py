@@ -12,6 +12,7 @@ from typing import Callable, Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from jaxrens.init.positions import (
     grid_positions_in_cell,
@@ -62,10 +63,16 @@ def _check_min_distance(
 # JIT-compiled inner check
 # ---------------------------------------------------------------------------
 
-_REJECT_OK = jnp.int32(0)
-_REJECT_ENERGY = jnp.int32(1)
-_REJECT_NAN = jnp.int32(2)
-_REJECT_CLOSE = jnp.int32(3)
+# NumPy (not jnp) scalars: a module-level ``jnp.int32(0)`` executes a JAX op
+# at import time, bringing up a backend — including a CUDA probe that errors on
+# GPU-less nodes — before ``_jax_init`` has finished its XLA-flag setup, and
+# even for import-only consumers that set ``JAXRENS_SKIP_RUNTIME_CHECKS=1``.
+# ``np.int32`` carries the same dtype into the ``jnp.where`` chain below
+# without touching a device.  Same rationale as ``MoveInfo``'s defaults.
+_REJECT_OK = np.int32(0)
+_REJECT_ENERGY = np.int32(1)
+_REJECT_NAN = np.int32(2)
+_REJECT_CLOSE = np.int32(3)
 
 
 @partial(jax.jit, static_argnames=("energy_fn",))

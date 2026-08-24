@@ -214,18 +214,36 @@ def _check_initial_constraints(
     """
     positions = jnp.asarray(resolved_init.initial_positions)
     types = jnp.asarray(resolved_init.initial_types)
-    n_live = int(positions.shape[0])
+    # The multi-replica path stacks walkers as ``(n_total, K, n_atoms, 3)``
+    # while the single-replica path is already ``(n_live, n_atoms, 3)``.
+    # Collapse any leading replica/live axes into one flat walker axis so a
+    # single vmap feeds the predicate per-walker ``(n_atoms, 3)`` / ``(3, 3)``
+    # arrays in both layouts (otherwise the cell stays batched and
+    # ``pairwise_distances`` fails to broadcast).  ``types`` carries the same
+    # leading axes (batched ``(n_total, K, n_atoms)`` / ``(n_live, n_atoms)``
+    # since the ResolvedInit types contract became per-walker) and must be
+    # flattened the same way, or vmap sees mismatched mapped-axis sizes.
+    n_atoms = positions.shape[-2]
+    positions = positions.reshape(-1, n_atoms, 3)
+    types = types.reshape(-1, n_atoms)
+    n_walkers = int(positions.shape[0])
     cells = resolved_init.initial_cells
-    cells = jnp.zeros((n_live, 3, 3)) if cells is None else jnp.asarray(cells)
+    cells = (
+        jnp.zeros((n_walkers, 3, 3))
+        if cells is None
+        else jnp.asarray(cells).reshape(n_walkers, 3, 3)
+    )
 
     for desc in descriptors:
         predicate = desc.build(**desc.build_kwargs)
-        valid = jax.vmap(lambda p, t, c: predicate(p, t, c))(positions, types, cells)
+        valid = jax.vmap(lambda p, t, c: predicate(p, t, c))(
+            positions, types, cells
+        )
         valid = np.asarray(valid)
         if not valid.all():
             bad = int(np.argmax(~valid))
             raise ValueError(
-                f"Initial walker {bad} of {n_live} violates the "
+                f"Initial walker {bad} of {n_walkers} violates the "
                 f"{desc.name!r} configuration constraint. Adjust the initial "
                 f"configuration (e.g. start_species / start_config_file) or "
                 f"relax the constraint before running."
@@ -451,7 +469,7 @@ def _compute_initial_energies(
 
         def per_replica(pos_K, types_K, cells_K):
             return jax.vmap(
-                lambda p, t, c: energy_backend(p, t, c, bucket)[0]
+                lambda p, t, c: energy_backend(p, t, c, bucket).energy
             )(pos_K, types_K, cells_K)
 
         return batcher.wrap_for_batch(per_replica)(positions, types, cells)
@@ -902,6 +920,7 @@ def _resolve_init_species(
             n_atoms=n_atoms,
             max_volume_per_atom=cell_cfg.max_volume_per_atom,
             flat_V_prior=cell_cfg.flat_V_prior,
+            min_volume_per_atom=cell_cfg.effective_initial_min_volume_per_atom,
         )
     )
     cubic_cell = jnp.eye(3, dtype=jnp.float32) * lc
@@ -949,7 +968,9 @@ def _resolve_init_species(
             energy_backend,
         )
 
-    initial_types_broadcast = jnp.broadcast_to(initial_types[None], (n_live, n_atoms))
+    initial_types_broadcast = jnp.broadcast_to(
+        initial_types[None], (n_live, n_atoms)
+    )
 
     # Energies and neighbor counts are computed once at the correct
     # bucket size by the caller via ``_finalise_initial_energies_and_counts``
@@ -1022,8 +1043,9 @@ def _resolve_init_config_file(
             energy_backend,
         )
 
-
-    initial_types_broadcast = jnp.broadcast_to(types_single[None], (n_live, n_atoms))
+    initial_types_broadcast = jnp.broadcast_to(
+        types_single[None], (n_live, n_atoms)
+    )
 
     return ResolvedInit(
         initial_positions=initial_positions,
@@ -1220,9 +1242,6 @@ def _resolve_single_replica(
         collision_check_interval=int(root.output.collision_check_interval),
         wrap_atoms=bool(root.output.wrap_atoms),
         snapshot_clean=bool(root.output.snapshot_clean),
-        write_uncertainty=bool(root.output.write_uncertainty),
-        write_force_uncertainty=bool(root.output.write_force_uncertainty),
-        uncertainty_in_place=bool(root.output.uncertainty_in_place),
     )
 
     # Build termination criteria.  ``IterationTermination`` is only added
@@ -1285,7 +1304,11 @@ def _resolve_single_replica(
     moves = tuple(m.to_move_config() for m in root.moves)
     move_descriptors = tuple(
         _dc.replace(
-            m.to_descriptor(n_atoms=n_atoms, cell_cfg=root.cell),
+            m.to_descriptor(
+                n_atoms=n_atoms,
+                cell_cfg=root.cell,
+                symbol_map=resolved_init.symbol_map,
+            ),
             min_rate=policy.min_rate,
             max_rate=policy.max_rate,
             step_size_max=policy.step_size_max,
@@ -1638,9 +1661,7 @@ def _resolve_multi_replica(
         else None
     )
     # This allows for varying types across replicas.
-    initial_types = jnp.stack(
-        [x.initial_types for x in per_run_init], axis=0
-    )
+    initial_types = jnp.stack([x.initial_types for x in per_run_init], axis=0)
 
     # --- Consolidated finalize on stacked (G, P, K, ...) arrays -----------
     # Reshape (n_total, K, ...) → (G, P, K, ...) and run a single
@@ -1784,9 +1805,6 @@ def _resolve_multi_replica(
         collision_check_interval=int(root.output.collision_check_interval),
         wrap_atoms=bool(root.output.wrap_atoms),
         snapshot_clean=bool(root.output.snapshot_clean),
-        write_uncertainty=bool(root.output.write_uncertainty),
-        write_force_uncertainty=bool(root.output.write_force_uncertainty),
-        uncertainty_in_place=bool(root.output.uncertainty_in_place),
     )
 
     # Same termination logic as the single-run path: default to PriorMass
@@ -1815,7 +1833,11 @@ def _resolve_multi_replica(
     moves = tuple(m.to_move_config() for m in root.moves)
     move_descriptors = tuple(
         _dc.replace(
-            m.to_descriptor(n_atoms=n_atoms, cell_cfg=root.cell),
+            m.to_descriptor(
+                n_atoms=n_atoms,
+                cell_cfg=root.cell,
+                symbol_map=stacked_init.symbol_map,
+            ),
             min_rate=policy.min_rate,
             max_rate=policy.max_rate,
             step_size_max=policy.step_size_max,

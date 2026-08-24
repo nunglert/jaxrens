@@ -1,6 +1,6 @@
 """``jaxrens plot <file>`` — produce a PNG from a single artefact.
 
-Dispatches by filename suffix:
+Dispatches by filename suffix::
 
     *.adaptation.h5    → 2-panel step-size + acceptance-rate plot
                          (mean ± std across replicas).
@@ -128,7 +128,9 @@ def plot_max_neighbors_file(input_path: Path, output_path: Path) -> Path:
     axes[0].grid(alpha=0.3)
     plot_max_neighbors(trace, ax=axes[1], kind="heatmap", show_bucket=True)
     axes[1].set_title("density heatmap (log-count)", fontsize=10)
-    fig.suptitle(f"neighbor-bucket diagnostics · {input_path.name}", fontsize=10)
+    fig.suptitle(
+        f"neighbor-bucket diagnostics · {input_path.name}", fontsize=10
+    )
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=120)

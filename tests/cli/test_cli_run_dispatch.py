@@ -15,8 +15,7 @@ import pytest
 
 from jaxrens.cli.cli import main
 
-
-_DATA = Path(__file__).parent.parent / "data" / "cli"
+_DATA = Path(__file__).parent.parent / "_assets" / "data" / "cli"
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +28,7 @@ def single_device(monkeypatch):
     """Force ``_local_device_count`` → 1 so minimal.yaml resolves to SingleRun
     regardless of the host's actual GPU count."""
     from jaxrens.cli import resolve as _r
+
     monkeypatch.setattr(_r, "_local_device_count", lambda: 1)
 
 
@@ -50,16 +50,20 @@ def stub_orchestrators(monkeypatch):
     def _stub(label):
         def _f(*args, **kwargs):
             calls[label].append((args, kwargs))
+
         return _f
 
     monkeypatch.setattr(
-        "jaxrens.cli.cli._run_single", _stub("single"),
+        "jaxrens.cli.cli._run_single",
+        _stub("single"),
     )
     monkeypatch.setattr(
-        "jaxrens.cli.run.run_sharded_from_config", _stub("sharded"),
+        "jaxrens.cli.run.run_sharded_from_config",
+        _stub("sharded"),
     )
     monkeypatch.setattr(
-        "jaxrens.cli.run.run_multi_gpu_from_config", _stub("multi_gpu"),
+        "jaxrens.cli.run.run_multi_gpu_from_config",
+        _stub("multi_gpu"),
     )
     return calls
 
@@ -79,10 +83,13 @@ def _write_minimal_yaml(path: Path, working_dir: Path, **extras) -> Path:
     ``init={"restart_file": "..."}`` etc.
     """
     import yaml as _yaml
+
     cfg = {
         "run": {
-            "n_live": 8, "max_iterations": 5,
-            "n_mcmc_steps": 2, "seed": 0,
+            "n_live": 8,
+            "max_iterations": 5,
+            "n_mcmc_steps": 2,
+            "seed": 0,
         },
         "moves": [{"type": "random_walk", "step_size": 0.3}],
         "backend": {"type": "harmonic"},
@@ -109,10 +116,14 @@ class TestRestartConflictGuards:
     All three are caught before any I/O and return exit code 2."""
 
     def test_force_and_resume_conflict(
-        self, fresh_workdir, single_device, capsys,
+        self,
+        fresh_workdir,
+        single_device,
+        capsys,
     ):
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml", fresh_workdir / "out",
+            fresh_workdir / "cfg.yaml",
+            fresh_workdir / "out",
         )
         with pytest.raises(SystemExit) as exc_info:
             main(["run", "-c", str(cfg), "--force", "--resume"])
@@ -121,10 +132,14 @@ class TestRestartConflictGuards:
         assert "--force and --resume" in err
 
     def test_force_and_restart_file_conflict(
-        self, fresh_workdir, single_device, capsys,
+        self,
+        fresh_workdir,
+        single_device,
+        capsys,
     ):
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml", fresh_workdir / "out",
+            fresh_workdir / "cfg.yaml",
+            fresh_workdir / "out",
             init={"restart_file": str(fresh_workdir / "fake.h5")},
         )
         with pytest.raises(SystemExit) as exc_info:
@@ -134,10 +149,14 @@ class TestRestartConflictGuards:
         assert "--force is incompatible with init.restart_file" in err
 
     def test_resume_and_restart_file_conflict(
-        self, fresh_workdir, single_device, capsys,
+        self,
+        fresh_workdir,
+        single_device,
+        capsys,
     ):
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml", fresh_workdir / "out",
+            fresh_workdir / "cfg.yaml",
+            fresh_workdir / "out",
             init={"restart_file": str(fresh_workdir / "fake.h5")},
         )
         with pytest.raises(SystemExit) as exc_info:
@@ -157,10 +176,14 @@ class TestRunDispatch:
     ``resolved.batcher`` — verify each branch reaches the right stub."""
 
     def test_single_run_dispatch(
-        self, fresh_workdir, single_device, stub_orchestrators,
+        self,
+        fresh_workdir,
+        single_device,
+        stub_orchestrators,
     ):
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml", fresh_workdir / "out",
+            fresh_workdir / "cfg.yaml",
+            fresh_workdir / "out",
         )
         with pytest.raises(SystemExit) as exc_info:
             main(["run", "-c", str(cfg)])
@@ -170,7 +193,10 @@ class TestRunDispatch:
         assert len(stub_orchestrators["multi_gpu"]) == 0
 
     def test_multi_replica_dispatch(
-        self, fresh_workdir, single_device, stub_orchestrators,
+        self,
+        fresh_workdir,
+        single_device,
+        stub_orchestrators,
     ):
         """NPT pressure list of length 2 with ``_local_device_count → 1``
         → PmapVmapRuns(n_gpu=1, n_per_gpu=2) → ``run_multi_gpu_from_config``.
@@ -180,7 +206,8 @@ class TestRunDispatch:
         Same pattern as ``test_multi_run.py::TestRunMultiGpuFromConfig``.
         """
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml", fresh_workdir / "out",
+            fresh_workdir / "cfg.yaml",
+            fresh_workdir / "out",
             ensemble={"type": "npt", "pressure": [0.01, 0.02]},
         )
         with pytest.raises(SystemExit) as exc_info:
@@ -191,20 +218,29 @@ class TestRunDispatch:
         assert len(stub_orchestrators["sharded"]) == 0
 
     def test_sharded_single_dispatch(
-        self, fresh_workdir, single_device, stub_orchestrators,
+        self,
+        fresh_workdir,
+        single_device,
+        stub_orchestrators,
     ):
         """``run.shard_n_gpu=2`` (with the resolver's single-replica
         initial-energy compute pinned to ``batcher=SingleRun()``) →
         ShardedSingleRun → ``run_sharded_from_config``.  Stubbed
         orchestrator means no actual sharded pmap runs."""
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml", fresh_workdir / "out",
+            fresh_workdir / "cfg.yaml",
+            fresh_workdir / "out",
         )
         with pytest.raises(SystemExit) as exc_info:
-            main([
-                "run", "-c", str(cfg),
-                "--set", "run.shard_n_gpu=2",
-            ])
+            main(
+                [
+                    "run",
+                    "-c",
+                    str(cfg),
+                    "--set",
+                    "run.shard_n_gpu=2",
+                ]
+            )
         assert exc_info.value.code == 0
         assert len(stub_orchestrators["sharded"]) == 1
         assert len(stub_orchestrators["single"]) == 0
@@ -223,9 +259,11 @@ class TestAssertNGpus:
     def test_mismatch_returns_2(self, fresh_workdir, monkeypatch, capsys):
         # Pretend JAX only sees 1 device, while the user asserted 4.
         import jax
+
         monkeypatch.setattr(jax, "local_devices", lambda: [object()])
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml", fresh_workdir / "out",
+            fresh_workdir / "cfg.yaml",
+            fresh_workdir / "out",
         )
         with pytest.raises(SystemExit) as exc_info:
             main(["run", "-c", str(cfg), "--n-gpus", "4"])
@@ -235,13 +273,18 @@ class TestAssertNGpus:
         assert "SLURM" in err  # diagnostic text mentions SLURM
 
     def test_match_proceeds(
-        self, fresh_workdir, single_device, stub_orchestrators,
+        self,
+        fresh_workdir,
+        single_device,
+        stub_orchestrators,
         monkeypatch,
     ):
         import jax
+
         monkeypatch.setattr(jax, "local_devices", lambda: [object()])
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml", fresh_workdir / "out",
+            fresh_workdir / "cfg.yaml",
+            fresh_workdir / "out",
         )
         with pytest.raises(SystemExit) as exc_info:
             main(["run", "-c", str(cfg), "--n-gpus", "1"])

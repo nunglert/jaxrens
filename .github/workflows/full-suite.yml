@@ -27,12 +27,19 @@ jobs:
       - name: pytest tests -n 4 (full suite, coverage)
         # ``--gpus all`` exposes all 4 T4s; tests/conftest.py pins each xdist
         # worker (gw0..gw3) to a distinct GPU before JAX is imported.
+        #
+        # ``--require-backends=all`` turns a missing optional backend into a
+        # hard failure instead of a skip.  Dockerfile.ci installs all four
+        # extras, so any of them being unimportable here means the image built
+        # wrong -- and without this flag those tests would simply be skipped
+        # and the run would still exit 0.
         run: |
           docker run --rm --gpus all \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             jaxrens-ci:${{ github.sha }} \
             pytest tests -n 4 -v --tb=short -m "not multi_gpu" -o addopts="" \
+              --require-backends=all \
               --cov=jaxrens \
               --cov-branch \
               --cov-report=term-missing \

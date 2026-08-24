@@ -113,7 +113,11 @@ class BucketManager:
     ) -> None:
         self.ladder = tuple(int(x) for x in ladder)
         if not self.ladder:
-            raise ValueError("ladder must be non-empty.")
+            raise ValueError(
+                "BucketManager ladder is empty. It holds the max_neighbors "
+                "capacities the run escalates through on overflow, so it "
+                "needs at least one entry (e.g. (64, 96, 128))."
+            )
         self.offset = int(offset)
         self.shrink_dwell = int(shrink_dwell)
         if self.shrink_dwell < 0:
@@ -152,12 +156,19 @@ class BucketManager:
 
         true_max = int(new_ns_state.population.max_neighbor_count.max())
         current = int(ns_state.population.max_neighbors)
-        new_max = _pick_next_bucket(true_max, current, self.ladder, self.offset)
+        new_max = _pick_next_bucket(
+            true_max, current, self.ladder, self.offset
+        )
         logger.warning(
             "Overflow at %s %d: observed max_neighbors=%d, "
             "resizing bucket %d -> %d (ladder=%s, offset=%d)",
-            label, iteration, true_max, current, new_max,
-            list(self.ladder), self.offset,
+            label,
+            iteration,
+            true_max,
+            current,
+            new_max,
+            list(self.ladder),
+            self.offset,
         )
         # Growing invalidates any pending shrink streak.
         self.low_count = 0
@@ -192,7 +203,10 @@ class BucketManager:
         obs_max = int(ns_state.population.max_neighbor_count.max())
         current = int(ns_state.population.max_neighbors)
         smaller = _pick_prev_bucket(
-            obs_max, current, self.ladder, self.offset,
+            obs_max,
+            current,
+            self.ladder,
+            self.offset,
         )
         if smaller is None:
             self.low_count = 0
@@ -205,8 +219,13 @@ class BucketManager:
         logger.info(
             "Shrinking bucket at iter %d: observed max_neighbors=%d, "
             "resizing bucket %d -> %d (ladder=%s, offset=%d, dwell=%d)",
-            iteration, obs_max, current, smaller,
-            list(self.ladder), self.offset, self.shrink_dwell,
+            iteration,
+            obs_max,
+            current,
+            smaller,
+            list(self.ladder),
+            self.offset,
+            self.shrink_dwell,
         )
         self.low_count = 0
         return ns_state.set(

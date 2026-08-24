@@ -1,7 +1,7 @@
 # bench/configs/mace.yaml — ns_step bench, MACE-MP-Small Si16 NPT.
 #
 # Heavy backend.  Skipped if `mace_jax` is missing or
-# `tests/fixtures/mace_mp_small/` is absent.
+# `tests/_assets/models/mace_mp_small/` is absent.
 
 run:
   n_live: 32
@@ -13,7 +13,7 @@ run:
 backend:
   type: mace
   # Path is resolved against CWD; bench is run from repo root.
-  checkpoint_path: tests/fixtures/mace_mp_small
+  checkpoint_path: tests/_assets/models/mace_mp_small
   supercell_trafo: [3, 3, 3]
   periodic: true
   max_neighbors_list: [35, 50, 65, 70, 85, 100]

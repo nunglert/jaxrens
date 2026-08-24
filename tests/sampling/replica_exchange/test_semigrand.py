@@ -76,7 +76,7 @@ class TestSemiGrandProposeConvention:
           Ω_B_new = U_B - μ_A · N_B = 5.0 - (0.0·1 + 0.0·2) = 5.0
         """
         kernel = SemiGrandSwap(n_species=2)
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
 
         mu_a = [0.0, 0.0]
         mu_b = [0.5, 1.0]
@@ -106,7 +106,7 @@ class TestSemiGrandProposeConvention:
     def test_no_backend_calls(self):
         """propose() must return (proposed, 0, 0) — zero energy/grad evals."""
         kernel = SemiGrandSwap(n_species=2)
-        key = jax.random.PRNGKey(1)
+        key = jax.random.key(1)
 
         types_a = jnp.zeros(4, dtype=jnp.int32)
         types_b = jnp.ones(4, dtype=jnp.int32)
@@ -122,7 +122,7 @@ class TestSemiGrandProposeConvention:
     def test_positions_and_types_unchanged(self):
         """Positions and types in proposed must match originals."""
         kernel = SemiGrandSwap(n_species=2)
-        key = jax.random.PRNGKey(2)
+        key = jax.random.key(2)
 
         pos_a = jax.random.normal(key, (3, 3))
         pos_b = jax.random.normal(key, (3, 3)) + 1.0
@@ -165,7 +165,7 @@ class TestSemiGrandProposeConvention:
             kernel: state.energy_A + μ_A·N_A - μ_B·N_A = -1.0 + 4.0 - 0 = 3.0
         """
         kernel = SemiGrandSwap(n_species=2)
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
 
         mu_a = [1.0, 2.0]
         mu_b = [0.0, 0.0]
@@ -195,7 +195,7 @@ class TestSemiGrandProposeConvention:
     def test_symmetric_zero_mu(self):
         """With μ_A = μ_B = 0, propose returns Ω = U (unchanged energies)."""
         kernel = SemiGrandSwap(n_species=2)
-        key = jax.random.PRNGKey(3)
+        key = jax.random.key(3)
 
         types_a = jnp.array([0, 1, 0], dtype=jnp.int32)
         types_b = jnp.array([1, 0, 1], dtype=jnp.int32)
@@ -299,7 +299,7 @@ class TestSemiGrandNSpeciesMismatch:
     def test_propose_width_mismatch_raises(self):
         """Passing a 2-element μ to SemiGrandSwap(n_species=3) must raise ValueError."""
         kernel = SemiGrandSwap(n_species=3)
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         types = jnp.zeros(4, dtype=jnp.int32)
         sa = _state(jnp.zeros((4, 3)), types, jnp.array(1.0))
         sb = _state(jnp.zeros((4, 3)), types, jnp.array(2.0))
@@ -312,7 +312,7 @@ class TestSemiGrandNSpeciesMismatch:
     def test_propose_missing_chemical_potentials_raises(self):
         """Missing 'chemical_potentials' key must raise ValueError."""
         kernel = SemiGrandSwap(n_species=2)
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         types = jnp.zeros(4, dtype=jnp.int32)
         sa = _state(jnp.zeros((4, 3)), types, jnp.array(1.0))
         sb = _state(jnp.zeros((4, 3)), types, jnp.array(2.0))
@@ -330,7 +330,7 @@ class TestSemiGrandStepFunction:
 
     @staticmethod
     def _make_inputs(n_runs=2, n_walkers=5, n_atoms=4, n_species=2, seed=0):
-        key = jax.random.PRNGKey(seed)
+        key = jax.random.key(seed)
         k1, k2 = jax.random.split(key)
         positions = (
             jax.random.normal(k1, (n_runs, n_walkers, n_atoms, 3)) * 0.1
@@ -346,7 +346,7 @@ class TestSemiGrandStepFunction:
         """n_energy_evals must always be 0 for semi-grand (no backend calls)."""
         positions, types, energies, emax, chem_pots = self._make_inputs()
         kernel = SemiGrandSwap(n_species=2)
-        key = jax.random.PRNGKey(7)
+        key = jax.random.key(7)
 
         _, _, _, _, swap_info = semi_grand_replica_exchange_step(
             rng_key=key,
@@ -382,7 +382,7 @@ class TestSemiGrandStepFunction:
                 n_swap_cycles=1,
             )
 
-        key = jax.random.PRNGKey(42)
+        key = jax.random.key(42)
         new_pos, new_types, new_ene, new_cells, swap_info = _step(key)
 
         assert new_pos.shape == positions.shape
@@ -395,7 +395,7 @@ class TestSemiGrandStepFunction:
     def test_single_run_no_swaps(self):
         """n_runs=1 means no swap pairs possible → state unchanged."""
         n_runs, n_walkers, n_atoms, n_species = 1, 5, 4, 2
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         positions = (
             jax.random.normal(key, (n_runs, n_walkers, n_atoms, 3)) * 0.1
         )
@@ -436,7 +436,7 @@ class TestSemiGrandStepFunction:
             n_runs=2
         )
         kernel = SemiGrandSwap(n_species=2)
-        key = jax.random.PRNGKey(5)
+        key = jax.random.key(5)
 
         _, _, _, _, swap_info = semi_grand_replica_exchange_step(
             rng_key=key,
@@ -457,7 +457,7 @@ class TestSemiGrandStepFunction:
         """Positions and types must never change in semi-grand RE."""
         positions, types, energies, emax, chem_pots = self._make_inputs()
         kernel = SemiGrandSwap(n_species=2)
-        key = jax.random.PRNGKey(9)
+        key = jax.random.key(9)
 
         new_pos, new_types, _, _, _ = semi_grand_replica_exchange_step(
             rng_key=key,
@@ -481,7 +481,7 @@ class TestSemiGrandStepFunction:
     def test_identical_mu_zero_grand_potential_accepts(self):
         """With μ_A = μ_B = 0, Ω = U, so swap accepts iff U < Emax."""
         n_runs, n_walkers, n_atoms = 2, 4, 3
-        key = jax.random.PRNGKey(11)
+        key = jax.random.key(11)
         positions = jnp.zeros((n_runs, n_walkers, n_atoms, 3))
         types = jnp.zeros((n_runs, n_walkers, n_atoms), dtype=jnp.int32)
 
@@ -610,7 +610,7 @@ class TestSemiGrandEndToEnd:
 
         kernel = SemiGrandSwap(n_species=n_species)
         _, _, _, _, swap_info = semi_grand_replica_exchange_step(
-            rng_key=jax.random.PRNGKey(0),
+            rng_key=jax.random.key(0),
             all_positions=positions,
             all_types=types,
             all_energies=energies,

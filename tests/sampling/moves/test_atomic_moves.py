@@ -4,9 +4,7 @@ Tests:
 - HMC: step, JIT, vmap, lax.scan, acceptance rate on differentiable potential
 - SingleAtomMove: step, JIT, vmap, lax.scan
 - SingleAtomSweep: step, JIT, sweep through all atoms
-- SingleAtomSwap: step, JIT, multi-component systems
 - AtomMorph: step, JIT, species changes
-- RandomShift: step, JIT, rigid translation
 - All kernels operate on MCState
 """
 
@@ -16,9 +14,9 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from jaxrens.backends.toy import create_harmonic, create_double_well
-from jaxrens.sampling.moves import hmc, single_atom, alchemical
-from jaxrens.base import MoveInfo
+from jaxrens.backends.toy import create_double_well, create_harmonic
+from jaxrens.sampling.base import MoveInfo
+from jaxrens.sampling.moves import alchemical, hmc, single_atom
 from jaxrens.state.mc_state import MCState
 
 
@@ -46,7 +44,9 @@ def _make_batch_state(positions, types, energies, step_size=0.1):
     n = positions.shape[0]
     return MCState(
         positions=positions,
-        types=jnp.broadcast_to(types, (n, *types.shape)) if types.ndim == 1 else types,
+        types=jnp.broadcast_to(types, (n, *types.shape))
+        if types.ndim == 1
+        else types,
         energy=energies,
         cell=jnp.zeros((n, 3, 3)),
         step_size=jnp.full(n, step_size),
@@ -79,12 +79,14 @@ def positions_1atom():
 
 @pytest.fixture
 def positions_4atom():
-    return jnp.array([
-        [0.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ])
+    return jnp.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
 
 
 @pytest.fixture
@@ -129,8 +131,12 @@ class TestHMC:
         key = jax.random.key(2)
         positions = jax.random.normal(key, (n_walkers, 1, 3))
         cell = jnp.zeros((3, 3))
-        energies = jax.vmap(lambda pos: backend(pos, types_1, cell, 0)[0])(positions)
-        states = _make_batch_state(positions, types_1, energies, step_size=0.01)
+        energies = jax.vmap(lambda pos: backend(pos, types_1, cell, 0)[0])(
+            positions
+        )
+        states = _make_batch_state(
+            positions, types_1, energies, step_size=0.01
+        )
         step_fn = jax.jit(hmc.build_kernel(backend, n_leapfrog=5))
         keys = jax.random.split(jax.random.key(3), n_walkers)
         constraints = 100.0 * jnp.ones(n_walkers)
@@ -200,7 +206,9 @@ class TestSingleAtomMove:
         n_walkers = 4
         positions = jax.random.normal(jax.random.key(12), (n_walkers, 1, 3))
         cell = jnp.zeros((3, 3))
-        energies = jax.vmap(lambda pos: backend(pos, types_1, cell, 0)[0])(positions)
+        energies = jax.vmap(lambda pos: backend(pos, types_1, cell, 0)[0])(
+            positions
+        )
         states = _make_batch_state(positions, types_1, energies, step_size=0.1)
         step_fn = jax.jit(single_atom.build_kernel(backend))
         keys = jax.random.split(jax.random.key(13), n_walkers)
@@ -262,56 +270,6 @@ class TestSingleAtomSweep:
         assert jnp.isfinite(new_state.energy)
 
 
-# ── SingleAtomSwap Tests ────────────────────────────────────────────────────
-
-
-class TestSingleAtomSwap:
-    def test_step_basic(self, harmonic, positions_4atom, types_4):
-        backend = harmonic
-        energy = backend(positions_4atom, types_4, jnp.zeros((3, 3)), 0)[0]
-        state = _make_state(positions_4atom, types_4, energy)
-        step_fn = jax.jit(single_atom.build_swap_kernel(backend))
-
-        key = jax.random.key(30)
-        new_state, info = step_fn(key, state, 100.0)
-        assert new_state.positions.shape == (4, 3)
-        assert jnp.sum(new_state.types == 0) + jnp.sum(new_state.types == 1) == 4
-
-    def test_jit(self, harmonic, positions_4atom, types_4):
-        backend = harmonic
-        energy = backend(positions_4atom, types_4, jnp.zeros((3, 3)), 0)[0]
-        state = _make_state(positions_4atom, types_4, energy)
-        step_fn = jax.jit(single_atom.build_swap_kernel(backend))
-
-        new_state, info = step_fn(jax.random.key(31), state, 100.0)
-        assert jnp.isfinite(new_state.energy)
-
-    def test_preserves_species_counts(self, harmonic, positions_4atom, types_4):
-        backend = harmonic
-        energy = backend(positions_4atom, types_4, jnp.zeros((3, 3)), 0)[0]
-        state = _make_state(positions_4atom, types_4, energy)
-        step_fn = jax.jit(single_atom.build_swap_kernel(backend))
-
-        for i in range(10):
-            state, info = step_fn(jax.random.key(32 + i), state, 100.0)
-            n_type0 = jnp.sum(state.types == 0)
-            n_type1 = jnp.sum(state.types == 1)
-            assert n_type0 == 2
-            assert n_type1 == 2
-
-    def test_no_swap_single_species(self, harmonic, positions_4atom):
-        backend = harmonic
-        types_single = jnp.zeros((4,), dtype=jnp.int32)
-        energy = backend(positions_4atom, types_single, jnp.zeros((3, 3)), 0)[0]
-        state = _make_state(positions_4atom, types_single, energy)
-        step_fn = jax.jit(single_atom.build_swap_kernel(backend))
-
-        for i in range(20):
-            state, info = step_fn(jax.random.key(40 + i), state, 100.0)
-
-        assert jnp.all(state.types == 0)
-
-
 # ── AtomMorph Tests ─────────────────────────────────────────────────────────
 
 
@@ -349,56 +307,3 @@ class TestAtomMorph:
                 break
 
         assert changed, "Morph should accept at least once in 50 tries"
-
-
-# ── RandomShift Tests ───────────────────────────────────────────────────────
-
-
-class TestRandomShift:
-    def test_step_basic(self, harmonic, positions_4atom, types_4):
-        backend = harmonic
-        energy = backend(positions_4atom, types_4, jnp.zeros((3, 3)), 0)[0]
-        state = _make_state(positions_4atom, types_4, energy, step_size=0.1)
-        step_fn = jax.jit(alchemical.build_shift_kernel(backend))
-
-        key = jax.random.key(70)
-        new_state, info = step_fn(key, state, 100.0)
-        assert new_state.positions.shape == (4, 3)
-
-    def test_jit(self, harmonic, positions_4atom, types_4):
-        backend = harmonic
-        energy = backend(positions_4atom, types_4, jnp.zeros((3, 3)), 0)[0]
-        state = _make_state(positions_4atom, types_4, energy, step_size=0.1)
-        step_fn = jax.jit(alchemical.build_shift_kernel(backend))
-
-        new_state, info = step_fn(jax.random.key(71), state, 100.0)
-        assert jnp.isfinite(new_state.energy)
-
-    def test_rigid_translation(self, harmonic, positions_4atom, types_4):
-        backend = harmonic
-        energy = backend(positions_4atom, types_4, jnp.zeros((3, 3)), 0)[0]
-        state = _make_state(positions_4atom, types_4, energy, step_size=0.5)
-        step_fn = jax.jit(alchemical.build_shift_kernel(backend))
-
-        key = jax.random.key(72)
-        new_state, info = step_fn(key, state, 1000.0)
-
-        if bool(info.accepted):
-            displacements = new_state.positions - state.positions
-            for i in range(1, 4):
-                assert jnp.allclose(displacements[0], displacements[i], atol=1e-6)
-
-    def test_lax_scan(self, harmonic, positions_4atom, types_4):
-        backend = harmonic
-        energy = backend(positions_4atom, types_4, jnp.zeros((3, 3)), 0)[0]
-        state = _make_state(positions_4atom, types_4, energy, step_size=0.1)
-        step_fn = jax.jit(alchemical.build_shift_kernel(backend))
-
-        def scan_step(state, key):
-            new_state, info = step_fn(key, state, 100.0)
-            return new_state, info.accepted
-
-        keys = jax.random.split(jax.random.key(75), 20)
-        final_state, accepted = jax.lax.scan(scan_step, state, keys)
-        assert final_state.positions.shape == (4, 3)
-        assert accepted.shape == (20,)

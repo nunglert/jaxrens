@@ -126,7 +126,12 @@ class MaxNeighborsLogger(BufferedH5Logger):
             overflow: shape ``(n_runs,)`` or scalar for single-run.
         """
         if self._closed:
-            raise RuntimeError("MaxNeighborsLogger has been closed.")
+            raise RuntimeError(
+                "MaxNeighborsLogger has already been closed; it cannot record "
+                "further neighbour-list occupancy. A logger is closed once at end of "
+                "run, so this means the NS loop wrote after teardown "
+                "(or the same logger was closed twice)."
+            )
 
         counts = self._coerce_counts(max_neighbor_count)
         buckets = self._coerce_per_run(bucket_size, dtype=np.int32)

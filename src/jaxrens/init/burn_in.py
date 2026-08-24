@@ -90,13 +90,17 @@ def _one_walk(
 
     walker_keys = jax.random.split(key, n_walkers)
     # chain_keys: (n_walkers, walklength)
-    chain_keys = jax.vmap(lambda k: jax.random.split(k, walklength))(walker_keys)
+    chain_keys = jax.vmap(lambda k: jax.random.split(k, walklength))(
+        walker_keys
+    )
 
     def walker_fn(walker_state: Any, wkeys: jax.Array) -> tuple[Any, Any]:
         """Scan step_fn over walklength keys for one walker."""
+
         def scan_body(state, k):
             new_state, info = step_fn(k, state, emax)
             return new_state, info.accepted
+
         final, accepted_arr = jax.lax.scan(scan_body, walker_state, wkeys)
         return final, accepted_arr
 
@@ -160,7 +164,8 @@ def initial_walk(
     Emax = max(live_energies) + emax_offset_per_atom * n_atoms, held constant
     across all n_walks * walklength steps.
 
-    Parallelism:
+    Parallelism::
+
         walker_batch_size=None: vmap over all walkers simultaneously (fastest).
         walker_batch_size=N: chunk via lax.map(batch_size=N). Any positive
             int; non-divisors are handled internally by padding.
@@ -269,14 +274,18 @@ def initial_walk(
         # log shows ``move=random_walk`` etc. instead of ``move=move_0``.
         # Falls back to positional names for back-compat with direct callers
         # (tests / scripts) that don't have descriptors handy.
-        if move_names is not None and len(move_names) != len(adaptation_policies):
+        if move_names is not None and len(move_names) != len(
+            adaptation_policies
+        ):
             raise ValueError(
                 f"initial_walk: len(move_names)={len(move_names)} does not "
                 f"match len(adaptation_policies)={len(adaptation_policies)}."
             )
         descs = [
             MoveKernel(
-                name=(move_names[i] if move_names is not None else f"move_{i}"),
+                name=(
+                    move_names[i] if move_names is not None else f"move_{i}"
+                ),
                 build_kernel=_noop_build_kernel,
                 min_rate=p.min_rate,
                 max_rate=p.max_rate,
@@ -307,7 +316,12 @@ def initial_walk(
     # pmap-of-vmap for PmapVmapRuns).
     def _per_replica(k, run_state, run_emax):
         return _one_walk(
-            k, run_state, step_fn, walklength, run_emax, walker_batch_size,
+            k,
+            run_state,
+            step_fn,
+            walklength,
+            run_emax,
+            walker_batch_size,
         )
 
     jit_one_walk = batcher.wrap_for_batch(_per_replica)
@@ -331,14 +345,18 @@ def initial_walk(
             # Other batched: SPLIT (independent per replica).
             if isinstance(batcher, ShardedSingleRun):
                 key_adapt = jnp.broadcast_to(
-                    key_adapt, (batcher.n_gpu,) + key_adapt.shape,
+                    key_adapt,
+                    (batcher.n_gpu,) + key_adapt.shape,
                 )
             elif batcher.is_batched:
                 key_adapt = jax.random.split(
-                    key_adapt, batcher.n_runs,
+                    key_adapt,
+                    batcher.n_runs,
                 ).reshape(batcher.shape_prefix)
             ns_state, _diag, _new_key = adapt_step(
-                ns_state, emax, key_adapt,
+                ns_state,
+                emax,
+                key_adapt,
             )
 
         key, sub = jax.random.split(key)
@@ -354,8 +372,10 @@ def initial_walk(
         # static field on the MCState pytree.  Counter ``walk_i`` is not
         # advanced.
         ns_state, retry = bucket_mgr.grow_if_overflow(
-            ns_state, new_ns_state,
-            label="burn-in walk", iteration=walk_i,
+            ns_state,
+            new_ns_state,
+            label="burn-in walk",
+            iteration=walk_i,
         )
         if retry:
             continue

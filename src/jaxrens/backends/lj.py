@@ -33,7 +33,6 @@ import jax.numpy as jnp
 from jaxrens.backends._graph_neighbors import _make_image_offsets
 from jaxrens.backends.base import BackendResult
 
-
 _ScalarOrSeq = float | Sequence[float] | jnp.ndarray
 
 
@@ -86,7 +85,11 @@ class LJBackend:
                     f"got {eps_arr.shape} vs {sig_arr.shape}"
                 )
             if eps_arr.shape[0] == 0:
-                raise ValueError("per-species epsilon/sigma must be non-empty")
+                raise ValueError(
+                    "per-species epsilon/sigma must be non-empty; give "
+                    "one value per species, or pass scalars to use a single "
+                    "epsilon/sigma for every pair."
+                )
 
         self._per_species = bool(eps_arr.ndim == 1)
         if self._per_species:
@@ -154,30 +157,34 @@ class LJBackend:
         # the (j, i, -k) mirror entry duplicates it: hence the 0.5 prefactor
         # below counts each interaction exactly once.
         is_center = jnp.all(self._image_offsets == 0.0, axis=-1)  # (K,)
-        self_pair = jnp.eye(n_atoms, dtype=bool)                  # (N, N)
+        self_pair = jnp.eye(n_atoms, dtype=bool)  # (N, N)
         exclude = is_center[:, None, None] & self_pair[None, :, :]  # (K, N, N)
 
         # Avoid 0/0 at the excluded entries.
         r2_safe = jnp.where(exclude, 1.0, r2)
 
         if self._per_species:
-            eps_per_atom = self._eps_table[species]                          # (N,)
-            sig_per_atom = self._sig_table[species]                          # (N,)
-            eps_ij = jnp.sqrt(eps_per_atom[:, None] * eps_per_atom[None, :]) # (N, N)
-            sig_ij = 0.5 * (sig_per_atom[:, None] + sig_per_atom[None, :])   # (N, N)
-            sig_r2 = sig_ij[None, :, :] ** 2 / r2_safe                       # (K, N, N)
+            eps_per_atom = self._eps_table[species]  # (N,)
+            sig_per_atom = self._sig_table[species]  # (N,)
+            eps_ij = jnp.sqrt(
+                eps_per_atom[:, None] * eps_per_atom[None, :]
+            )  # (N, N)
+            sig_ij = 0.5 * (
+                sig_per_atom[:, None] + sig_per_atom[None, :]
+            )  # (N, N)
+            sig_r2 = sig_ij[None, :, :] ** 2 / r2_safe  # (K, N, N)
             eps_ij_bcast = eps_ij[None, :, :]
         else:
             eps_ij_bcast = self.epsilon
-            sig_r2 = self.sigma ** 2 / r2_safe
+            sig_r2 = self.sigma**2 / r2_safe
 
-        sig_r6 = sig_r2 ** 3
-        sig_r12 = sig_r6 ** 2
+        sig_r6 = sig_r2**3
+        sig_r12 = sig_r6**2
 
         pair_energy = 4.0 * eps_ij_bcast * (sig_r12 - sig_r6)
 
         if self.cutoff is not None:
-            cutoff_mask = r2 < self.cutoff ** 2
+            cutoff_mask = r2 < self.cutoff**2
             pair_energy = jnp.where(cutoff_mask, pair_energy, 0.0)
 
         # Zero out excluded (central self) entries before summing.

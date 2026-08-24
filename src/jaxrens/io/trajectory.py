@@ -8,11 +8,32 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class TrajectoryWriter(Protocol):
+    """Protocol for trajectory output backends.
+
+    The three writers below implement it structurally (no inheritance);
+    ``TrajectoryCallback`` in ``jaxrens.cli.monitor`` only ever calls these
+    three methods.
+    """
+
+    def write_dead_point(
+        self, iteration: int, walker: Any, energy: float
+    ) -> None:
+        ...
+
+    def write_walker_snapshot(self, iteration: int, walkers: Any) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
 
 
 def _wrap_positions_np(positions: Any, cell: Any) -> np.ndarray:
@@ -34,19 +55,22 @@ def _wrap_positions_np(positions: Any, cell: Any) -> np.ndarray:
 
 
 def _wrapped_walker(walker: Any, wrap: bool) -> Any:
-    """Return *walker* with positions wrapped into its own ``box``.
+    """Return a ``WalkerState`` with positions wrapped into its own cell.
 
-    Only dict walkers carrying a periodic ``box`` are wrapped (the shape the
-    writers emit); anything else passes through unchanged.  Returns a shallow
-    copy so the caller's walker is not mutated.
+    Normalizes *walker* to a ``WalkerState`` first, so both typed walkers and
+    loose dicts are handled on one path.  A no-op (aside from normalization)
+    when wrapping is off or the walker is non-periodic/degenerate.  Returns a
+    new ``WalkerState``; the caller's walker is not mutated.
     """
-    if not wrap or not isinstance(walker, dict) or walker.get("box") is None:
+    import jax.numpy as jnp
+
+    from jaxrens.io.formats import ensure_walker_state
+
+    walker = ensure_walker_state(walker)
+    if not wrap or walker.cell is None:
         return walker
-    wrapped = dict(walker)
-    wrapped["positions"] = _wrap_positions_np(
-        walker["positions"], walker["box"]
-    )
-    return wrapped
+    wrapped_pos = _wrap_positions_np(walker.positions, walker.cell)
+    return walker.set(positions=jnp.asarray(wrapped_pos))
 
 
 class ExtxyzTrajectoryWriter:
@@ -103,21 +127,10 @@ class ExtxyzTrajectoryWriter:
         snapshot_path = self.path.with_suffix(f".snap.{iteration}.extxyz")
         from ase.io import write as ase_write
 
-        from jaxrens.io.formats import walker_to_ase_atoms
-
-        positions = np.asarray(walkers["positions"])
-        types = np.asarray(walkers["types"])
-        energies = np.asarray(walkers["energies"])
+        from jaxrens.io.formats import iter_walker_states, walker_to_ase_atoms
 
         atoms_list = []
-        for i in range(positions.shape[0]):
-            w = {
-                "positions": positions[i],
-                "types": types[i],
-                "energy": energies[i],
-            }
-            if walkers.get("cells") is not None:
-                w["box"] = np.asarray(walkers["cells"])[i]
+        for i, w in enumerate(iter_walker_states(walkers)):
             atoms = walker_to_ase_atoms(w, self.symbol_map)
             if self.wrap and any(atoms.get_pbc()):
                 atoms.wrap()
@@ -185,6 +198,7 @@ class H5TrajectoryWriter:
             truncate_h5_traj(self.path, restart_iteration)
         self._file = h5py.File(self.path, self._mode)
         self._file.attrs["symbol_map"] = str(symbol_map)
+        _stamp_unvalidated(self._file)
 
     def write_dead_point(
         self, iteration: int, walker: Any, energy: float
@@ -197,7 +211,7 @@ class H5TrajectoryWriter:
         grp.attrs["energy"] = energy
 
     def write_walker_snapshot(self, iteration: int, walkers: Any) -> None:
-        from jaxrens.io.formats import walker_to_h5_group
+        from jaxrens.io.formats import iter_walker_states, walker_to_h5_group
 
         grp_name = f"snapshot_{iteration}"
         grp = self._file.create_group(grp_name)
@@ -207,21 +221,10 @@ class H5TrajectoryWriter:
         # one subgroup per walker, mirroring the extxyz writer's per-frame
         # dump.  ``walker_to_h5_group`` is the same helper used for dead
         # points, so snapshots round-trip via ``h5_group_to_walker``.
-        positions = np.asarray(walkers["positions"])
-        types = np.asarray(walkers["types"])
-        energies = np.asarray(walkers["energies"])
-        cells = walkers.get("cells")
-        cells = np.asarray(cells) if cells is not None else None
-        grp.attrs["n_walkers"] = positions.shape[0]
+        walkers_list = list(iter_walker_states(walkers))
+        grp.attrs["n_walkers"] = len(walkers_list)
 
-        for i in range(positions.shape[0]):
-            w = {
-                "positions": positions[i],
-                "types": types[i],
-                "energy": energies[i],
-            }
-            if cells is not None:
-                w["box"] = cells[i]
+        for i, w in enumerate(walkers_list):
             walker_to_h5_group(
                 grp.create_group(f"walker_{i}"), _wrapped_walker(w, self.wrap)
             )
@@ -238,6 +241,9 @@ class H5TrajectoryWriter:
         self._prev_snapshot_name = grp_name
 
     def close(self) -> None:
+        # Re-stamp: markers that fired after the writer was built (a move
+        # kernel rebuilt mid-run, say) still belong on the output file.
+        _stamp_unvalidated(self._file)
         self._file.close()
 
 
@@ -254,12 +260,30 @@ class NullTrajectoryWriter:
         pass
 
 
+def _stamp_unvalidated(h5file: Any) -> None:
+    """Record any unvalidated code paths this run touched in the file's attrs.
+
+    A stderr warning is invisible in a batch job and gone by the time anyone
+    reads the output; an attribute on the trajectory travels with the data.
+    Written at open *and* at close: the first covers a run that crashes, the
+    second picks up markers that fired after the writer was constructed.
+    """
+    from jaxrens.unvalidated import triggered
+
+    records = triggered()
+    if not records:
+        return
+    h5file.attrs["unvalidated_features"] = [
+        f"{r.feature} (since {r.since}): {r.concern}" for r in records
+    ]
+
+
 def create_trajectory_writer(
     format: str,
     path: Path | str,
     symbol_map: dict[int, str],
     **kwargs: Any,
-) -> ExtxyzTrajectoryWriter | H5TrajectoryWriter | NullTrajectoryWriter:
+) -> TrajectoryWriter:
     """Factory for trajectory writers."""
     match format:
         case "extxyz":
@@ -271,4 +295,7 @@ def create_trajectory_writer(
                 NullTrajectoryWriter()
             )  # ignores mode/wrap/restart_iteration kwargs
         case _:
-            raise ValueError(f"Unknown trajectory format: {format!r}")
+            raise ValueError(
+                f"Unknown trajectory format {format!r}. Supported formats "
+                f"are 'extxyz', 'h5', and 'none' (writes nothing)."
+            )

@@ -5,13 +5,16 @@ returns the per-cohort scalar/vector ensemble parameters (pressure, chemical
 potentials, ...) consumed by ``EnsembleBackend`` at run time.
 
 Supported ensembles
--------------------
-NVT         — canonical; no additional parameters.
-NPT         — isothermal-isobaric; requires ``pressure``.
-semi_grand  — semi-grand μPT; requires a per-species ``chemical_potentials``
-              vector and an optional ``pressure``.  The backend adds
-              ``- μ·N`` (and ``+ P·V`` when a pressure is given) to the raw
-              potential, i.e. ``H = U + P·V - μ·N``.
+--------------------
+
+``NVT``
+    canonical; no additional parameters.
+``NPT``
+    isothermal-isobaric; requires ``pressure``.
+``semi_grand``
+    semi-grand μPT; requires a per-species ``chemical_potentials`` vector and
+    an optional ``pressure``.  The backend adds ``- μ·N`` (and ``+ P·V`` when a
+    pressure is given) to the raw potential, i.e. ``H = U + P·V - μ·N``.
 
 Each spec may carry a *list* on its driving parameter (pressures for NPT,
 μ-vectors for semi_grand) to fan a run out across replicas — the resolver

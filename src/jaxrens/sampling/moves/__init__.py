@@ -9,6 +9,10 @@ from jaxrens.sampling.moves import (
     shear,
     single_atom,
     stretch,
+    swap,
     volume,
 )
-from jaxrens.sampling.moves.replica_exchange import PressureRENSSwap, SwapKernel
+from jaxrens.sampling.moves.replica_exchange import (
+    PressureRENSSwap,
+    SwapKernel,
+)

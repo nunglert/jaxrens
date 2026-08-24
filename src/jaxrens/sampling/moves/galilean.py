@@ -9,6 +9,7 @@ Algorithm per NS step (Baldock semantics — mirrors
 
 1. Initialize or perturb the velocity direction.
 2. For each of ``n_reflect`` iterations:
+
    a. Step: ``new_pos = pos + step_size * direction``.  Position always
       advances — even into the violated region.
    b. Evaluate energy at ``new_pos``.  NaN energies are coerced to
@@ -16,6 +17,7 @@ Algorithm per NS step (Baldock semantics — mirrors
       ``mcmc.py:788-792``).
    c. If ``new_energy >= Emax``: reflect direction off the constraint
       surface using forces: ``direction -= 2 * (F_hat . direction) * F_hat``.
+
 3. Accept iff the trajectory's *final* energy is below ``Emax`` — i.e.
    the walker has exited the violated region by the last step.  Reject
    reverts to the initial position and flips the direction.
@@ -27,6 +29,24 @@ kernel reverted ``pos``/``energy`` on every violation, which made the
 final accept-gate trivially True (carry always held the last *good*
 state) and silently NaN-corrupted under NaN-producing backends.
 
+Species scoping
+---------------
+Passing ``species=(code, ...)`` restricts the move to the atoms of those
+type codes and holds every other atom fixed — a GMC trajectory confined
+to one element's sublattice.  This is what makes independent step sizes
+per sublattice possible: register one scoped kernel per element and the
+MWG per-move step-size array (plus the per-move bisection in
+``adaptation/manager.py``) tunes each one on its own acceptance rate.
+Useful when one sublattice melts well before the other, where a single
+joint move is throttled by whichever sublattice is stiffer.
+
+The move stays a valid NS kernel: confining it to a linear subspace is
+just GMC with the frozen coordinates as fixed parameters.  Reflection
+off the *projected* gradient is still volume-preserving, the
+flip-on-reject still gives reversibility, and the ``Emax`` gate is still
+on the total energy.  Ergodicity comes from composing the per-species
+moves, exactly as it does for ``single_atom``.
+
 Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
 """
 
@@ -36,28 +56,43 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float, Key
 
 from jaxrens.backends.base import eval_energy_and_forces
-from jaxrens.base import MoveInfo
+from jaxrens.sampling.base import MoveInfo
 
 
-def _random_direction(key: jax.Array, shape: tuple) -> jnp.ndarray:
+def _normalize(
+    v: Float[Array, "N 3"], mask: Float[Array, "N 1"] | None
+) -> Float[Array, "N 3"]:
+    """Mask ``v`` to the moving subspace, then normalize to unit length.
+
+    Masking *before* normalizing is what keeps the result a unit vector of
+    the restricted subspace; the frozen rows are exactly zero, so they
+    contribute nothing to the norm and never move.
+    """
+    if mask is not None:
+        v = v * mask
+    norm = jnp.sqrt(jnp.sum(v**2))
+    return v / jnp.maximum(norm, 1e-10)
+
+
+def _random_direction(
+    key: Key[Array, ""], shape: tuple, mask: Float[Array, "N 1"] | None = None
+) -> Float[Array, "N 3"]:
     """Generate a random unit direction vector."""
-    d = jax.random.normal(key, shape)
-    norm = jnp.sqrt(jnp.sum(d**2))
-    return d / jnp.maximum(norm, 1e-10)
+    return _normalize(jax.random.normal(key, shape), mask)
 
 
 def _perturb_direction(
-    key: jax.Array,
-    direction: jnp.ndarray,
+    key: Key[Array, ""],
+    direction: Float[Array, "N 3"],
     perturb_angle: float = 0.1,
-) -> jnp.ndarray:
+    mask: Float[Array, "N 1"] | None = None,
+) -> Float[Array, "N 3"]:
     """Perturb a direction vector by a small random angle."""
     noise = perturb_angle * jax.random.normal(key, direction.shape)
-    new_dir = direction + noise
-    norm = jnp.sqrt(jnp.sum(new_dir**2))
-    return new_dir / jnp.maximum(norm, 1e-10)
+    return _normalize(direction + noise, mask)
 
 
 def build_kernel(
@@ -65,6 +100,8 @@ def build_kernel(
     n_reflect: int = 5,
     perturb_angle: float = 0.1,
     use_forces: bool = True,
+    species: tuple[int, ...] | None = None,
+    direction_field: str = "direction",
 ):
     """Build a Galilean Monte Carlo move kernel.
 
@@ -74,21 +111,53 @@ def build_kernel(
         perturb_angle: Angle (radians) to perturb direction between moves.
         use_forces: If True, reflect using gradient (forces). If False,
             use random reflection (cheaper but less efficient).
+        species: Type codes this move may displace; every other atom is
+            held fixed for the whole trajectory.  ``None`` (the default)
+            moves all atoms.  See the module docstring.
+        direction_field: Name of the MCState field holding this move's
+            persistent direction.  Species-scoped moves **must** each use a
+            distinct field: ``build_mwg`` unions ``extra_state_fields`` by
+            name, so two scoped moves sharing ``"direction"`` would zero out
+            each other's persistence on every call — destroying the very
+            thing GMC relies on.
 
     Returns:
         step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
+
+    Note:
+        A scoped move whose species is absent from a given walker degenerates
+        to a no-op that always "accepts" (the identity move trivially satisfies
+        detailed balance, but its acceptance rate carries no information, so
+        its adapted step size is meaningless).  The resolver rejects species
+        absent from the system; this can still arise per-walker under
+        composition-changing ensembles (semi-grand, alchemical moves).
     """
 
     def step(rng_key, state, likelihood_constraint):
         key_init, key_perturb, key_reflect = jax.random.split(rng_key, 3)
 
+        prev_direction = getattr(state, direction_field)
+
+        # Moving-subspace mask, derived from ``state.types`` at trace time
+        # rather than baked in at build time: swap/alchemical moves mutate
+        # types, so a positional mask would silently go stale.
+        if species is None:
+            mask = None
+        else:
+            codes = jnp.asarray(species, dtype=state.types.dtype)
+            mask = jnp.isin(state.types, codes)[:, None].astype(
+                state.positions.dtype
+            )
+
         # Initialize direction if zero (first call), otherwise perturb
-        dir_norm = jnp.sqrt(jnp.sum(state.direction**2))
+        dir_norm = jnp.sqrt(jnp.sum(prev_direction**2))
         is_zero = dir_norm < 1e-8
         direction = jnp.where(
             is_zero,
-            _random_direction(key_init, state.positions.shape),
-            _perturb_direction(key_perturb, state.direction, perturb_angle),
+            _random_direction(key_init, state.positions.shape, mask),
+            _perturb_direction(
+                key_perturb, prev_direction, perturb_angle, mask
+            ),
         )
 
         max_neighbors = state.max_neighbors
@@ -146,13 +215,20 @@ def build_kernel(
                 # antiparallel to the energy gradient, and the reflection
                 # d - 2(n·d)n is invariant under n -> -n, so using the force
                 # direction is identical to using the gradient.
-                f_norm = jnp.sqrt(jnp.sum(force**2))
-                f_hat = force / jnp.maximum(f_norm, 1e-10)
+                #
+                # Under species scoping the normal is the *projection* of the
+                # gradient onto the moving subspace (``_normalize`` masks
+                # before normalizing) — that is the correct constraint-surface
+                # normal for the restricted problem, not merely bookkeeping to
+                # keep the frozen rows at zero.
+                f_hat = _normalize(force, mask)
                 reflected_dir = (
                     direction - 2.0 * jnp.sum(f_hat * direction) * f_hat
                 )
             else:
-                reflected_dir = _random_direction(step_key, direction.shape)
+                reflected_dir = _random_direction(
+                    step_key, direction.shape, mask
+                )
 
             # Position and energy advance unconditionally — the walker
             # drifts through violated regions.  Only the direction
@@ -193,9 +269,13 @@ def build_kernel(
         new_state = state.set(
             positions=jnp.where(accepted, final_pos, state.positions),
             energy=jnp.where(accepted, final_energy, state.energy),
-            direction=jnp.where(accepted, final_dir, -state.direction),
             max_neighbor_count=acc_count,
             overflow=acc_overflow,
+            **{
+                direction_field: jnp.where(
+                    accepted, final_dir, -prev_direction
+                )
+            },
         )
 
         # n_reflect calls to value_and_grad (when use_forces=True),

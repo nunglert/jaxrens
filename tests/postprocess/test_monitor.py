@@ -1373,15 +1373,17 @@ class TestFromMultiRunDirectoryConfigInference:
 # Smoke test: load existing lj8_npt example output (ships in repo)
 # ---------------------------------------------------------------------------
 
-_LJ8_NPT_OUTPUT = Path(__file__).parent.parent / "data" / "lj8_npt" / "output"
+_LJ8_NPT_OUTPUT = (
+    Path(__file__).parent.parent / "_assets" / "data" / "lj8_npt" / "output"
+)
 
 
 class TestSmokeRealRun:
     """Load the pre-computed lj8_npt example artefacts and exercise the full stack.
 
-    The artefacts under ``tests/data/lj8_npt/output/`` are committed to the
+    The artefacts under ``tests/_assets/data/lj8_npt/output/`` are committed to the
     repo and produced by running ``jaxrens run -c
-    tests/data/lj8_npt/config.yaml`` (a sub-second 8-atom LJ NPT NS, 200
+    tests/_assets/data/lj8_npt/config.yaml`` (a sub-second 8-atom LJ NPT NS, 200
     iterations).
     """
 

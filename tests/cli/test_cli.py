@@ -268,6 +268,55 @@ class TestRun:
         assert (tmp_path / "ns.acc_rates.h5").exists()
         assert (tmp_path / "ns.max_neighbors.h5").exists()
 
+    def test_run_from_config_multi_move_baseline_no_full_auto(self, tmp_path):
+        """Regression: a SingleRun with >1 move and the adaptation logger wired
+        but *no* ``full_auto`` must still write the iter-0 baseline row.
+
+        ``move_descriptors`` used to reach ``run_ns`` only via
+        ``full_auto_kwargs``; without ``full_auto`` the count fell back to
+        ``n_moves=1`` and the population's step_sizes were built as ``(K, 1)``,
+        mismatching the always-wired adaptation logger's ``(n_runs, n_moves)``
+        baseline row and raising ``ValueError: Expected shape (1, 2), got
+        (1, 1)``.  A single move accidentally matched (n_moves==1), so the bug
+        only shows with two or more moves.
+        """
+        from jaxrens.sampling.move_kernel import MoveKernel
+        from jaxrens.sampling.moves import random_walk as _rw
+
+        ns_config = NSConfig(
+            n_live=12, max_iterations=8, n_mcmc_steps=2, seed=0
+        )
+        move_config = MoveConfig(move_type="random_walk", step_size=0.3)
+        backend_config = BackendConfig(backend_type="harmonic")
+        output_config = OutputConfig(
+            format="none",
+            working_dir=tmp_path,
+            info_interval=999,
+            temperature_lag_interval=None,
+        )
+        # Two moves -> logger n_moves == 2.  No adaptation_config passed, so the
+        # run is *not* full_auto -- the exact configuration that used to crash.
+        descriptors = [
+            MoveKernel("rw0", _rw.build_kernel, step_size=0.3),
+            MoveKernel("rw1", _rw.build_kernel, step_size=0.15),
+        ]
+        key = jax.random.key(7)
+        positions = jax.random.uniform(
+            key, (12, 1, 3), minval=-3.0, maxval=3.0
+        )
+        types = jnp.zeros((1,), dtype=jnp.int32)
+        # Must complete without a shape mismatch in the baseline row.
+        run_from_config(
+            ns_config,
+            move_config,
+            backend_config,
+            output_config,
+            initial_positions=positions,
+            initial_types=types,
+            move_descriptors=descriptors,
+        )
+        assert (tmp_path / "ns.adaptation.h5").exists()
+
 
 class TestConfigureFileLogging:
     """``configure_file_logging`` is called exactly once, early, from

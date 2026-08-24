@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -39,6 +39,36 @@ from jaxrens.sampling.termination import PriorMassTermination, check_any
 from jaxrens.state.ns import NSState
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class NSCallback(Protocol):
+    """Protocol for NS loop callbacks.
+
+    Called at the outer loop boundary (Python level, outside JIT/pmap) by
+    ``_dispatch_callbacks`` below.  ``@runtime_checkable`` is required, not
+    decorative: ``jaxrens.sampling`` is instrumented by jaxtyping/beartype
+    (see ``--jaxtyping-packages`` in pyproject.toml), which isinstance-checks
+    every annotation, and a plain Protocol raises at decoration time.  Note it
+    checks method *presence* only, which is exactly what the dispatcher's
+    ``hasattr`` guards already assume.  Implementations live in
+    ``jaxrens.cli.monitor``.  Every method is optional in practice — the
+    dispatcher checks with ``hasattr`` before calling.
+    """
+
+    def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
+        ...
+
+    def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
+        ...
+
+    def on_dead_point(
+        self, iteration: int, dead_walker: Any, energy: float
+    ) -> None:
+        ...
+
+    def on_finish(self, ns_state: Any) -> None:
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +116,8 @@ def _bump_cumulative_counters(
 
 
 def _inject_cumulative_into_info(
-    info: dict[str, Any], cumulative: dict[str, np.ndarray],
+    info: dict[str, Any],
+    cumulative: dict[str, np.ndarray],
 ) -> None:
     """Write cumulative counter snapshots into *info* for downstream callbacks.
 
@@ -99,10 +130,12 @@ def _inject_cumulative_into_info(
         cumulative: Dict with keys ``"n_evaluations"`` and
             ``"n_grad_evaluations"`` (numpy int64 arrays).
     """
-    info["cumulative_n_evaluations_per_move"] = cumulative["n_evaluations"].copy()
-    info["cumulative_n_grad_evaluations_per_move"] = (
-        cumulative["n_grad_evaluations"].copy()
-    )
+    info["cumulative_n_evaluations_per_move"] = cumulative[
+        "n_evaluations"
+    ].copy()
+    info["cumulative_n_grad_evaluations_per_move"] = cumulative[
+        "n_grad_evaluations"
+    ].copy()
 
 
 def _pack_adjustment_info(
@@ -245,7 +278,7 @@ def _scalarize_sharded_info(info: dict[str, Any]) -> dict[str, Any]:
 
 
 def _dispatch_callbacks(
-    callbacks: list,
+    callbacks: list[NSCallback],
     iteration: int,
     ns_state: NSState,
     info: dict[str, Any],
@@ -288,7 +321,7 @@ def _run_loop(
     n_mcmc_steps: int,
     n_extra: int,
     termination_criteria: list,
-    callbacks: list,
+    callbacks: list[NSCallback],
     n_moves: int,
     move_descriptors: list[MoveKernel] | None,
     rng_key: Key[Array, "*B"],
@@ -360,14 +393,18 @@ def _run_loop(
           ``(n_moves,)`` for ``SingleRun``, ``(n_runs, n_moves)`` for
           ``VmapRuns``.
     """
-    from jaxrens.sampling.nested_sampling import ns_step  # avoid circular at module level
+    from jaxrens.sampling.nested_sampling import (  # avoid circular at module level
+        ns_step,
+    )
 
     # JIT-compile ns_step once before the loop.  Callers may override
     # the underlying step function (e.g. ``ns_step_sharded`` for the
     # ShardedSingleRun mode) via ``ns_step_fn``; default preserves the
     # SingleRun / VmapRuns / PmapVmapRuns behaviour.
     step_to_wrap = ns_step_fn if ns_step_fn is not None else ns_step
-    jit_ns_step = batcher.wrap_step(step_to_wrap, step_fn, n_mcmc_steps, n_extra)
+    jit_ns_step = batcher.wrap_step(
+        step_to_wrap, step_fn, n_mcmc_steps, n_extra
+    )
 
     # Per-replica step sizes: pop.step_sizes is (*shape_prefix, K, n_moves).
     # The descriptor drops the walker axis to give (*shape_prefix, n_moves).
@@ -378,10 +415,12 @@ def _run_loop(
     # Empty prefix collapses to (n_moves,) for SingleRun.
     cumulative: dict = {
         "n_evaluations": np.zeros(
-            batcher.shape_prefix + (n_moves,), dtype=np.int64,
+            batcher.shape_prefix + (n_moves,),
+            dtype=np.int64,
         ),
         "n_grad_evaluations": np.zeros(
-            batcher.shape_prefix + (n_moves,), dtype=np.int64,
+            batcher.shape_prefix + (n_moves,),
+            dtype=np.int64,
         ),
     }
 
@@ -442,7 +481,9 @@ def _run_loop(
             # same constraint the population was sampled under — minor
             # off-by-one vs. the upcoming step's L_{i+1}, but principled.
             ns_state, per_move_outputs, rng_key = adapt_step(
-                ns_state, ns_state.emax, rng_key,
+                ns_state,
+                ns_state.emax,
+                rng_key,
             )
             # Re-extract for the downstream callbacks / info dict.
             current_step_sizes = batcher.extract_step_sizes(
@@ -456,12 +497,17 @@ def _run_loop(
         if batcher.is_batched:
             new_ns_state, info = jit_ns_step(ns_state)
         else:
-            new_ns_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps, n_extra)
+            new_ns_state, info = jit_ns_step(
+                ns_state, step_fn, n_mcmc_steps, n_extra
+            )
 
         # ---- Overflow retry ----
         # For PmapVmapRuns, any overflow across any (G, P) shard triggers a retry.
         ns_state, retry = bucket_mgr.grow_if_overflow(
-            ns_state, new_ns_state, label="iter", iteration=record_iteration,
+            ns_state,
+            new_ns_state,
+            label="iter",
+            iteration=record_iteration,
         )
         if retry:
             continue
@@ -470,12 +516,18 @@ def _run_loop(
         # No-op when shrink_dwell == 0; otherwise steps the bucket down one
         # ladder entry once the observed peak has stayed below the next-
         # smaller bucket (with margin) for ``shrink_dwell`` iterations.
-        ns_state = bucket_mgr.maybe_shrink(ns_state, iteration=record_iteration)
+        ns_state = bucket_mgr.maybe_shrink(
+            ns_state, iteration=record_iteration
+        )
 
         # ---- Inter-RE phase ----
         # Fires after ns_step, before cumulative counter bump and callbacks.
         # Zero overhead when inter_re_mgr is None or is_active=False.
-        if inter_re_mgr is not None and inter_re_mgr.is_active and inter_re_mgr.fires(i):
+        if (
+            inter_re_mgr is not None
+            and inter_re_mgr.is_active
+            and inter_re_mgr.fires(i)
+        ):
             inter_re_key, key_re = jax.random.split(inter_re_key)
             # RE reads the contour off ``ns_state.emax`` (set by the
             # ns_step that just ran).  No emax recomputation here, no
@@ -533,6 +585,7 @@ def _run_loop(
         # to ``(K, ...)`` so SingleRun-shaped callbacks see uniform
         # shapes.
         from jaxrens.sampling.batch_descriptor import ShardedSingleRun
+
         if isinstance(batcher, ShardedSingleRun):
             info = _scalarize_sharded_info(info)
             ns_state_for_cb = _gather_sharded_ns_state(ns_state)
@@ -543,7 +596,8 @@ def _run_loop(
 
         # ---- Termination ----
         log_z_scalar, hmax_scalar = batcher.reduce_for_termination(
-            ns_state.log_evidence, info.get("hmax", jnp.inf),
+            ns_state.log_evidence,
+            info.get("hmax", jnp.inf),
         )
         for criterion in termination_criteria:
             if isinstance(criterion, PriorMassTermination):
@@ -557,5 +611,3 @@ def _run_loop(
         i += 1
 
     return ns_state, rng_key, cumulative
-
-

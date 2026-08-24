@@ -70,7 +70,11 @@ def load_structure(
     atoms = all_frames[0]
 
     if len(atoms) == 0:
-        raise ValueError(f"structure at {path} contains no atoms")
+        raise ValueError(
+            f"The structure at {path} contains no atoms. Nested sampling "
+            f"needs a non-empty starting configuration; check that the file "
+            f"holds the frame you expect."
+        )
 
     import numpy as np
 

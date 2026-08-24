@@ -26,9 +26,11 @@ import yaml
 
 from . import multi_gpu_n_devices
 
-
 _FIXTURE = (
-    Path(__file__).resolve().parent.parent / "fixtures" / "nequix_small"
+    Path(__file__).resolve().parent.parent
+    / "_assets"
+    / "models"
+    / "nequix_small"
 )
 _MODEL_NQX = _FIXTURE / "model.nqx"
 
@@ -132,12 +134,10 @@ def test_nequix_full_pipeline(tmp_path: Path) -> None:
     """
     pytest.importorskip("nequix")
 
-    from jaxrens.cli.resolve import (
-        resolve,
-    )
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
+    from jaxrens.cli.resolve import resolve
     from jaxrens.cli.run import run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
 
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["backend"]["checkpoint_path"] = str(_MODEL_NQX)
@@ -145,9 +145,9 @@ def test_nequix_full_pipeline(tmp_path: Path) -> None:
 
     root = RootSpec.model_validate(raw)
     resolved = resolve(root)
-    assert isinstance(resolved.batcher, PmapVmapRuns), (
-        "Two-pressure config should route through the multi-GPU dispatcher."
-    )
+    assert isinstance(
+        resolved.batcher, PmapVmapRuns
+    ), "Two-pressure config should route through the multi-GPU dispatcher."
 
     run_multi_gpu_from_config(resolved)
 
@@ -160,12 +160,12 @@ def test_nequix_full_pipeline(tmp_path: Path) -> None:
     for r in range(n_total):
         energies_path = out / f"nequix_smoke.run{r:02d}.energies"
         traj_path = out / f"nequix_smoke.run{r:02d}.traj.extxyz"
-        assert energies_path.exists(), (
-            f"missing per-replica energy log: {energies_path}"
-        )
-        assert traj_path.exists(), (
-            f"missing per-replica trajectory: {traj_path}"
-        )
+        assert (
+            energies_path.exists()
+        ), f"missing per-replica energy log: {energies_path}"
+        assert (
+            traj_path.exists()
+        ), f"missing per-replica trajectory: {traj_path}"
         log = EnergyLogger.read(energies_path)
         assert log.energies.shape == (5,), (
             f"{energies_path.name}: expected 5 data entries, "
@@ -187,7 +187,11 @@ def test_nequix_full_pipeline(tmp_path: Path) -> None:
 
     saved_positions = np.asarray(state["positions"])
     assert saved_positions.shape == (
-        resolved.ns.n_gpu, resolved.ns.n_per_gpu, 4, 8, 3,
+        resolved.ns.n_gpu,
+        resolved.ns.n_per_gpu,
+        4,
+        8,
+        3,
     )
 
 
@@ -292,12 +296,10 @@ def test_nequix_multi_gpu_pipeline(tmp_path: Path) -> None:
     """
     pytest.importorskip("nequix")
 
-    from jaxrens.cli.resolve import (
-        resolve,
-    )
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
+    from jaxrens.cli.resolve import resolve
     from jaxrens.cli.run import run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
 
     n_gpu = multi_gpu_n_devices()
     n_total = n_gpu * 2

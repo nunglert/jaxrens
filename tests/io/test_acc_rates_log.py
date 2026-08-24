@@ -15,7 +15,9 @@ from jaxrens.io.acc_rates_log import AccRatesLog, AccRatesLogger
 def _make_counts(n_entries=10, n_runs=1, n_moves=3, seed=0):
     rng = np.random.default_rng(seed)
     iters = np.arange(n_entries, dtype=np.int64)
-    n_prop = rng.integers(50, 200, (n_entries, n_runs, n_moves)).astype(np.int64)
+    n_prop = rng.integers(50, 200, (n_entries, n_runs, n_moves)).astype(
+        np.int64
+    )
     # n_accepted <= n_proposed component-wise
     n_acc = (n_prop * rng.uniform(0.0, 1.0, n_prop.shape)).astype(np.int64)
     return iters, n_acc, n_prop
@@ -49,7 +51,9 @@ class TestAccRatesLoggerRoundTrip:
         iters, n_acc, n_prop = _make_counts(n_entries, n_runs, n_moves)
         path = tmp_path / "acc_multi.h5"
         log = AccRatesLogger(
-            path=path, move_names=["a", "b"], n_runs=n_runs,
+            path=path,
+            move_names=["a", "b"],
+            n_runs=n_runs,
         )
         for i in range(n_entries):
             log.write_entry(int(iters[i]), n_acc[i], n_prop[i])
@@ -73,7 +77,9 @@ class TestAccRatesLoggerRoundTrip:
         # n_proposed is always > 0 from _make_counts (50..200), so no
         # zero-guard surprise here.
         np.testing.assert_allclose(
-            rates, n_acc / n_prop, rtol=1e-5,
+            rates,
+            n_acc / n_prop,
+            rtol=1e-5,
         )
 
     def test_1d_input_coerced(self, tmp_path):
@@ -113,7 +119,8 @@ class TestAccRatesLoggerRoundTrip:
         loaded = AccRatesLogger.read(path)
         assert loaded.iterations.shape == (n_entries,)
         np.testing.assert_array_equal(
-            loaded.iterations, np.arange(n_entries, dtype=np.int64),
+            loaded.iterations,
+            np.arange(n_entries, dtype=np.int64),
         )
 
 
@@ -152,7 +159,9 @@ class TestAdaptationCallbackPmapVmapShapeRegression:
         cb = AdaptationCallback(adapt_logger)
 
         # ---- on_start writes the iter-0 baseline (already-flat shape) ----
-        ss_initial = np.full((n_gpu, n_per_gpu, n_moves), 0.2, dtype=np.float32)
+        ss_initial = np.full(
+            (n_gpu, n_per_gpu, n_moves), 0.2, dtype=np.float32
+        )
         cb.on_start(
             ns_state=None,
             start_info={
@@ -166,31 +175,43 @@ class TestAdaptationCallbackPmapVmapShapeRegression:
             "_batcher": batcher,
             "step_sizes_per_move": ss_initial,
             "acceptance_rates_per_move": np.full(
-                (n_gpu, n_per_gpu, n_moves), 0.5, dtype=np.float32,
+                (n_gpu, n_per_gpu, n_moves),
+                0.5,
+                dtype=np.float32,
             ),
             "reject_counts_per_move": np.zeros(
-                (n_gpu, n_per_gpu, n_moves, 4), dtype=np.int32,
+                (n_gpu, n_per_gpu, n_moves, 4),
+                dtype=np.int32,
             ),
             "adjustment_n_rounds": np.ones(
-                (n_gpu, n_per_gpu, n_moves), dtype=np.int32,
+                (n_gpu, n_per_gpu, n_moves),
+                dtype=np.int32,
             ),
             "adjustment_converged": np.ones(
-                (n_gpu, n_per_gpu, n_moves), dtype=bool,
+                (n_gpu, n_per_gpu, n_moves),
+                dtype=bool,
             ),
             "adjustment_cap_hits": np.zeros(
-                (n_gpu, n_per_gpu, n_moves), dtype=np.int32,
+                (n_gpu, n_per_gpu, n_moves),
+                dtype=np.int32,
             ),
             "adjustment_floor_hits": np.zeros(
-                (n_gpu, n_per_gpu, n_moves), dtype=np.int32,
+                (n_gpu, n_per_gpu, n_moves),
+                dtype=np.int32,
             ),
             "adjustment_bracket_detected": np.zeros(
-                (n_gpu, n_per_gpu, n_moves), dtype=bool,
+                (n_gpu, n_per_gpu, n_moves),
+                dtype=bool,
             ),
             "n_evaluations_per_move": np.full(
-                (n_gpu, n_per_gpu, n_moves), 100, dtype=np.int64,
+                (n_gpu, n_per_gpu, n_moves),
+                100,
+                dtype=np.int64,
             ),
             "n_grad_evaluations_per_move": np.full(
-                (n_gpu, n_per_gpu, n_moves), 20, dtype=np.int64,
+                (n_gpu, n_per_gpu, n_moves),
+                20,
+                dtype=np.int64,
             ),
         }
         # This used to crash with "Can't broadcast (1, 2, 8, 4) -> (1, 16, 4)".
@@ -205,7 +226,10 @@ class TestAdaptationCallbackPmapVmapShapeRegression:
         assert log.step_sizes.shape == (2, n_runs, n_moves)
         assert log.adjustment_stats is not None
         assert log.adjustment_stats["reject_reason_counts"].shape == (
-            2, n_runs, n_moves, 4,
+            2,
+            n_runs,
+            n_moves,
+            4,
         )
         assert log.adjustment_stats["n_rounds"].shape == (2, n_runs, n_moves)
         assert log.n_evaluations is not None
@@ -245,7 +269,8 @@ class TestAdaptationCallbackHealthWarnings:
             "acceptance_rates_per_move": np.asarray(acc, dtype=np.float32),
             "adjustment_floor_hits": np.asarray(floor_hits, dtype=np.int32),
             "adjustment_bracket_detected": np.asarray(
-                bracket_detected, dtype=bool,
+                bracket_detected,
+                dtype=bool,
             ),
             "adjustment_n_rounds": np.zeros(n_moves, dtype=np.int32),
             "adjustment_converged": np.ones(n_moves, dtype=bool),
@@ -275,7 +300,8 @@ class TestAdaptationCallbackHealthWarnings:
         cb.on_finish(ns_state=None)
 
         floor_msgs = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if "hit step-size floor" in r.getMessage()
         ]
         assert len(floor_msgs) == 1, (
@@ -306,20 +332,21 @@ class TestAdaptationCallbackHealthWarnings:
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.monitor"):
             for k in range(K):
                 cb.on_iteration(
-                    iteration=1000 + 100 * k, ns_state=None, info=pathological,
+                    iteration=1000 + 100 * k,
+                    ns_state=None,
+                    info=pathological,
                 )
         cb.on_finish(ns_state=None)
 
-        stall_msgs = [
-            r for r in caplog.records if "STALLED" in r.getMessage()
-        ]
-        assert len(stall_msgs) == 1, (
-            f"expected one STALL warning at event {K}, got {len(stall_msgs)}"
-        )
+        stall_msgs = [r for r in caplog.records if "STALLED" in r.getMessage()]
+        assert (
+            len(stall_msgs) == 1
+        ), f"expected one STALL warning at event {K}, got {len(stall_msgs)}"
         assert "move=m0" in stall_msgs[0].getMessage()
         # Floor warning also fires (on event 1), independently.
         floor_msgs = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if "hit step-size floor" in r.getMessage()
         ]
         assert len(floor_msgs) == 1
@@ -344,7 +371,9 @@ class TestAdaptationCallbackHealthWarnings:
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.monitor"):
             for k in range(K + 2):
                 cb.on_iteration(
-                    iteration=10 + k, ns_state=None, info=bracketed,
+                    iteration=10 + k,
+                    ns_state=None,
+                    info=bracketed,
                 )
         cb.on_finish(ns_state=None)
         assert not any("STALLED" in r.getMessage() for r in caplog.records)
@@ -365,7 +394,9 @@ class TestAdaptationCallbackHealthWarnings:
         with caplog.at_level(logging.WARNING, logger="jaxrens.cli.monitor"):
             for k in range(10):
                 cb.on_iteration(
-                    iteration=10 + k, ns_state=None, info=healthy,
+                    iteration=10 + k,
+                    ns_state=None,
+                    info=healthy,
                 )
         cb.on_finish(ns_state=None)
         assert caplog.records == []
@@ -383,5 +414,6 @@ class TestAccRatesLoggerEmpty:
         log = AccRatesLogger(path=path, move_names=["m0"], n_runs=1)
         log.close()
         with pytest.raises(RuntimeError):
-            log.write_entry(0, np.array([1], dtype=np.int64),
-                            np.array([2], dtype=np.int64))
+            log.write_entry(
+                0, np.array([1], dtype=np.int64), np.array([2], dtype=np.int64)
+            )

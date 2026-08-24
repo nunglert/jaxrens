@@ -32,6 +32,89 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Banner / version reporting
+# ---------------------------------------------------------------------------
+
+# Wordmark rendered with figlet's "small" font.  Kept as a literal so the
+# --help / --version paths stay dependency-free and JAX-free.
+_WORDMARK = r"""  _
+ (_)__ ___ ___ _ ___ _ _  ___
+ | / _` \ \ / '_/ -_) ' \(_-<
+_/ \__,_/_\_\_| \___|_||_/__/
+|__/"""
+
+_TAGLINE = "JAX-based nested sampling for atomistic systems"
+
+
+def _package_version() -> str:
+    """Return the installed jaxrens version string (JAX-free)."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("jaxrens")
+    except PackageNotFoundError:
+        return "0.0.0+unknown"
+
+
+def _banner(stream: Any = None) -> str:
+    """Colourised wordmark + tagline for --help / --version headers."""
+    from jaxrens.cli.style import style
+
+    if stream is None:
+        stream = sys.stdout
+    mark = style(_WORDMARK, "cyan", "bold", stream=stream)
+    tag = style(_TAGLINE, "dim", stream=stream)
+    ver = style(f"v{_package_version()}", "green", stream=stream)
+    return f"{mark}\n\n{tag}  ·  {ver}"
+
+
+def _version_report() -> str:
+    """Multi-line ``--version`` output: jaxrens + key runtime versions.
+
+    Versions are read from installed package metadata, so this does *not*
+    import JAX (which would pay the backend-probe cost on a GPU-less box).
+    """
+    import platform
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    from jaxrens.cli.style import style
+
+    def _dep(name: str) -> str:
+        try:
+            return _pkg_version(name)
+        except PackageNotFoundError:
+            return "not installed"
+
+    py = f"{platform.python_version()} ({platform.python_implementation()})"
+    rows = [
+        ("jax", _dep("jax")),
+        ("jaxlib", _dep("jaxlib")),
+        ("numpy", _dep("numpy")),
+        ("python", py),
+    ]
+    width = max(len(k) for k, _ in rows)
+    body = "\n".join(
+        f"  {style(k.ljust(width), 'grey')}  {v}" for k, v in rows
+    )
+    header = style(f"jaxrens {_package_version()}", "cyan", "bold")
+    return f"{header}\n{body}"
+
+
+class _VersionAction(argparse.Action):
+    """`--version` handler that prints the styled multi-line report."""
+
+    def __init__(self, option_strings, dest, **kwargs):
+        kwargs.setdefault("nargs", 0)
+        kwargs.setdefault("help", "Show version information and exit.")
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(_version_report())
+        parser.exit()
+
+
+# ---------------------------------------------------------------------------
 # --set dotted-path parser (≤40 lines)
 # ---------------------------------------------------------------------------
 
@@ -51,7 +134,12 @@ def _parse_set_override(spec: str) -> tuple[list[str | int], Any]:
         *value* is the YAML-parsed scalar.
     """
     if "=" not in spec:
-        raise ValueError(f"--set value must contain '=': {spec!r}")
+        raise ValueError(
+            f"--set expects KEY=VALUE, got {spec!r} with no '='. "
+            f"Use dotted keys to reach nested config, with bracket "
+            f"notation for list entries, e.g. --set run.n_live=128 or "
+            f"--set moves[0].step_size=0.1."
+        )
     key_str, _, val_str = spec.partition("=")
     raw_parts = key_str.split(".")
     path: list[str | int] = []
@@ -362,6 +450,21 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ok_header(text: str) -> str:
+    """Green ``✓ OK`` header line for the ``validate`` subcommand."""
+    from jaxrens.cli.style import style
+
+    mark = style("✓ OK", "green", "bold")
+    return f"{mark} — {text}"
+
+
+def _kv(label: str, value: str) -> str:
+    """Render an aligned ``  <label>  <value>`` detail row (label dimmed)."""
+    from jaxrens.cli.style import style
+
+    return f"  {style(f'{label:<9}', 'cyan')} {value}"
+
+
 def _cmd_validate(args: argparse.Namespace) -> int:
     root = _load_and_validate(args.config, args.set)
 
@@ -369,13 +472,23 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         n_moves = len(root.moves)
         move_types = ", ".join(m.move_type for m in root.moves)
         print(
-            f"OK — schema validation passed (parse-only)\n"
-            f"  run:     n_live={root.run.n_live}, "
-            f"max_iterations={root.run.max_iterations}\n"
-            f"  moves:   {n_moves} move(s) [{move_types}]\n"
-            f"  backend: {root.backend.backend_type}\n"
-            f"  output:  format={root.output.format}, "
-            f"prefix={root.output.out_file_prefix}"
+            "\n".join(
+                [
+                    _ok_header("schema validation passed (parse-only)"),
+                    _kv(
+                        "run",
+                        f"n_live={root.run.n_live}, "
+                        f"max_iterations={root.run.max_iterations}",
+                    ),
+                    _kv("moves", f"{n_moves} move(s) [{move_types}]"),
+                    _kv("backend", f"{root.backend.backend_type}"),
+                    _kv(
+                        "output",
+                        f"format={root.output.format}, "
+                        f"prefix={root.output.out_file_prefix}",
+                    ),
+                ]
+            )
         )
         return 0
 
@@ -388,28 +501,41 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     n_atoms = int(resolved.init.initial_positions.shape[-2])
 
     if isinstance(resolved.batcher, SingleRun):
-        topology_line = "  topology: SingleRun (1 replica, 1 GPU)\n"
+        topology = "SingleRun (1 replica, 1 GPU)"
     elif isinstance(resolved.batcher, ShardedSingleRun):
-        topology_line = (
-            f"  topology: ShardedSingleRun "
-            f"(1 replica, sharded across {resolved.batcher.n_gpu} GPUs)\n"
+        topology = (
+            f"ShardedSingleRun "
+            f"(1 replica, sharded across {resolved.batcher.n_gpu} GPUs)"
         )
     else:
-        topology_line = (
-            f"  topology: n_gpu={resolved.ns.n_gpu} × "
+        topology = (
+            f"n_gpu={resolved.ns.n_gpu} × "
             f"n_per_gpu={resolved.ns.n_per_gpu} = "
-            f"{resolved.ns.n_gpu * resolved.ns.n_per_gpu} replica(s)\n"
+            f"{resolved.ns.n_gpu * resolved.ns.n_per_gpu} replica(s)"
         )
 
     print(
-        f"OK\n"
-        f"{topology_line}"
-        f"  run:     n_live={resolved.ns.n_live}, "
-        f"max_iterations={resolved.ns.max_iterations}\n"
-        f"  moves:   {n_moves} move(s) [{move_types}]\n"
-        f"  backend: {resolved.backend.backend_type}, n_atoms={n_atoms}\n"
-        f"  output:  format={resolved.output.format}, "
-        f"prefix={resolved.output.out_file_prefix}"
+        "\n".join(
+            [
+                _ok_header("configuration valid"),
+                _kv("topology", topology),
+                _kv(
+                    "run",
+                    f"n_live={resolved.ns.n_live}, "
+                    f"max_iterations={resolved.ns.max_iterations}",
+                ),
+                _kv("moves", f"{n_moves} move(s) [{move_types}]"),
+                _kv(
+                    "backend",
+                    f"{resolved.backend.backend_type}, n_atoms={n_atoms}",
+                ),
+                _kv(
+                    "output",
+                    f"format={resolved.output.format}, "
+                    f"prefix={resolved.output.out_file_prefix}",
+                ),
+            ]
+        )
     )
     return 0
 
@@ -463,9 +589,20 @@ def _cmd_plot(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jaxrens",
-        description="jaxrens nested sampling toolkit",
+        description=_banner(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "-V",
+        "--version",
+        action=_VersionAction,
+    )
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True,
+        title="commands",
+        metavar="<command>",
+    )
 
     # -- run --
     p_run = sub.add_parser(
@@ -572,99 +709,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="OUTPUT.png",
         help="Output PNG path.  Default: sibling <stem>.<kind>.png.",
-    )
-
-    # -- annotate-uncertainty --
-    p_unc = sub.add_parser(
-        "annotate-uncertainty",
-        help=(
-            "Post-hoc: annotate a written NS trajectory with committee "
-            "energy/force uncertainty (ns_energy_std / ns_force_std)."
-        ),
-    )
-    p_unc.add_argument(
-        "--traj",
-        required=True,
-        metavar="FILE",
-        help="Trajectory to annotate (.extxyz/.xyz/.h5/.hdf5).",
-    )
-    p_unc.add_argument(
-        "--model",
-        required=True,
-        metavar="PICKLE",
-        help="NeuralIL ensemble model pickle (the committee).",
-    )
-    p_unc.add_argument(
-        "--supercell",
-        nargs=3,
-        type=int,
-        default=[1, 1, 1],
-        metavar=("A", "B", "C"),
-        help="Supercell transform passed to the backend.  Default 1 1 1.",
-    )
-    p_unc.add_argument(
-        "--no-forces",
-        action="store_false",
-        dest="forces",
-        help="Only compute energy uncertainty (skip the force jacobian).",
-    )
-    p_unc.add_argument(
-        "--in-place",
-        action="store_true",
-        help="Edit the trajectory in place instead of writing *.annotated.<ext>.",
-    )
-    p_unc.add_argument(
-        "--chunk-size",
-        type=int,
-        default=64,
-        metavar="N",
-        help="Frames per batched evaluation (bounds memory).  Default 64.",
-    )
-
-    # -- annotate-steinhardt --
-    p_stein = sub.add_parser(
-        "annotate-steinhardt",
-        help=(
-            "Post-hoc: annotate a trajectory with per-atom Steinhardt "
-            "bond-orientational order parameters (q_l / w_l)."
-        ),
-    )
-    p_stein.add_argument(
-        "--traj",
-        required=True,
-        metavar="FILE",
-        help="Trajectory to annotate (.extxyz/.xyz).",
-    )
-    p_stein.add_argument(
-        "--l",
-        dest="ls",
-        required=True,
-        type=int,
-        nargs="+",
-        metavar="L",
-        help="Bond-order degree(s), even in practice, e.g. --l 4 6.",
-    )
-    p_stein.add_argument(
-        "--r-cut",
-        required=True,
-        type=float,
-        metavar="R",
-        help="Neighbour cutoff in Angstrom.",
-    )
-    p_stein.add_argument(
-        "--r-cut-min",
-        type=float,
-        default=0.0,
-        metavar="R",
-        help="Lower neighbour cutoff in Angstrom.  Default 0.",
-    )
-    p_stein.add_argument(
-        "--in-place",
-        action="store_true",
-        help=(
-            "Edit the trajectory in place instead of writing "
-            "*.annotated.<ext>."
-        ),
     )
 
     return parser
@@ -784,54 +828,6 @@ def _format_validation_error(exc: Any, config_path: str) -> str:
     return "\n".join(lines)
 
 
-def _cmd_annotate_uncertainty(args: argparse.Namespace) -> int:
-    """Standalone post-hoc committee-uncertainty annotation of a trajectory."""
-    from jaxrens.backends.base import get_committee_backend
-    from jaxrens.backends.neuralil import create_neuralil
-    from jaxrens.postprocess.uncertainty import annotate_trajectory_uncertainty
-
-    backend = create_neuralil(
-        pickle_file=args.model,
-        supercell_trafo=tuple(args.supercell),
-    )
-    committee = get_committee_backend(backend)
-    if committee is None:
-        print(
-            "jaxrens: the provided model is not an NN committee (ensemble); "
-            "committee uncertainty requires an ensemble model.",
-            file=sys.stderr,
-        )
-        return 2
-    out = annotate_trajectory_uncertainty(
-        args.traj,
-        committee,
-        with_forces=args.forces,
-        in_place=args.in_place,
-        chunk_size=args.chunk_size,
-    )
-    print(f"Wrote committee-uncertainty annotation: {out}")
-    return 0
-
-
-def _cmd_annotate_steinhardt(args: argparse.Namespace) -> int:
-    """Standalone post-hoc Steinhardt order-parameter annotation."""
-    from jaxrens.postprocess.steinhardt import annotate_trajectory_steinhardt
-
-    try:
-        out = annotate_trajectory_steinhardt(
-            args.traj,
-            args.ls,
-            args.r_cut,
-            r_cut_min=args.r_cut_min,
-            in_place=args.in_place,
-        )
-    except ValueError as exc:
-        print(f"jaxrens annotate-steinhardt: {exc}", file=sys.stderr)
-        return 2
-    print(f"Wrote Steinhardt annotation: {out}")
-    return 0
-
-
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point registered via ``[project.scripts]``."""
     from pydantic import ValidationError
@@ -844,21 +840,25 @@ def main(argv: list[str] | None = None) -> None:
         "validate": _cmd_validate,
         "dump-schema": _cmd_dump_schema,
         "plot": _cmd_plot,
-        "annotate-uncertainty": _cmd_annotate_uncertainty,
-        "annotate-steinhardt": _cmd_annotate_steinhardt,
     }
+    from jaxrens.cli.style import style
+
+    def _err(msg: str) -> None:
+        mark = style("✗", "red", "bold", stream=sys.stderr)
+        print(f"{mark} {msg}", file=sys.stderr)
+
     handler = dispatch[args.command]
     try:
         sys.exit(handler(args))
     except ValidationError as exc:
         cfg = getattr(args, "config", "<unknown>")
-        print(_format_validation_error(exc, cfg), file=sys.stderr)
+        _err(_format_validation_error(exc, cfg))
         sys.exit(2)
     except FileNotFoundError as exc:
-        print(f"jaxrens: {exc}", file=sys.stderr)
+        _err(f"jaxrens: {exc}")
         sys.exit(2)
     except yaml.YAMLError as exc:
-        print(f"jaxrens: YAML parse error: {exc}", file=sys.stderr)
+        _err(f"jaxrens: YAML parse error: {exc}")
         sys.exit(2)
 
 

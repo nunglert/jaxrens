@@ -18,7 +18,7 @@ class MoveKernel:
     Attributes:
         name: Human-readable label (e.g. "random_walk", "volume").
         build_kernel: Reference to the module's build_kernel function.
-            Signature: build_kernel(energy_fn, params, **kernel_kwargs)
+            Signature: build_kernel(energy_fn, params, ``**kernel_kwargs``)
             -> step_fn(rng_key, state, likelihood_constraint) -> (state, MoveInfo)
         kernel_kwargs: Extra keyword arguments forwarded to build_kernel
             (e.g. n_reflect for Galilean, n_atoms for volume).
@@ -30,8 +30,10 @@ class MoveKernel:
             Keys are field names, values are (type, initializer_fn) tuples.
             The initializer is called as initializer(positions, types) and
             must return the initial value for that field.
-            Example for Galilean:
+            Example for Galilean::
+
                 {"direction": (jnp.ndarray, lambda pos, types: jnp.zeros_like(pos))}
+
             The MWG factory unions extra_state_fields from all descriptors
             to build the MCState class dynamically.
         reject_reasons: Set of reject-reason bucket names this move can emit.

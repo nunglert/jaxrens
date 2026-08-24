@@ -28,20 +28,19 @@ from jaxrens.cli.schema.backend import (
 )
 from jaxrens.cli.schema.moves import (
     AlchemicalMorphMoveSpec,
-    AlchemicalShiftMoveSpec,
     GMCMoveSpec,
     HMCMoveSpec,
     RandomWalkMoveSpec,
     ShearMoveSpec,
     SingleAtomMoveSpec,
-    SingleAtomSwapMoveSpec,
     SingleAtomSweepMoveSpec,
+    SpeciesSwapMoveSpec,
     StretchMoveSpec,
     VolumeMoveSpec,
 )
 from jaxrens.sampling.batch_descriptor import PmapVmapRuns, SingleRun
 
-_DATA = Path(__file__).parent.parent / "data" / "cli"
+_DATA = Path(__file__).parent.parent / "_assets" / "data" / "cli"
 _MINIMAL_YAML = _DATA / "minimal.yaml"
 _MIXED_MOVES_YAML = _DATA / "mixed_moves.yaml"
 _LJ_BACKEND_YAML = _DATA / "lj_backend.yaml"
@@ -419,7 +418,11 @@ class TestDiscriminatedUnion:
             ({"type": "hmc"}, HMCMoveSpec),
             ({"type": "single_atom"}, SingleAtomMoveSpec),
             ({"type": "single_atom_sweep"}, SingleAtomSweepMoveSpec),
-            ({"type": "single_atom_swap"}, SingleAtomSwapMoveSpec),
+            ({"type": "species_swap"}, SpeciesSwapMoveSpec),
+            (
+                {"type": "species_swap", "species": ["Ge", "Si"]},
+                SpeciesSwapMoveSpec,
+            ),
             ({"type": "volume"}, VolumeMoveSpec),
             ({"type": "shear"}, ShearMoveSpec),
             ({"type": "stretch"}, StretchMoveSpec),
@@ -427,7 +430,6 @@ class TestDiscriminatedUnion:
                 {"type": "alchemical_morph", "n_species": 2},
                 AlchemicalMorphMoveSpec,
             ),
-            ({"type": "alchemical_shift"}, AlchemicalShiftMoveSpec),
         ],
     )
     def test_correct_subclass_instantiated(self, move_dict, expected_cls):
@@ -1007,6 +1009,33 @@ class TestCellSpec:
         assert cfg.min_volume_per_atom == pytest.approx(1.0)
         assert cfg.min_aspect_ratio == pytest.approx(0.8)
         assert cfg.flat_V_prior is False
+        # Unset initial floor falls back to the sampling constraint.
+        assert cfg.initial_min_volume_per_atom is None
+        assert cfg.effective_initial_min_volume_per_atom == pytest.approx(1.0)
+
+    def test_initial_min_volume_decoupled_from_constraint(self):
+        from jaxrens.cli.schema.cell import CellSpec
+
+        cfg = CellSpec(
+            min_volume_per_atom=1.0, initial_min_volume_per_atom=20.0
+        )
+        # The init floor is independent of the (smaller) sampling constraint.
+        assert cfg.min_volume_per_atom == pytest.approx(1.0)
+        assert cfg.effective_initial_min_volume_per_atom == pytest.approx(20.0)
+
+    def test_initial_min_volume_rejects_negative(self):
+        from jaxrens.cli.schema.cell import CellSpec
+
+        with pytest.raises(ValueError, match="must be >= 0"):
+            CellSpec(initial_min_volume_per_atom=-1.0)
+
+    def test_initial_min_volume_rejects_above_max(self):
+        from jaxrens.cli.schema.cell import CellSpec
+
+        with pytest.raises(ValueError, match="exceeds"):
+            CellSpec(
+                max_volume_per_atom=50.0, initial_min_volume_per_atom=60.0
+            )
 
     def test_custom_values_accepted(self):
         from jaxrens.cli.schema.cell import CellSpec

@@ -16,7 +16,34 @@ import pytest
 
 from jaxrens.cli.cli import main
 
-_DATA = Path(__file__).parent.parent / "data" / "cli"
+_DATA = Path(__file__).parent.parent / "_assets" / "data" / "cli"
+
+
+# ---------------------------------------------------------------------------
+# --version
+# ---------------------------------------------------------------------------
+
+
+class TestVersion:
+    @pytest.mark.parametrize("flag", ["--version", "-V"])
+    def test_prints_version_and_exits_zero(self, flag, capsys):
+        from jaxrens import __version__
+
+        with pytest.raises(SystemExit) as exc_info:
+            main([flag])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert "jaxrens" in out
+        assert __version__ in out
+        # Runtime deps are reported too (read from metadata, JAX not imported).
+        assert "jax" in out
+        assert "python" in out
+
+    def test_version_output_is_plain_when_not_a_tty(self, capsys):
+        """capsys is not a TTY, so no ANSI escape codes should leak."""
+        with pytest.raises(SystemExit):
+            main(["--version"])
+        assert "\x1b[" not in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -43,64 +70,6 @@ class TestDumpSchema:
             main(["dump-schema", "--format", "json"])
         assert exc_info.value.code == 0
         json.loads(capsys.readouterr().out)  # parses
-
-
-# ---------------------------------------------------------------------------
-# annotate-steinhardt
-# ---------------------------------------------------------------------------
-
-
-class TestAnnotateSteinhardt:
-    def test_annotates_extxyz(self, tmp_path, capsys):
-        from ase.io import read
-
-        src = Path(__file__).parent.parent / "data" / "postprocess"
-        frames = read(str(src / "steinhardt" / "fcc_Cu.xyz"), index=":")
-        traj = tmp_path / "run.traj.extxyz"
-        from ase.io import write
-
-        write(str(traj), frames)
-
-        with pytest.raises(SystemExit) as exc_info:
-            main(
-                [
-                    "annotate-steinhardt",
-                    "--traj",
-                    str(traj),
-                    "--l",
-                    "4",
-                    "6",
-                    "--r-cut",
-                    "3.0",
-                ]
-            )
-        assert exc_info.value.code == 0
-        out = capsys.readouterr().out
-        assert "Steinhardt annotation" in out
-
-        annotated = read(
-            str(tmp_path / "run.traj.annotated.extxyz"), index=":"
-        )
-        for atoms in annotated:
-            assert "q6" in atoms.arrays and "w4" in atoms.arrays
-
-    def test_non_extxyz_returns_2(self, tmp_path, capsys):
-        bogus = tmp_path / "run.traj.h5"
-        bogus.write_bytes(b"nope")
-        with pytest.raises(SystemExit) as exc_info:
-            main(
-                [
-                    "annotate-steinhardt",
-                    "--traj",
-                    str(bogus),
-                    "--l",
-                    "6",
-                    "--r-cut",
-                    "3.0",
-                ]
-            )
-        assert exc_info.value.code == 2
-        assert "jaxrens annotate-steinhardt:" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

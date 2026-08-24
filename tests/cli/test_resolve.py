@@ -25,7 +25,6 @@ from jaxrens.cli.schema.backend import (
 )
 from jaxrens.cli.schema.moves import (
     AlchemicalMorphMoveSpec,
-    AlchemicalShiftMoveSpec,
     GMCMoveSpec,
     HMCMoveSpec,
     RandomWalkMoveSpec,
@@ -39,7 +38,7 @@ from jaxrens.state.config import (
     OutputConfig,
 )
 
-_DATA = Path(__file__).parent.parent / "data" / "cli"
+_DATA = Path(__file__).parent.parent / "_assets" / "data" / "cli"
 _MINIMAL_YAML = _DATA / "minimal.yaml"
 _LJ_BACKEND_YAML = _DATA / "lj_backend.yaml"
 _FULL_CONFIG_YAML = _DATA / "full_config.yaml"
@@ -246,11 +245,6 @@ class TestToDescriptor:
         spec = AlchemicalMorphMoveSpec(n_species=3)
         desc = spec.to_descriptor()
         assert desc.kernel_kwargs == {"n_species": 3}
-
-    def test_alchemical_shift_descriptor(self):
-        spec = AlchemicalShiftMoveSpec()
-        desc = spec.to_descriptor()
-        assert desc.kernel_kwargs == {}
 
     def test_name_defaults_to_type(self):
         spec = RandomWalkMoveSpec()

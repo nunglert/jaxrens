@@ -46,6 +46,7 @@ jobs:
           docker run --rm --gpus all \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
+            -e JAXRENS_BENCH_SHA="${{ github.event.pull_request.head.sha }}" \
             jaxrens-ci:${{ github.sha }} \
             python bench/run.py
           cp bench/results.jsonl /tmp/pr.jsonl
@@ -68,6 +69,7 @@ jobs:
           docker run --rm --gpus all \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
+            -e JAXRENS_BENCH_SHA="${{ github.event.pull_request.base.sha }}" \
             jaxrens-ci:${{ github.sha }} \
             python bench/run.py
           cp bench/results.jsonl /tmp/base.jsonl
