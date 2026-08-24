@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import pytest
 
 from jaxrens.backends.toy import create_double_well, create_harmonic
-from jaxrens.base import MoveInfo
+from jaxrens.sampling.base import MoveInfo
 from jaxrens.sampling.moves import alchemical, hmc, single_atom
 from jaxrens.state.mc_state import MCState
 

@@ -29,8 +29,8 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int, Key
 
-from jaxrens.base import MoveInfo
 from jaxrens.constraints.base import ConstraintDescriptor, make_move_gate
+from jaxrens.sampling.base import MoveInfo
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.state.mc_state import make_mc_state_class
 

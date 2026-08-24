@@ -8,11 +8,31 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+class TrajectoryWriter(Protocol):
+    """Protocol for trajectory output backends.
+
+    The three writers below implement it structurally (no inheritance);
+    ``TrajectoryCallback`` in ``jaxrens.cli.monitor`` only ever calls these
+    three methods.
+    """
+
+    def write_dead_point(
+        self, iteration: int, walker: Any, energy: float
+    ) -> None:
+        ...
+
+    def write_walker_snapshot(self, iteration: int, walkers: Any) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
 
 
 def _wrap_positions_np(positions: Any, cell: Any) -> np.ndarray:
@@ -262,7 +282,7 @@ def create_trajectory_writer(
     path: Path | str,
     symbol_map: dict[int, str],
     **kwargs: Any,
-) -> ExtxyzTrajectoryWriter | H5TrajectoryWriter | NullTrajectoryWriter:
+) -> TrajectoryWriter:
     """Factory for trajectory writers."""
     match format:
         case "extxyz":

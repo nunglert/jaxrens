@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 
-from jaxrens.base import MoveInfo
+from jaxrens.sampling.base import MoveInfo
 
 
 def finalize_cell_move(

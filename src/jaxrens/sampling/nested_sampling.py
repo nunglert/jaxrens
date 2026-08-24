@@ -21,7 +21,6 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float, Int, Key
 
-from jaxrens.base import NSCallback
 from jaxrens.sampling.adaptation.manager import build_adapt_step
 from jaxrens.sampling.batch_descriptor import (
     PmapVmapRuns,
@@ -36,6 +35,7 @@ from jaxrens.sampling.moves.replica_exchange import (
     XRENSSwap,
 )
 from jaxrens.sampling.run_loop import (
+    NSCallback,
     _bump_cumulative_counters,
     _dispatch_callbacks,
     _gather_sharded_ns_state,
@@ -978,7 +978,7 @@ def run_ns(
     convergence_threshold: float = 0.1,
     initial_step_size: float = 0.1,
     target_acceptance: float = 0.5,
-    callbacks: list[Any] | None = None,
+    callbacks: list[NSCallback] | None = None,
     termination_criteria: list[TerminationCriterion] | None = None,
     ensemble_params: dict | None = None,
     per_move_fns: list[Callable] | None = None,
@@ -1214,7 +1214,7 @@ def run_ns_parallel(
     restart_states: list | None = None,
     inter_re_config=None,
     backend=None,
-    callbacks: list | None = None,
+    callbacks: list[NSCallback] | None = None,
     max_neighbors_list: tuple[int, ...] | list[int] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
@@ -1759,7 +1759,7 @@ def run_ns_multi_gpu(
     convergence_threshold: float = 0.1,
     initial_step_size: float = 0.1,
     target_acceptance: float = 0.5,
-    callbacks: list[Any] | None = None,
+    callbacks: list[NSCallback] | None = None,
     termination_criteria: list[TerminationCriterion] | None = None,
     ensemble_params_per_run: list[dict] | None = None,
     per_move_fns: list[Callable] | None = None,
@@ -2153,7 +2153,7 @@ def run_ns_sharded(
     convergence_threshold: float = 0.1,
     initial_step_size: float = 0.1,
     target_acceptance: float = 0.5,
-    callbacks: list[Any] | None = None,
+    callbacks: list[NSCallback] | None = None,
     termination_criteria: list[TerminationCriterion] | None = None,
     ensemble_params: dict | None = None,
     per_move_fns: list[Callable] | None = None,

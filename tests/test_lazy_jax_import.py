@@ -15,7 +15,9 @@ import pytest
 def _python_check(code: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-c", code],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
 
@@ -112,11 +114,12 @@ def test_direct_submodule_import_applies_x64_pin():
     assert r.returncode == 0, r.stderr
 
 
-def test_direct_top_level_base_import_applies_x64_pin():
-    # ``jaxrens.base`` is reached directly from tests/user code without a
-    # subpackage __init__ in between — its own pin must fire.
+def test_direct_move_info_import_applies_x64_pin():
+    # ``MoveInfo`` is imported directly from tests/user code, bypassing any
+    # module that would otherwise have pinned x64 — the pin must fire from
+    # ``jaxrens.sampling``'s own __init__ and from the module itself.
     r = _python_check(
-        "from jaxrens.base import MoveInfo; "
+        "from jaxrens.sampling.base import MoveInfo; "
         "import jax; "
         "assert jax.config.read('jax_enable_x64') is False"
     )

@@ -21,12 +21,11 @@ import numpy as np
 import pytest
 
 from jaxrens.backends.toy import create_harmonic
-from jaxrens.base import MoveInfo
+from jaxrens.sampling.base import MoveInfo
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import galilean, random_walk
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, ns_step, run_ns
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -37,9 +36,12 @@ from jaxrens.sampling.nested_sampling import init_ns, ns_step, run_ns
 def harmonic_rw_setup():
     """Harmonic oscillator with random_walk only."""
     backend = create_harmonic(k=1.0)
-    init_fn, step_fn, _ = build_mwg(backend, [
-        MoveKernel("random_walk", random_walk.build_kernel),
-    ])
+    init_fn, step_fn, _ = build_mwg(
+        backend,
+        [
+            MoveKernel("random_walk", random_walk.build_kernel),
+        ],
+    )
     n_walkers = 20
     key = jax.random.key(77)
     key, init_key = jax.random.split(key)
@@ -48,11 +50,17 @@ def harmonic_rw_setup():
     energies = jax.vmap(
         lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
     )(positions)
-    ns_state = init_ns(init_fn, positions, types, energies, cells=None, rng_key=key)
+    ns_state = init_ns(
+        init_fn, positions, types, energies, cells=None, rng_key=key
+    )
     return {
-        "init_fn": init_fn, "step_fn": step_fn,
-        "positions": positions, "types": types,
-        "energies": energies, "ns_state": ns_state, "key": key,
+        "init_fn": init_fn,
+        "step_fn": step_fn,
+        "positions": positions,
+        "types": types,
+        "energies": energies,
+        "ns_state": ns_state,
+        "key": key,
     }
 
 
@@ -65,16 +73,22 @@ def galilean_setup():
     n_reflect = 5
     backend = create_harmonic(k=1.0)
 
-    init_fn, step_fn, _ = build_mwg(backend, [
-        MoveKernel(
-            "galilean",
-            galilean.build_kernel,
-            kernel_kwargs={"n_reflect": n_reflect, "use_forces": True},
-            extra_state_fields={
-                "direction": (jnp.ndarray, lambda pos, types: jnp.zeros_like(pos))
-            },
-        ),
-    ])
+    init_fn, step_fn, _ = build_mwg(
+        backend,
+        [
+            MoveKernel(
+                "galilean",
+                galilean.build_kernel,
+                kernel_kwargs={"n_reflect": n_reflect, "use_forces": True},
+                extra_state_fields={
+                    "direction": (
+                        jnp.ndarray,
+                        lambda pos, types: jnp.zeros_like(pos),
+                    )
+                },
+            ),
+        ],
+    )
     n_walkers = 20
     key = jax.random.key(88)
     key, init_key = jax.random.split(key)
@@ -83,11 +97,17 @@ def galilean_setup():
     energies = jax.vmap(
         lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
     )(positions)
-    ns_state = init_ns(init_fn, positions, types, energies, cells=None, rng_key=key)
+    ns_state = init_ns(
+        init_fn, positions, types, energies, cells=None, rng_key=key
+    )
     return {
-        "init_fn": init_fn, "step_fn": step_fn,
-        "positions": positions, "types": types,
-        "energies": energies, "ns_state": ns_state, "key": key,
+        "init_fn": init_fn,
+        "step_fn": step_fn,
+        "positions": positions,
+        "types": types,
+        "energies": energies,
+        "ns_state": ns_state,
+        "key": key,
         "n_reflect": n_reflect,
     }
 
@@ -171,7 +191,8 @@ class TestRandomWalkCounters:
 class TestGalileanCounters:
     def test_galilean_eval_counts(self, galilean_setup):
         """Galilean ns_step info: n_evaluations_per_move == n_grad_evaluations_per_move
-        == n_reflect * n_walk * n_mcmc_steps (all reflect calls use value_and_grad)."""
+        == n_reflect * n_walk * n_mcmc_steps (all reflect calls use value_and_grad).
+        """
         s = galilean_setup
         n_mcmc_steps = 4
         n_walk = 1
@@ -184,7 +205,9 @@ class TestGalileanCounters:
 
         expected = s["n_reflect"] * n_walk * n_mcmc_steps
         assert n_e == expected, f"n_evaluations={n_e}, expected={expected}"
-        assert n_g == expected, f"n_grad_evaluations={n_g}, expected={expected}"
+        assert (
+            n_g == expected
+        ), f"n_grad_evaluations={n_g}, expected={expected}"
         # galilean: every eval is a value_and_grad call
         assert n_e == n_g
 
@@ -209,17 +232,23 @@ class TestMixedMWGCounters:
         n_reflect = 5
         backend = create_harmonic(k=1.0)
 
-        init_fn, step_fn, _ = build_mwg(backend, [
-            MoveKernel(
-                "galilean",
-                galilean.build_kernel,
-                kernel_kwargs={"n_reflect": n_reflect, "use_forces": True},
-                extra_state_fields={
-                    "direction": (jnp.ndarray, lambda pos, types: jnp.zeros_like(pos))
-                },
-            ),  # idx 0
-            MoveKernel("random_walk", random_walk.build_kernel),  # idx 1
-        ])
+        init_fn, step_fn, _ = build_mwg(
+            backend,
+            [
+                MoveKernel(
+                    "galilean",
+                    galilean.build_kernel,
+                    kernel_kwargs={"n_reflect": n_reflect, "use_forces": True},
+                    extra_state_fields={
+                        "direction": (
+                            jnp.ndarray,
+                            lambda pos, types: jnp.zeros_like(pos),
+                        )
+                    },
+                ),  # idx 0
+                MoveKernel("random_walk", random_walk.build_kernel),  # idx 1
+            ],
+        )
         n_walkers = 20
         key = jax.random.key(99)
         key, init_key = jax.random.split(key)
@@ -228,11 +257,18 @@ class TestMixedMWGCounters:
         energies = jax.vmap(
             lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
         )(positions)
-        ns_state = init_ns(init_fn, positions, types, energies, cells=None, rng_key=key)
+        ns_state = init_ns(
+            init_fn, positions, types, energies, cells=None, rng_key=key
+        )
         return {
-            "init_fn": init_fn, "step_fn": step_fn,
-            "positions": positions, "types": types, "energies": energies,
-            "ns_state": ns_state, "key": key, "n_reflect": n_reflect,
+            "init_fn": init_fn,
+            "step_fn": step_fn,
+            "positions": positions,
+            "types": types,
+            "energies": energies,
+            "ns_state": ns_state,
+            "key": key,
+            "n_reflect": n_reflect,
         }
 
     def test_mixed_eval_shapes(self, mixed_setup):
@@ -285,12 +321,20 @@ class TestCumulativeCounters:
         class _CB:
             def on_iteration(self, iteration, ns_state, info):
                 capture_cb(iteration, ns_state, info)
-            def on_dead_point(self, *a): pass
-            def on_finish(self, *a): pass
+
+            def on_dead_point(self, *a):
+                pass
+
+            def on_finish(self, *a):
+                pass
 
         run_ns(
-            s["positions"], s["types"], s["energies"], cells=None,
-            init_fn=s["init_fn"], step_fn=s["step_fn"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            init_fn=s["init_fn"],
+            step_fn=s["step_fn"],
             rng_key=s["key"],
             max_iterations=10,
             n_mcmc_steps=5,
@@ -299,8 +343,9 @@ class TestCumulativeCounters:
         assert len(seen_values) > 0
         # Strictly monotonically non-decreasing
         for i in range(1, len(seen_values)):
-            assert seen_values[i] >= seen_values[i - 1], \
-                f"cumulative decreased at step {i}: {seen_values[i-1]} -> {seen_values[i]}"
+            assert (
+                seen_values[i] >= seen_values[i - 1]
+            ), f"cumulative decreased at step {i}: {seen_values[i-1]} -> {seen_values[i]}"
 
     def test_cumulative_grad_always_leq_evals(self, harmonic_rw_setup):
         """cumulative_n_grad_evaluations_per_move <= cumulative_n_evaluations_per_move."""
@@ -315,12 +360,20 @@ class TestCumulativeCounters:
                 if e is not None:
                     final_e[0] = np.asarray(e)
                     final_g[0] = np.asarray(g)
-            def on_dead_point(self, *a): pass
-            def on_finish(self, *a): pass
+
+            def on_dead_point(self, *a):
+                pass
+
+            def on_finish(self, *a):
+                pass
 
         run_ns(
-            s["positions"], s["types"], s["energies"], cells=None,
-            init_fn=s["init_fn"], step_fn=s["step_fn"],
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            init_fn=s["init_fn"],
+            step_fn=s["step_fn"],
             rng_key=s["key"],
             max_iterations=5,
             n_mcmc_steps=3,
@@ -349,18 +402,32 @@ class TestTrialEvalCounters:
                 if trial_e is not None:
                     assert int(np.asarray(trial_e).sum()) > 0
                     found_trial[0] = True
-            def on_dead_point(self, *a): pass
-            def on_finish(self, *a): pass
 
-        desc = [MoveKernel(
-            "random_walk", random_walk.build_kernel,
-            step_size=0.1, step_size_max=5.0, min_rate=0.2, max_rate=0.7,
-        )]
+            def on_dead_point(self, *a):
+                pass
+
+            def on_finish(self, *a):
+                pass
+
+        desc = [
+            MoveKernel(
+                "random_walk",
+                random_walk.build_kernel,
+                step_size=0.1,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
+            )
+        ]
         backend = create_harmonic(k=1.0)
         init_fn, step_fn, per_move_fns = build_mwg(backend, desc)
         run_ns(
-            s["positions"], s["types"], s["energies"], cells=None,
-            init_fn=init_fn, step_fn=step_fn,
+            s["positions"],
+            s["types"],
+            s["energies"],
+            cells=None,
+            init_fn=init_fn,
+            step_fn=step_fn,
             rng_key=s["key"],
             max_iterations=30,
             n_mcmc_steps=3,
@@ -389,9 +456,12 @@ class TestHMCCounters:
         def build_hmc_kernel(be):
             return hmc.build_kernel(be, n_leapfrog=n_leapfrog)
 
-        init_fn, step_fn, _ = build_mwg(backend, [
-            MoveKernel("hmc", build_hmc_kernel),
-        ])
+        init_fn, step_fn, _ = build_mwg(
+            backend,
+            [
+                MoveKernel("hmc", build_hmc_kernel),
+            ],
+        )
         n_walkers = 10
         key = jax.random.key(55)
         key, init_key = jax.random.split(key)
@@ -400,7 +470,9 @@ class TestHMCCounters:
         energies = jax.vmap(
             lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
         )(positions)
-        ns_state = init_ns(init_fn, positions, types, energies, cells=None, rng_key=key)
+        ns_state = init_ns(
+            init_fn, positions, types, energies, cells=None, rng_key=key
+        )
 
         jit_step = jax.jit(ns_step, static_argnums=(1, 2, 3))
         n_mcmc_steps = 3
@@ -412,5 +484,9 @@ class TestHMCCounters:
 
         expected_evals = (2 * n_leapfrog + 1) * n_walk * n_mcmc_steps
         expected_grad_evals = (2 * n_leapfrog) * n_walk * n_mcmc_steps
-        assert n_e == expected_evals, f"n_evals={n_e}, expected={expected_evals}"
-        assert n_g == expected_grad_evals, f"n_grad_evals={n_g}, expected={expected_grad_evals}"
+        assert (
+            n_e == expected_evals
+        ), f"n_evals={n_e}, expected={expected_evals}"
+        assert (
+            n_g == expected_grad_evals
+        ), f"n_grad_evals={n_g}, expected={expected_grad_evals}"

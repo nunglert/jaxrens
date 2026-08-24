@@ -82,7 +82,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Int
 
-from jaxrens.base import MoveInfo
+from jaxrens.sampling.base import MoveInfo
 from jaxrens.unvalidated import unvalidated
 
 

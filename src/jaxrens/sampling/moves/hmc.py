@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.backends.base import eval_energy_and_forces
-from jaxrens.base import MoveInfo
+from jaxrens.sampling.base import MoveInfo
 from jaxrens.unvalidated import unvalidated
 
 
