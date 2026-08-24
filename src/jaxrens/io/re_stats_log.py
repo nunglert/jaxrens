@@ -111,7 +111,12 @@ class RELogger(BufferedH5Logger):
             n_attempted_per_pair: shape (n_pairs,) int.
         """
         if self._closed:
-            raise RuntimeError("RELogger has been closed.")
+            raise RuntimeError(
+                "RELogger has already been closed; it cannot record "
+                "further replica-exchange swap statistics. A logger is closed once at end of "
+                "run, so this means the NS loop wrote after teardown "
+                "(or the same logger was closed twice)."
+            )
 
         n_acc = self._coerce(n_accepted_per_pair)
         n_att = self._coerce(n_attempted_per_pair)

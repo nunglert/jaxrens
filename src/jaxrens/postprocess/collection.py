@@ -15,7 +15,9 @@ import numpy as np
 from jaxrens.postprocess.monitor import Monitor
 
 
-def _observable_volume(monitor: Monitor, T: np.ndarray, **kwargs) -> np.ndarray:
+def _observable_volume(
+    monitor: Monitor, T: np.ndarray, **kwargs
+) -> np.ndarray:
     if not hasattr(monitor, "volume_trace"):
         raise AttributeError(
             f"Monitor {monitor.label!r} has no volume_trace; "
@@ -49,6 +51,7 @@ def _discover_config(path: Path) -> Path | None:
 
 def _load_yaml(config_path: Path) -> dict[str, Any]:
     import yaml
+
     with open(config_path) as fh:
         return yaml.safe_load(fh) or {}
 
@@ -61,7 +64,8 @@ def _prefix_from_config(cfg: dict[str, Any]) -> str | None:
 
 
 def _labels_and_metadata_from_config(
-    cfg: dict[str, Any], n_total: int,
+    cfg: dict[str, Any],
+    n_total: int,
 ) -> tuple[list[str] | None, list[dict[str, Any]]]:
     """Derive overlay labels and per-replica metadata from a config dict.
 
@@ -140,7 +144,9 @@ class MonitorCollection:
         monitors = []
         for i, p in enumerate(paths):
             label = labels[i] if labels is not None else None
-            monitors.append(Monitor.from_directory(p, label=label, prefix=prefix))
+            monitors.append(
+                Monitor.from_directory(p, label=label, prefix=prefix)
+            )
         return cls(monitors)
 
     @classmethod
@@ -240,17 +246,21 @@ class MonitorCollection:
         # Resolve checkpoint: skip 0-byte stubs from mid-write periodic saves.
         candidates: list[Path] = []
         if prefer_final:
-            candidates.extend([
-                path / f"{prefix}.final.checkpoint.h5",
-                path / f"{prefix}.checkpoint.h5",
-                path / f"{prefix}.initial.checkpoint.h5",
-            ])
+            candidates.extend(
+                [
+                    path / f"{prefix}.final.checkpoint.h5",
+                    path / f"{prefix}.checkpoint.h5",
+                    path / f"{prefix}.initial.checkpoint.h5",
+                ]
+            )
         else:
-            candidates.extend([
-                path / f"{prefix}.checkpoint.h5",
-                path / f"{prefix}.final.checkpoint.h5",
-                path / f"{prefix}.initial.checkpoint.h5",
-            ])
+            candidates.extend(
+                [
+                    path / f"{prefix}.checkpoint.h5",
+                    path / f"{prefix}.final.checkpoint.h5",
+                    path / f"{prefix}.initial.checkpoint.h5",
+                ]
+            )
         ckpt_path = next(
             (p for p in candidates if p.exists() and p.stat().st_size > 0),
             None,
@@ -312,7 +322,9 @@ class MonitorCollection:
 
         # Derive labels + per-replica metadata from config when caller did
         # not supply explicit labels.  ``metadata`` is always n_total long.
-        inferred_labels, metadata = _labels_and_metadata_from_config(cfg, n_total)
+        inferred_labels, metadata = _labels_and_metadata_from_config(
+            cfg, n_total
+        )
         if labels is None and inferred_labels is not None:
             labels = inferred_labels
 
@@ -370,6 +382,7 @@ class MonitorCollection:
         adaptation_path = path / f"{prefix}.adaptation.h5"
         if adaptation_path.exists():
             from jaxrens.io.adaptation_log import AdaptationLogger
+
             coll.adaptation_trace = AdaptationLogger.read(adaptation_path)
 
         return coll
@@ -537,7 +550,10 @@ class MonitorCollection:
 
         if self.adaptation_trace is not None:
             return plot_step_sizes(
-                self.adaptation_trace, ax=ax, per_run=per_run, **kwargs,
+                self.adaptation_trace,
+                ax=ax,
+                per_run=per_run,
+                **kwargs,
             )
         for monitor in self._monitors:
             if monitor.adaptation_trace is not None:
@@ -595,7 +611,11 @@ class MonitorCollection:
         from jaxrens.postprocess.plotting import plot_heatmap
 
         if not self._monitors:
-            raise ValueError("Cannot plot a heatmap from an empty collection")
+            raise ValueError(
+                "Cannot plot a heatmap from an empty MonitorCollection. Add "
+                "at least one monitor (each contributes one row/column of the "
+                "grid) before calling this."
+            )
 
         # Resolve pressure-axis source.
         if pressure_attr == "auto":
@@ -623,8 +643,10 @@ class MonitorCollection:
                     "NPT pressure list."
                 ) from exc
             P_label_resolved = P_label or (
-                "P [GPa]" if pressure_attr == "pressure_gpa"
-                else r"P [eV/Å³]" if pressure_attr == "pressure_eva3"
+                "P [GPa]"
+                if pressure_attr == "pressure_gpa"
+                else r"P [eV/Å³]"
+                if pressure_attr == "pressure_eva3"
                 else pressure_attr
             )
 
@@ -651,13 +673,23 @@ class MonitorCollection:
             Z[row] = np.asarray(fn(self._monitors[idx], T_arr, **obs_kwargs))
 
         return plot_heatmap(
-            T_arr, pressures_sorted, Z,
-            ax=ax, cmap=cmap, fmt=fmt, vmin=vmin, vmax=vmax,
-            do_colorbar=do_colorbar, cbar_label=cbar_label_resolved,
-            T_label=T_label, P_label=P_label_resolved,
+            T_arr,
+            pressures_sorted,
+            Z,
+            ax=ax,
+            cmap=cmap,
+            fmt=fmt,
+            vmin=vmin,
+            vmax=vmax,
+            do_colorbar=do_colorbar,
+            cbar_label=cbar_label_resolved,
+            T_label=T_label,
+            P_label=P_label_resolved,
         )
 
-    def plot_acceptance_rates(self, *, ax=None, per_run: bool = False, **kwargs):
+    def plot_acceptance_rates(
+        self, *, ax=None, per_run: bool = False, **kwargs
+    ):
         """Plot per-move acceptance-rate trace for the cohort.
 
         Uses the cohort-wide ``self.adaptation_trace`` (set by
@@ -677,11 +709,16 @@ class MonitorCollection:
 
         if self.adaptation_trace is not None:
             return plot_acceptance_rates(
-                self.adaptation_trace, ax=ax, per_run=per_run, **kwargs,
+                self.adaptation_trace,
+                ax=ax,
+                per_run=per_run,
+                **kwargs,
             )
         for monitor in self._monitors:
             if monitor.adaptation_trace is not None:
-                ax = plot_acceptance_rates(monitor, ax=ax, per_run=per_run, **kwargs)
+                ax = plot_acceptance_rates(
+                    monitor, ax=ax, per_run=per_run, **kwargs
+                )
         return ax
 
     # ------------------------------------------------------------------

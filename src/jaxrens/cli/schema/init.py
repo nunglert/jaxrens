@@ -18,10 +18,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-
 # ---------------------------------------------------------------------------
 # InitialWalkSpec (deferred: n_walks > 0 is not yet consumed by runtime)
 # ---------------------------------------------------------------------------
+
 
 class InitialWalkSpec(BaseModel):
     """Parameters for optional fixed-Emax burn-in walks before nested sampling.
@@ -64,6 +64,7 @@ class InitialWalkSpec(BaseModel):
 # InitSpec
 # ---------------------------------------------------------------------------
 
+
 def _parse_species_string(s: str) -> dict[int, int]:
     """Parse a species string into element counts.
 
@@ -96,9 +97,7 @@ def _parse_species_string(s: str) -> dict[int, int]:
             group).
     """
     if not s or not s.strip():
-        raise ValueError(
-            f"Species string must not be empty.  Received: {s!r}"
-        )
+        raise ValueError(f"Species string must not be empty.  Received: {s!r}")
 
     if ":" in s:
         raise ValueError(
@@ -149,7 +148,10 @@ def _parse_species_string(s: str) -> dict[int, int]:
             counts[z] = counts.get(z, 0) + n
 
     if not counts:
-        raise ValueError(f"Species string {s!r} produced no atoms.")
+        raise ValueError(
+            f"Species string {s!r} produced no atoms. It must name at least "
+            f"one element with a positive count, e.g. 'Si16' or 'Ge8Si8'."
+        )
     return counts
 
 

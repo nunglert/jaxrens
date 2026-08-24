@@ -753,6 +753,13 @@ class XRENSSwap(SwapKernel):
             the length of each ``target_composition`` array passed at call time.
     """
 
+    @unvalidated(
+        concern=("no production NS run has used this move."),
+        since="0.2.2",
+        clears_when=(
+            "Production runs delivering correct physics for a binary system."
+        ),
+    )
     def __init__(self, n_species: int) -> None:
         if not isinstance(n_species, int) or n_species < 1:
             raise ValueError(
@@ -908,13 +915,6 @@ class XRENSSwap(SwapKernel):
 # ---------------------------------------------------------------------------
 
 
-@unvalidated(
-    concern=("no production NS run has used this move."),
-    since="0.2.2",
-    clears_when=(
-        "Production runs delivering correct physics for a binary system."
-    ),
-)
 def xrens_replica_exchange_step(
     rng_key: Key[Array, ""],
     all_positions: Float[Array, "R K N 3"],

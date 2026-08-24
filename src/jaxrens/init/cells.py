@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from jaxrens.sampling.moves.shear import _build_shear_cell
 from jaxrens.utils.cell import get_volume, min_aspect_ratio
@@ -17,7 +18,11 @@ from jaxrens.utils.cell import get_volume, min_aspect_ratio
 # Pure stretch proposal (mirrors stretch.py kernel logic, without MCState)
 # ---------------------------------------------------------------------------
 
-_AXIS_PAIRS = jnp.array([[0, 1], [0, 2], [1, 2]])
+# NumPy (not jnp): a module-level ``jnp.array`` executes a JAX op at import
+# time and brings up a backend.  Converted with ``jnp.asarray`` at the use site
+# instead, where it folds into the traced constant — a plain numpy array cannot
+# be indexed by a tracer.  Same rationale as ``MoveInfo``'s defaults.
+_AXIS_PAIRS = np.array([[0, 1], [0, 2], [1, 2]])
 
 
 def _propose_stretch(
@@ -39,7 +44,7 @@ def _propose_stretch(
     """
     k1, k2 = jax.random.split(key)
     pair_idx = jax.random.randint(k1, (), 0, 3)
-    axes = _AXIS_PAIRS[pair_idx]
+    axes = jnp.asarray(_AXIS_PAIRS)[pair_idx]
     i, j = axes[0], axes[1]
     rv = step_size * jax.random.normal(k2)
     diag = jnp.ones(3).at[i].set(jnp.exp(rv)).at[j].set(jnp.exp(-rv))

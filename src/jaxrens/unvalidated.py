@@ -63,7 +63,7 @@ __all__ = [
     "warn_unvalidated",
 ]
 
-logger = logging.getLogger("jaxrens.unvalidated")
+logger = logging.getLogger(__name__)
 
 _ENV_VAR = "JAXRENS_UNVALIDATED"
 _POLICIES = ("warn", "ignore", "error")

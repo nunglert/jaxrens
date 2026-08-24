@@ -120,7 +120,12 @@ class AccRatesLogger(BufferedH5Logger):
             n_proposed:  same shape rules as n_accepted.
         """
         if self._closed:
-            raise RuntimeError("AccRatesLogger has been closed.")
+            raise RuntimeError(
+                "AccRatesLogger has already been closed; it cannot record "
+                "further per-move acceptance rates. A logger is closed once at end of "
+                "run, so this means the NS loop wrote after teardown "
+                "(or the same logger was closed twice)."
+            )
 
         n_acc = self._coerce(n_accepted)
         n_prop = self._coerce(n_proposed)

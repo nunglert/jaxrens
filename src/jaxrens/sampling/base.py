@@ -4,6 +4,8 @@ Lives next to the move kernels that produce it and the MWG wrapper that
 consumes it, mirroring ``jaxrens.backends.base`` for the energy contract.
 """
 
+from __future__ import annotations
+
 from typing import NamedTuple
 
 import jax.numpy as jnp

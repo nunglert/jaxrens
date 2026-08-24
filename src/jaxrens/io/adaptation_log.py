@@ -163,7 +163,12 @@ class AdaptationLogger(BufferedH5Logger):
                 used value_and_grad.
         """
         if self._closed:
-            raise RuntimeError("AdaptationLogger has been closed.")
+            raise RuntimeError(
+                "AdaptationLogger has already been closed; it cannot record "
+                "further step-size adaptation events. A logger is closed once at end of "
+                "run, so this means the NS loop wrote after teardown "
+                "(or the same logger was closed twice)."
+            )
 
         ss = self._coerce(step_sizes)
         acc = self._coerce(acceptance_rates)

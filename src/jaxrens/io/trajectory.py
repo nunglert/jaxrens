@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
+@runtime_checkable
 class TrajectoryWriter(Protocol):
     """Protocol for trajectory output backends.
 
@@ -294,4 +295,7 @@ def create_trajectory_writer(
                 NullTrajectoryWriter()
             )  # ignores mode/wrap/restart_iteration kwargs
         case _:
-            raise ValueError(f"Unknown trajectory format: {format!r}")
+            raise ValueError(
+                f"Unknown trajectory format {format!r}. Supported formats "
+                f"are 'extxyz', 'h5', and 'none' (writes nothing)."
+            )

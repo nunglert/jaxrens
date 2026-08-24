@@ -1021,7 +1021,11 @@ def run_ns(
             termination_criteria.append(IterationTermination(max_iterations))
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
-        raise ValueError("max_neighbors_list must be non-empty.")
+        raise ValueError(
+            "max_neighbors_list is empty. It is the neighbour-list capacity "
+            "ladder the run escalates through on overflow, so it needs at "
+            "least one entry, e.g. max_neighbors_list=[64, 96, 128]."
+        )
     starting_bucket = _choose_starting_bucket(
         initial_max_neighbor_counts,
         ladder,
@@ -1276,7 +1280,11 @@ def run_ns_parallel(
 
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
-        raise ValueError("max_neighbors_list must be non-empty.")
+        raise ValueError(
+            "max_neighbors_list is empty. It is the neighbour-list capacity "
+            "ladder the run escalates through on overflow, so it needs at "
+            "least one entry, e.g. max_neighbors_list=[64, 96, 128]."
+        )
     starting_bucket = _choose_starting_bucket(
         initial_max_neighbor_counts,
         ladder,
@@ -1835,9 +1843,17 @@ def run_ns_multi_gpu(
         callbacks = []
 
     if n_gpu < 1:
-        raise ValueError(f"n_gpu must be >= 1, got {n_gpu}")
+        raise ValueError(
+            f"n_gpu must be >= 1, got {n_gpu}. It is the number of devices "
+            f"to shard the walker population across; use 1 for a "
+            f"single-device run."
+        )
     if n_per_gpu < 1:
-        raise ValueError(f"n_per_gpu must be >= 1, got {n_per_gpu}")
+        raise ValueError(
+            f"n_per_gpu must be >= 1, got {n_per_gpu}. It is the number of "
+            f"independent NS runs placed on each device, so every device "
+            f"needs at least one."
+        )
     n_available = len(jax.devices())
     if n_gpu > n_available:
         raise ValueError(
@@ -1877,7 +1893,11 @@ def run_ns_multi_gpu(
 
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
-        raise ValueError("max_neighbors_list must be non-empty.")
+        raise ValueError(
+            "max_neighbors_list is empty. It is the neighbour-list capacity "
+            "ladder the run escalates through on overflow, so it needs at "
+            "least one entry, e.g. max_neighbors_list=[64, 96, 128]."
+        )
     logger.debug(
         "[stage] run_ns_multi_gpu: choose_starting_bucket "
         "(initial_max_neighbor_counts shape=%s, ladder=%s, offset=%d)",
@@ -2200,7 +2220,11 @@ def run_ns_sharded(
         callbacks = []
 
     if n_gpu < 1:
-        raise ValueError(f"n_gpu must be >= 1, got {n_gpu}")
+        raise ValueError(
+            f"n_gpu must be >= 1, got {n_gpu}. It is the number of devices "
+            f"to shard the walker population across; use 1 for a "
+            f"single-device run."
+        )
     n_available = len(jax.local_devices())
     if n_gpu > n_available:
         raise ValueError(
@@ -2239,7 +2263,11 @@ def run_ns_sharded(
 
     ladder = tuple(int(x) for x in max_neighbors_list)
     if not ladder:
-        raise ValueError("max_neighbors_list must be non-empty.")
+        raise ValueError(
+            "max_neighbors_list is empty. It is the neighbour-list capacity "
+            "ladder the run escalates through on overflow, so it needs at "
+            "least one entry, e.g. max_neighbors_list=[64, 96, 128]."
+        )
     starting_bucket = _choose_starting_bucket(
         initial_max_neighbor_counts,
         ladder,

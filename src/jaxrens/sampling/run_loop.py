@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -41,11 +41,17 @@ from jaxrens.state.ns import NSState
 logger = logging.getLogger(__name__)
 
 
+@runtime_checkable
 class NSCallback(Protocol):
     """Protocol for NS loop callbacks.
 
     Called at the outer loop boundary (Python level, outside JIT/pmap) by
-    ``_dispatch_callbacks`` below.  Implementations live in
+    ``_dispatch_callbacks`` below.  ``@runtime_checkable`` is required, not
+    decorative: ``jaxrens.sampling`` is instrumented by jaxtyping/beartype
+    (see ``--jaxtyping-packages`` in pyproject.toml), which isinstance-checks
+    every annotation, and a plain Protocol raises at decoration time.  Note it
+    checks method *presence* only, which is exactly what the dispatcher's
+    ``hasattr`` guards already assume.  Implementations live in
     ``jaxrens.cli.monitor``.  Every method is optional in practice — the
     dispatcher checks with ``hasattr`` before calling.
     """

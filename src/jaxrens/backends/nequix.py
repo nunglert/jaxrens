@@ -52,6 +52,7 @@ from jaxrens.backends._graph_neighbors import (
     _supercell_edges,
 )
 from jaxrens.backends.base import BackendResult
+from jaxrens.unvalidated import unvalidated
 from jaxrens.utils.cell import wrap_positions
 
 logger = logging.getLogger(__name__)
@@ -265,6 +266,11 @@ def _resolve_model_path(model_name_or_path: str) -> str:
     )
 
 
+@unvalidated(
+    concern=("no production NS run has used this backend"),
+    since="0.2.2",
+    clears_when=("Benchmark run vs a similar quality MACE model"),
+)
 def create_nequix(
     checkpoint_path: str | None = None,
     supercell_trafo: tuple[int, int, int] = (1, 1, 1),
@@ -289,7 +295,11 @@ def create_nequix(
     """
     _require_nequix()
     if checkpoint_path is None:
-        raise ValueError("checkpoint_path is required for the Nequix backend")
+        raise ValueError(
+            "checkpoint_path is required for the Nequix backend. Pass either "
+            "a bundled model name (e.g. 'nequix-mp-1', downloaded on first "
+            "use) or a path to a local .nqx file."
+        )
 
     path = _resolve_model_path(checkpoint_path)
     model, config = load_model(path, kernel=False)

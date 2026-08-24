@@ -469,7 +469,7 @@ def _compute_initial_energies(
 
         def per_replica(pos_K, types_K, cells_K):
             return jax.vmap(
-                lambda p, t, c: energy_backend(p, t, c, bucket)[0]
+                lambda p, t, c: energy_backend(p, t, c, bucket).energy
             )(pos_K, types_K, cells_K)
 
         return batcher.wrap_for_batch(per_replica)(positions, types, cells)

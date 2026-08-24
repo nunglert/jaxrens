@@ -313,7 +313,11 @@ def create_mace(
     _require_mace()
 
     if model_path is None:
-        raise ValueError("model_path is required for the MACE backend.")
+        raise ValueError(
+            "model_path is required for the MACE backend. Point it at a "
+            "converted JAX bundle directory or a .pkl produced by the "
+            "torch->JAX converter (see the mace-convert extra)."
+        )
 
     # The .pkl shape stores graphdef+state directly and can't go through
     # load_model_bundle (which rebuilds the module from a config); route it

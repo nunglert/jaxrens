@@ -134,7 +134,11 @@ def _parse_set_override(spec: str) -> tuple[list[str | int], Any]:
         *value* is the YAML-parsed scalar.
     """
     if "=" not in spec:
-        raise ValueError(f"--set value must contain '=': {spec!r}")
+        raise ValueError(
+            f"--set expects KEY=VALUE, got {spec!r} with no '='. "
+            f"Use dotted keys to reach nested config, e.g. "
+            f"--set ns.n_walkers=128 or --set moves.0.step_size=0.1."
+        )
     key_str, _, val_str = spec.partition("=")
     raw_parts = key_str.split(".")
     path: list[str | int] = []

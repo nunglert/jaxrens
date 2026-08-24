@@ -95,7 +95,9 @@ def plot_log_evidence_trace(
     kwargs.setdefault("label", monitor.label or "log Z trace")
 
     n_dead = monitor.n_dead
-    log_w = np.asarray(calc_log_weights(n_dead, monitor.n_live, monitor.n_cull))
+    log_w = np.asarray(
+        calc_log_weights(n_dead, monitor.n_live, monitor.n_cull)
+    )
     log_L = -np.asarray(monitor.dead_energies)
     log_terms = log_w + log_L
 
@@ -231,12 +233,21 @@ def plot_heatmap(
         Z_plot = Z
         xlabel, ylabel = T_label, P_label
     else:
-        raise ValueError(f"fmt must be 'PT' or 'TP', got {fmt!r}")
+        raise ValueError(
+            f"fmt must be 'PT' (pressure on x, temperature on y) or 'TP' "
+            f"(the transpose), got {fmt!r}."
+        )
 
     pcolormesh_kwargs.setdefault("shading", "auto")
     pcolormesh_kwargs.setdefault("rasterized", True)
     im = ax.pcolormesh(
-        X, Y, Z_plot, vmin=vmin, vmax=vmax, cmap=cmap, **pcolormesh_kwargs,
+        X,
+        Y,
+        Z_plot,
+        vmin=vmin,
+        vmax=vmax,
+        cmap=cmap,
+        **pcolormesh_kwargs,
     )
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
@@ -328,8 +339,8 @@ def plot_step_sizes(
     trace = _resolve_adaptation_trace(monitor_or_trace)
     ax = _get_ax(ax)
 
-    iters = trace.iterations                     # (n_entries,)
-    ss = trace.step_sizes                        # (n_entries, n_runs, n_moves)
+    iters = trace.iterations  # (n_entries,)
+    ss = trace.step_sizes  # (n_entries, n_runs, n_moves)
     move_names = trace.move_names
     n_runs = trace.n_runs
 
@@ -347,8 +358,9 @@ def plot_step_sizes(
             mean_k = ss_k.mean(axis=1)
             std_k = ss_k.std(axis=1)
             ax.plot(iters, mean_k, label=name, color=color, **kwargs)
-            ax.fill_between(iters, mean_k - std_k, mean_k + std_k,
-                            alpha=0.2, color=color)
+            ax.fill_between(
+                iters, mean_k - std_k, mean_k + std_k, alpha=0.2, color=color
+            )
 
     ax.set_xlabel("iteration")
     ax.set_ylabel("step size")
@@ -387,8 +399,8 @@ def plot_acceptance_rates(
     trace = _resolve_adaptation_trace(monitor_or_trace)
     ax = _get_ax(ax)
 
-    iters = trace.iterations                      # (n_entries,)
-    acc = trace.acceptance_rates                  # (n_entries, n_runs, n_moves)
+    iters = trace.iterations  # (n_entries,)
+    acc = trace.acceptance_rates  # (n_entries, n_runs, n_moves)
     move_names = trace.move_names
     n_runs = trace.n_runs
 
@@ -406,8 +418,9 @@ def plot_acceptance_rates(
             mean_k = acc_k.mean(axis=1)
             std_k = acc_k.std(axis=1)
             ax.plot(iters, mean_k, label=name, color=color, **kwargs)
-            ax.fill_between(iters, mean_k - std_k, mean_k + std_k,
-                            alpha=0.2, color=color)
+            ax.fill_between(
+                iters, mean_k - std_k, mean_k + std_k, alpha=0.2, color=color
+            )
 
     ax.set_xlabel("iteration")
     ax.set_ylabel("acceptance rate")
@@ -476,7 +489,7 @@ def plot_re_acceptance(
         )
 
     ax = _get_ax(ax)
-    iters = re_log.iterations                              # (n_entries,)
+    iters = re_log.iterations  # (n_entries,)
     acc = np.asarray(re_log.acceptance_rates, dtype=np.float64)
 
     if window is not None and window > 1:
@@ -494,8 +507,11 @@ def plot_re_acceptance(
         for p in range(re_log.n_pairs):
             color = colors[p % len(colors)]
             ax.plot(
-                iters, acc[:, p],
-                label=f"pair {p}-{p + 1}", color=color, **kwargs,
+                iters,
+                acc[:, p],
+                label=f"pair {p}-{p + 1}",
+                color=color,
+                **kwargs,
             )
     else:
         mean = acc.mean(axis=1)
@@ -594,12 +610,17 @@ def plot_re_acceptance_stacked(
         offset = p * offset_scale
         ax.axhline(offset, lw=0.5, alpha=0.5, color="black")
         ax.plot(
-            iters, acc[:, p] + offset,
-            color=colors[p], alpha=raw_alpha, lw=raw_lw,
+            iters,
+            acc[:, p] + offset,
+            color=colors[p],
+            alpha=raw_alpha,
+            lw=raw_lw,
         )
         ax.plot(
-            iters, acc_smooth[:, p] + offset,
-            color=colors[p], lw=smooth_lw,
+            iters,
+            acc_smooth[:, p] + offset,
+            color=colors[p],
+            lw=smooth_lw,
         )
 
     ax.set_ylim(-0.1 * offset_scale, (n_pairs - 1) * offset_scale + 1.1)
@@ -688,7 +709,7 @@ def plot_max_neighbors(
     ax = _get_ax(ax)
     iters = log.iterations  # (n_entries,)
     counts = log.max_neighbor_count[:, run, :]  # (n_entries, n_walkers)
-    buckets = log.bucket_size[:, run]            # (n_entries,)
+    buckets = log.bucket_size[:, run]  # (n_entries,)
 
     if kind == "percentiles":
         for pct in percentiles:
@@ -707,9 +728,13 @@ def plot_max_neighbors(
             H[vals - cmin, i] = freq
         # log scale to make sparse bins visible.
         with np.errstate(divide="ignore"):
-            H_log = np.log10(H, where=H > 0, out=np.full_like(H, np.nan, dtype=np.float64))
+            H_log = np.log10(
+                H, where=H > 0, out=np.full_like(H, np.nan, dtype=np.float64)
+            )
         y_edges = np.arange(cmin, cmax + 2) - 0.5
-        x_edges = np.concatenate([iters, [iters[-1] + 1]]).astype(np.float64) - 0.5
+        x_edges = (
+            np.concatenate([iters, [iters[-1] + 1]]).astype(np.float64) - 0.5
+        )
         ax.pcolormesh(x_edges, y_edges, H_log, **kwargs)
         ylabel = "max_neighbor_count"
     else:
@@ -719,8 +744,13 @@ def plot_max_neighbors(
 
     if show_bucket:
         ax.step(
-            iters, buckets, where="post",
-            label="bucket", color="k", linestyle="--", linewidth=1.0,
+            iters,
+            buckets,
+            where="post",
+            label="bucket",
+            color="k",
+            linestyle="--",
+            linewidth=1.0,
         )
 
     ax.set_xlabel("iteration")
