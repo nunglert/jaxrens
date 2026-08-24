@@ -37,32 +37,72 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_PATH = REPO_ROOT / "bench" / "results.jsonl"
 
 
-def _git_sha() -> str | None:
+#: Env var carrying an authoritative commit SHA, overriding the git probe.
+#: CI sets it because the bench runs inside a container over a bind-mounted
+#: checkout: the container is root, the mount is owned by the runner's uid, and
+#: git then refuses the repo with "detected dubious ownership", so the probe
+#: below returns None and the comparison renders "Comparing PR ? against base ?".
+#: The workflow already knows both SHAs, so it passes them in rather than having
+#: us re-derive something it can state authoritatively.
+_SHA_ENV = "JAXRENS_BENCH_SHA"
+
+_GIT_WARNED = False
+
+
+def _run_git(*args: str) -> str | None:
+    """Run a git command in the repo, returning stdout, or None on failure.
+
+    Failures are logged (once per process) rather than swallowed: this probe
+    silently returning None is what let the "?" SHAs reach a rendered PR
+    comment unnoticed.
+    """
+    global _GIT_WARNED
     try:
         out = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "rev-parse", "--short", "HEAD"],
+            ["git", "-C", str(REPO_ROOT), *args],
             capture_output=True,
             text=True,
             check=True,
             timeout=2,
         )
         return out.stdout.strip()
-    except (subprocess.SubprocessError, FileNotFoundError):
+    except (subprocess.SubprocessError, FileNotFoundError) as exc:
+        if not _GIT_WARNED:
+            _GIT_WARNED = True
+            stderr = getattr(exc, "stderr", "") or ""
+            logger.warning(
+                "bench: `git %s` failed, provenance fields will be null: %s%s",
+                " ".join(args),
+                exc,
+                f" -- {stderr.strip()}" if stderr.strip() else "",
+            )
         return None
+
+
+def _git_sha() -> str | None:
+    """Short commit SHA: the ``JAXRENS_BENCH_SHA`` override, else a git probe.
+
+    Normalised to 7 characters either way — ``compare.py`` slices to 7 and
+    ``view.py`` formats the column at width 8, and the archived rows in
+    ``results.jsonl`` have always held the short form.
+    """
+    override = os.environ.get(_SHA_ENV, "").strip()
+    if override:
+        return override[:7]
+    sha = _run_git("rev-parse", "--short", "HEAD")
+    return sha[:7] if sha else None
 
 
 def _git_dirty() -> bool | None:
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=2,
-        )
-        return bool(out.stdout.strip())
-    except (subprocess.SubprocessError, FileNotFoundError):
-        return None
+    """Whether the worktree has uncommitted changes (None if git is unusable).
+
+    Deliberately *not* forced to False when ``JAXRENS_BENCH_SHA`` is set: CI
+    deletes ``bench/results.jsonl`` between runs, so the tree genuinely is
+    dirty relative to that SHA, and None is the honest answer when we cannot
+    ask git.
+    """
+    out = _run_git("status", "--porcelain")
+    return bool(out) if out is not None else None
 
 
 def _env_fingerprint() -> dict:

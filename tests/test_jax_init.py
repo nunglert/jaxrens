@@ -16,12 +16,12 @@ def _clean_xla_env(monkeypatch):
     monkeypatch.delenv("JAXRENS_XLA_AUTOTUNE", raising=False)
 
 
-def test_default_disables_autotune(monkeypatch):
-    """Unset knob -> autotune level pinned to 0 (the hang-avoidance default)."""
+def test_default_is_xla_stock_autotune(monkeypatch):
+    """Unset knob -> XLA's own level 4, i.e. fully autotuned kernels."""
     _configure_xla_flags()
     import os
 
-    assert os.environ["XLA_FLAGS"] == "--xla_gpu_autotune_level=0"
+    assert os.environ["XLA_FLAGS"] == "--xla_gpu_autotune_level=4"
 
 
 @pytest.mark.parametrize("level", ["0", "1", "2", "3", "4"])
@@ -41,17 +41,17 @@ def test_appends_to_existing_flags(monkeypatch):
 
     flags = os.environ["XLA_FLAGS"]
     assert "--xla_dump_to=/some/dir" in flags
-    assert "--xla_gpu_autotune_level=0" in flags
+    assert "--xla_gpu_autotune_level=4" in flags
 
 
 def test_user_autotune_level_left_untouched(monkeypatch):
     """If the user already picked a level in XLA_FLAGS, don't second-guess."""
-    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_autotune_level=4")
-    monkeypatch.setenv("JAXRENS_XLA_AUTOTUNE", "0")  # ignored -- user wins
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_autotune_level=0")
+    monkeypatch.setenv("JAXRENS_XLA_AUTOTUNE", "4")  # ignored -- user wins
     _configure_xla_flags()
     import os
 
-    assert os.environ["XLA_FLAGS"] == "--xla_gpu_autotune_level=4"
+    assert os.environ["XLA_FLAGS"] == "--xla_gpu_autotune_level=0"
 
 
 @pytest.mark.parametrize("bad", ["9", "-1", "high", ""])
@@ -61,4 +61,4 @@ def test_invalid_level_warns_and_falls_back(monkeypatch, bad):
         _configure_xla_flags()
     import os
 
-    assert os.environ["XLA_FLAGS"] == "--xla_gpu_autotune_level=0"
+    assert os.environ["XLA_FLAGS"] == "--xla_gpu_autotune_level=4"

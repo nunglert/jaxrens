@@ -37,16 +37,7 @@ import jax
 def _configure_xla_flags() -> None:
     """Pin the XLA GEMM/conv autotuning level via ``XLA_FLAGS`` before backend init.
 
-    XLA's default GPU autotuning (``--xla_gpu_autotune_level=4``) probes
-    candidate GEMM / convolution kernels at compile time.  On this project's
-    multi-GPU L40S nodes -- especially under ``jaxrens run --n-gpus N``, where
-    several processes autotune the same node concurrently -- that probe can
-    hang the compile *indefinitely* (a liveness failure, not just a slowdown).
-    We therefore default the level to ``0`` (autotuning off): slightly slower
-    kernels, but compiles that reliably finish.
-
-    Override with ``JAXRENS_XLA_AUTOTUNE=<0..4>`` (e.g. ``=4`` to restore XLA's
-    stock autotuning on a box where it behaves).  If you have already set
+    Override with ``JAXRENS_XLA_AUTOTUNE=<0..4>``.  If you have already set
     ``xla_gpu_autotune_level`` yourself in ``XLA_FLAGS``, we leave it untouched.
 
     Mechanism: this is an XLA compiler flag, *not* a ``jax.config`` knob -- only
@@ -60,7 +51,7 @@ def _configure_xla_flags() -> None:
     existing = os.environ.get("XLA_FLAGS", "")
     if "xla_gpu_autotune_level" in existing:
         return  # user set it explicitly -- don't second-guess.
-    raw = os.environ.get("JAXRENS_XLA_AUTOTUNE", "0").strip()
+    raw = os.environ.get("JAXRENS_XLA_AUTOTUNE", "4").strip()
     try:
         level = int(raw)
         if not 0 <= level <= 4:
@@ -68,11 +59,11 @@ def _configure_xla_flags() -> None:
     except ValueError:
         warnings.warn(
             f"jaxrens: ignoring invalid JAXRENS_XLA_AUTOTUNE={raw!r} "
-            f"(expected an integer 0-4); using the jaxrens default of 0.",
+            f"(expected an integer 0-4); using the jaxrens default of 4.",
             RuntimeWarning,
             stacklevel=2,
         )
-        level = 0
+        level = 4
     flag = f"--xla_gpu_autotune_level={level}"
     os.environ["XLA_FLAGS"] = f"{existing} {flag}".strip()
 

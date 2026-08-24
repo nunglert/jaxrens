@@ -86,8 +86,8 @@ class LJBackend:
                 )
             if eps_arr.shape[0] == 0:
                 raise ValueError(
-                    "per-species epsilon/sigma are empty arrays; give one "
-                    "value per species, or pass scalars to use a single "
+                    "per-species epsilon/sigma must be non-empty; give "
+                    "one value per species, or pass scalars to use a single "
                     "epsilon/sigma for every pair."
                 )
 
