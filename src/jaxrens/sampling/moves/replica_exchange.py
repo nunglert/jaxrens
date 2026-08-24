@@ -38,6 +38,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, Key
 
 from jaxrens.sampling.morph import morph_types_to_composition
+from jaxrens.unvalidated import unvalidated
 from jaxrens.utils.cell import get_volume
 
 # ---------------------------------------------------------------------------
@@ -907,6 +908,13 @@ class XRENSSwap(SwapKernel):
 # ---------------------------------------------------------------------------
 
 
+@unvalidated(
+    concern=("no production NS run has used this move."),
+    since="0.2.2",
+    clears_when=(
+        "Production runs delivering correct physics for a binary system."
+    ),
+)
 def xrens_replica_exchange_step(
     rng_key: Key[Array, ""],
     all_positions: Float[Array, "R K N 3"],

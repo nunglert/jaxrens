@@ -15,8 +15,25 @@ import jax.numpy as jnp
 
 from jaxrens.backends.base import eval_energy_and_forces
 from jaxrens.base import MoveInfo
+from jaxrens.unvalidated import unvalidated
 
 
+@unvalidated(
+    concern=(
+        "no production NS run has used this move.  Two specifics: the "
+        "acceptance test is a hard `delta_H < 1.0` cut -- an absolute, "
+        "unit-dependent energy tolerance rather than a Metropolis "
+        "`exp(-delta_H)` test -- so it is not a detailed-balance-preserving "
+        "accept; and the leapfrog timestep reuses `state.step_size`, which "
+        "the adaptation tunes as a random-walk displacement, not as an "
+        "integrator timestep"
+    ),
+    since="0.2.2",
+    clears_when=(
+        "a multi-walker NS run whose HMC accept rate and energy trace track "
+        "the random-walk move on the same system"
+    ),
+)
 def build_kernel(
     backend: Any,
     n_leapfrog: int = 10,

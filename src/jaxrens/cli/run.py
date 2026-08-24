@@ -184,12 +184,10 @@ def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
     descriptors via ``ResolvedConfig.move_descriptors`` instead.
     """
     from jaxrens.cli.schema.moves import (
-        AlchemicalShiftMoveSpec,
         GMCMoveSpec,
         HMCMoveSpec,
         RandomWalkMoveSpec,
         SingleAtomMoveSpec,
-        SingleAtomSwapMoveSpec,
     )
 
     _SIMPLE_SPEC_MAP: dict[str, Any] = {
@@ -198,8 +196,6 @@ def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
         "gmc": GMCMoveSpec,
         "hmc": HMCMoveSpec,
         "single_atom": SingleAtomMoveSpec,
-        "single_atom_swap": SingleAtomSwapMoveSpec,
-        "alchemical_shift": AlchemicalShiftMoveSpec,
     }
 
     spec_cls = _SIMPLE_SPEC_MAP.get(mc.move_type)
@@ -207,7 +203,7 @@ def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
         raise ValueError(
             f"Unknown move type: {mc.move_type!r}. "
             f"Available via MoveConfig: {list(_SIMPLE_SPEC_MAP)}. "
-            f"For volume/shear/stretch/single_atom_sweep/alchemical_morph use "
+            f"For volume/shear/stretch/single_atom_sweep/alchemical_morph/species_swap use "
             f"ResolvedConfig.move_descriptors (they require n_atoms/n_species)."
         )
 

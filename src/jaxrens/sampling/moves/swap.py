@@ -6,10 +6,10 @@ fixed composition and fixed geometry — the productive degree of freedom
 for alloys, where a displacement move has to tunnel through a barrier to
 achieve what one swap does directly.
 
-Why this exists next to ``single_atom.build_swap_kernel``
----------------------------------------------------------
-The older kernel draws two atom indices uniformly and *then* rejects the
-draw if the two happen to share a species.  The species test is applied
+Why the pair is drawn by construction
+-------------------------------------
+The obvious implementation — draw two atom indices uniformly, then reject
+the draw if they happen to share a species — applies the species test
 after the energy call, so every same-species draw costs a full backend
 evaluation and returns a guaranteed rejection.  The wasted fraction is
 ``sum_s x_s**2`` — 50% for an equimolar binary, and ~97% for a single
@@ -83,6 +83,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Int
 
 from jaxrens.base import MoveInfo
+from jaxrens.unvalidated import unvalidated
 
 
 def _nth_atom_of_species(
@@ -108,6 +109,13 @@ def _nth_atom_of_species(
     )
 
 
+@unvalidated(
+    concern=("no production NS run has used this move."),
+    since="0.2.2",
+    clears_when=(
+        "Production runs delivering correct physics for a binary system."
+    ),
+)
 def build_kernel(
     backend: Any,
     n_species: int,

@@ -27,7 +27,6 @@ from jaxrens.cli.schema.ensemble import (
 from jaxrens.cli.schema.init import InitialWalkSpec, InitSpec
 from jaxrens.cli.schema.moves import (
     AlchemicalMorphMoveSpec,
-    AlchemicalShiftMoveSpec,
     BaseMoveSpec,
     GMCMoveSpec,
     HMCMoveSpec,
@@ -36,7 +35,6 @@ from jaxrens.cli.schema.moves import (
     RandomWalkMoveSpec,
     ShearMoveSpec,
     SingleAtomMoveSpec,
-    SingleAtomSwapMoveSpec,
     SingleAtomSweepMoveSpec,
     StretchMoveSpec,
     VolumeMoveSpec,
@@ -57,7 +55,6 @@ __all__ = [
     "AdaptationSpec",
     "AdaptationPolicy",
     "AlchemicalMorphMoveSpec",
-    "AlchemicalShiftMoveSpec",
     "BackendSpec",
     "BaseBackendSpec",
     "BaseEnsembleSpec",
@@ -91,7 +88,6 @@ __all__ = [
     "ShearMoveSpec",
     "SingleAtomMoveSpec",
     "SingleAtomSweepMoveSpec",
-    "SingleAtomSwapMoveSpec",
     "StretchMoveSpec",
     "TemperatureTerminationSpec",
     "TerminationSpec",

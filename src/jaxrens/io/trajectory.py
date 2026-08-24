@@ -177,6 +177,7 @@ class H5TrajectoryWriter:
             truncate_h5_traj(self.path, restart_iteration)
         self._file = h5py.File(self.path, self._mode)
         self._file.attrs["symbol_map"] = str(symbol_map)
+        _stamp_unvalidated(self._file)
 
     def write_dead_point(
         self, iteration: int, walker: Any, energy: float
@@ -219,6 +220,9 @@ class H5TrajectoryWriter:
         self._prev_snapshot_name = grp_name
 
     def close(self) -> None:
+        # Re-stamp: markers that fired after the writer was built (a move
+        # kernel rebuilt mid-run, say) still belong on the output file.
+        _stamp_unvalidated(self._file)
         self._file.close()
 
 
@@ -233,6 +237,24 @@ class NullTrajectoryWriter:
 
     def close(self) -> None:
         pass
+
+
+def _stamp_unvalidated(h5file: Any) -> None:
+    """Record any unvalidated code paths this run touched in the file's attrs.
+
+    A stderr warning is invisible in a batch job and gone by the time anyone
+    reads the output; an attribute on the trajectory travels with the data.
+    Written at open *and* at close: the first covers a run that crashes, the
+    second picks up markers that fired after the writer was constructed.
+    """
+    from jaxrens.unvalidated import triggered
+
+    records = triggered()
+    if not records:
+        return
+    h5file.attrs["unvalidated_features"] = [
+        f"{r.feature} (since {r.since}): {r.concern}" for r in records
+    ]
 
 
 def create_trajectory_writer(

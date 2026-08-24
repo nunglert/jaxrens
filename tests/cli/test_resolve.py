@@ -25,7 +25,6 @@ from jaxrens.cli.schema.backend import (
 )
 from jaxrens.cli.schema.moves import (
     AlchemicalMorphMoveSpec,
-    AlchemicalShiftMoveSpec,
     GMCMoveSpec,
     HMCMoveSpec,
     RandomWalkMoveSpec,
@@ -246,11 +245,6 @@ class TestToDescriptor:
         spec = AlchemicalMorphMoveSpec(n_species=3)
         desc = spec.to_descriptor()
         assert desc.kernel_kwargs == {"n_species": 3}
-
-    def test_alchemical_shift_descriptor(self):
-        spec = AlchemicalShiftMoveSpec()
-        desc = spec.to_descriptor()
-        assert desc.kernel_kwargs == {}
 
     def test_name_defaults_to_type(self):
         spec = RandomWalkMoveSpec()

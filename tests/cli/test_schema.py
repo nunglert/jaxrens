@@ -28,13 +28,11 @@ from jaxrens.cli.schema.backend import (
 )
 from jaxrens.cli.schema.moves import (
     AlchemicalMorphMoveSpec,
-    AlchemicalShiftMoveSpec,
     GMCMoveSpec,
     HMCMoveSpec,
     RandomWalkMoveSpec,
     ShearMoveSpec,
     SingleAtomMoveSpec,
-    SingleAtomSwapMoveSpec,
     SingleAtomSweepMoveSpec,
     SpeciesSwapMoveSpec,
     StretchMoveSpec,
@@ -420,7 +418,6 @@ class TestDiscriminatedUnion:
             ({"type": "hmc"}, HMCMoveSpec),
             ({"type": "single_atom"}, SingleAtomMoveSpec),
             ({"type": "single_atom_sweep"}, SingleAtomSweepMoveSpec),
-            ({"type": "single_atom_swap"}, SingleAtomSwapMoveSpec),
             ({"type": "species_swap"}, SpeciesSwapMoveSpec),
             (
                 {"type": "species_swap", "species": ["Ge", "Si"]},
@@ -433,7 +430,6 @@ class TestDiscriminatedUnion:
                 {"type": "alchemical_morph", "n_species": 2},
                 AlchemicalMorphMoveSpec,
             ),
-            ({"type": "alchemical_shift"}, AlchemicalShiftMoveSpec),
         ],
     )
     def test_correct_subclass_instantiated(self, move_dict, expected_cls):

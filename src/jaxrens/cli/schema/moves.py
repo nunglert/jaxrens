@@ -42,13 +42,11 @@ MoveType = Literal[
     "hmc",
     "single_atom",
     "single_atom_sweep",
-    "single_atom_swap",
     "species_swap",
     "volume",
     "shear",
     "stretch",
     "alchemical_morph",
-    "alchemical_shift",
 ]
 
 
@@ -368,24 +366,12 @@ class SingleAtomSweepMoveSpec(BaseMoveSpec):
         return {"n_atoms": n_atoms}
 
 
-class SingleAtomSwapMoveSpec(BaseMoveSpec):
-    type: Literal["single_atom_swap"] = "single_atom_swap"
-
-    def _build_kernel(self) -> Callable:
-        return single_atom.build_swap_kernel
-
-    def _mutates(self) -> frozenset[str]:
-        return frozenset({"types"})
-
-
 class SpeciesSwapMoveSpec(BaseMoveSpec):
     """Exchange the identities of two atoms of *different* species.
 
-    Supersedes ``single_atom_swap``, which draws two atoms uniformly and
-    discards the draw after the energy call when they share a species.  This
-    spec's kernel draws an unlike pair by construction, so no evaluation is
-    wasted and the acceptance rate is not capped by the composition.  Prefer
-    it for any new config; ``single_atom_swap`` is kept for compatibility.
+    The kernel draws an unlike pair by construction, so no evaluation is
+    wasted on a same-species draw and the acceptance rate is not capped by
+    the composition.
 
     ``species`` restricts the exchange to the named elements::
 
@@ -614,15 +600,6 @@ class AlchemicalMorphMoveSpec(BaseMoveSpec):
         return frozenset({"types"})
 
 
-class AlchemicalShiftMoveSpec(BaseMoveSpec):
-    type: Literal["alchemical_shift"] = "alchemical_shift"
-
-    def _build_kernel(self) -> Callable:
-        return alchemical.build_shift_kernel
-
-    # Inherits the no-op _kernel_kwargs from BaseMoveSpec.
-
-
 # ---------------------------------------------------------------------------
 # Discriminated union
 # ---------------------------------------------------------------------------
@@ -634,13 +611,11 @@ MoveSpec = Annotated[
         HMCMoveSpec,
         SingleAtomMoveSpec,
         SingleAtomSweepMoveSpec,
-        SingleAtomSwapMoveSpec,
         SpeciesSwapMoveSpec,
         VolumeMoveSpec,
         ShearMoveSpec,
         StretchMoveSpec,
         AlchemicalMorphMoveSpec,
-        AlchemicalShiftMoveSpec,
     ],
     Field(discriminator="type"),
 ]

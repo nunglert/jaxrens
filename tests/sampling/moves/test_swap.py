@@ -1,6 +1,6 @@
 """Tests for the species-swap move kernel (``moves/swap.py``).
 
-Covers what distinguishes it from ``single_atom.build_swap_kernel``:
+Covers what distinguishes it from a naive uniform two-index draw:
 - every proposal is an unlike pair (no wasted evaluation)
 - the atom pair is *uniform* over unlike pairs, including ternary systems
 - composition is preserved, rejection restores the original types

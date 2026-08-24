@@ -61,9 +61,6 @@ the variants below.
 .. autopydantic_model:: jaxrens.cli.schema.moves.SingleAtomSweepMoveSpec
    :field-show-constraints: true
 
-.. autopydantic_model:: jaxrens.cli.schema.moves.SingleAtomSwapMoveSpec
-   :field-show-constraints: true
-
 .. autopydantic_model:: jaxrens.cli.schema.moves.VolumeMoveSpec
    :field-show-constraints: true
 
@@ -74,9 +71,6 @@ the variants below.
    :field-show-constraints: true
 
 .. autopydantic_model:: jaxrens.cli.schema.moves.AlchemicalMorphMoveSpec
-   :field-show-constraints: true
-
-.. autopydantic_model:: jaxrens.cli.schema.moves.AlchemicalShiftMoveSpec
    :field-show-constraints: true
 
 
