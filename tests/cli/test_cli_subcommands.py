@@ -16,7 +16,7 @@ import pytest
 
 from jaxrens.cli.cli import main
 
-_DATA = Path(__file__).parent.parent / "data" / "cli"
+_DATA = Path(__file__).parent.parent / "_assets" / "data" / "cli"
 
 
 # ---------------------------------------------------------------------------

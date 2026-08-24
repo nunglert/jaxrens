@@ -8,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")  # headless before any other matplotlib import
 
 import numpy as np
@@ -82,16 +83,22 @@ class TestRELoggerRoundTrip:
         for flavor in ("pressure", "xrens", "semi_grand"):
             path = tmp_path / f"re_{flavor}.h5"
             log = RELogger(path=path, n_pairs=2, flavor=flavor)
-            log.write_entry(0, np.array([1, 0], dtype=np.int32),
-                            np.array([1, 1], dtype=np.int32))
+            log.write_entry(
+                0,
+                np.array([1, 0], dtype=np.int32),
+                np.array([1, 1], dtype=np.int32),
+            )
             log.close()
             assert RELogger.read(path).flavor == flavor
 
     def test_close_idempotent(self, tmp_path):
         path = tmp_path / "re.h5"
         log = RELogger(path=path, n_pairs=2, flavor="pressure")
-        log.write_entry(0, np.array([1, 0], dtype=np.int32),
-                        np.array([1, 1], dtype=np.int32))
+        log.write_entry(
+            0,
+            np.array([1, 0], dtype=np.int32),
+            np.array([1, 1], dtype=np.int32),
+        )
         log.close()
         log.close()  # second close must not raise
 
@@ -99,14 +106,22 @@ class TestRELoggerRoundTrip:
         log = RELogger(path=tmp_path / "re.h5", n_pairs=2, flavor="pressure")
         log.close()
         with pytest.raises(RuntimeError):
-            log.write_entry(0, np.array([0, 0], dtype=np.int32),
-                            np.array([0, 0], dtype=np.int32))
+            log.write_entry(
+                0,
+                np.array([0, 0], dtype=np.int32),
+                np.array([0, 0], dtype=np.int32),
+            )
 
     def test_shape_mismatch_raises(self, tmp_path):
         log = RELogger(path=tmp_path / "re.h5", n_pairs=3, flavor="pressure")
-        with pytest.raises(ValueError, match="expected per-pair array of shape"):
-            log.write_entry(0, np.array([0, 0], dtype=np.int32),
-                            np.array([0, 0, 0], dtype=np.int32))
+        with pytest.raises(
+            ValueError, match="expected per-pair array of shape"
+        ):
+            log.write_entry(
+                0,
+                np.array([0, 0], dtype=np.int32),
+                np.array([0, 0, 0], dtype=np.int32),
+            )
 
 
 class TestRELogAcceptanceRates:
@@ -158,7 +173,9 @@ def _write_minimal_checkpoint(tmp_path: Path, prefix: str = "ns") -> None:
     save_checkpoint(tmp_path / f"{prefix}.final.checkpoint.h5", ns_state)
 
     # Monitor.from_directory needs .energies for the dead-energy fallback.
-    e_logger = EnergyLogger(path=tmp_path / f"{prefix}.energies", n_walkers=n_live)
+    e_logger = EnergyLogger(
+        path=tmp_path / f"{prefix}.energies", n_walkers=n_live
+    )
     for i, e in enumerate(dead_e):
         e_logger.write_entry(i, float(e), 0.0)
     e_logger.close()

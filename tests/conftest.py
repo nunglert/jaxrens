@@ -25,6 +25,8 @@ from __future__ import annotations
 import os
 import subprocess
 
+import pytest
+
 
 def _visible_gpu_count() -> int:
     """Count GPUs reported by ``nvidia-smi -L`` (0 if none / unavailable)."""
@@ -85,6 +87,79 @@ def _pin_xdist_worker_to_gpu() -> None:
 _pin_xdist_worker_to_gpu()
 
 
+_BACKENDS = ("mace", "neuralil", "nequix", "jaxmd")
+
+
+def pytest_addoption(parser) -> None:
+    """Register ``--require-backends``.
+
+    Optional backends normally degrade to skips when they are not installed,
+    which is right for local development but wrong for CI: a soft install
+    failure (a git-URL dep resolving to a stale revision, or a package whose
+    native library will not load) would turn into a pile of skips and a green
+    build, because skips do not change the exit code.
+
+    CI names the backends it *knows* it installed; anything missing then fails
+    the session before a single test runs, instead of passing quietly.
+    """
+    parser.addoption(
+        "--require-backends",
+        action="store",
+        default=os.environ.get("JAXRENS_REQUIRE_BACKENDS", ""),
+        help=(
+            "Comma-separated optional backends that MUST be importable "
+            f"(any of: {', '.join(_BACKENDS)}, or 'all'). Missing ones abort "
+            "the run rather than being skipped. Also settable via "
+            "JAXRENS_REQUIRE_BACKENDS."
+        ),
+    )
+
+
+def _check_required_backends(config) -> None:
+    """Abort the session if a ``--require-backends`` entry is not importable.
+
+    Uses each backend module's own ``is_available()`` so the test suite asks
+    exactly the question the library asks, rather than a second, drifting
+    definition of "installed".
+    """
+    import importlib
+
+    raw = (config.getoption("--require-backends") or "").strip()
+    if not raw:
+        return
+
+    names = (
+        _BACKENDS
+        if raw == "all"
+        else tuple(n.strip() for n in raw.split(",") if n.strip())
+    )
+    unknown = [n for n in names if n not in _BACKENDS]
+    if unknown:
+        raise pytest.UsageError(
+            f"--require-backends: unknown backend(s) {unknown}. "
+            f"Valid names are {list(_BACKENDS)}, or 'all'."
+        )
+
+    broken = {}
+    for name in names:
+        module = importlib.import_module(f"jaxrens.backends.{name}")
+        if not module.is_available():
+            err = getattr(
+                module, f"_{name.upper()}_IMPORT_ERROR", ""
+            ) or getattr(module, "_MACE_IMPORT_ERROR", "")
+            broken[name] = err or "(no import error recorded)"
+
+    if broken:
+        detail = "\n".join(f"  - {n}: {e}" for n, e in broken.items())
+        raise pytest.UsageError(
+            f"--require-backends named {sorted(broken)}, but they are not "
+            f"importable:\n{detail}\n"
+            f"The install is broken. Refusing to run and report green -- "
+            f"these tests would otherwise be skipped and the suite would "
+            f"still exit 0."
+        )
+
+
 def _multi_gpu_selected(config) -> bool:
     """Whether the active ``-m`` expression selects the ``multi_gpu`` suite.
 
@@ -120,6 +195,8 @@ def pytest_configure(config) -> None:
     * the ``-m multi_gpu`` suite, which needs every device;
     * CPU-only hosts (no ``nvidia-smi`` / zero GPUs).
     """
+    _check_required_backends(config)
+
     if os.environ.get("PYTEST_XDIST_WORKER", "").startswith("gw"):
         return  # xdist worker: pinned at import
     if getattr(config.option, "numprocesses", None):
@@ -143,7 +220,6 @@ def pytest_configure(config) -> None:
 # initialising JAX there would just preallocate VRAM on GPU 0 and
 # collide with worker ``gw0``.
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Dummy data fixtures

@@ -9,7 +9,7 @@ Verifies:
 - trial_n_evaluations_per_move / trial_n_grad_evaluations_per_move emitted on adjust iters
 
 The AdaptationLog v3 schema round-trip (which folds in n_evaluations /
-n_grad_evaluations) lives in tests/log_io/test_adaptation_log.py alongside
+n_grad_evaluations) lives in tests/io/test_adaptation_log.py alongside
 the v1/v2 schema tests.
 """
 

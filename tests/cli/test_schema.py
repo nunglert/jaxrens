@@ -40,7 +40,7 @@ from jaxrens.cli.schema.moves import (
 )
 from jaxrens.sampling.batch_descriptor import PmapVmapRuns, SingleRun
 
-_DATA = Path(__file__).parent.parent / "data" / "cli"
+_DATA = Path(__file__).parent.parent / "_assets" / "data" / "cli"
 _MINIMAL_YAML = _DATA / "minimal.yaml"
 _MIXED_MOVES_YAML = _DATA / "mixed_moves.yaml"
 _LJ_BACKEND_YAML = _DATA / "lj_backend.yaml"

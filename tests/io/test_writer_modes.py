@@ -14,11 +14,7 @@ from jaxrens.io.adaptation_log import AdaptationLogger
 from jaxrens.io.energy_log import EnergyLogger
 from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
 from jaxrens.io.re_stats_log import RELogger
-from jaxrens.io.trajectory import (
-    ExtxyzTrajectoryWriter,
-    H5TrajectoryWriter,
-)
-
+from jaxrens.io.trajectory import ExtxyzTrajectoryWriter, H5TrajectoryWriter
 
 # ---------------------------------------------------------------------------
 # EnergyLogger
@@ -68,18 +64,23 @@ def _walker(i):
 
 def _count_frames(path):
     from ase.io import read as ase_read
+
     return len(ase_read(str(path), ":"))
 
 
 def test_extxyz_writer_mode_w_truncates(tmp_path):
     path = tmp_path / "traj.extxyz"
-    w1 = ExtxyzTrajectoryWriter(path, symbol_map={0: "H"}, wrap=False, mode="w")
+    w1 = ExtxyzTrajectoryWriter(
+        path, symbol_map={0: "H"}, wrap=False, mode="w"
+    )
     for i in range(5):
         w1.write_dead_point(i, _walker(i), float(-i))
     w1.close()
     assert _count_frames(path) == 5
 
-    w2 = ExtxyzTrajectoryWriter(path, symbol_map={0: "H"}, wrap=False, mode="w")
+    w2 = ExtxyzTrajectoryWriter(
+        path, symbol_map={0: "H"}, wrap=False, mode="w"
+    )
     for i in range(2):
         w2.write_dead_point(100 + i, _walker(i), float(-i))
     w2.close()
@@ -88,12 +89,16 @@ def test_extxyz_writer_mode_w_truncates(tmp_path):
 
 def test_extxyz_writer_mode_a_appends(tmp_path):
     path = tmp_path / "traj.extxyz"
-    w1 = ExtxyzTrajectoryWriter(path, symbol_map={0: "H"}, wrap=False, mode="w")
+    w1 = ExtxyzTrajectoryWriter(
+        path, symbol_map={0: "H"}, wrap=False, mode="w"
+    )
     for i in range(5):
         w1.write_dead_point(i, _walker(i), float(-i))
     w1.close()
 
-    w2 = ExtxyzTrajectoryWriter(path, symbol_map={0: "H"}, wrap=False, mode="a")
+    w2 = ExtxyzTrajectoryWriter(
+        path, symbol_map={0: "H"}, wrap=False, mode="a"
+    )
     for i in range(2):
         w2.write_dead_point(100 + i, _walker(i), float(-i))
     w2.close()
@@ -161,7 +166,9 @@ def test_h5_trajectory_writer_mode_a_preserves(tmp_path):
 
 
 def _write_adaptation(path, *, mode, n, base_iter=0):
-    lg = AdaptationLogger(path=path, move_names=["a", "b"], n_runs=1, mode=mode)
+    lg = AdaptationLogger(
+        path=path, move_names=["a", "b"], n_runs=1, mode=mode
+    )
     for i in range(n):
         lg.write_entry(
             base_iter + i,
@@ -197,7 +204,11 @@ def test_adaptation_logger_mode_a_appends(tmp_path):
 
 def _write_re(path, *, mode, n, base_iter=0):
     lg = RELogger(
-        path=path, n_pairs=2, flavor="pressure", flush_interval=1, mode=mode,
+        path=path,
+        n_pairs=2,
+        flavor="pressure",
+        flush_interval=1,
+        mode=mode,
     )
     for i in range(n):
         lg.write_entry(
@@ -234,7 +245,11 @@ def test_re_logger_mode_a_appends(tmp_path):
 
 def _write_mn(path, *, mode, n, base_iter=0):
     lg = MaxNeighborsLogger(
-        path=path, n_runs=1, n_walkers=2, flush_interval=1, mode=mode,
+        path=path,
+        n_runs=1,
+        n_walkers=2,
+        flush_interval=1,
+        mode=mode,
     )
     for i in range(n):
         lg.write_entry(
@@ -272,7 +287,11 @@ def test_max_neighbors_logger_mode_a_appends(tmp_path):
 
 def _write_acc(path, *, mode, n, base_iter=0):
     lg = AccRatesLogger(
-        path=path, move_names=["a", "b"], n_runs=1, flush_interval=1, mode=mode,
+        path=path,
+        move_names=["a", "b"],
+        n_runs=1,
+        flush_interval=1,
+        mode=mode,
     )
     for i in range(n):
         lg.write_entry(

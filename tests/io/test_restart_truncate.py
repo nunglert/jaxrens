@@ -19,7 +19,6 @@ from jaxrens.io.restart_truncate import (
     truncate_h5_traj,
 )
 
-
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
@@ -60,7 +59,9 @@ class TestTruncateEnergies:
         from jaxrens.io.energy_log import EnergyLogger
 
         # Resume: mode="a", restart_iteration=6 truncates then appends.
-        log = EnergyLogger(p, n_walkers=4, n_atoms=2, mode="a", restart_iteration=6)
+        log = EnergyLogger(
+            p, n_walkers=4, n_atoms=2, mode="a", restart_iteration=6
+        )
         for i in (6, 7, 8):
             log.write_entry(i, energy=-float(i), volume=float(i))
         log.close()
@@ -95,13 +96,17 @@ class TestTruncateExtxyz:
 
     def test_writer_truncates_on_append_open(self, tmp_path):
         from ase.io import read as ase_read
+
         from jaxrens.io.trajectory import ExtxyzTrajectoryWriter
 
         p = tmp_path / "run.traj.extxyz"
         self._write(p, 8)
         # Resume: append-mode construction with restart_iteration=5 rewinds.
         w = ExtxyzTrajectoryWriter(
-            p, symbol_map={0: "H"}, mode="a", restart_iteration=5,
+            p,
+            symbol_map={0: "H"},
+            mode="a",
+            restart_iteration=5,
         )
         for i in (5, 6):
             walker = {
@@ -145,7 +150,11 @@ class TestTruncateH5Iterations:
         p = tmp_path / "run.adaptation.h5"
         self._write_adaptation(p, 10)
         log = AdaptationLogger(
-            p, move_names=["a", "b"], n_runs=1, mode="a", restart_iteration=4,
+            p,
+            move_names=["a", "b"],
+            n_runs=1,
+            mode="a",
+            restart_iteration=4,
         )
         for i in (4, 5):
             log.write_entry(
@@ -192,16 +201,21 @@ class TestLoopRecordIterationContinuity:
 
     def _make_checkpoint(self, tmp_path, n_dead, n_walkers=4, n_atoms=1):
         import jax
+
         from jaxrens.io.checkpoint import save_checkpoint
 
         rng = np.random.default_rng(0)
         state = {
-            "positions": rng.uniform(-2, 2, (n_walkers, n_atoms, 3)).astype(np.float32),
+            "positions": rng.uniform(-2, 2, (n_walkers, n_atoms, 3)).astype(
+                np.float32
+            ),
             "types": np.zeros((n_walkers, n_atoms), dtype=np.int32),
             "energies": rng.uniform(1, 10, n_walkers).astype(np.float32),
             "cells": np.stack([np.eye(3, dtype=np.float32) * 6.0] * n_walkers),
             "dead_energies": rng.uniform(10, 20, n_dead).astype(np.float32),
-            "dead_positions": rng.uniform(-2, 2, (n_dead, n_atoms, 3)).astype(np.float32),
+            "dead_positions": rng.uniform(-2, 2, (n_dead, n_atoms, 3)).astype(
+                np.float32
+            ),
             "dead_volumes": None,
             "live_volumes": None,
             "log_evidence": -7.3,
@@ -216,6 +230,7 @@ class TestLoopRecordIterationContinuity:
 
     def test_dead_point_labels_continue_from_checkpoint(self, tmp_path):
         import jax
+
         import jaxrens.sampling.moves.random_walk as rw_mod
         from jaxrens.backends.toy import create_harmonic
         from jaxrens.init.restart import load_restart
@@ -226,20 +241,26 @@ class TestLoopRecordIterationContinuity:
 
         n_dead = 5
         n_extra = 3
-        walker_set, bundle = load_restart(self._make_checkpoint(tmp_path, n_dead))
+        walker_set, bundle = load_restart(
+            self._make_checkpoint(tmp_path, n_dead)
+        )
 
         backend = create_harmonic()
         desc = MoveKernel(
-            name="random_walk", build_kernel=rw_mod.build_kernel,
-            step_size=0.3, weight=1.0, kernel_kwargs={}, extra_state_fields={},
+            name="random_walk",
+            build_kernel=rw_mod.build_kernel,
+            step_size=0.3,
+            weight=1.0,
+            kernel_kwargs={},
+            extra_state_fields={},
         )
         init_fn, step_fn, _ = build_mwg(backend, [desc])
 
         # Energies are re-evaluated on restart (WalkerSet carries no energy).
         types0 = walker_set.types[0]
-        energies = jax.vmap(
-            lambda p, c: backend(p, types0, c, 0)[0]
-        )(walker_set.positions, walker_set.cells)
+        energies = jax.vmap(lambda p, c: backend(p, types0, c, 0)[0])(
+            walker_set.positions, walker_set.cells
+        )
 
         seen: list[int] = []
 

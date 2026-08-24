@@ -9,7 +9,7 @@ the bucketed-kernel overflow ladder, and a few MCMC steps with
 Skipped when:
 
 * ``mace_jax`` is not importable (``pytest.importorskip``).
-* The ``tests/fixtures/mace_mp_small`` model bundle is missing.
+* The ``tests/_assets/models/mace_mp_small`` model bundle is missing.
 * No GPU is available — MACE is slow on CPU; the integration tier runs
   on the GPU CI runner only.
 
@@ -29,8 +29,12 @@ import yaml
 
 from . import multi_gpu_n_devices
 
-
-_FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "mace_mp_small"
+_FIXTURE = (
+    Path(__file__).resolve().parent.parent
+    / "_assets"
+    / "models"
+    / "mace_mp_small"
+)
 
 
 _CONFIG_YAML = """
@@ -133,12 +137,10 @@ def test_mace_full_pipeline(tmp_path: Path) -> None:
     """
     pytest.importorskip("mace_jax")
 
-    from jaxrens.cli.resolve import (
-        resolve,
-    )
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
+    from jaxrens.cli.resolve import resolve
     from jaxrens.cli.run import run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
 
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["backend"]["checkpoint_path"] = str(_FIXTURE)
@@ -148,9 +150,9 @@ def test_mace_full_pipeline(tmp_path: Path) -> None:
     resolved = resolve(root)
 
     # Two-pressure list → multi-run dispatcher.
-    assert isinstance(resolved.batcher, PmapVmapRuns), (
-        "Two-pressure config should route through the multi-GPU dispatcher."
-    )
+    assert isinstance(
+        resolved.batcher, PmapVmapRuns
+    ), "Two-pressure config should route through the multi-GPU dispatcher."
 
     run_multi_gpu_from_config(resolved)
 
@@ -164,12 +166,16 @@ def test_mace_full_pipeline(tmp_path: Path) -> None:
     for r in range(n_total):
         energies_path = out / f"mace_smoke.run{r:02d}.energies"
         traj_path = out / f"mace_smoke.run{r:02d}.traj.extxyz"
-        assert energies_path.exists(), f"missing per-replica energy log: {energies_path}"
-        assert traj_path.exists(), f"missing per-replica trajectory: {traj_path}"
+        assert (
+            energies_path.exists()
+        ), f"missing per-replica energy log: {energies_path}"
+        assert (
+            traj_path.exists()
+        ), f"missing per-replica trajectory: {traj_path}"
         log = EnergyLogger.read(energies_path)
-        assert log.energies.shape == (5,), (
-            f"{energies_path.name}: expected 5 data entries, got {log.energies.shape}"
-        )
+        assert log.energies.shape == (
+            5,
+        ), f"{energies_path.name}: expected 5 data entries, got {log.energies.shape}"
 
     final_ckpt = out / "mace_smoke.final.checkpoint.h5"
     assert final_ckpt.exists(), f"missing final checkpoint: {final_ckpt}"
@@ -188,7 +194,11 @@ def test_mace_full_pipeline(tmp_path: Path) -> None:
     # Live walkers retained their (G, P, n_walkers, n_atoms, 3) layout.
     saved_positions = np.asarray(state["positions"])
     assert saved_positions.shape == (
-        resolved.ns.n_gpu, resolved.ns.n_per_gpu, 4, 8, 3,
+        resolved.ns.n_gpu,
+        resolved.ns.n_per_gpu,
+        4,
+        8,
+        3,
     )
 
 
@@ -294,12 +304,10 @@ def test_mace_multi_gpu_pipeline(tmp_path: Path) -> None:
     """
     pytest.importorskip("mace_jax")
 
-    from jaxrens.cli.resolve import (
-        resolve,
-    )
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
+    from jaxrens.cli.resolve import resolve
     from jaxrens.cli.run import run_multi_gpu_from_config
     from jaxrens.cli.schema import RootSpec
+    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
 
     n_gpu = multi_gpu_n_devices()
     n_total = n_gpu * 2

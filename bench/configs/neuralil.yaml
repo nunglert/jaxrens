@@ -1,7 +1,7 @@
 # bench/configs/neuralil.yaml — ns_step bench, locally-trained NeuralIL Si16 NPT.
 #
 # Heavy backend.  Skipped if `neuralil` is missing.  Model fixture
-# lives in-repo at tests/fixtures/neuralil_si/ so this works both in
+# lives in-repo at tests/_assets/models/neuralil_si/ so this works both in
 # CI and on the local cluster without depending on experiments/.
 
 run:
@@ -14,7 +14,7 @@ run:
 backend:
   type: neuralil
   # Path is resolved against CWD; bench is run from repo root.
-  checkpoint_path: tests/fixtures/neuralil_si/model.pkl
+  checkpoint_path: tests/_assets/models/neuralil_si/model.pkl
   supercell_trafo: [3, 3, 3]
   periodic: true
   max_neighbors_list: [20, 30, 40, 50, 60]

@@ -23,12 +23,16 @@ from jaxrens.backends.mace import (
     is_available,
 )
 
+pytestmark = pytest.mark.mace
+
 mace_required = pytest.mark.skipif(
     not is_available(),
     reason="mace-jax not installed",
 )
 
-FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "mace_mp_small"
+FIXTURE_DIR = (
+    Path(__file__).parent.parent / "_assets" / "models" / "mace_mp_small"
+)
 
 
 def _mace_torch_available() -> bool:

@@ -54,7 +54,7 @@
 # the `.npz`; the loader finds the `.json` next to it.
 #
 # For a self-contained run without a download, this tutorial instead
-# uses the tiny bundled fixture at `tests/fixtures/mace_mp_small/`
+# uses the tiny bundled fixture at `tests/_assets/models/mace_mp_small/`
 # (a `config.json` + `params.msgpack` bundle directory) so it works
 # from a fresh checkout.
 
@@ -78,7 +78,7 @@ while (
     and REPO_ROOT != REPO_ROOT.parent
 ):
     REPO_ROOT = REPO_ROOT.parent
-MODEL_PATH = REPO_ROOT / "tests" / "fixtures" / "mace_mp_small"
+MODEL_PATH = REPO_ROOT / "tests" / "_assets" / "models" / "mace_mp_small"
 print("model path:", MODEL_PATH)
 
 # %% [markdown]

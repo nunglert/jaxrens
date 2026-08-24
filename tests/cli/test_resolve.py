@@ -38,7 +38,7 @@ from jaxrens.state.config import (
     OutputConfig,
 )
 
-_DATA = Path(__file__).parent.parent / "data" / "cli"
+_DATA = Path(__file__).parent.parent / "_assets" / "data" / "cli"
 _MINIMAL_YAML = _DATA / "minimal.yaml"
 _LJ_BACKEND_YAML = _DATA / "lj_backend.yaml"
 _FULL_CONFIG_YAML = _DATA / "full_config.yaml"

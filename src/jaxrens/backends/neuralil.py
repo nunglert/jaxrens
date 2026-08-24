@@ -54,7 +54,14 @@ try:
     from neuralil.plain_ensembles.training import get_n_models
 
     _NEURALIL_AVAILABLE = True
-except ImportError as exc:
+# OSError, not just ImportError: an optional backend can install cleanly
+# and still fail to load at import time when a native library is missing
+# (mace-jax dlopens libcue_ops.so, which needs libcuda.so.1).  Catching
+# only ImportError lets that escape and take down every importer of this
+# module -- including the default test suite, which deselects the backend
+# but still collects it.  Anything else still propagates, so a real bug in
+# the backend is not silently downgraded to "unavailable".
+except (ImportError, OSError) as exc:
     _NEURALIL_IMPORT_ERROR = str(exc)
 
 try:

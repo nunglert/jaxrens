@@ -40,7 +40,6 @@ from jaxrens.sampling.nested_sampling import init_ns
 from jaxrens.sampling.run_loop import _run_loop
 from jaxrens.sampling.termination import IterationTermination
 
-
 # ---------------------------------------------------------------------------
 # Logger round-trip
 # ---------------------------------------------------------------------------
@@ -85,7 +84,9 @@ class TestMaxNeighborsLogger:
     def test_multi_run_shape(self, tmp_path: Path):
         log_path = tmp_path / "ns.max_neighbors.h5"
         n_runs, n_walkers = 3, 5
-        logger = MaxNeighborsLogger(log_path, n_runs=n_runs, n_walkers=n_walkers)
+        logger = MaxNeighborsLogger(
+            log_path, n_runs=n_runs, n_walkers=n_walkers
+        )
         rng = np.random.default_rng(1)
         counts = rng.integers(0, 50, size=(n_runs, n_walkers), dtype=np.int32)
         logger.write_entry(
@@ -107,14 +108,17 @@ class TestMaxNeighborsLogger:
         log = MaxNeighborsLog(
             iterations=np.array([0, 1], dtype=np.int64),
             max_neighbor_count=np.array(
-                [[[10, 12, 5]], [[20, 8, 9]]], dtype=np.int32,
+                [[[10, 12, 5]], [[20, 8, 9]]],
+                dtype=np.int32,
             ),
             bucket_size=np.array([[30], [30]], dtype=np.int32),
             overflow=np.array([[False], [False]], dtype=np.bool_),
             n_runs=1,
             n_walkers=3,
         )
-        np.testing.assert_array_equal(log.peak_per_iter, np.array([[12], [20]]))
+        np.testing.assert_array_equal(
+            log.peak_per_iter, np.array([[12], [20]])
+        )
         np.testing.assert_array_equal(log.headroom, np.array([[18], [10]]))
 
 
@@ -142,7 +146,10 @@ def _build_ns_state(n_walkers: int = 4, n_atoms: int = 2):
     key = jax.random.key(0)
     key, key_pos = jax.random.split(key)
     positions = jax.random.uniform(
-        key_pos, (n_walkers, n_atoms, 3), minval=-2.0, maxval=2.0,
+        key_pos,
+        (n_walkers, n_atoms, 3),
+        minval=-2.0,
+        maxval=2.0,
     )
     types = jnp.zeros((n_atoms,), dtype=jnp.int32)
     cells = jnp.zeros((n_walkers, 3, 3))
@@ -161,7 +168,9 @@ class TestMaxNeighborsCallback:
         ns_state, step_fn = _build_ns_state(n_walkers=4, n_atoms=2)
         log_path = tmp_path / "ns.max_neighbors.h5"
         mn_logger = MaxNeighborsLogger(
-            log_path, n_runs=1, n_walkers=4,
+            log_path,
+            n_runs=1,
+            n_walkers=4,
         )
         cb = MaxNeighborsCallback(mn_logger, interval=1)
 
@@ -264,7 +273,9 @@ class TestMonitorLoaderAndPlot:
         _seed_dummy_run_dir(tmp_path)
         # Add a max_neighbors.h5 with two entries.
         mn = MaxNeighborsLogger(
-            tmp_path / "ns.max_neighbors.h5", n_runs=1, n_walkers=4,
+            tmp_path / "ns.max_neighbors.h5",
+            n_runs=1,
+            n_walkers=4,
         )
         mn.write_entry(
             iteration=0,
@@ -293,13 +304,16 @@ class TestMonitorLoaderAndPlot:
     def test_plot_percentiles_smoke(self, tmp_path: Path):
         _seed_dummy_run_dir(tmp_path)
         mn = MaxNeighborsLogger(
-            tmp_path / "ns.max_neighbors.h5", n_runs=1, n_walkers=4,
+            tmp_path / "ns.max_neighbors.h5",
+            n_runs=1,
+            n_walkers=4,
         )
         for i in range(5):
             mn.write_entry(
                 iteration=i,
                 max_neighbor_count=np.array(
-                    [10 + i, 12, 5, 8 + i], dtype=np.int32,
+                    [10 + i, 12, 5, 8 + i],
+                    dtype=np.int32,
                 ),
                 bucket_size=np.int32(30),
                 overflow=np.bool_(False),
@@ -307,8 +321,10 @@ class TestMonitorLoaderAndPlot:
         mn.close()
         monitor = Monitor.from_directory(tmp_path)
         ax = plot_max_neighbors(
-            monitor, kind="percentiles",
-            percentiles=(50, 95, 100), show_bucket=True,
+            monitor,
+            kind="percentiles",
+            percentiles=(50, 95, 100),
+            show_bucket=True,
         )
         # Two percentile lines + bucket step = at least 3 lines on the axes.
         assert len(ax.lines) >= 3
@@ -317,13 +333,16 @@ class TestMonitorLoaderAndPlot:
     def test_plot_heatmap_smoke(self, tmp_path: Path):
         _seed_dummy_run_dir(tmp_path)
         mn = MaxNeighborsLogger(
-            tmp_path / "ns.max_neighbors.h5", n_runs=1, n_walkers=4,
+            tmp_path / "ns.max_neighbors.h5",
+            n_runs=1,
+            n_walkers=4,
         )
         for i in range(5):
             mn.write_entry(
                 iteration=i,
                 max_neighbor_count=np.array(
-                    [10 + i, 12, 5, 8 + i], dtype=np.int32,
+                    [10 + i, 12, 5, 8 + i],
+                    dtype=np.int32,
                 ),
                 bucket_size=np.int32(30),
                 overflow=np.bool_(False),
@@ -338,7 +357,9 @@ class TestMonitorLoaderAndPlot:
     def test_invalid_kind_raises(self, tmp_path: Path):
         _seed_dummy_run_dir(tmp_path)
         mn = MaxNeighborsLogger(
-            tmp_path / "ns.max_neighbors.h5", n_runs=1, n_walkers=4,
+            tmp_path / "ns.max_neighbors.h5",
+            n_runs=1,
+            n_walkers=4,
         )
         mn.write_entry(
             iteration=0,
