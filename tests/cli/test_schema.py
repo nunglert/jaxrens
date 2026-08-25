@@ -668,8 +668,8 @@ class TestAdaptationSpec:
         from jaxrens.cli.schema.adaptation import AdaptationSpec
 
         cfg = AdaptationSpec()
-        assert cfg.full_auto is False
-        assert cfg.adjust_interval == 0
+        assert cfg.full_auto is True
+        assert cfg.adjust_interval == 100
         assert cfg.per_move == {}
         assert cfg.defaults.min_rate is None
 
@@ -693,7 +693,7 @@ class TestAdaptationSpec:
     def test_default_adaptation_config_round_trip(self):
         d = _minimal_dict()
         root = RootSpec.model_validate(d)
-        assert root.adaptation.full_auto is False
+        assert root.adaptation.full_auto is True
         assert root.adaptation.defaults.min_rate is None
 
 

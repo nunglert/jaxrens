@@ -45,7 +45,7 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             jaxrens-ci:${{ github.sha }} \
-            pytest tests/smoke tests/integration -v --tb=short -m "not multi_gpu" -o addopts=""
+            pytest tests/smoke tests/integration -v --tb=short -m "not multi_gpu"
 
   full:
     # Consolidated full + multi-GPU run on a single 4× T4 node.  Defined once

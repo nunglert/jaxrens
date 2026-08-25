@@ -38,7 +38,7 @@ jobs:
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
             jaxrens-ci:${{ github.sha }} \
-            pytest tests -n 4 -v --tb=short -m "not multi_gpu" -o addopts="" \
+            pytest tests -n 4 -v --tb=short -m "not multi_gpu" \
               --require-backends=all \
               --cov=jaxrens \
               --cov-branch \
@@ -72,5 +72,4 @@ jobs:
             -e NCCL_DEBUG=INFO \
             jaxrens-ci:${{ github.sha }} \
             pytest tests -v -s --tb=long -m multi_gpu \
-              --timeout=600 --timeout-method=thread \
-              -o addopts=""
+              --timeout=600 --timeout-method=thread
