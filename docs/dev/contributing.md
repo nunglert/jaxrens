@@ -21,7 +21,8 @@ Add the relevant backend extra(s) only if you touch code that imports them
 
 ```bash
 pip install -e ".[docs]"
-bash docs/autobuild.sh       # sphinx-autobuild docs docs/_build/html -j auto
+bash docs/autobuild.sh       # sphinx-autobuild docs docs/_build/html, minus
+                              # the treemap's self-regenerated output
 ```
 
 ## Where code belongs

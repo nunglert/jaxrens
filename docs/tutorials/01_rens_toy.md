@@ -1,4 +1,4 @@
-# Replica exchange on a toy model
+# RENS on a periodic toy model
 
 The cheapest possible `jaxrens` run, and the only one small enough that you
 can see what replica exchange is actually doing. Two particles in a periodic
@@ -53,12 +53,6 @@ both particles in the attractive well with the box commensurate. As pressure
 rises the $P a$ term tilts the surface toward small $a$, and by $P = 1.5$ the
 compressed basin near $a \approx 1$ has taken over. Three replicas, two
 competing minima, and a swap is the only cheap way across.
-
-:::{note}
-The parameter values below are sensible defaults, not the paper's — they
-reproduce the qualitative behaviour (repulsive core, attractive well,
-commensurate basins), and every one is a config key you can change.
-:::
 
 ## The config
 

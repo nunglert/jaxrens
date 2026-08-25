@@ -54,6 +54,7 @@ docs = [
     "matplotlib>=3.8",
     "squarify>=0.4",
     "plotly>=5.20",
+    "sphinx-autobuild"
 ]
 
 # Torch-side tooling to convert a Torch MACE model into a JAX bundle.

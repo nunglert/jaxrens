@@ -1,4 +1,4 @@
-# A MACE run: 16-atom silicon, NPT
+# MACE: 16-atom silicon, NPT
 
 Same shape as {doc}`02_lj_run`, with a machine-learned potential instead of
 Lennard-Jones. Only the `backend:` block really changes — which is the point:

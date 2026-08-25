@@ -260,15 +260,16 @@ def _regen_treemap(app):
     The two artefacts are gitignored — this hook is the only thing that
     produces them.  A failure is therefore a real problem (the ``<iframe>`` in
     ``reference/index.rst`` and ``user/introduction.md`` would 404), so it is
-    reported as a Sphinx warning rather than swallowed.  The other figures in
-    ``generate.py`` are synthetic and stay committed.
+    reported as a Sphinx warning rather than swallowed.  The other figures
+    (``generate_concepts.py``, ``generate_tutorials.py``) are synthetic /
+    tutorial-derived and stay committed.
     """
     figdir = os.path.join(os.path.dirname(__file__), "_static", "figures")
     sys.path.insert(0, figdir)
     try:
-        import generate  # type: ignore[import-not-found]
+        import generate_treemap  # type: ignore[import-not-found]
 
-        generate.fig_pkg_treemap()
+        generate_treemap.fig_pkg_treemap()
     except Exception as exc:  # pragma: no cover - build-time diagnostic
         logger = sphinx.util.logging.getLogger(__name__)
         logger.warning(

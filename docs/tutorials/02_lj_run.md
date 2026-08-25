@@ -1,4 +1,4 @@
-# Lennard-Jones: 8 atoms, NPT
+# Periodic Lennard-Jones: 8 atoms, NPT
 
 A first run on a real interatomic potential, start to finish, from the
 terminal. If you have not seen a `jaxrens` config before, start with

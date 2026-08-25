@@ -1,4 +1,4 @@
-# A point in a landscape
+# NS for a simple non-periodic 2D example
 
 The smallest thing nested sampling can be asked to do, and the best place to
 see what it *is* before any materials complexity arrives. One particle, a
@@ -25,18 +25,16 @@ basin *without being told where it is*, by shrinking a contour of constant
 energy until only that basin survives inside it.
 
 ```{image} ../_static/figures/tutorials/gauss2d_surface.png
-:alt: the Gaussian-mixture energy surface, and the walker population contracting onto the deepest basin
-:width: 100%
+:alt: the Gaussian-mixture energy surface, with the five Gaussian centres marked
+:width: 70%
+:align: center
 ```
 
-Left: the surface itself, with the five Gaussian centres marked — note the two
-at the top right sitting almost on top of each other, which is what makes that
-basin deeper than the rest. Right: the live population, dumped every 500
-iterations by `output.snapshot_interval`. At iteration 500 the walkers are
-spread across all four basins; by 1500 each basin holds a tight cluster; by
-2500 only the merged one is still occupied. That contraction *is* the
-algorithm — everything the log prints below is a number describing this
-picture.
+The five Gaussian centres are marked — note the two at the top right sitting
+almost on top of each other, which is what makes that basin deeper than the
+rest. Everything the log prints below is a number describing NS shrinking a
+contour down onto it; further down is what that contraction actually looks
+like.
 
 ## The config
 
@@ -90,7 +88,7 @@ The final 200 dead points sit at `x = 1.80 ± 0.03`, `y = 1.60 ± 0.02` — the
 bottom of the merged basin. NS found it among five wells without gradients and
 without being told it existed.
 
-## The plots
+## Plotting diagnostics
 
 ```bash
 jaxrens plot output/gauss2d.energies
@@ -118,6 +116,35 @@ What you are checking is the acceptance rate: it should sit inside the band
 set by `adaptation.defaults.min_rate`/`max_rate`. Pinned at zero means the
 move is too large to ever be accepted; pinned at one means it is so small the
 walker is not going anywhere.
+
+## Visualizing walker populations and NS trajectory
+
+The diagnostics above are numbers; this is the same run in space. The
+snapshots dumped every `output.snapshot_interval` iterations show the live
+population as it is at that moment:
+
+```{image} ../_static/figures/tutorials/gauss2d_walkers.png
+:alt: walker population snapshots contracting onto the deepest basin, one panel per snapshot
+:width: 100%
+```
+
+At iteration 500 the population is spread across all four basins; by 1500
+each basin holds a tight cluster; by 2500 only the merged one is still
+occupied. That contraction *is* the algorithm.
+
+The population snapshots are stills; the full `*.traj.extxyz` is every dead
+point the run ever produced, one per iteration, coloured by when it was
+culled:
+
+```{image} ../_static/figures/tutorials/gauss2d_trajectory.png
+:alt: every culled point across the run, coloured by NS iteration
+:width: 70%
+:align: center
+```
+
+Early (dark) points are scattered everywhere; late (bright) points pile up
+almost entirely in the merged basin — the whole history of the contraction
+in one picture, rather than five slices through it.
 
 ## Next
 
