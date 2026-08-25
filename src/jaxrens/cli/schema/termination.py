@@ -49,6 +49,19 @@ class BaseTerminationSpec(BaseModel):
 
 
 class IterationTerminationSpec(BaseTerminationSpec):
+    """Stop after a fixed number of NS iterations.
+
+    The blunt instrument — useful to bound a job's wall time, but the
+    iteration count that reaches a given temperature scales with ``n_live``,
+    so this does not transfer between configs.  Prefer ``prior_mass``.
+
+    ::
+
+        termination:
+          - type: iteration
+            max_iterations: 20000
+    """
+
     type: Literal["iteration"] = Field(
         default="iteration",
         description="Discriminator selecting this criterion.",
@@ -73,6 +86,19 @@ class IterationTerminationSpec(BaseTerminationSpec):
 
 
 class PriorMassTerminationSpec(BaseTerminationSpec):
+    """Stop once the remaining prior mass falls below ``threshold``.
+
+    The usual choice: prior mass contracts as ``exp(-i / n_live)``, so the
+    same threshold means the same depth of exploration regardless of
+    ``n_live``.  Smaller values sample further into the low-energy tail.
+
+    ::
+
+        termination:
+          - type: prior_mass
+            threshold: 1.e-5
+    """
+
     type: Literal["prior_mass"] = Field(
         default="prior_mass",
         description="Discriminator selecting this criterion.",
@@ -102,6 +128,21 @@ class PriorMassTerminationSpec(BaseTerminationSpec):
 
 
 class TemperatureTerminationSpec(BaseTerminationSpec):
+    """Stop once the NS temperature estimate cools to ``target_temp``.
+
+    Use when the physics sets the endpoint — "sample down to 100 K" — rather
+    than a count.  Relies on the finite-difference estimator, so set
+    ``output.temperature_kB`` to match your backend's energy units or the
+    target is meaningless.
+
+    ::
+
+        termination:
+          - type: temperature
+            target_temp: 100.0
+            threshold: 10.0
+    """
+
     type: Literal["temperature"] = Field(
         default="temperature",
         description="Discriminator selecting this criterion.",
@@ -143,6 +184,21 @@ class TemperatureTerminationSpec(BaseTerminationSpec):
 
 
 class EnergyTerminationSpec(BaseTerminationSpec):
+    """Stop once ``E_max`` drops below ``min_energy``.
+
+    In the backend's own energy units, so the value does not carry across
+    backends or system sizes.  Handy as a safety net next to another
+    criterion — the run stops when *any* of them fires.
+
+    ::
+
+        termination:
+          - type: prior_mass
+            threshold: 1.e-5
+          - type: energy
+            min_energy: -1000.0
+    """
+
     type: Literal["energy"] = Field(
         default="energy",
         description="Discriminator selecting this criterion.",

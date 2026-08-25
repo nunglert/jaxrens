@@ -248,3 +248,70 @@ class TestValidateTopologyLines:
     # test_validate_reports_multi_replica_topology`` which monkeypatches
     # the device count and hits the resolver's multi-replica branch
     # through ``main(["validate", ...])`` end-to-end.
+
+
+# ---------------------------------------------------------------------------
+# validate tiers: --parse-only < default (plan) < --full
+# ---------------------------------------------------------------------------
+
+
+class TestValidateTiers:
+    """``validate`` must not build a backend or place walkers by default.
+
+    The full resolve costs seconds on a toy backend and minutes on an MLIP,
+    nearly all of it constructing an energy model and compiling a kernel that
+    validation never calls.  These tests pin the tier boundary so a later
+    change cannot quietly put that cost back on the default path.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _single_device(self, monkeypatch):
+        from jaxrens.cli import resolve as _r
+
+        monkeypatch.setattr(_r, "_local_device_count", lambda: 1)
+
+    def test_default_tier_does_not_materialise(self, capsys, monkeypatch):
+        from jaxrens.cli import resolve as _r
+
+        def _boom(*a, **k):  # pragma: no cover - must never run
+            raise AssertionError(
+                "default `validate` resolved the full config; it must stop "
+                "at the plan phase"
+            )
+
+        monkeypatch.setattr(_r, "resolve", _boom)
+        with pytest.raises(SystemExit) as exc_info:
+            main(["validate", "-c", str(_DATA / "minimal.yaml")])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert "plan valid" in out
+        # The report must say what it did not check, so a passing run is
+        # never mistaken for a full startup rehearsal.
+        assert "skipped" in out
+        assert "--full" in out
+
+    def test_full_tier_materialises(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            main(["validate", "-c", str(_DATA / "minimal.yaml"), "--full"])
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert "configuration valid" in out
+        assert "plan valid" not in out
+
+    def test_plan_reports_n_atoms_from_species(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            main(["validate", "-c", str(_DATA / "minimal.yaml")])
+        assert exc_info.value.code == 0
+        # n_atoms comes from the species string, not from placed walkers.
+        assert "n_atoms=" in capsys.readouterr().out
+
+    def test_plan_rejects_missing_path(self, tmp_path, capsys):
+        import yaml as _yaml
+
+        raw = _yaml.safe_load((_DATA / "minimal.yaml").read_text())
+        raw["init"] = {"start_config_file": str(tmp_path / "nope.xyz")}
+        cfg = tmp_path / "missing_path.yaml"
+        cfg.write_text(_yaml.safe_dump(raw))
+        with pytest.raises(SystemExit) as exc_info:
+            main(["validate", "-c", str(cfg)])
+        assert exc_info.value.code != 0

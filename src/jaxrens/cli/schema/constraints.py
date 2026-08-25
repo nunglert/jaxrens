@@ -47,6 +47,26 @@ class MinDistanceConstraintSpec(BaseConstraintSpec):
     mapping of ``"A-B"`` element-symbol pairs to floats, with an optional
     ``"default"`` key for unspecified pairs (default 0.0 — no constraint).
     Distances use the minimum-image convention under a periodic cell.
+
+    Unlike ``backend.softcore_repulsion``, which deforms the potential below
+    its cutoff and so changes the sampled distribution, a constraint
+    restricts the prior — exactly like the likelihood threshold — and costs
+    nothing where it is not violated.
+
+    ::
+
+        constraints:
+          - type: minimum_distance
+            d_min: 0.8
+
+    ::
+
+        constraints:
+          - type: minimum_distance
+            d_min:
+              default: 1.0
+              Si-Si: 2.0
+              Si-O: 1.6
     """
 
     type: Literal["minimum_distance"] = Field(

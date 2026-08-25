@@ -47,9 +47,11 @@ positions, move descriptors, per-replica ensemble params — without
 importing pydantic; and the **core** consumes frozen dataclasses and
 JAX arrays, knowing nothing about YAML.
 
-That separation is why `jaxrens validate --parse-only` is cheap (schema
-only) while `jaxrens validate` does the full resolve including backend
-construction. Every field you can write is documented at
+The resolver splits further, into a *plan* phase that only makes
+decisions (topology, divisibility, path existence) and a *materialise*
+phase that builds the backend and places walkers. That is what lets
+`jaxrens validate` be near-instant by default and pay the full startup
+cost only under `--full`. Every field you can write is documented at
 {doc}`/reference/config`.
 
 ## 2. The two-loop NS structure

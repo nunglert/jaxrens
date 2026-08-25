@@ -14,21 +14,48 @@ concrete trace; this page focuses on the subcommand surface itself.
 
 ## `jaxrens validate`
 
-Schema-check a YAML config and print a one-screen summary.
-Resolves the full config (backend construction, replica
-derivation, initial walker positions) without running NS — a
-useful sanity check before submitting a long job.
+Check a YAML config and print a one-screen summary, without running NS.
+Validation comes in three tiers, because the checks differ enormously in
+cost — the expensive ones build an energy model and compile a kernel that
+validation never calls.
 
 ```bash
-jaxrens validate -c config.yaml
-jaxrens validate -c config.yaml --set run.n_live=64
-jaxrens validate -c config.yaml --parse-only
+jaxrens validate -c config.yaml --parse-only   # schema only
+jaxrens validate -c config.yaml                # + resolver plan (default)
+jaxrens validate -c config.yaml --full         # + startup rehearsal
 ```
 
-Pass `--parse-only` to stop after pydantic schema validation, skipping
-the resolver entirely (no structure-file read, no backend build, no
-walker placement). It is fast — for catching typos and wrong field
-names without paying for heavy-backend initialization.
+| Tier | Checks | Cost |
+|---|---|---|
+| `--parse-only` | pydantic only: field names, types, ranges, cross-field validators | milliseconds |
+| *(default)* | the above, plus the **resolver plan** — replica topology and divisibility, interval-unit scaling, `shard_n_gpu` compatibility, cell-prior geometry bounds, and that every path the config names exists and is readable | well under a second |
+| `--full` | the above, plus **startup rehearsal** — builds the backend, places the walker population, evaluates its initial energies | seconds (toy backends) to minutes (MLIPs) |
+
+The default tier deliberately stops short of loading anything. It ends
+with a `skipped` line naming what it did not check, so a pass is never
+mistaken for a full rehearsal:
+
+```
+✓ OK — configuration plan valid
+  topology  SingleRun (1 replica, 1 GPU)
+  run       n_live=128, max_iterations=2000
+  moves     4 move(s) [gmc, volume, shear, stretch]
+  backend   lj, n_atoms=64
+  output    format=extxyz, prefix=lj8_npt
+  skipped   backend build, walker placement, initial energies — rerun with --full to check those
+```
+
+`n_atoms` is derived from `init.start_species` (or a single read of
+`init.start_config_file`), not from placed walkers. A config initialised
+from a walker set or a restart file carries its atom count inside the
+data, so the plan tier omits the field rather than guessing.
+
+Use `--full` before submitting a long job: it is the tier that proves the
+checkpoint actually loads and that a valid initial configuration exists.
+
+```bash
+jaxrens validate -c config.yaml --set run.n_live=64
+```
 
 Exit code is zero on success. For a multi-run config it prints the
 derived topology:

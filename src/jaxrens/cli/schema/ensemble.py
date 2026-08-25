@@ -53,7 +53,18 @@ class BaseEnsembleSpec(BaseModel):
 
 
 class NVTEnsembleSpec(BaseEnsembleSpec):
-    """Canonical NVT — fixed cell, no ensemble correction (``H = U``)."""
+    """Canonical NVT — fixed cell, no ensemble correction (``H = U``).
+
+    The default when ``ensemble:`` is omitted entirely.  Drop the cell moves
+    (``volume`` / ``shear`` / ``stretch``) from ``moves:`` here: without a
+    ``P*V`` term nothing balances a volume change, and the cell will drift to
+    whichever bound the prior allows.
+
+    ::
+
+        ensemble:
+          type: nvt
+    """
 
     type: Literal["nvt"] = Field(
         default="nvt", description="Discriminator selecting this ensemble."
@@ -64,7 +75,26 @@ class NVTEnsembleSpec(BaseEnsembleSpec):
 
 
 class NPTEnsembleSpec(BaseEnsembleSpec):
-    """Isothermal-isobaric NPT — the backend adds ``P*V`` to the energy."""
+    """Isothermal-isobaric NPT — the backend adds ``P*V`` to the energy.
+
+    A **list** of pressures is what fans the run out across replicas, one per
+    entry — the usual way to set up a pressure-RENS ladder alongside
+    ``inter_re``.
+
+    ::
+
+        ensemble:
+          type: npt
+          pressure: 0.1
+          pressure_units: eva3
+
+    ::
+
+        ensemble:
+          type: npt
+          pressure: [0.01, 0.1, 1.0, 10.0]   # 4 replicas
+          pressure_units: gpa
+    """
 
     type: Literal["npt"] = Field(
         default="npt", description="Discriminator selecting this ensemble."
@@ -117,6 +147,26 @@ class SemiGrandEnsembleSpec(BaseEnsembleSpec):
     ``pressure`` is optional (default 0 → no ``P·V`` term) and may itself be a
     list for a pressure replica axis.  When both are lists their lengths must
     match; a scalar/single-vector broadcasts across the other's replicas.
+
+    The composition fluctuates here, so pair it with a move that can change
+    species — ``species_swap`` conserves composition, ``alchemical_morph``
+    does not.
+
+    ::
+
+        ensemble:
+          type: semi_grand
+          chemical_potentials: [0.0, 0.5]    # one vector, 2 species
+          pressure: 0.0
+
+    ::
+
+        ensemble:
+          type: semi_grand
+          chemical_potentials:               # 3 replicas
+            - [0.0, 0.0]
+            - [0.0, 0.5]
+            - [0.0, 1.0]
     """
 
     type: Literal["semi_grand"] = Field(

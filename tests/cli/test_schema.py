@@ -1297,19 +1297,54 @@ class TestDocumentedExampleConfig:
         )
 
 
-class TestMoveDocstringExamples:
-    """Every move spec must carry a ``moves:`` example, and it must parse.
+# Discriminated-union sections whose variants are rendered as tabs in the
+# configuration reference: (YAML section, module, union alias).
+_VARIANT_UNIONS = [
+    ("moves", "jaxrens.cli.schema.moves", "MoveSpec"),
+    ("backend", "jaxrens.cli.schema.backend", "BackendSpec"),
+    ("ensemble", "jaxrens.cli.schema.ensemble", "EnsembleSpec"),
+    ("termination", "jaxrens.cli.schema.termination", "TerminationSpec"),
+    ("constraints", "jaxrens.cli.schema.constraints", "ConstraintSpec"),
+]
 
-    The configuration reference renders each move variant's docstring into
-    its tab, so these snippets are what a reader copies when picking a move
-    type.  They are hand-written prose inside otherwise-generated pages,
-    which makes them the one part of that page that can silently rot when a
-    field is renamed.
+
+def _union_members(module_path: str, attr: str):
+    """Concrete variant classes behind a discriminated-union alias."""
+    import importlib
+    import inspect as _inspect
+    import typing
+
+    union = getattr(importlib.import_module(module_path), attr)
+    args = typing.get_args(union)
+    members = [m for m in typing.get_args(args[0]) if _inspect.isclass(m)]
+    return members or [args[0]]
+
+
+def _variant_cases():
+    """One parametrize case per (section, concrete variant) pair.
+
+    Driven off the unions themselves, so a newly added variant shows up as a
+    failing case until it carries an example -- rather than being silently
+    left out of the sweep.
+    """
+    for section, module_path, attr in _VARIANT_UNIONS:
+        for spec in _union_members(module_path, attr):
+            yield pytest.param(section, spec, id=f"{section}-{spec.__name__}")
+
+
+class TestDocstringExamples:
+    """Every variant spec must carry a YAML example, and it must parse.
+
+    The configuration reference renders each variant's docstring into its
+    tab, so these snippets are what a reader copies when picking a move
+    type, a backend, an ensemble or a stopping criterion.  They are
+    hand-written prose inside otherwise-generated pages, which makes them
+    the one part of that page that can silently rot when a field is renamed.
     """
 
     @staticmethod
-    def _examples(model) -> list[str]:
-        """Pull indented ``moves:`` literal blocks out of a docstring."""
+    def _examples(model, section: str) -> list[str]:
+        """Pull indented ``<section>:`` literal blocks out of a docstring."""
         import inspect as _inspect
         import textwrap
 
@@ -1332,31 +1367,16 @@ class TestMoveDocstringExamples:
         return [
             textwrap.dedent("\n".join(b))
             for b in blocks
-            if "moves:" in "\n".join(b)
+            if f"{section}:" in "\n".join(b)
         ]
 
-    @pytest.mark.parametrize(
-        "spec",
-        [
-            RandomWalkMoveSpec,
-            GMCMoveSpec,
-            HMCMoveSpec,
-            SingleAtomMoveSpec,
-            SingleAtomSweepMoveSpec,
-            SpeciesSwapMoveSpec,
-            VolumeMoveSpec,
-            ShearMoveSpec,
-            StretchMoveSpec,
-            AlchemicalMorphMoveSpec,
-        ],
-        ids=lambda s: s.__name__,
-    )
-    def test_example_present_and_valid(self, spec):
-        examples = self._examples(spec)
+    @pytest.mark.parametrize("section,spec", list(_variant_cases()))
+    def test_example_present_and_valid(self, section, spec):
+        examples = self._examples(spec, section)
         assert examples, (
-            f"{spec.__name__} has no ``moves:`` example in its docstring; "
-            "the config reference renders that docstring as the variant's "
-            "tab, so the tab would show no usage snippet."
+            f"{spec.__name__} has no ``{section}:`` example in its "
+            "docstring; the config reference renders that docstring as the "
+            "variant's tab, so the tab would show no usage snippet."
         )
         declared = spec.model_fields["type"].default
         for text in examples:
@@ -1364,7 +1384,10 @@ class TestMoveDocstringExamples:
             base = _minimal_dict()
             base.update(fragment)
             root = RootSpec.model_validate(base)
-            assert any(m.type == declared for m in root.moves), (
+            entries = getattr(root, section)
+            if not isinstance(entries, list):
+                entries = [entries]
+            assert any(e.type == declared for e in entries), (
                 f"{spec.__name__} example declares no `type: {declared}` "
-                f"entry; got {[m.type for m in root.moves]}"
+                f"entry; got {[e.type for e in entries]}"
             )

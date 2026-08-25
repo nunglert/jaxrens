@@ -229,7 +229,17 @@ class BaseBackendSpec(BaseModel):
 
 
 class HarmonicBackendSpec(BaseBackendSpec):
-    """Toy isotropic harmonic well about the origin.  For tests."""
+    """Toy isotropic harmonic well about the origin.  For tests.
+
+    Has an analytic partition function, which makes it the reference for
+    checking that the evidence estimator is unbiased.
+
+    ::
+
+        backend:
+          type: harmonic
+          k: 1.0
+    """
 
     type: Literal["harmonic"] = Field(
         default="harmonic",
@@ -244,7 +254,18 @@ class HarmonicBackendSpec(BaseBackendSpec):
 
 
 class DoubleWellBackendSpec(BaseBackendSpec):
-    """Toy double-well potential with a tunable barrier.  For tests."""
+    """Toy double-well potential with a tunable barrier.  For tests.
+
+    Two basins separated by a barrier, so it exercises the sampler's ability
+    to cross one — the toy analogue of a first-order transition.
+
+    ::
+
+        backend:
+          type: double_well
+          a: 1.0
+          b: 1.0
+    """
 
     type: Literal["double_well"] = Field(
         default="double_well",
@@ -260,7 +281,20 @@ class DoubleWellBackendSpec(BaseBackendSpec):
 
 
 class GaussianMixtureBackendSpec(BaseBackendSpec):
-    """Toy multi-modal Gaussian mixture.  For testing mode-hopping."""
+    """Toy multi-modal Gaussian mixture.  For testing mode-hopping.
+
+    ``centers`` defaults to a built-in set; give your own to control how many
+    modes there are and how far apart they sit.
+
+    ::
+
+        backend:
+          type: gaussian_mixture
+          sigma: 0.5
+          centers:
+            - [0.0, 0.0, 0.0]
+            - [2.0, 0.0, 0.0]
+    """
 
     type: Literal["gaussian_mixture"] = Field(
         default="gaussian_mixture",
@@ -289,7 +323,22 @@ class GaussianMixtureBackendSpec(BaseBackendSpec):
 
 
 class LJBackendSpec(BaseBackendSpec):
-    """Lennard-Jones, computed all-pairs with optional periodic images."""
+    """Lennard-Jones, computed all-pairs with optional periodic images.
+
+    Set ``periodic: true`` and a ``cutoff`` for condensed-phase work.  Mind
+    the interaction between ``cutoff``, the ``cell:`` volume bounds and
+    ``supercell_trafo``: the resolver warns at startup when the smallest cell
+    the prior permits is too thin to honour the cutoff.
+
+    ::
+
+        backend:
+          type: lj
+          epsilon: 1.0
+          sigma: 1.0
+          cutoff: 2.5
+          periodic: true
+    """
 
     type: Literal["lj"] = Field(
         default="lj", description="Discriminator selecting this backend."
@@ -336,7 +385,20 @@ class LJBackendSpec(BaseBackendSpec):
 
 
 class NeuralILBackendSpec(BaseBackendSpec):
-    """NeuralIL machine-learned potential loaded from a pickle."""
+    """NeuralIL machine-learned potential loaded from a pickle.
+
+    ``supercell_trafo`` must be large enough that the cell spans twice the
+    model's ``r_cut`` (read from the pickle); raise it for tight unit cells.
+
+    ::
+
+        backend:
+          type: neuralil
+          checkpoint_path: models/neuralil_si.pkl
+          periodic: true
+          supercell_trafo: [2, 2, 2]
+          softcore: true
+    """
 
     type: Literal["neuralil"] = Field(
         default="neuralil",
@@ -414,7 +476,23 @@ class NeuralILBackendSpec(BaseBackendSpec):
 
 
 class MACEBackendSpec(BaseBackendSpec):
-    """MACE-JAX message-passing potential."""
+    """MACE-JAX message-passing potential.
+
+    Foundation models without a proper short-range repulsive term let walkers
+    collapse at high ``E_max``; pair this with ``softcore_repulsion`` (or a
+    ``minimum_distance`` constraint) when that happens.
+
+    ::
+
+        backend:
+          type: mace
+          checkpoint_path: models/mace_si.model
+          periodic: true
+          supercell_trafo: [2, 2, 2]
+          softcore_repulsion:
+            r_core_cut: 1.25
+            r_core_switch: 0.75
+    """
 
     type: Literal["mace"] = Field(
         default="mace", description="Discriminator selecting this backend."
@@ -447,6 +525,19 @@ class MACEBackendSpec(BaseBackendSpec):
 
 
 class NequixBackendSpec(BaseBackendSpec):
+    """Nequix message-passing potential.
+
+    ``checkpoint_path`` takes either a local ``.nqx`` file or a bundled model
+    name, which the ``nequix`` package downloads on first use.
+
+    ::
+
+        backend:
+          type: nequix
+          checkpoint_path: nequix-mp-1
+          periodic: true
+    """
+
     type: Literal["nequix"] = Field(
         default="nequix",
         description="Discriminator selecting this backend.",
@@ -484,6 +575,27 @@ class JaxMDBackendSpec(BaseBackendSpec):
     All-pairs computation — no neighbor list, so ``max_neighbors_list``
     and ``max_neighbors_offset`` from the base spec are ignored.  See
     ``backends/jaxmd.py`` for the architectural rationale.
+
+    Tersoff needs exactly one of ``tersoff_params`` (a built-in set) or
+    ``tersoff_params_file`` (a LAMMPS-format file); EAM needs
+    ``eam_params_file`` and no Tersoff key.  Mixing them is rejected at
+    parse time.
+
+    ::
+
+        backend:
+          type: jaxmd
+          potential: tersoff
+          tersoff_params: Si
+          periodic: true
+
+    ::
+
+        backend:
+          type: jaxmd
+          potential: eam
+          eam_params_file: potentials/Cu_u3.eam
+          periodic: true
     """
 
     type: Literal["jaxmd"] = Field(

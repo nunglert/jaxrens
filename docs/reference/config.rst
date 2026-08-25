@@ -12,8 +12,9 @@ Validate a file without running anything:
 
 .. code-block:: bash
 
-   jaxrens validate -c config.yaml                # full check, imports JAX
-   jaxrens validate --parse-only -c config.yaml   # schema only, fast
+   jaxrens validate --parse-only -c config.yaml   # schema only
+   jaxrens validate -c config.yaml                # + resolver plan
+   jaxrens validate --full -c config.yaml         # + startup rehearsal
    jaxrens dump-schema                            # the raw JSON Schema
 
 .. seealso::

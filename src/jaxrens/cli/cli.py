@@ -492,6 +492,46 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if not args.full:
+        # Default tier: every check that needs neither an energy model nor a
+        # walker population.  The full resolve costs ~15 s on the toy LJ
+        # example and minutes on an MLIP, almost all of it building a backend
+        # and JIT-compiling an energy kernel that validation never calls.
+        from jaxrens.cli.resolve import resolve_plan
+
+        plan = resolve_plan(root)
+        n_moves = len(plan.root.moves)
+        move_types = ", ".join(m.move_type for m in plan.root.moves)
+        backend_line = plan.root.backend.backend_type
+        if plan.n_atoms is not None:
+            backend_line += f", n_atoms={plan.n_atoms}"
+        print(
+            "\n".join(
+                [
+                    _ok_header("configuration plan valid"),
+                    _kv("topology", plan.topology),
+                    _kv(
+                        "run",
+                        f"n_live={plan.root.run.n_live}, "
+                        f"max_iterations={plan.root.run.max_iterations}",
+                    ),
+                    _kv("moves", f"{n_moves} move(s) [{move_types}]"),
+                    _kv("backend", backend_line),
+                    _kv(
+                        "output",
+                        f"format={plan.root.output.format}, "
+                        f"prefix={plan.root.output.out_file_prefix}",
+                    ),
+                    _kv(
+                        "skipped",
+                        "backend build, walker placement, initial energies "
+                        "— rerun with --full to check those",
+                    ),
+                ]
+            )
+        )
+        return 0
+
     from jaxrens.cli.resolve import resolve
     from jaxrens.sampling.batch_descriptor import ShardedSingleRun, SingleRun
 
@@ -674,9 +714,21 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Stop after pydantic schema validation; skip the resolver "
-            "(no structure file read, no backend build, no walker placement). "
-            "Fast — for catching typos / wrong field names without paying "
-            "for heavy-backend initialization."
+            "entirely. The cheapest tier — catches typos and wrong field "
+            "names and nothing else."
+        ),
+    )
+    p_val.add_argument(
+        "--full",
+        action="store_true",
+        default=False,
+        help=(
+            "Also build the backend, place the walker population and "
+            "evaluate its initial energies — i.e. rehearse startup. Proves "
+            "the model file loads and that a valid initial configuration "
+            "exists, at the cost of seconds (toy backends) to minutes "
+            "(MLIPs). Without it, validation stops at the resolver plan: "
+            "topology, divisibility, path existence, geometry bounds."
         ),
     )
 
@@ -855,6 +907,9 @@ def main(argv: list[str] | None = None) -> None:
         _err(_format_validation_error(exc, cfg))
         sys.exit(2)
     except FileNotFoundError as exc:
+        _err(f"jaxrens: {exc}")
+        sys.exit(2)
+    except PermissionError as exc:
         _err(f"jaxrens: {exc}")
         sys.exit(2)
     except yaml.YAMLError as exc:
