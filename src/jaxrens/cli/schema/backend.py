@@ -345,11 +345,16 @@ class RENSToyBackendSpec(BaseBackendSpec):
         description="Discriminator selecting this backend.",
     )
     eps_rep: float = Field(
-        default=1.0,
-        description="Height of the repulsive core, ``E_rep`` (eq 14).",
+        default=10.0,
+        description=(
+            "Height of the repulsive core, ``E_rep`` (eq 14).  The core is a "
+            "Gaussian and therefore *bounded*: set it too low and the two "
+            "particles simply interpenetrate, since the attraction from "
+            "their periodic self-images outweighs a finite overlap cost."
+        ),
     )
     h_rep: float = Field(
-        default=3.0,
+        default=8.0,
         description=(
             "Decay constant of the repulsive core; larger values make the "
             "repulsion narrower."

@@ -554,20 +554,30 @@ _TUT = FIGDIR.parents[2] / "examples" / "tutorials"
 _TUTFIG = FIGDIR / "tutorials"
 
 
+def _tutorial_config(name: str) -> dict:
+    """Load a tutorial's YAML config.
+
+    The surface figures are built from the same file the tutorial tells the
+    reader to run, so tuning a parameter moves the plot with it instead of
+    leaving the two quietly disagreeing.
+    """
+    import yaml
+
+    with open(_TUT / name / "config.yaml") as fh:
+        return yaml.safe_load(fh)
+
+
 def fig_gauss2d_surface() -> None:
     """Gaussian-mixture landscape, with the walker population contracting."""
     import jax.numpy as jnp
 
     from jaxrens.backends.toy import create_gaussian_mixture
 
-    centers = [
-        [-1.5, -1.5, 0.0],
-        [1.5, -1.5, 0.0],
-        [-1.5, 1.5, 0.0],
-        [1.60, 1.60, 0.0],
-        [2.00, 1.60, 0.0],
-    ]
-    backend = create_gaussian_mixture(centers=centers, sigma=0.35)
+    cfg = _tutorial_config("00_gaussian_2d")
+    centers = cfg["backend"]["centers"]
+    backend = create_gaussian_mixture(
+        centers=centers, sigma=cfg["backend"]["sigma"]
+    )
 
     lim = 3.2
     n = 320
@@ -594,6 +604,10 @@ def fig_gauss2d_surface() -> None:
         ax.contour(X, Y, E, levels=14, colors="w", linewidths=0.4, alpha=0.6)
         ax.set_xlabel("x")
         ax.set_aspect("equal")
+        # Pin the limits: the scatter overlay would otherwise stretch the
+        # right-hand panel and the two would no longer be comparable.
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
     axes[0].set_ylabel("y")
     fig.colorbar(im, ax=axes, label="energy  $E(x, y)$", shrink=0.9)
 
@@ -648,47 +662,54 @@ def fig_rens_toy_surface() -> None:
 
     from jaxrens.backends.toy import create_rens_toy
 
+    # Parameters come from the tutorial's own config, not from literals here:
+    # the figure has to show the surface the tutorial actually samples, and a
+    # second copy of these numbers would drift the first time either is tuned.
+    cfg = _tutorial_config("01_rens_toy")
     backend = create_rens_toy(
-        eps_rep=1.0,
-        h_rep=3.0,
-        eps_attr=1.0,
-        mu=1.0,
-        sigma=0.2,
-        r_cut=3.0,
-        n_images=8,
+        **{
+            k: v
+            for k, v in cfg["backend"].items()
+            if k not in ("type", "periodic")
+        }
     )
-    pressures = [0.5, 1.0, 1.5]
+    pressures = list(cfg["ensemble"]["pressure"])
 
+    # d on the horizontal axis, a on the vertical: the irreducible region
+    # d <= a/2 is then the *upper-left* wedge, which is how the paper orients
+    # it.  (With a horizontal it lands lower-right and reads inverted.)
     n = 260
     a_grid = np.linspace(0.5, 4.0, n)
     d_grid = np.linspace(0.0, 2.0, n)
-    A, D = np.meshgrid(a_grid, d_grid)
+    D, A = np.meshgrid(d_grid, a_grid)
 
     types = jnp.zeros(2, dtype=int)
     U = np.empty(A.shape)
     for i in range(A.shape[0]):
         for j in range(A.shape[1]):
-            a, d = A[i, j], D[i, j]
+            a, d = float(A[i, j]), float(D[i, j])
             pos = jnp.array([[0.0, 0.0, 0.0], [float(d), 0.0, 0.0]])
             cell = jnp.diag(jnp.array([float(a), 1.0, 1.0]))
             U[i, j] = float(backend(pos, types, cell).energy)
 
     # Irreducible wedge: d and a - d describe the same configuration under
-    # periodicity, so everything above d = a/2 is a mirror image.  Masking it
+    # periodicity, so everything with d > a/2 is a mirror image.  Masking it
     # is what makes the surface readable -- and matches Figure 3a of the paper.
     wedge = D <= A / 2.0
 
     fig, axes = plt.subplots(
-        1, 3, figsize=(13, 4.0), sharey=True, constrained_layout=True
+        1, 3, figsize=(12, 4.4), sharey=True, constrained_layout=True
     )
     for ax, P in zip(axes, pressures, strict=False):
         H = np.where(wedge, U + P * A, np.nan)
-        im = ax.pcolormesh(A, D, H, cmap="viridis", shading="auto")
-        ax.contour(A, D, H, levels=16, colors="w", linewidths=0.4, alpha=0.6)
-        ax.plot(a_grid, a_grid / 2.0, color="k", lw=1.0)
-        ax.set_xlabel("box length  $a$")
+        im = ax.pcolormesh(D, A, H, cmap="viridis", shading="auto")
+        ax.contour(D, A, H, levels=16, colors="w", linewidths=0.4, alpha=0.6)
+        ax.plot(a_grid / 2.0, a_grid, color="k", lw=1.0)
+        ax.set_xlabel("separation  $d$")
+        ax.set_xlim(d_grid[0], d_grid[-1])
+        ax.set_ylim(a_grid[0], a_grid[-1])
         ax.set_title(f"$P = {P}$", fontsize=10)
-    axes[0].set_ylabel("separation  $d$")
+    axes[0].set_ylabel("box length  $a$")
     fig.colorbar(im, ax=axes, label="enthalpy  $H = U + P a$", shrink=0.9)
     fig.suptitle(
         "irreducible wedge of the toy-model enthalpy surface "

@@ -38,6 +38,22 @@ at $a \approx \mu, 2\mu, 3\mu, \dots$ **That** is the point. Independent NS
 runs at different pressures fall into different basins and stay there; replica
 exchange is what lets them escape.
 
+```{image} ../_static/figures/tutorials/rens_toy_surface.png
+:alt: irreducible wedge of the toy-model enthalpy surface at three pressures
+:width: 100%
+```
+
+Only the wedge $d \leq a/2$ is shown. Under periodicity a separation $d$ and
+$a - d$ describe the same configuration, so everything above the diagonal is a
+mirror image; masking it is what makes the structure readable.
+
+Read the three panels left to right and the tutorial's result is already
+visible. At $P = 0.5$ the deepest basin sits at $a \approx 2, d \approx 1$ —
+both particles in the attractive well with the box commensurate. As pressure
+rises the $P a$ term tilts the surface toward small $a$, and by $P = 1.5$ the
+compressed basin near $a \approx 1$ has taken over. Three replicas, two
+competing minima, and a swap is the only cheap way across.
+
 :::{note}
 The parameter values below are sensible defaults, not the paper's — they
 reproduce the qualitative behaviour (repulsive core, attractive well,

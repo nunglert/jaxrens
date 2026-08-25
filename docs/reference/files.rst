@@ -184,12 +184,41 @@ covers every replica.
     ``n_evaluations`` / ``n_grad_evaluations`` int64 and
     ``reject_reason_counts`` of shape ``(N, n_runs, n_moves, 4)`` — the four
     buckets being accepted, likelihood, cell-geometry and prior rejection.
-    Read with :class:`~jaxrens.io.adaptation_log.AdaptationLogger`.
+
+    .. dropdown:: Load it in Python
+
+       .. code-block:: python
+
+          from jaxrens.io.adaptation_log import AdaptationLogger
+
+          log = AdaptationLogger.read("output/ns.adaptation.h5")
+          log.iterations          # (N,)                     int64
+          log.step_sizes          # (N, n_runs, n_moves)     float32
+          log.acceptance_rates    # (N, n_runs, n_moves)     float32
+          log.n_evaluations       # (N, n_runs, n_moves)     int64
+
+          # Acceptance of move 0 in replica 0, over the run:
+          log.acceptance_rates[:, 0, 0]
 
 ``<prefix>.acc_rates.h5``
     Opt-in via ``output.save_acc_rates``.  Raw ``n_accepted`` and
     ``n_proposed`` counts, ``(N, n_runs, n_moves)`` int64 — the unaggregated
-    form of what ``adaptation.h5`` stores as rates.
+    form of what ``adaptation.h5`` stores as rates.  Use it when you want to
+    pool counts over a window rather than average ratios.
+
+    .. dropdown:: Load it in Python
+
+       .. code-block:: python
+
+          from jaxrens.io.acc_rates_log import AccRatesLogger
+
+          log = AccRatesLogger.read("output/ns.acc_rates.h5")
+          log.iterations   # (N,)                   int64
+          log.n_accepted   # (N, n_runs, n_moves)   int64
+          log.n_proposed   # (N, n_runs, n_moves)   int64
+
+          # Pooled acceptance per move for replica 0 (counts, not mean-of-ratios):
+          rate = log.n_accepted[:, 0, :].sum(0) / log.n_proposed[:, 0, :].sum(0)
 
 ``<prefix>.max_neighbors.h5``
     Opt-in via ``output.save_max_neighbors``, and a no-op for backends with
@@ -197,12 +226,43 @@ covers every replica.
     int32 against ``bucket_size`` ``(N, n_runs)`` int32 and an ``overflow``
     bool — this is how you size ``backend.max_neighbors_list``.
 
+    .. dropdown:: Load it in Python
+
+       .. code-block:: python
+
+          from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
+
+          log = MaxNeighborsLogger.read("output/ns.max_neighbors.h5")
+          log.iterations          # (N,)                        int64
+          log.max_neighbor_count  # (N, n_runs, n_walkers)      int32
+          log.bucket_size         # (N, n_runs)                 int32
+          log.overflow            # (N, n_runs)                 bool
+
+          # Headroom actually used: how close the worst walker came to the rung.
+          headroom = log.bucket_size[:, 0] - log.max_neighbor_count[:, 0].max(-1)
+
 ``<prefix>.re_stats.h5``
     Opt-in via ``output.save_re_stats``, and only meaningful with
     ``inter_re``.  ``n_accepted_per_pair`` and ``n_attempted_per_pair``, both
     ``(N, n_pairs)`` int32 with ``n_pairs = n_runs - 1``, plus the swap
-    ``flavor``.  Its cadence follows ``inter_re.re_interval``.  Read with
-    :class:`~jaxrens.io.re_stats_log.RELogger`.
+    ``flavor``.  Its cadence follows ``inter_re.re_interval``.
+
+    .. dropdown:: Load it in Python
+
+       .. code-block:: python
+
+          from jaxrens.io.re_stats_log import RELogger
+
+          log = RELogger.read("output/ns.re_stats.h5")
+          log.iterations             # (N,)            int64
+          log.n_accepted_per_pair    # (N, n_pairs)    int32
+          log.n_attempted_per_pair   # (N, n_pairs)    int32
+          log.n_pairs, log.flavor
+          log.acceptance_rates       # (N, n_pairs) float32, 0 where none attempted
+
+          # Overall acceptance per adjacent pair -- a rung near 0 needs splitting:
+          per_pair = (log.n_accepted_per_pair.sum(0)
+                      / log.n_attempted_per_pair.sum(0))
 
 
 ``.log``

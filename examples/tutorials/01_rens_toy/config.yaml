@@ -26,18 +26,18 @@ backend:
   # Box lengths commensurate with mu are favoured, which is what makes the
   # enthalpy surface multi-modal.
   eps_rep: 1.0
-  h_rep: 3.0
+  h_rep: 6.0
   eps_attr: 1.0
-  mu: 1.0
-  sigma: 0.2
-  r_cut: 3.0
+  mu: 3.0
+  sigma: 0.1
+  r_cut: 4.0
   n_images: 8
 
 ensemble:
   type: npt
   # A list fans the run out across replicas -- one per pressure. This is the
   # replica axis that inter_re then swaps along.
-  pressure: [0.5, 1.0, 1.5]
+  pressure: [1.0, 2.5, 4.0]
   pressure_units: eva3
 
 inter_re:

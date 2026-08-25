@@ -24,6 +24,20 @@ That asymmetry is the whole exercise. Nested sampling has to find the deeper
 basin *without being told where it is*, by shrinking a contour of constant
 energy until only that basin survives inside it.
 
+```{image} ../_static/figures/tutorials/gauss2d_surface.png
+:alt: the Gaussian-mixture energy surface, and the walker population contracting onto the deepest basin
+:width: 100%
+```
+
+Left: the surface itself, with the five Gaussian centres marked — note the two
+at the top right sitting almost on top of each other, which is what makes that
+basin deeper than the rest. Right: the live population, dumped every 500
+iterations by `output.snapshot_interval`. At iteration 500 the walkers are
+spread across all four basins; by 1500 each basin holds a tight cluster; by
+2500 only the merged one is still occupied. That contraction *is* the
+algorithm — everything the log prints below is a number describing this
+picture.
+
 ## The config
 
 `examples/tutorials/00_gaussian_2d/config.yaml`:

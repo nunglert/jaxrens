@@ -96,14 +96,16 @@ class RENSToyBackend:
     the physics, so it only needs to be large enough that
     ``n_images * a_min >= r_cut`` for the smallest box the prior allows.
 
-    Self-images (``i == j``, ``n != 0``) are **excluded**, following the
-    ``i != j`` restriction in eq 17.
+    Self-images (``i == j``, ``n != 0``) are **included** -- a particle
+    interacts with its own periodic images, and at box lengths near ``mu``
+    that term dominates.  Only the ``i == j``, ``n == 0`` self-term is
+    dropped.
     """
 
     def __init__(
         self,
-        eps_rep: float = 1.0,
-        h_rep: float = 3.0,
+        eps_rep: float = 10.0,
+        h_rep: float = 8.0,
         eps_attr: float = 1.0,
         mu: float = 1.0,
         sigma: float = 0.2,
@@ -138,17 +140,22 @@ class RENSToyBackend:
         x = positions[:, 0]
         a = cell[0, 0]
 
-        # All ordered pairs, then mask the diagonal: i != j, counted twice and
-        # halved, exactly as eq 17 is written.
+        # Full lattice sum: every ordered pair against every periodic image,
+        # counted twice and halved.  The ONLY term excluded is a particle
+        # with its own image at zero shift -- a particle does interact with
+        # its own images at n*a, and dropping those would remove the whole
+        # a-dependence of the energy at small box lengths, where n*a is
+        # comparable to mu and the contribution is strongly attractive.
         dx = x[:, None] - x[None, :]
-        off_diagonal = 1.0 - jnp.eye(x.shape[0])
-
         shifts = jnp.arange(-self.n_images, self.n_images + 1) * a
         d = jnp.abs(dx[:, :, None] + shifts[None, None, :])
 
-        within = d <= self.r_cut
+        self_term = jnp.eye(x.shape[0], dtype=bool)[:, :, None] & (
+            shifts[None, None, :] == 0.0
+        )
+        within = (d <= self.r_cut) & ~self_term
         pair = jnp.where(within, self.pair_energy(d), 0.0)
-        energy = 0.5 * jnp.sum(pair * off_diagonal[:, :, None])
+        energy = 0.5 * jnp.sum(pair)
 
         return BackendResult(energy=energy)
 
@@ -213,8 +220,8 @@ def create_double_well(a: float = 1.0, b: float = 1.0) -> DoubleWellBackend:
 
 
 def create_rens_toy(
-    eps_rep: float = 1.0,
-    h_rep: float = 3.0,
+    eps_rep: float = 10.0,
+    h_rep: float = 8.0,
     eps_attr: float = 1.0,
     mu: float = 1.0,
     sigma: float = 0.2,
