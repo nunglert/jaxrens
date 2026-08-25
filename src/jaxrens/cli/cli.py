@@ -37,11 +37,12 @@ logger = logging.getLogger(__name__)
 
 # Wordmark rendered with figlet's "small" font.  Kept as a literal so the
 # --help / --version paths stay dependency-free and JAX-free.
-_WORDMARK = r"""  _
- (_)__ ___ ___ _ ___ _ _  ___
- | / _` \ \ / '_/ -_) ' \(_-<
-_/ \__,_/_\_\_| \___|_||_/__/
-|__/"""
+_WORDMARK = r"""                                         
+    __ _____ __ __ _____ _____ _____ _____ 
+ __|  |  _  |  |  | __  |   __|   | |   __|
+|  |  |     |-   -|    -|   __| | | |__   |
+|_____|__|__|__|__|__|__|_____|_|___|_____|
+"""
 
 _TAGLINE = "JAX-based nested sampling for atomistic systems"
 

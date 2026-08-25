@@ -18,9 +18,8 @@ following features, which JAXRENS supports:
 
 JAXRENS is a good fit when you:
 
-- Are interested in the unbiased thermodynamic sampling of small (bulk) systems, directly yielding the global partition function.
-- Already live inside the JAX ecosystem (models trained with
-  MACE-JAX, NeuralIL, or your own Flax/JAX code). 
+- Are interested in the unbiased thermodynamic sampling of small systems, directly yielding the global partition function.
+- Already live inside the JAX ecosystem. If not, [tojax](https://github.com/cusp-ai-oss/tojax) might allow you to convert your model to a corresponding JAX model.
 
 ## Quickstart install
 
@@ -43,8 +42,7 @@ pin explanation. The full set of extras is `mace`, `neuralil`,
 
 ## Core modules
 
-`sampling/` (NS loop + move kernels + adaptation) and `cli/` (schema
-+ resolver + run entry points) carry most of the complexity;
+`sampling/` (NS loop + move kernels + adaptation) and `cli/` (schema + resolver + run entry points) carry most of the complexity;
 `backends/` hosts the energy-model adapters (LJ, MACE, NeuralIL,
 Nequix, jax-md, toy potentials); `state/` carries the pytree
 dataclasses everything else consumes; `constraints/` holds the hard

@@ -17,13 +17,13 @@ _static/figures/pkg_treemap.svg
 # build, so they would cause huge diffs if committed.
 reference/api/
 
-# Everything under docs/tutorials/ is generated at build time from
-# examples/tutorials/*.py.  The .ipynb files come from jupytext; any
-# other file (e.g. *.energies, *.log) is a runtime side effect of the
-# tutorial notebook executing in this directory under nbsphinx.  The
-# only source-of-truth file here is the hand-written index.rst.
-tutorials/*
-!tutorials/index.rst
+# The tutorials are hand-written CLI walk-throughs (tracked .md files)
+# that literalinclude their YAML from examples/tutorials/.  Only build
+# artefacts are ignored here: .ipynb from any future jupytext conversion,
+# plus any run output produced if a tutorial is executed in place.
+tutorials/*.ipynb
+tutorials/*.energies
+tutorials/*.log
 
 # Ipynb checkpoint scratch created by Jupyter / nbsphinx if someone
 # opens a committed notebook in the browser.

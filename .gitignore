@@ -25,3 +25,7 @@ experiments/*
 WORKLOG.md
 .claude
 CLAUDE.md
+
+# Output produced by running the tutorials in place.
+examples/tutorials/*/output/
+examples/tutorials/*/*.log

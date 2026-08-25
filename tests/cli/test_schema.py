@@ -1391,3 +1391,25 @@ class TestDocstringExamples:
                 f"{spec.__name__} example declares no `type: {declared}` "
                 f"entry; got {[e.type for e in entries]}"
             )
+
+
+class TestTutorialConfigs:
+    """Every tutorial config must parse against the current schema.
+
+    The docs pages ``literalinclude`` these files, so a renamed field would
+    otherwise ship a broken copy-pasteable example — the tutorials are the
+    first thing a new user runs.
+    """
+
+    _TUTORIALS = sorted(
+        (Path(__file__).resolve().parents[2] / "examples" / "tutorials").glob(
+            "*/config.yaml"
+        )
+    )
+
+    def test_tutorials_are_discovered(self):
+        assert self._TUTORIALS, "no examples/tutorials/*/config.yaml found"
+
+    @pytest.mark.parametrize("path", _TUTORIALS, ids=lambda p: p.parent.name)
+    def test_tutorial_config_validates(self, path):
+        RootSpec.model_validate(yaml.safe_load(path.read_text()))
