@@ -55,7 +55,7 @@ class SwapKernel(ABC):
     separate from the deterministic acceptance check.
 
     Swap-state contract (deliberately *not* ``WalkerState``)
-    -------------------------------------------------------
+    --------------------------------------------------------
     ``propose``/``accept`` speak a small, JIT-internal *pair* protocol, not the
     single-walker ``WalkerState`` pytree used everywhere else:
 

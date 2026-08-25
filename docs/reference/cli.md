@@ -37,7 +37,7 @@ derived topology:
 OK — multi-run dispatch
   topology: n_gpu=4 × n_per_gpu=2 = 8 replica(s)
   run:     n_live=64, max_iterations=1000
-  moves:   4 move(s) [galilean, volume, shear, stretch]
+  moves:   4 move(s) [gmc, volume, shear, stretch]
   backend: mace, n_atoms=40
   output:  format=extxyz, prefix=mace_srtio3
 ```
@@ -78,7 +78,8 @@ jaxrens run -c config.yaml --force
 
 ## `jaxrens dump-schema`
 
-Emit the JSON schema for `RootConfig`. Useful for editor
+Emit the JSON schema for {class}`~jaxrens.cli.schema.root.RootSpec`,
+the top-level config model. Useful for editor
 autocomplete (point your YAML LSP at the generated schema).
 
 ```bash
@@ -112,21 +113,23 @@ the methods on the collection (see {doc}`index`).
 
 ## The YAML surface
 
-Every YAML config has ten top-level sections. Not all are required
-— most have sensible defaults.
+Every YAML config has eleven top-level sections plus one scalar key.
+Not all are required — most have sensible defaults.
 
 | Section | Purpose | Cardinality |
 |---|---|---|
 | `run` | NS parameters (n_live, max_iter, seed, …) | required |
 | `moves` | ordered list of MCMC kernels | required |
-| `backend` | energy model (lj/mace/neuralil/harmonic/…) | required |
+| `backend` | energy model (lj/mace/neuralil/nequix/jaxmd/toy) | required |
 | `output` | file format, intervals, working dir | required |
-| `ensemble` | NVT / NPT + optional pressure list | optional |
+| `ensemble` | NVT / NPT / semi-grand + optional pressure list | optional |
 | `inter_re` | replica-exchange flavor (pressure/xrens/semi_grand) | optional |
-| `adaptation` | step-size bisection settings | optional |
+| `adaptation` | step-size adaptation policy + per-move overrides | optional |
 | `termination` | list of stopping criteria | optional |
 | `init` | starting walkers (species / config file / restart) | optional |
 | `cell` | cell-shape / volume constraints | optional |
+| `constraints` | hard configuration constraints (e.g. minimum distance) | optional |
+| `interval_units` | scalar: `absolute` (default) or `per_walker` — rescales every iteration-counted field at once | optional |
 
 For the full schema — every field of every section, with its type,
 default, and constraints — see the {doc}`config`. For a

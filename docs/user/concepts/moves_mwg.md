@@ -2,8 +2,12 @@
 
 jaxrens decouples *what* configurations to propose from *how* they
 combine in a single NS iteration. Individual MCMC kernels — random
-walk, galilean, HMC, volume, shear, stretch, single-atom swap,
-alchemical — each implement the `MoveKernel` protocol. They're
+walk, galilean, HMC, volume, shear, stretch, single-atom, single-atom
+sweep, species swap, alchemical morph — are each described to the
+sampler by a {class}`~jaxrens.sampling.move_kernel.MoveKernel`
+descriptor (a dataclass carrying the kernel's `build_kernel` factory,
+its `kernel_kwargs`, `weight`, `step_size`, any `extra_state_fields`,
+and which state aspects it `mutates`). They're
 composed at run time into a single step function by
 {func}`~jaxrens.sampling.mwg.build_mwg`, which implements
 Metropolis-within-Gibbs (MWG): at each MCMC step, one kernel is
@@ -24,7 +28,7 @@ kernel fires roughly $p_k \cdot n_\mathrm{mcmc}$ times. YAML:
 
 ```yaml
 moves:
-  - type: galilean
+  - type: gmc
     step_size: 0.1
     weight: 4.0      # 4/7 of steps
   - type: volume
@@ -38,11 +42,20 @@ moves:
     weight: 1.0
 ```
 
+:::{note}
+The Galilean kernel's YAML discriminator is `gmc`. `type: galilean`
+is still accepted as a legacy alias and rewritten to `gmc` at parse
+time, so older configs keep working — but `gmc` is the canonical
+spelling and the one the {doc}`/reference/config` documents. The
+*module* is still `sampling/moves/galilean.py`; only the config key
+changed.
+:::
+
 ```{mermaid}
 flowchart LR
     W["walker state x_t"] --> S["sample move idx<br/>p_k = w_k / Σ w_j"]
     S --> R{"which kernel?"}
-    R -->|galilean| G["galilean.step"]
+    R -->|gmc| G["galilean.step"]
     R -->|volume| V["volume.step"]
     R -->|shear| SH["shear.step"]
     R -->|stretch| ST["stretch.step"]
@@ -225,8 +238,8 @@ built-in kernel.
 
 | Concern | File |
 |---|---|
-| Kernel protocol / descriptor | {class}`jaxrens.sampling.move_kernel.MoveKernel` |
+| Kernel descriptor | {class}`jaxrens.sampling.move_kernel.MoveKernel` |
 | MWG composer | {func}`jaxrens.sampling.mwg.build_mwg` |
-| Individual kernels | `sampling/moves/{random_walk,galilean,hmc,single_atom,alchemical,volume,shear,stretch,replica_exchange}.py` |
-| Info payload | `jaxrens.base.MoveInfo` |
+| Individual kernels | `sampling/moves/{random_walk,galilean,hmc,single_atom,swap,alchemical,volume,shear,stretch,replica_exchange}.py` |
+| Info payload | {class}`jaxrens.sampling.base.MoveInfo` |
 | Adaptation | `sampling/adaptation/{stepsize_handler,manager}.py` |

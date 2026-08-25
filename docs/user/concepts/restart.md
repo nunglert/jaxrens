@@ -318,7 +318,7 @@ moves:
   - type: random_walk
     step_size: 0.05
     weight: 1.0
-  # galilean removed
+  # gmc removed
 ```
 
 ```bash

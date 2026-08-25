@@ -66,7 +66,16 @@ mermaid_include_elk = True
 mermaid_elk_version = "0.2.0"
 
 templates_path = ["_templates"]
-exclude_patterns = ["Thumbs.db", ".DS_Store", "_build", "test*.py"]
+# TODO.md is a working scratch list that lives beside the docs but is not
+# one of them -- excluded so it stops raising "not included in any
+# toctree" on every build.
+exclude_patterns = [
+    "Thumbs.db",
+    ".DS_Store",
+    "_build",
+    "test*.py",
+    "TODO.md",
+]
 
 source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
 
