@@ -24,6 +24,7 @@ from jaxrens.sampling.moves import (
     single_atom,
     stretch,
     swap,
+    toy_1d,
     volume,
 )
 from jaxrens.state.config import MoveConfig
@@ -817,6 +818,74 @@ class AlchemicalMorphMoveSpec(BaseMoveSpec):
         return frozenset({"types"})
 
 
+class Lattice1DMoveSpec(BaseMoveSpec):
+    """Change the box length of the 1-D toy model.
+
+    The 1-D analogue of a volume move, and the counterpart to
+    ``distance_1d``; the RENS paper runs the two in a 1:1 ratio.  Bounds come
+    from the ``cell:`` section, read as bounds on ``a / n_atoms``.  Only for
+    ``backend: rens_toy``.
+
+    ::
+
+        moves:
+          - {type: lattice_1d, step_size: 0.3, weight: 1.0}
+          - {type: distance_1d, step_size: 0.3, weight: 1.0}
+    """
+
+    type: Literal["lattice_1d"] = Field(
+        default="lattice_1d",
+        description="Discriminator selecting this move.",
+    )
+
+    def _reject_reasons(self) -> frozenset[str]:
+        return frozenset({"energy", "cell"})
+
+    def _mutates(self) -> frozenset[str]:
+        return frozenset({"positions", "cell"})
+
+    def _build_kernel(self) -> Callable:
+        return toy_1d.build_lattice_kernel
+
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        symbol_map: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        if n_atoms is None or cell_cfg is None:
+            raise ValueError(
+                "Lattice1DMoveSpec.to_descriptor() requires n_atoms and "
+                "cell_cfg from the resolver."
+            )
+        return {
+            "n_atoms": n_atoms,
+            "max_vol_per_atom": cell_cfg.max_volume_per_atom,
+            "min_vol_per_atom": cell_cfg.min_volume_per_atom,
+        }
+
+
+class Distance1DMoveSpec(BaseMoveSpec):
+    """Displace one particle of the 1-D toy model along the axis.
+
+    Counterpart to ``lattice_1d``.  Only ``x`` moves — ``y`` and ``z`` are
+    not arguments of the toy energy.  Only for ``backend: rens_toy``.
+
+    ::
+
+        moves:
+          - {type: distance_1d, step_size: 0.3, weight: 1.0}
+    """
+
+    type: Literal["distance_1d"] = Field(
+        default="distance_1d",
+        description="Discriminator selecting this move.",
+    )
+
+    def _build_kernel(self) -> Callable:
+        return toy_1d.build_distance_kernel
+
+
 # ---------------------------------------------------------------------------
 # Discriminated union
 # ---------------------------------------------------------------------------
@@ -829,6 +898,8 @@ MoveSpec = Annotated[
         SingleAtomMoveSpec,
         SingleAtomSweepMoveSpec,
         SpeciesSwapMoveSpec,
+        Lattice1DMoveSpec,
+        Distance1DMoveSpec,
         VolumeMoveSpec,
         ShearMoveSpec,
         StretchMoveSpec,

@@ -9,5 +9,7 @@ included here verbatim, so the page and the file cannot drift apart.
 .. toctree::
    :maxdepth: 1
 
-   00_first_run
-   01_mace_run
+   00_gaussian_2d
+   01_rens_toy
+   02_lj_run
+   03_mace_run

@@ -1,6 +1,6 @@
 # A MACE run: 16-atom silicon, NPT
 
-Same shape as {doc}`00_first_run`, with a machine-learned potential instead of
+Same shape as {doc}`02_lj_run`, with a machine-learned potential instead of
 Lennard-Jones. Only the `backend:` block really changes — which is the point:
 swapping the energy model does not change how you drive the code.
 
@@ -31,9 +31,9 @@ model you just converted. See {doc}`/user/mace_models` for the details.
 
 ## The config
 
-`examples/tutorials/01_mace_si16/config.yaml`:
+`examples/tutorials/03_mace_si16/config.yaml`:
 
-```{literalinclude} ../../examples/tutorials/01_mace_si16/config.yaml
+```{literalinclude} ../../examples/tutorials/03_mace_si16/config.yaml
 :language: yaml
 ```
 
@@ -56,7 +56,7 @@ and `stretch` get 32 of the 34 total weight between them.
 ## 1. Validate — and use `--full` here
 
 ```bash
-cd examples/tutorials/01_mace_si16
+cd examples/tutorials/03_mace_si16
 jaxrens validate -c config.yaml --full
 ```
 

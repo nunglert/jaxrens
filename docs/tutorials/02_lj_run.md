@@ -1,7 +1,8 @@
-# First run: 8-atom Lennard-Jones, NPT
+# Lennard-Jones: 8 atoms, NPT
 
-The smallest physically meaningful `jaxrens` run, start to finish, from the
-terminal. It is deliberately tiny — 32 live walkers, 500 iterations — so it
+A first run on a real interatomic potential, start to finish, from the
+terminal. If you have not seen a `jaxrens` config before, start with
+{doc}`01_rens_toy`. It is deliberately tiny — 32 live walkers, 500 iterations — so it
 finishes in well under a minute on one GPU, while still exercising mixed-move
 MWG, burn-in, step-size adaptation and cell constraints.
 
@@ -9,9 +10,9 @@ Everything here is one YAML file and three commands.
 
 ## The config
 
-`examples/tutorials/00_lj_first_run/config.yaml`:
+`examples/tutorials/02_lj_npt/config.yaml`:
 
-```{literalinclude} ../../examples/tutorials/00_lj_first_run/config.yaml
+```{literalinclude} ../../examples/tutorials/02_lj_npt/config.yaml
 :language: yaml
 ```
 
@@ -29,7 +30,7 @@ images fixes it. Drop it to `[1, 1, 1]` and the next step will tell you.
 ## 1. Check it before you run it
 
 ```bash
-cd examples/tutorials/00_lj_first_run
+cd examples/tutorials/02_lj_npt
 jaxrens validate -c config.yaml
 ```
 
@@ -135,13 +136,28 @@ Wrote output/lj8.energies.png
 Wrote output/lj8.adaptation.png
 ```
 
-The energies plot is the dead-point trail (with volume, when the run is NPT);
-the adaptation plot is a two-panel step-size and acceptance-rate trace per
-move. Use `-o` to choose the output path.
+```{image} ../_static/figures/tutorials/lj8.energies.png
+:alt: dead-point energy and volume trails for the Lennard-Jones run
+:width: 100%
+```
+
+The energies plot is the dead-point trail, with the cell volume alongside it
+because this run is NPT. For a multi-replica run the same command overlays
+every replica on both panels.
+
+```{image} ../_static/figures/tutorials/lj8.adaptation.png
+:alt: per-move step-size and acceptance-rate traces
+:width: 100%
+```
+
+The adaptation plot carries one trace per move, which is what makes a mixed
+move set debuggable: `gmc`, `volume`, `shear` and `stretch` adapt
+independently, and a single misbehaving one shows up immediately. Use `-o` to
+choose the output path.
 
 If the acceptance trace sits pinned at 0 or 1 for a move, that move is
 misconfigured — see {doc}`../user/troubleshooting`.
 
-- {doc}`01_mace_run` — the same shape with a machine-learned potential.
+- {doc}`03_mace_run` — the same shape with a machine-learned potential.
 - {doc}`/reference/config` — every key you can put in that YAML.
 - {doc}`/user/concepts/ns_loop` — what the two loops are actually doing.

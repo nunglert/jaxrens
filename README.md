@@ -21,11 +21,13 @@
 
 ```bash
 pip install -e .
-jaxrens run -c examples/lennard_jones/single_run/config.yaml
+jaxrens run -c examples/tutorials/00_gaussian_2d/config.yaml
 ```
 
-That runs an 8-atom Lennard-Jones solid at constant pressure — a few minutes on
-one GPU — writing a trajectory, energy log, and checkpoints to `./output/`.
+That runs the smallest example there is — a single particle in a landscape of
+Gaussian wells, a few seconds on a CPU — writing a trajectory, energy log and
+checkpoints to `./output/`.  For a real potential, try
+`examples/tutorials/02_lj_npt/` (8-atom Lennard-Jones at constant pressure).
 
 A config is one YAML file. The pieces you will touch most:
 
@@ -62,9 +64,9 @@ jaxrens run -c config.yaml --set run.n_live=256 --set moves[0].step_size=0.05
 jaxrens dump-schema > schema.json      # editor autocomplete for the YAML
 ```
 
-More: [`examples/lennard_jones/`](examples/lennard_jones/) (single run and
-replica exchange, each with a plotting script) and
-[`examples/tutorials/`](examples/tutorials/).
+More: [`examples/tutorials/`](examples/tutorials/) — four worked configs of
+increasing complexity (2-D landscape, replica exchange on a 1-D toy model,
+Lennard-Jones, MACE), each with a walk-through in the docs.
 
 ## How it works
 

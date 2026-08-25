@@ -317,6 +317,91 @@ class GaussianMixtureBackendSpec(BaseBackendSpec):
         return create_gaussian_mixture(centers=self.centers, sigma=self.sigma)
 
 
+class RENSToyBackendSpec(BaseBackendSpec):
+    """Two particles in a periodic 1-D box — the RENS-paper toy model.
+
+    Multi-modal in ``(a, d)`` despite its simplicity, which makes it the
+    cheapest way to see replica exchange actually do something: independent
+    runs at different pressures settle into different basins, and the swaps
+    are what rescue them.
+
+    Drive it with the ``lattice_1d`` and ``distance_1d`` moves — the general
+    3-D cell moves scale isotropically and would break the ``diag(a, 1, 1)``
+    cell this backend relies on.  See
+    :class:`~jaxrens.backends.toy.RENSToyBackend` for the embedding.
+
+    ::
+
+        backend:
+          type: rens_toy
+          periodic: true
+          mu: 1.0
+          sigma: 0.2
+          r_cut: 3.0
+    """
+
+    type: Literal["rens_toy"] = Field(
+        default="rens_toy",
+        description="Discriminator selecting this backend.",
+    )
+    eps_rep: float = Field(
+        default=1.0,
+        description="Height of the repulsive core, ``E_rep`` (eq 14).",
+    )
+    h_rep: float = Field(
+        default=3.0,
+        description=(
+            "Decay constant of the repulsive core; larger values make the "
+            "repulsion narrower."
+        ),
+    )
+    eps_attr: float = Field(
+        default=1.0,
+        description="Depth of the attractive well, ``E_attr`` (eq 15).",
+    )
+    mu: float = Field(
+        default=1.0,
+        description=(
+            "Separation at which the attractive well sits.  Sets the "
+            "preferred particle spacing, and with it the box lengths that "
+            "are commensurate with it."
+        ),
+    )
+    sigma: float = Field(
+        default=0.2, description="Width of the attractive well."
+    )
+    r_cut: float = Field(
+        default=3.0,
+        description=(
+            "Interaction cutoff.  Pairs and periodic images beyond it "
+            "contribute nothing."
+        ),
+    )
+    n_images: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "Periodic images summed on each side.  Static (it fixes the "
+            "compiled shape), so it only has to satisfy "
+            "``n_images * a_min >= r_cut`` for the smallest box the cell "
+            "prior permits; the cutoff mask does the physics."
+        ),
+    )
+
+    def build_backend(self) -> EnergyBackend:
+        from jaxrens.backends.toy import create_rens_toy
+
+        return create_rens_toy(
+            eps_rep=self.eps_rep,
+            h_rep=self.h_rep,
+            eps_attr=self.eps_attr,
+            mu=self.mu,
+            sigma=self.sigma,
+            r_cut=self.r_cut,
+            n_images=self.n_images,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Concrete specs — production backends
 # ---------------------------------------------------------------------------
@@ -706,6 +791,7 @@ BackendSpec = Annotated[
         HarmonicBackendSpec,
         DoubleWellBackendSpec,
         GaussianMixtureBackendSpec,
+        RENSToyBackendSpec,
         LJBackendSpec,
         NeuralILBackendSpec,
         MACEBackendSpec,

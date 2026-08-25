@@ -12,6 +12,9 @@ run:
   n_live: 32           # tiny: resolution is poor, but it finishes fast
   max_iterations: 500
   n_mcmc_steps: 10     # decorrelation per replacement walker
+  # Walkers MCMC-walked in parallel each iteration is 1 + n_extra, so this
+  # is the batch width the GPU actually sees. Left at 0 only one chain
+  # runs and the device idles; it does not change the population size.
   n_extra: 15
   seed: 42
 

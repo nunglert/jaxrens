@@ -271,6 +271,20 @@ class InitSpec(BaseModel):
             "keep the input cell."
         ),
     )
+    cell_randomization_mode: Literal["shape_walk", "linear_1d"] = Field(
+        default="shape_walk",
+        description=(
+            "How random cells are drawn.  ``shape_walk`` (default) runs a "
+            "shear/stretch random walk per walker, giving general triclinic "
+            "cells.  ``linear_1d`` instead draws a box length ``a`` per "
+            "walker and builds ``diag(a, 1, 1)``, the embedding the "
+            "``rens_toy`` backend needs so that ``det(cell) == a``; the draw "
+            "spans ``cell.initial_min_volume_per_atom`` (falling back to "
+            "``min_volume_per_atom``) up to ``cell.max_volume_per_atom``, "
+            "which is how the RENS paper biases its initial population "
+            "toward the high-enthalpy end."
+        ),
+    )
     pos_randomization_mode: Literal["grid", "uniform"] = Field(
         default="grid",
         description=(

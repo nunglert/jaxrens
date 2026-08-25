@@ -1,0 +1,87 @@
+# Two particles in a periodic 1-D box -- the toy model of
+#   Unglert, Partay & Madsen, J. Chem. Theory Comput. 21, 7304 (2025),
+# run as three pressure replicas with replica exchange between them.
+#
+# Runs in seconds on a CPU, needs no model file, and is the cheapest way to
+# watch RENS actually do something.
+#
+#     jaxrens validate -c config.yaml --full
+#     jaxrens run -c config.yaml
+#     jaxrens plot output/toy.re_stats.h5
+
+run:
+  n_live: 64
+  max_iterations: 3000
+  n_mcmc_steps: 20
+  # Walkers MCMC-walked in parallel each iteration is 1 + n_extra, so this
+  # is the batch width the GPU actually sees. Left at 0 only one chain
+  # runs and the device idles; it does not change the population size.
+  n_extra: 15
+  seed: 42
+
+backend:
+  type: rens_toy
+  periodic: true
+  # Pair interaction: a repulsive core plus an attractive well at d = mu.
+  # Box lengths commensurate with mu are favoured, which is what makes the
+  # enthalpy surface multi-modal.
+  eps_rep: 1.0
+  h_rep: 3.0
+  eps_attr: 1.0
+  mu: 1.0
+  sigma: 0.2
+  r_cut: 3.0
+  n_images: 8
+
+ensemble:
+  type: npt
+  # A list fans the run out across replicas -- one per pressure. This is the
+  # replica axis that inter_re then swaps along.
+  pressure: [0.5, 1.0, 1.5]
+  pressure_units: eva3
+
+inter_re:
+  flavor: pressure
+  re_interval: 1
+  n_swap_cycles: 1
+
+moves:
+  # The paper's two step types, in its 1:1 ratio.
+  - {type: lattice_1d, step_size: 0.3, weight: 1.0}
+  - {type: distance_1d, step_size: 0.3, weight: 1.0}
+
+termination:
+  - type: prior_mass
+    threshold: 1.0e-6
+
+adaptation:
+  full_auto: true
+  adjust_interval: 100
+  defaults: {min_rate: 0.2, max_rate: 0.5, adjust_factor: 1.5, step_size_max: 2.0}
+
+init:
+  start_species: "1 2"              # two particles; the element is irrelevant
+  cell_randomization_mode: linear_1d
+  pos_randomization_mode: uniform
+  init_distance_criterion: 0.05
+  random_initialise_pos: true
+  random_initialise_cell: true
+
+cell:
+  min_volume_per_atom: 0.25         # a_min = 0.5
+  max_volume_per_atom: 5.0          # a_max = 10
+  # Bias the initial population toward large boxes (high enthalpy), so NS has
+  # to discover the low-enthalpy basins rather than starting in them.
+  initial_min_volume_per_atom: 3.0
+  # Meaningless for a diag(a, 1, 1) cell, whose aspect ratio is just 1/a.
+  min_aspect_ratio: 0.0
+
+output:
+  format: extxyz
+  working_dir: ./output
+  out_file_prefix: toy
+  info_interval: 250
+  traj_interval: 1
+  checkpoint_interval: 1000
+  save_re_stats: true               # per-fire swap statistics -> jaxrens plot
+  save_acc_rates: true

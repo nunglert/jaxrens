@@ -1,0 +1,81 @@
+# A single particle in a fixed 2-D landscape of Gaussian wells.
+#
+# The simplest thing nested sampling can be asked to do: no periodic cell, no
+# pressure, no cell moves -- one point wandering a landscape with several
+# minima, and NS shrinking a contour around them until only the deepest
+# survives. Runs in a couple of seconds on a CPU.
+#
+#     jaxrens validate -c config.yaml --full
+#     jaxrens run -c config.yaml
+
+run:
+  n_live: 200          # cheap here, so use enough walkers to resolve the modes
+  max_iterations: 3000
+  n_mcmc_steps: 20
+  # Walkers MCMC-walked in parallel each iteration is 1 + n_extra, so this
+  # is the batch width the GPU actually sees. Left at 0 only one chain
+  # runs and the device idles; it does not change the population size.
+  n_extra: 31
+  seed: 42
+
+backend:
+  type: gaussian_mixture
+  periodic: false      # no cell, no images -- the landscape is fixed in space
+  sigma: 0.35
+  # Four wells in the xy-plane. The energy is -log sum_k exp(-|r - mu_k|^2 /
+  # 2 sigma^2), so overlapping wells merge and distant ones stay separate.
+  # Three isolated wells of equal depth, plus a close-together pair whose
+  # Gaussians overlap and merge into a single deeper basin -- so there is one
+  # unique global minimum for NS to find, not a four-way tie.
+  centers:
+    - [-1.5, -1.5, 0.0]
+    - [ 1.5, -1.5, 0.0]
+    - [-1.5,  1.5, 0.0]
+    - [ 1.60, 1.60, 0.0]
+    - [ 2.00, 1.60, 0.0]
+
+ensemble:
+  type: nvt            # no P*V term: there is no volume to speak of
+
+moves:
+  # One particle and no cell, so a single displacement move is the whole
+  # sampler. No volume / shear / stretch -- there is nothing for them to act on.
+  - {type: random_walk, step_size: 0.5, weight: 1.0}
+
+termination:
+  - type: prior_mass
+    threshold: 1.0e-6
+
+adaptation:
+  full_auto: true
+  adjust_interval: 100
+  defaults: {min_rate: 0.2, max_rate: 0.5, adjust_factor: 1.5, step_size_max: 2.0}
+
+init:
+  start_species: "1 1"            # one particle; the element is irrelevant
+  random_initialise_pos: true
+  pos_randomization_mode: uniform
+  random_initialise_cell: false
+  init_distance_criterion: 0.0    # only one particle -- no pair to constrain
+
+cell:
+  # Not sampled: it only bounds where the initial position is drawn from.
+  min_volume_per_atom: 64.0
+  max_volume_per_atom: 64.0
+  min_aspect_ratio: 0.0
+
+output:
+  format: extxyz
+  working_dir: ./output
+  out_file_prefix: gauss2d
+  info_interval: 250
+  traj_interval: 1
+  # Non-periodic: the cell only bounds the initial draw, so wrapping
+  # positions into it would just obscure where the walkers actually are.
+  wrap_atoms: false
+  checkpoint_interval: 1000
+  # Dump the whole live population periodically and keep every dump, so the
+  # contraction can be replayed afterwards (the docs plot these over the
+  # energy surface). snapshot_clean would otherwise keep only the latest.
+  snapshot_interval: 500
+  snapshot_clean: false

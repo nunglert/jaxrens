@@ -61,9 +61,14 @@ class RunSpec(BaseModel):
     n_extra: int = Field(
         default=0,
         description=(
-            "Extra walkers carried beyond ``n_live``, used as a reservoir "
-            "for cloning so a replacement never has to copy a walker that "
-            "is itself being replaced this iteration.  ``0`` disables."
+            "Additional walkers, drawn at random from the existing "
+            "population, that are MCMC-walked alongside the replacement "
+            "each iteration.  This is the **parallel batch width**: "
+            "``1 + n_extra`` chains run under one ``vmap``, so ``0`` (the "
+            "default) walks a single chain and leaves a GPU almost idle.  "
+            "It does not enlarge the population — that stays ``n_live`` — "
+            "and the extras are not dead points; they decorrelate the "
+            "live set at the cost of more energy evaluations per iteration."
         ),
     )
     n_cull: int = Field(

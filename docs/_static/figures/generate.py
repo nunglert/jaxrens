@@ -15,7 +15,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-
 FIGDIR = Path(__file__).resolve().parent
 plt.rcParams.update(
     {
@@ -66,15 +65,17 @@ def fig_mwg_acceptance() -> None:
     n_iter = 600
     i = np.arange(n_iter)
 
-    def noisy_line(target_start: float, target_end: float, tau: float) -> np.ndarray:
+    def noisy_line(
+        target_start: float, target_end: float, tau: float
+    ) -> np.ndarray:
         baseline = target_end + (target_start - target_end) * np.exp(-i / tau)
         return np.clip(baseline + 0.06 * rng.standard_normal(n_iter), 0.0, 1.0)
 
     series = {
         "galilean": noisy_line(0.9, 0.45, 200),
-        "volume":   noisy_line(0.8, 0.40, 150),
-        "shear":    noisy_line(0.7, 0.35, 180),
-        "stretch":  noisy_line(0.7, 0.35, 180),
+        "volume": noisy_line(0.8, 0.40, 150),
+        "shear": noisy_line(0.7, 0.35, 180),
+        "stretch": noisy_line(0.7, 0.35, 180),
     }
 
     fig, ax = plt.subplots()
@@ -94,7 +95,7 @@ def fig_mwg_acceptance() -> None:
 def fig_ensemble_tilt() -> None:
     """H(V) for NVT, NPT, muVT (schematic), backends/ensembles page."""
     V = np.linspace(6.0, 60.0, 400)
-    U = 3.0 / V ** 2 - 2.0 / V + 0.5
+    U = 3.0 / V**2 - 2.0 / V + 0.5
     U -= U.min()
 
     P_npt = 0.05
@@ -148,22 +149,29 @@ def fig_pytree_shapes() -> None:
 
     header = ["", "positions", "energy", "log_evidence"]
     rows = [
-        ("SingleRun",       "(K, A, 3)",       "(K,)",      "()"),
-        ("VmapRuns",        "(R, K, A, 3)",    "(R, K)",    "(R,)"),
-        ("PmapVmapRuns",    "(G, P, K, A, 3)", "(G, P, K)", "(G, P)"),
+        ("SingleRun", "(K, A, 3)", "(K,)", "()"),
+        ("VmapRuns", "(R, K, A, 3)", "(R, K)", "(R,)"),
+        ("PmapVmapRuns", "(G, P, K, A, 3)", "(G, P, K)", "(G, P)"),
     ]
 
     col_x = [0.4, 2.2, 5.4, 7.6]
     header_y = 4.1
     row_ys = [3.1, 2.2, 1.3]
     cell_colors = {
-        "SingleRun":     "#e7f1fb",
-        "VmapRuns":      "#fff3e0",
-        "PmapVmapRuns":  "#e9f5e9",
+        "SingleRun": "#e7f1fb",
+        "VmapRuns": "#fff3e0",
+        "PmapVmapRuns": "#e9f5e9",
     }
 
     for x, text in zip(col_x, header):
-        ax.text(x, header_y, text, fontsize=10, fontweight="bold", family="monospace")
+        ax.text(
+            x,
+            header_y,
+            text,
+            fontsize=10,
+            fontweight="bold",
+            family="monospace",
+        )
 
     for row, y in zip(rows, row_ys):
         ax.add_patch(
@@ -182,7 +190,8 @@ def fig_pytree_shapes() -> None:
 
     ax.set_title(
         "Batch-axis shapes for the three BatchDescriptor backends",
-        fontsize=11, pad=6,
+        fontsize=11,
+        pad=6,
     )
     fig.tight_layout()
     fig.savefig(FIGDIR / "pytree_shapes.png")
@@ -307,10 +316,7 @@ def _walk_pkg(src_root: Path) -> list[tuple[str, str, int, int, int]]:
     for rid in row_by_id:
         _total(rid)
 
-    return [
-        (rid, parent, *totals[rid])
-        for rid, parent, _, _, _ in dedup
-    ]
+    return [(rid, parent, *totals[rid]) for rid, parent, _, _, _ in dedup]
 
 
 def _subpkg_of(rid: str, pkg_name: str) -> str:
@@ -338,7 +344,9 @@ def _fig_pkg_treemap_html(rows: list[tuple[str, str, int, int, int]]) -> None:
 
     subpkgs = sorted({_subpkg_of(r[0], pkg_name) for r in rows} - {"_root"})
     palette = pc.qualitative.Set3
-    subpkg_color = {name: palette[i % len(palette)] for i, name in enumerate(subpkgs)}
+    subpkg_color = {
+        name: palette[i % len(palette)] for i, name in enumerate(subpkgs)
+    }
     subpkg_color["_root"] = "#f0f0f0"
     colors = [subpkg_color[_subpkg_of(r[0], pkg_name)] for r in rows]
 
@@ -425,7 +433,11 @@ def _fig_pkg_treemap_svg(rows: list[tuple[str, str, int, int, int]]) -> None:
         if parent == pkg_name:
             top_files[rid.rsplit(".", 1)[-1]] = loc
         else:
-            sub = parent.split(".")[1] if parent.startswith(pkg_name + ".") else parent
+            sub = (
+                parent.split(".")[1]
+                if parent.startswith(pkg_name + ".")
+                else parent
+            )
             leaf = rid.split(".", 2)[-1]
             subpackages.setdefault(sub, {})[leaf] = loc
 
@@ -435,7 +447,9 @@ def _fig_pkg_treemap_svg(rows: list[tuple[str, str, int, int, int]]) -> None:
 
     # Same Set3 qualitative palette as the HTML treemap so the two artefacts
     # look visually consistent (subpackage identity is conveyed by hue).
-    group_order = sorted(groups, key=lambda g: sum(groups[g].values()), reverse=True)
+    group_order = sorted(
+        groups, key=lambda g: sum(groups[g].values()), reverse=True
+    )
     palette = pc.qualitative.Set3
     group_colors = {
         name: _plotly_color_to_rgba(palette[i % len(palette)])
@@ -456,49 +470,237 @@ def _fig_pkg_treemap_svg(rows: list[tuple[str, str, int, int, int]]) -> None:
 
     for g_name, rect in zip(group_order, outer_rects):
         base = group_colors[g_name]
-        ax.add_patch(mpatches.Rectangle(
-            (rect["x"], rect["y"]), rect["dx"], rect["dy"],
-            facecolor=base, edgecolor="white", linewidth=2.0, alpha=0.30,
-        ))
+        ax.add_patch(
+            mpatches.Rectangle(
+                (rect["x"], rect["y"]),
+                rect["dx"],
+                rect["dy"],
+                facecolor=base,
+                edgecolor="white",
+                linewidth=2.0,
+                alpha=0.30,
+            )
+        )
         mods = groups[g_name]
         sizes = list(mods.values())
         inner_sizes = squarify.normalize_sizes(sizes, rect["dx"], rect["dy"])
         inner_rects = squarify.squarify(
-            inner_sizes, rect["x"], rect["y"], rect["dx"], rect["dy"],
+            inner_sizes,
+            rect["x"],
+            rect["y"],
+            rect["dx"],
+            rect["dy"],
         )
         for (m_name, _), ir in zip(mods.items(), inner_rects):
-            ax.add_patch(mpatches.Rectangle(
-                (ir["x"], ir["y"]), ir["dx"], ir["dy"],
-                facecolor=base, edgecolor="white", linewidth=0.8, alpha=0.80,
-            ))
+            ax.add_patch(
+                mpatches.Rectangle(
+                    (ir["x"], ir["y"]),
+                    ir["dx"],
+                    ir["dy"],
+                    facecolor=base,
+                    edgecolor="white",
+                    linewidth=0.8,
+                    alpha=0.80,
+                )
+            )
             if ir["dx"] > 5.0 and ir["dy"] > 2.2:
                 ax.text(
                     ir["x"] + ir["dx"] / 2,
                     ir["y"] + ir["dy"] / 2,
                     m_name,
-                    ha="center", va="center",
+                    ha="center",
+                    va="center",
                     fontsize=min(9, ir["dx"] / 6.0, ir["dy"] / 1.3),
                 )
         if rect["dx"] > 10 and rect["dy"] > 4:
             ax.text(
-                rect["x"] + 0.6, rect["y"] + rect["dy"] - 0.8,
+                rect["x"] + 0.6,
+                rect["y"] + rect["dy"] - 0.8,
                 g_name,
-                ha="left", va="top",
-                fontsize=11, fontweight="bold",
-                bbox=dict(facecolor="white", alpha=0.85, pad=1.8, edgecolor="none"),
+                ha="left",
+                va="top",
+                fontsize=11,
+                fontweight="bold",
+                bbox=dict(
+                    facecolor="white", alpha=0.85, pad=1.8, edgecolor="none"
+                ),
             )
 
     total = sum(totals)
     ax.set_title(
         f"jaxrens package structure — subpackages outside, modules inside, "
         f"areas ∝ lines of code (total {total})",
-        fontsize=10, pad=6,
+        fontsize=10,
+        pad=6,
     )
     fig.tight_layout()
     out_path = FIGDIR / "pkg_treemap.svg"
     fig.savefig(out_path, format="svg")
     plt.close(fig)
     print(f"  wrote {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Tutorial energy surfaces
+#
+# These show the reader *what is being sampled* before any NS output is
+# discussed.  Both are computed straight from the backend, so they cannot
+# drift from the model the tutorial configs actually run; the walker overlay
+# in the Gaussian figure is read from a completed tutorial run and is skipped
+# if that run's output is not present.
+# ---------------------------------------------------------------------------
+
+_TUT = FIGDIR.parents[2] / "examples" / "tutorials"
+_TUTFIG = FIGDIR / "tutorials"
+
+
+def fig_gauss2d_surface() -> None:
+    """Gaussian-mixture landscape, with the walker population contracting."""
+    import jax.numpy as jnp
+
+    from jaxrens.backends.toy import create_gaussian_mixture
+
+    centers = [
+        [-1.5, -1.5, 0.0],
+        [1.5, -1.5, 0.0],
+        [-1.5, 1.5, 0.0],
+        [1.60, 1.60, 0.0],
+        [2.00, 1.60, 0.0],
+    ]
+    backend = create_gaussian_mixture(centers=centers, sigma=0.35)
+
+    lim = 3.2
+    n = 320
+    gx = np.linspace(-lim, lim, n)
+    X, Y = np.meshgrid(gx, gx)
+    pts = np.stack([X.ravel(), Y.ravel(), np.zeros(X.size)], axis=-1)
+    cell = jnp.eye(3) * 8.0
+    types = jnp.zeros(1, dtype=int)
+    E = np.array(
+        [
+            float(backend(jnp.asarray(p)[None, :], types, cell).energy)
+            for p in pts
+        ]
+    ).reshape(X.shape)
+
+    snaps = sorted(
+        (_TUT / "00_gaussian_2d" / "output").glob("*.traj.snap.*.extxyz"),
+        key=lambda q: int(q.name.split(".snap.")[1].split(".")[0]),
+    )
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.6), constrained_layout=True)
+    for ax in axes:
+        im = ax.pcolormesh(X, Y, E, cmap="viridis", shading="auto")
+        ax.contour(X, Y, E, levels=14, colors="w", linewidths=0.4, alpha=0.6)
+        ax.set_xlabel("x")
+        ax.set_aspect("equal")
+    axes[0].set_ylabel("y")
+    fig.colorbar(im, ax=axes, label="energy  $E(x, y)$", shrink=0.9)
+
+    axes[0].scatter(
+        [c[0] for c in centers],
+        [c[1] for c in centers],
+        marker="x",
+        c="r",
+        s=45,
+        lw=1.4,
+        label="Gaussian centres",
+    )
+    axes[0].legend(loc="lower left", fontsize=8, framealpha=0.85)
+    axes[0].set_title(
+        "the landscape: four basins, one of them merged (deeper)", fontsize=10
+    )
+
+    if snaps:
+        from ase.io import read
+
+        picks = [snaps[0], snaps[len(snaps) // 2], snaps[-1]]
+        colors = ["#ffffff", "#ffd166", "#ef476f"]
+        for q, colour in zip(picks, colors, strict=False):
+            it = int(q.name.split(".snap.")[1].split(".")[0])
+            pos = np.array([a.get_positions()[0] for a in read(q, index=":")])
+            axes[1].scatter(
+                pos[:, 0],
+                pos[:, 1],
+                s=7,
+                c=colour,
+                edgecolors="k",
+                linewidths=0.2,
+                label=f"iteration {it}",
+            )
+        axes[1].legend(loc="lower left", fontsize=8, framealpha=0.85)
+        axes[1].set_title(
+            "live population contracting onto the deepest basin", fontsize=10
+        )
+    else:
+        axes[1].set_title("(run the tutorial to overlay walkers)", fontsize=10)
+
+    _TUTFIG.mkdir(parents=True, exist_ok=True)
+    out = _TUTFIG / "gauss2d_surface.png"
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+    print(f"  wrote {out}")
+
+
+def fig_rens_toy_surface() -> None:
+    """Toy-model enthalpy surface H(a, d), irreducible wedge, per pressure."""
+    import jax.numpy as jnp
+
+    from jaxrens.backends.toy import create_rens_toy
+
+    backend = create_rens_toy(
+        eps_rep=1.0,
+        h_rep=3.0,
+        eps_attr=1.0,
+        mu=1.0,
+        sigma=0.2,
+        r_cut=3.0,
+        n_images=8,
+    )
+    pressures = [0.5, 1.0, 1.5]
+
+    n = 260
+    a_grid = np.linspace(0.5, 4.0, n)
+    d_grid = np.linspace(0.0, 2.0, n)
+    A, D = np.meshgrid(a_grid, d_grid)
+
+    types = jnp.zeros(2, dtype=int)
+    U = np.empty(A.shape)
+    for i in range(A.shape[0]):
+        for j in range(A.shape[1]):
+            a, d = A[i, j], D[i, j]
+            pos = jnp.array([[0.0, 0.0, 0.0], [float(d), 0.0, 0.0]])
+            cell = jnp.diag(jnp.array([float(a), 1.0, 1.0]))
+            U[i, j] = float(backend(pos, types, cell).energy)
+
+    # Irreducible wedge: d and a - d describe the same configuration under
+    # periodicity, so everything above d = a/2 is a mirror image.  Masking it
+    # is what makes the surface readable -- and matches Figure 3a of the paper.
+    wedge = D <= A / 2.0
+
+    fig, axes = plt.subplots(
+        1, 3, figsize=(13, 4.0), sharey=True, constrained_layout=True
+    )
+    for ax, P in zip(axes, pressures, strict=False):
+        H = np.where(wedge, U + P * A, np.nan)
+        im = ax.pcolormesh(A, D, H, cmap="viridis", shading="auto")
+        ax.contour(A, D, H, levels=16, colors="w", linewidths=0.4, alpha=0.6)
+        ax.plot(a_grid, a_grid / 2.0, color="k", lw=1.0)
+        ax.set_xlabel("box length  $a$")
+        ax.set_title(f"$P = {P}$", fontsize=10)
+    axes[0].set_ylabel("separation  $d$")
+    fig.colorbar(im, ax=axes, label="enthalpy  $H = U + P a$", shrink=0.9)
+    fig.suptitle(
+        "irreducible wedge of the toy-model enthalpy surface "
+        "($d \\leq a/2$)",
+        fontsize=11,
+    )
+
+    _TUTFIG.mkdir(parents=True, exist_ok=True)
+    out = _TUTFIG / "rens_toy_surface.png"
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+    print(f"  wrote {out}")
 
 
 def fig_pkg_treemap() -> None:
@@ -523,4 +725,6 @@ if __name__ == "__main__":
     fig_rens_acceptance()
     fig_pytree_shapes()
     fig_pkg_treemap()
+    fig_gauss2d_surface()
+    fig_rens_toy_surface()
     print(f"wrote figures to {FIGDIR}")

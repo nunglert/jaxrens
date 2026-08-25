@@ -290,6 +290,25 @@ def _build_cells(
     """
     _CELL_SHAPE_EQUIL_STEPS = 50
 
+    if init.cell_randomization_mode == "linear_1d":
+        # 1-D embedding: the cell is diag(a, 1, 1), so det(cell) == a and the
+        # standard NPT term P*V is the paper's P*a.  A 3-D shape walk would
+        # destroy that structure on the first shear.  Draw one box length per
+        # walker so the population starts spread out in a.
+        a_lo = cell_cfg.effective_initial_min_volume_per_atom * n_atoms
+        a_hi = cell_cfg.max_volume_per_atom * n_atoms
+        logger.info(
+            "[resolve] 1-D cell init: n_walkers=%d, a in [%.4g, %.4g]",
+            n_live,
+            a_lo,
+            a_hi,
+        )
+        a = jax.random.uniform(
+            shape_key, shape=(n_live,), minval=a_lo, maxval=a_hi
+        )
+        cells = jnp.broadcast_to(jnp.eye(3), (n_live, 3, 3))
+        return cells.at[:, 0, 0].set(a)
+
     if init.random_initialise_cell:
         logger.info(
             "[resolve] cell-shape random walk: n_walkers=%d, n_steps=%d",
