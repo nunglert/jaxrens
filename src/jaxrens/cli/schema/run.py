@@ -18,15 +18,71 @@ class RunSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    n_live: int = 500
+    n_live: int = Field(
+        default=500,
+        description=(
+            "Number of live walkers in the nested-sampling population. "
+            "Controls resolution: the prior mass contracts by "
+            "``exp(-n_cull / n_live)`` per iteration, so larger values "
+            "resolve sharper phase transitions at proportionally higher "
+            "cost."
+        ),
+    )
     # Widened to int|float so RootSpec.interval_units='per_walker' can accept
     # fractional sweeps (e.g. ``max_iterations: 2.5``).  Resolver rounds + casts.
-    max_iterations: Optional[int | float] = None
-    convergence_threshold: float = 0.1
-    n_mcmc_steps: int = 20
-    n_extra: int = 0
-    n_cull: int = 1
-    seed: int = 42
+    max_iterations: Optional[int | float] = Field(
+        default=None,
+        description=(
+            "Hard cap on NS iterations.  ``null`` (default) lets the "
+            "resolver derive a bound from the termination criteria "
+            "(chiefly ``termination[prior_mass].threshold`` and "
+            "``n_live``), which is what you want when ``prior_mass`` is "
+            "doing the actual stopping.  Honours ``interval_units``."
+        ),
+    )
+    convergence_threshold: float = Field(
+        default=0.1,
+        description=(
+            "Relative log-evidence increment below which the run is "
+            "considered converged.  Only consulted when no explicit "
+            "``termination`` criterion fires first."
+        ),
+    )
+    n_mcmc_steps: int = Field(
+        default=20,
+        description=(
+            "MCMC steps taken inside the JIT-compiled inner scan to "
+            "decorrelate each replacement walker from the live point it "
+            "was cloned from.  Too few leaves the new walker correlated "
+            "with its parent and biases the evidence; this is the main "
+            "accuracy/cost dial after ``n_live``."
+        ),
+    )
+    n_extra: int = Field(
+        default=0,
+        description=(
+            "Extra walkers carried beyond ``n_live``, used as a reservoir "
+            "for cloning so a replacement never has to copy a walker that "
+            "is itself being replaced this iteration.  ``0`` disables."
+        ),
+    )
+    n_cull: int = Field(
+        default=1,
+        description=(
+            "Number of highest-energy walkers removed per NS iteration.  "
+            "Values > 1 contract the prior mass faster per iteration and "
+            "amortise fixed per-iteration overhead, at the cost of a "
+            "coarser energy grid."
+        ),
+    )
+    seed: int = Field(
+        default=42,
+        description=(
+            "Seed for the master PRNG key.  Fixes walker initialisation, "
+            "every move proposal, and the burn-in walk, so two runs with "
+            "the same config and the same device topology are identical."
+        ),
+    )
     shard_n_gpu: int = Field(
         default=1,
         ge=1,

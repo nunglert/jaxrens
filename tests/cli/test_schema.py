@@ -1155,3 +1155,216 @@ class TestFullConfigFixture:
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
         assert "OK" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Field description coverage
+# ---------------------------------------------------------------------------
+
+_SCHEMA_MODULES = (
+    "adaptation",
+    "backend",
+    "cell",
+    "constraints",
+    "ensemble",
+    "init",
+    "inter_re",
+    "moves",
+    "output",
+    "root",
+    "run",
+    "termination",
+)
+
+
+def _all_spec_models():
+    """Every pydantic model declared in ``jaxrens.cli.schema.*``."""
+    import importlib
+    import inspect
+
+    from pydantic import BaseModel
+
+    for mod_name in _SCHEMA_MODULES:
+        module = importlib.import_module(f"jaxrens.cli.schema.{mod_name}")
+        for name, obj in vars(module).items():
+            if (
+                inspect.isclass(obj)
+                and issubclass(obj, BaseModel)
+                and obj.__module__ == module.__name__
+            ):
+                yield module.__name__, name, obj
+
+
+class TestFieldDescriptions:
+    """Every config field must carry a ``Field(description=...)``.
+
+    The description is the single source for three separate outputs: the
+    generated tables on ``docs/reference/config``, the ``jaxrens
+    dump-schema`` JSON, and the text pydantic quotes back in validation
+    errors.  A field added without one silently renders as a blank cell in
+    the configuration reference, which is exactly the failure mode this
+    test exists to prevent.
+    """
+
+    def test_every_field_has_a_description(self):
+        missing = [
+            f"{module}.{cls}.{field}"
+            for module, cls, model in _all_spec_models()
+            for field, info in model.model_fields.items()
+            if not (info.description or "").strip()
+        ]
+        assert not missing, (
+            "config schema fields without Field(description=...): "
+            + ", ".join(sorted(missing))
+        )
+
+    def test_descriptions_reach_the_json_schema(self):
+        """dump-schema must carry the same prose the docs render.
+
+        Compared against the model field rather than a fixed phrase: the
+        point is that the plumbing carries the description through, not
+        that any particular sentence survives an edit.
+        """
+        schema = RootSpec.model_json_schema()
+        assert schema["properties"]["run"]["description"] == (
+            RootSpec.model_fields["run"].description
+        )
+        from jaxrens.cli.schema.run import RunSpec
+
+        run_props = schema["$defs"]["RunSpec"]["properties"]
+        for name, info in RunSpec.model_fields.items():
+            assert run_props[name]["description"] == info.description
+
+
+class TestDocumentedExampleConfig:
+    """The 'A complete config' block in the docs must actually parse.
+
+    ``docs/reference/config.rst`` opens with a single YAML skeleton covering
+    every top-level section.  It is the first thing a new user copies, so a
+    key renamed in the schema without updating it is a real breakage — and
+    one nothing else would catch, since the surrounding tables are generated
+    while that block is hand-written.
+    """
+
+    _DOC = (
+        Path(__file__).resolve().parents[2]
+        / "docs"
+        / "reference"
+        / "config.rst"
+    )
+
+    def _example_yaml(self) -> str:
+        text = self._DOC.read_text()
+        start = text.index(
+            ".. code-block:: yaml", text.index("A complete config")
+        )
+        body, started = [], False
+        for line in text[start:].splitlines()[1:]:
+            if not line.strip():
+                body.append("")
+            elif line.startswith("   "):
+                started = True
+                body.append(line[3:])
+            elif started:
+                break
+        return "\n".join(body)
+
+    @pytest.mark.skipif(
+        not _DOC.exists(), reason="docs tree not present in this checkout"
+    )
+    def test_example_validates_without_warnings(self, recwarn):
+        root = RootSpec.model_validate(yaml.safe_load(self._example_yaml()))
+        assert [m.type for m in root.moves] == [
+            "gmc",
+            "volume",
+            "shear",
+            "stretch",
+        ]
+        assert root.backend.type == "lj"
+        assert root.ensemble.type == "npt"
+        assert [t.type for t in root.termination] == ["prior_mass"]
+        assert not [w for w in recwarn if issubclass(w.category, UserWarning)]
+
+    @pytest.mark.skipif(
+        not _DOC.exists(), reason="docs tree not present in this checkout"
+    )
+    def test_example_covers_every_top_level_key(self):
+        documented = set(yaml.safe_load(self._example_yaml()))
+        declared = set(RootSpec.model_fields) - {"interval_units"}
+        assert declared - documented == set(), (
+            "config sections missing from the documented example: "
+            f"{sorted(declared - documented)}"
+        )
+
+
+class TestMoveDocstringExamples:
+    """Every move spec must carry a ``moves:`` example, and it must parse.
+
+    The configuration reference renders each move variant's docstring into
+    its tab, so these snippets are what a reader copies when picking a move
+    type.  They are hand-written prose inside otherwise-generated pages,
+    which makes them the one part of that page that can silently rot when a
+    field is renamed.
+    """
+
+    @staticmethod
+    def _examples(model) -> list[str]:
+        """Pull indented ``moves:`` literal blocks out of a docstring."""
+        import inspect as _inspect
+        import textwrap
+
+        doc = _inspect.getdoc(model) or ""
+        blocks, current = [], None
+        for line in doc.splitlines():
+            if current is not None:
+                if not line.strip() or line.startswith((" ", "\t")):
+                    current.append(line)
+                    continue
+                blocks.append(current)
+                current = None
+            # reST opens a literal block either with a bare ``::`` line or
+            # with ``::`` appended to the preceding sentence; the move
+            # docstrings use both spellings.
+            if line.strip().endswith("::"):
+                current = []
+        if current is not None:
+            blocks.append(current)
+        return [
+            textwrap.dedent("\n".join(b))
+            for b in blocks
+            if "moves:" in "\n".join(b)
+        ]
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            RandomWalkMoveSpec,
+            GMCMoveSpec,
+            HMCMoveSpec,
+            SingleAtomMoveSpec,
+            SingleAtomSweepMoveSpec,
+            SpeciesSwapMoveSpec,
+            VolumeMoveSpec,
+            ShearMoveSpec,
+            StretchMoveSpec,
+            AlchemicalMorphMoveSpec,
+        ],
+        ids=lambda s: s.__name__,
+    )
+    def test_example_present_and_valid(self, spec):
+        examples = self._examples(spec)
+        assert examples, (
+            f"{spec.__name__} has no ``moves:`` example in its docstring; "
+            "the config reference renders that docstring as the variant's "
+            "tab, so the tab would show no usage snippet."
+        )
+        declared = spec.model_fields["type"].default
+        for text in examples:
+            fragment = yaml.safe_load(text)
+            base = _minimal_dict()
+            base.update(fragment)
+            root = RootSpec.model_validate(base)
+            assert any(m.type == declared for m in root.moves), (
+                f"{spec.__name__} example declares no `type: {declared}` "
+                f"entry; got {[m.type for m in root.moves]}"
+            )

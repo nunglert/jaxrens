@@ -49,8 +49,20 @@ class MinDistanceConstraintSpec(BaseConstraintSpec):
     Distances use the minimum-image convention under a periodic cell.
     """
 
-    type: Literal["minimum_distance"] = "minimum_distance"
-    d_min: float | dict[str, float]
+    type: Literal["minimum_distance"] = Field(
+        default="minimum_distance",
+        description="Discriminator selecting this constraint.",
+    )
+    d_min: float | dict[str, float] = Field(
+        description=(
+            "Minimum allowed interatomic distance (Angstrom).  Either a "
+            "single float applied to every pair, or a mapping of "
+            '``"A-B"`` element-symbol pairs to floats with an optional '
+            '``"default"`` key for unlisted pairs (itself defaulting to '
+            "0.0, i.e. no floor).  Distances use the minimum-image "
+            "convention under a periodic cell."
+        ),
+    )
 
     def _pair_lookup(self, mapping: dict[str, float]) -> tuple[dict, float]:
         """Normalize the ``"A-B"`` mapping into a symmetric symbol-pair dict."""

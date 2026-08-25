@@ -16,18 +16,72 @@ class OutputSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    format: str = "extxyz"
+    format: str = Field(
+        default="extxyz",
+        description=(
+            "Trajectory writer to use: ``extxyz`` (default, ASE-readable "
+            "text), ``h5`` (compact binary, better for long runs), or "
+            "``none`` to write no trajectory at all."
+        ),
+    )
     # The four ``*_interval`` fields are widened to int|float so the
     # per-walker interval-unit mode (see RootSpec.interval_units) can accept
     # fractional walker-sweeps (e.g. ``info_interval: 0.2``).  The resolver
     # rounds and casts to int before constructing OutputConfig.
-    traj_interval: int | float = 1
-    snapshot_interval: int | float = 100
-    checkpoint_interval: int | float = 100
-    info_interval: int | float = 100
-    out_file_prefix: str = "ns"
-    working_dir: Path = Path(".")
-    log_level: Literal["info", "debug"] = "info"
+    traj_interval: int | float = Field(
+        default=1,
+        description=(
+            "Write the culled (dead) walkers to the trajectory every N "
+            "iterations.  ``1`` (default) keeps every dead point, which is "
+            "what the post-processing estimators expect; raise it only if "
+            "trajectory size is a problem."
+        ),
+    )
+    snapshot_interval: int | float = Field(
+        default=100,
+        description=(
+            "Dump the full live-walker population to "
+            "``<prefix>.snap.<iter>.extxyz`` every N iterations, for crash "
+            "inspection.  See ``snapshot_clean``."
+        ),
+    )
+    checkpoint_interval: int | float = Field(
+        default=100,
+        description=(
+            "Write a restartable checkpoint every N iterations.  This is "
+            "the cadence that bounds how much work a crash costs you."
+        ),
+    )
+    info_interval: int | float = Field(
+        default=100,
+        description=(
+            "Print a progress line (iteration, ``E_max``, log-evidence, "
+            "per-move acceptance) every N iterations."
+        ),
+    )
+    out_file_prefix: str = Field(
+        default="ns",
+        description=(
+            "Basename shared by every output file, e.g. ``ns.traj.extxyz``, "
+            "``ns.energies``, ``ns.restart.h5``."
+        ),
+    )
+    working_dir: Path = Field(
+        default=Path("."),
+        description=(
+            "Directory all output is written to.  Created if absent; "
+            "guarded by the output-dir gate, which refuses to overwrite a "
+            "directory holding a different run unless you restart or "
+            "resume into it."
+        ),
+    )
+    log_level: Literal["info", "debug"] = Field(
+        default="info",
+        description=(
+            "Console log verbosity.  ``debug`` adds per-iteration resolver, "
+            "bucket-resize, and adaptation detail."
+        ),
+    )
 
     # Shared write-buffer flush cadence for trace loggers (acc_rates,
     # max_neighbors, re_stats).  A flush fires once the NS iteration
@@ -50,7 +104,15 @@ class OutputSpec(BaseModel):
     # True the runtime registers an ``AccRatesCallback`` that writes
     # ``<prefix>.acc_rates.h5`` every ``acc_rates_interval`` iterations.
     # Independent of ``adaptation.full_auto``.
-    save_acc_rates: bool = False
+    save_acc_rates: bool = Field(
+        default=False,
+        description=(
+            "Write per-move, per-chain-phase acceptance rates to "
+            "``<prefix>.acc_rates.h5``.  The first thing to turn on when "
+            "diagnosing a stuck or badly adapted chain.  Independent of "
+            "``adaptation.full_auto``."
+        ),
+    )
     acc_rates_interval: int | float = Field(
         default=1,
         description=(
@@ -64,7 +126,15 @@ class OutputSpec(BaseModel):
     # ``<prefix>.max_neighbors.h5`` every ``max_neighbors_interval``
     # iterations.  No-op for backends that don't use neighbor lists
     # (e.g. all-pairs LJ, toy backends).  Honours ``interval_units``.
-    save_max_neighbors: bool = False
+    save_max_neighbors: bool = Field(
+        default=False,
+        description=(
+            "Write the observed per-iteration maximum neighbour count to "
+            "``<prefix>.max_neighbors.h5``, for tuning "
+            "``backend.max_neighbors_list``.  No-op for backends without "
+            "neighbour lists (all-pairs LJ, toy potentials)."
+        ),
+    )
     max_neighbors_interval: int | float = Field(
         default=1,
         description=(
@@ -80,7 +150,15 @@ class OutputSpec(BaseModel):
     # there is intentionally no separate interval here, since the file
     # would just sub-sample an already sub-sampled signal).  No-op
     # when ``inter_re`` is not configured.
-    save_re_stats: bool = False
+    save_re_stats: bool = Field(
+        default=False,
+        description=(
+            "Write per-fire inter-replica swap statistics to "
+            "``<prefix>.re_stats.h5``.  Cadence follows "
+            "``inter_re.re_interval`` — there is deliberately no separate "
+            "interval.  No-op when ``inter_re`` is unset."
+        ),
+    )
 
     # Finite-difference temperature estimator (Baldock et al. 2017).
     # ``temperature_lag_interval`` is the length of the Emax FIFO used for the
@@ -89,9 +167,30 @@ class OutputSpec(BaseModel):
     # ``interval_units`` (``per_walker`` scales by ``n_live``).
     # ``temperature_kB`` defaults to eV/K (ASE convention) — set ``1.0``
     # for reduced-unit backends (LJ, harmonic).
-    temperature_lag_interval: int | float | None = 100
-    temperature_interval: int | float = 100
-    temperature_kB: float = 8.6173324e-5
+    temperature_lag_interval: int | float | None = Field(
+        default=100,
+        description=(
+            "Length of the ``E_max`` FIFO used by the finite-difference "
+            "temperature estimator (Baldock et al. 2017).  Longer lags "
+            "give a smoother but more delayed estimate.  ``null`` disables "
+            "the temperature callback entirely."
+        ),
+    )
+    temperature_interval: int | float = Field(
+        default=100,
+        description=(
+            "Evaluate and log the temperature estimate every N iterations."
+        ),
+    )
+    temperature_kB: float = Field(
+        default=8.6173324e-5,
+        description=(
+            "Boltzmann constant in the backend's energy units.  The "
+            "default is eV/K (ASE convention); set ``1.0`` for "
+            "reduced-unit backends such as LJ or harmonic, otherwise the "
+            "reported temperatures are meaningless."
+        ),
+    )
 
     # Pairwise-distance "collision" check.  When ``collision_check_threshold``
     # is set, the runtime registers a ``CollisionCheckCallback`` that every
@@ -105,7 +204,7 @@ class OutputSpec(BaseModel):
         default=None,
         description=(
             "Minimum interatomic distance below which ``CollisionCheckCallback``"
-            " emits a warning.  Backend length units (typically Å).  ``None``"
+            " emits a warning.  Backend length units (typically Å).  ``null``"
             " disables the callback."
         ),
     )
@@ -125,14 +224,32 @@ class OutputSpec(BaseModel):
     # Wrapping is a no-op for non-periodic frames (no cell / det≈0).  Set False
     # to keep absolute Cartesians (e.g. to avoid splitting a molecule that
     # straddles a periodic boundary).
-    wrap_atoms: bool = True
+    wrap_atoms: bool = Field(
+        default=True,
+        description=(
+            "Wrap atom positions into each frame's own cell before "
+            "writing.  Moves are unwrapped Cartesian, so atoms drift "
+            "arbitrarily far over a run and unwrapped output is scattered "
+            "across many cell lengths.  No-op for non-periodic frames.  "
+            "Set ``false`` to keep absolute Cartesians, e.g. to avoid "
+            "splitting a molecule across a boundary."
+        ),
+    )
 
     # When True (default), only the most recent walker snapshot
     # (``*.snap.<iter>.extxyz``) is kept: the previous one is deleted as soon
     # as the next is written.  Walker snapshots are a crash-inspection
     # convenience, so this stops the output directory from growing one dump per
     # ``snapshot_interval``.  Set False to retain every snapshot.
-    snapshot_clean: bool = True
+    snapshot_clean: bool = Field(
+        default=True,
+        description=(
+            "Keep only the most recent walker snapshot, deleting the "
+            "previous one as each new one lands.  Stops the output "
+            "directory growing by one dump per ``snapshot_interval``.  Set "
+            "``false`` to retain every snapshot."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod

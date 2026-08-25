@@ -1,6 +1,17 @@
 # Sphinx HTML output and doctree cache.
 _build/
 
+# Bytecode from the local Sphinx extensions in docs/_ext/.
+_ext/__pycache__/
+
+# Package treemap, regenerated from ``src/jaxrens`` on every Sphinx
+# build by the ``builder-inited`` hook in conf.py.  Committing it means
+# it goes stale the moment a module is added or removed, so it is a
+# build artefact like the autosummary stubs.  The other figures in
+# _static/figures/ are synthetic and stay committed.
+_static/figures/pkg_treemap.html
+_static/figures/pkg_treemap.svg
+
 # Auto-generated autosummary API stubs.  Sphinx regenerates these from
 # the ``:toctree: api/`` directive in docs/reference/index.rst on every
 # build, so they would cause huge diffs if committed.

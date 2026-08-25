@@ -84,19 +84,91 @@ class RootSpec(BaseModel):
             ">= 1, so a fractional sweep like ``0.001`` never collapses to 0."
         ),
     )
-    run: RunSpec
-    moves: list[MoveSpec]
-    backend: BackendSpec
-    output: OutputSpec
-    termination: list[TerminationSpec] | None = None
-    adaptation: AdaptationSpec = Field(default_factory=AdaptationSpec)
-    ensemble: EnsembleSpec = Field(default_factory=NVTEnsembleSpec)
-    init: InitSpec = Field(
-        default_factory=lambda: InitSpec(start_species="1 1")
+    run: RunSpec = Field(
+        description=(
+            "Sampler sizing and reproducibility: walker count, MCMC steps "
+            "per replacement, seed."
+        ),
     )
-    cell: CellSpec = Field(default_factory=CellSpec)
-    inter_re: InterRESpec | None = None
-    constraints: list[ConstraintSpec] = Field(default_factory=list)
+    moves: list[MoveSpec] = Field(
+        description=(
+            "Ordered list of MCMC move kernels composed by the "
+            "Metropolis-within-Gibbs scheduler.  Each entry's ``type:`` "
+            "picks the kernel and its ``weight`` sets the dispatch "
+            "probability.  A single mapping is accepted and wrapped in a "
+            "list."
+        ),
+    )
+    backend: BackendSpec = Field(
+        description=(
+            "The energy model.  ``type:`` selects one of the built-in "
+            "potentials or machine-learned backends."
+        ),
+    )
+    output: OutputSpec = Field(
+        description=(
+            "Where results are written, at what cadence, and which "
+            "optional diagnostic logs are enabled."
+        ),
+    )
+    termination: list[TerminationSpec] | None = Field(
+        default=None,
+        description=(
+            "Stopping criteria; the run ends when **any** of them fires.  "
+            "A single mapping is wrapped in a list.  ``null`` falls back "
+            "to ``run.max_iterations`` and "
+            "``run.convergence_threshold``."
+        ),
+    )
+    adaptation: AdaptationSpec = Field(
+        default_factory=AdaptationSpec,
+        description=(
+            "Step-size adaptation policy, with per-move overrides.  "
+            "Adaptation is on by default; set ``adaptation.adjust_interval: "
+            "0`` to freeze every move at its configured ``step_size``."
+        ),
+    )
+    ensemble: EnsembleSpec = Field(
+        default_factory=NVTEnsembleSpec,
+        description=(
+            "Thermodynamic ensemble.  Defaults to NVT; ``type: npt`` adds "
+            "``P*V`` and ``type: semi_grand`` adds ``-mu*N``.  A "
+            "list-valued driving parameter here is what fans a run out "
+            "across replicas."
+        ),
+    )
+    init: InitSpec = Field(
+        default_factory=lambda: InitSpec(start_species="1 1"),
+        description=(
+            "Where the atoms come from and how the initial population is "
+            "randomised.  Exactly one source-of-atoms key must be set."
+        ),
+    )
+    cell: CellSpec = Field(
+        default_factory=CellSpec,
+        description=(
+            "Cell-geometry bounds.  The single source of truth for the "
+            "volume, shear, and stretch kernels — the move specs "
+            "themselves carry no copies of these."
+        ),
+    )
+    inter_re: InterRESpec | None = Field(
+        default=None,
+        description=(
+            "Inter-replica exchange (RENS).  Omit to disable swaps "
+            "entirely."
+        ),
+    )
+    constraints: list[ConstraintSpec] = Field(
+        default_factory=list,
+        description=(
+            "Hard configuration constraints applied throughout sampling.  "
+            "A constraint rejects any proposal moving a walker into a "
+            "forbidden region, exactly like the likelihood threshold, and "
+            "is enforced only on the moves that can violate it.  Omitting "
+            "the key means no constraints and zero overhead."
+        ),
+    )
 
     @field_validator("moves", mode="before")
     @classmethod

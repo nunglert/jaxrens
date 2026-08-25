@@ -38,11 +38,36 @@ class SoftCoreSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    a0: float = 1.0
-    b0: float = 3.0
-    d0: float = 1.0
-    r_core_cut: float = 1.25
-    r_core_switch: float = 0.75
+    a0: float = Field(
+        default=1.0,
+        description="Morse well depth prefactor (energy units).",
+    )
+    b0: float = Field(
+        default=3.0,
+        description="Morse decay constant (inverse length units).",
+    )
+    d0: float = Field(
+        default=1.0,
+        description="Morse equilibrium distance (Angstrom).",
+    )
+    r_core_cut: float = Field(
+        default=1.25,
+        description=(
+            "Distance above which the soft-core term is exactly zero "
+            "(Angstrom).  Set it *below* the shortest physical bond in "
+            "your system — too large and the wall dominates the real "
+            "potential, jamming walkers at the cutoff instead of letting "
+            "them find the true minimum."
+        ),
+    )
+    r_core_switch: float = Field(
+        default=0.75,
+        description=(
+            "Distance below which the soft-core term is at full strength "
+            "(Angstrom); between here and ``r_core_cut`` it is smoothly "
+            "switched off.  Must be strictly less than ``r_core_cut``."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_cutoff_order(self) -> "SoftCoreSpec":
@@ -64,7 +89,14 @@ class BaseBackendSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    periodic: bool = False
+    periodic: bool = Field(
+        default=False,
+        description=(
+            "Treat the cell as periodic, applying the minimum-image "
+            "convention and periodic-image expansion.  Must be ``true`` "
+            "for any condensed-phase run and for every cell move."
+        ),
+    )
 
     # Optional soft-core repulsion wrapper.  When set, the resolver and
     # runtime wrap the built backend with ``SoftCoreBackend`` (adds a
@@ -74,7 +106,17 @@ class BaseBackendSpec(BaseModel):
     # Nequix, LJ, NeuralIL, etc.  For NeuralIL, prefer the (slightly
     # cheaper) per-backend ``softcore: true`` flag on ``NeuralILBackendSpec``
     # — the two are mutually exclusive (would otherwise double-count).
-    softcore_repulsion: Optional[SoftCoreSpec] = None
+    softcore_repulsion: Optional[SoftCoreSpec] = Field(
+        default=None,
+        description=(
+            "Wrap the backend in a parameter-free repulsive Morse "
+            "soft-core term to suppress close-contact pathologies at high "
+            "``E_max``.  Backend-agnostic — works with MACE, Nequix, LJ, "
+            "NeuralIL.  For NeuralIL prefer the slightly cheaper "
+            "per-backend ``softcore: true`` flag; setting both is "
+            "rejected, since it would double-count the repulsion."
+        ),
+    )
 
     # Overflow-retry ladder.  The outer NS loop picks the smallest entry
     # >= (observed max neighbor count + max_neighbors_offset) as the new
@@ -82,9 +124,25 @@ class BaseBackendSpec(BaseModel):
     # so keeping this list short bounds the number of recompilations.
     # Ignored by backends that don't do neighbor finding (LJ, toy).
     max_neighbors_list: list[int] = Field(
-        default_factory=lambda: [30, 35, 40, 45, 50]
+        default_factory=lambda: [30, 35, 40, 45, 50],
+        description=(
+            "Ascending ladder of neighbour-list capacities.  On overflow "
+            "the outer loop picks the smallest entry >= (observed maximum "
+            "+ ``max_neighbors_offset``) and recompiles once per distinct "
+            "bucket, so a short ladder bounds the number of "
+            "recompilations.  Ignored by backends that do no neighbour "
+            "finding (LJ, toy)."
+        ),
     )
-    max_neighbors_offset: int = Field(default=5, ge=0)
+    max_neighbors_offset: int = Field(
+        default=5,
+        ge=0,
+        description=(
+            "Headroom added to the observed maximum neighbour count "
+            "before choosing a ladder entry, so a marginal increase does "
+            "not immediately force another resize."
+        ),
+    )
 
     # Hysteresis-gated bucket shrinking (opt-in).  ``shrink_dwell = 0``
     # (default) preserves the pre-existing escalate-only behaviour.  When
@@ -93,7 +151,17 @@ class BaseBackendSpec(BaseModel):
     # the bucket one ladder entry down.  Going back to a previously-
     # visited bucket reuses the JAX compilation cache, so the compile
     # budget stays bounded by ``len(max_neighbors_list)``.
-    max_neighbors_shrink_dwell: int = Field(default=0, ge=0)
+    max_neighbors_shrink_dwell: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Consecutive iterations that must fit in the next smaller "
+            "bucket before the capacity is stepped down.  ``0`` (default) "
+            "keeps the escalate-only behaviour.  Shrinking back to an "
+            "already-visited bucket reuses the JAX compilation cache, so "
+            "the compile budget stays bounded by ``max_neighbors_list``."
+        ),
+    )
 
     @field_validator("max_neighbors_list")
     @classmethod
@@ -161,8 +229,13 @@ class BaseBackendSpec(BaseModel):
 
 
 class HarmonicBackendSpec(BaseBackendSpec):
-    type: Literal["harmonic"] = "harmonic"
-    k: float = 1.0
+    """Toy isotropic harmonic well about the origin.  For tests."""
+
+    type: Literal["harmonic"] = Field(
+        default="harmonic",
+        description="Discriminator selecting this backend.",
+    )
+    k: float = Field(default=1.0, description="Spring constant.")
 
     def build_backend(self) -> EnergyBackend:
         from jaxrens.backends.toy import create_harmonic
@@ -171,9 +244,14 @@ class HarmonicBackendSpec(BaseBackendSpec):
 
 
 class DoubleWellBackendSpec(BaseBackendSpec):
-    type: Literal["double_well"] = "double_well"
-    a: float = 1.0
-    b: float = 1.0
+    """Toy double-well potential with a tunable barrier.  For tests."""
+
+    type: Literal["double_well"] = Field(
+        default="double_well",
+        description="Discriminator selecting this backend.",
+    )
+    a: float = Field(default=1.0, description="Quartic coefficient.")
+    b: float = Field(default=1.0, description="Quadratic coefficient.")
 
     def build_backend(self) -> EnergyBackend:
         from jaxrens.backends.toy import create_double_well
@@ -182,9 +260,22 @@ class DoubleWellBackendSpec(BaseBackendSpec):
 
 
 class GaussianMixtureBackendSpec(BaseBackendSpec):
-    type: Literal["gaussian_mixture"] = "gaussian_mixture"
-    centers: Optional[list[list[float]]] = None
-    sigma: float = 0.5
+    """Toy multi-modal Gaussian mixture.  For testing mode-hopping."""
+
+    type: Literal["gaussian_mixture"] = Field(
+        default="gaussian_mixture",
+        description="Discriminator selecting this backend.",
+    )
+    centers: Optional[list[list[float]]] = Field(
+        default=None,
+        description=(
+            "Mixture-component centres, one coordinate list each.  "
+            "``null`` uses the built-in default set."
+        ),
+    )
+    sigma: float = Field(
+        default=0.5, description="Width shared by every component."
+    )
 
     def build_backend(self) -> EnergyBackend:
         from jaxrens.backends.toy import create_gaussian_mixture
@@ -198,15 +289,37 @@ class GaussianMixtureBackendSpec(BaseBackendSpec):
 
 
 class LJBackendSpec(BaseBackendSpec):
-    type: Literal["lj"] = "lj"
-    epsilon: float = 1.0
-    sigma: float = 1.0
-    cutoff: Optional[float] = None
+    """Lennard-Jones, computed all-pairs with optional periodic images."""
+
+    type: Literal["lj"] = Field(
+        default="lj", description="Discriminator selecting this backend."
+    )
+    epsilon: float = Field(
+        default=1.0, description="Well depth, in the run's energy units."
+    )
+    sigma: float = Field(
+        default=1.0, description="Zero-crossing distance of the potential."
+    )
+    cutoff: Optional[float] = Field(
+        default=None,
+        description=(
+            "Interaction cutoff in the same length units as ``sigma``.  "
+            "``null`` means no cutoff (full all-pairs sum)."
+        ),
+    )
     # Periodic-image expansion for the all-pairs sum. Must satisfy
     # min(perp_distance · sc) >= 2 · cutoff to capture every neighbor;
     # the resolver emits a startup warning if the cell prior permits
     # cells that would violate this bound.
-    supercell_trafo: tuple[int, int, int] = (1, 1, 1)
+    supercell_trafo: tuple[int, int, int] = Field(
+        default=(1, 1, 1),
+        description=(
+            "Periodic-image expansion for the all-pairs sum.  Must satisfy "
+            "``min(perpendicular_distance * sc) >= 2 * cutoff`` to capture "
+            "every neighbour; the resolver warns at startup when the cell "
+            "prior permits cells that would violate it."
+        ),
+    )
 
     def _backend_config_extras(self) -> dict:
         return {"checkpoint_path": None, "cutoff": self.cutoff}
@@ -223,14 +336,29 @@ class LJBackendSpec(BaseBackendSpec):
 
 
 class NeuralILBackendSpec(BaseBackendSpec):
-    type: Literal["neuralil"] = "neuralil"
-    checkpoint_path: str
+    """NeuralIL machine-learned potential loaded from a pickle."""
+
+    type: Literal["neuralil"] = Field(
+        default="neuralil",
+        description="Discriminator selecting this backend.",
+    )
+    checkpoint_path: str = Field(
+        description="Path to the trained NeuralIL model pickle.",
+    )
     # Periodic-image expansion for descriptor generation. Must satisfy
     # ``min(cell_axis_length * sc) >= 2 * r_cut`` (the cutoff is read
     # from the pickle's ``r_cut`` attribute). Defaults to (1,1,1) for
     # backwards compatibility with the no-supercell-needed integration
     # test; bump to (2,2,2) or (3,3,3) for tight unit cells.
-    supercell_trafo: tuple[int, int, int] = (1, 1, 1)
+    supercell_trafo: tuple[int, int, int] = Field(
+        default=(1, 1, 1),
+        description=(
+            "Periodic-image expansion for descriptor generation.  Must "
+            "satisfy ``min(cell_axis_length * sc) >= 2 * r_cut``, with "
+            "``r_cut`` read from the pickle.  Bump to ``[2, 2, 2]`` or "
+            "``[3, 3, 3]`` for tight unit cells."
+        ),
+    )
     # Soft-core override. ``None`` means "use whatever the pickle says"
     # (read from ``constructor_kwargs['softcore']``); explicit ``True``/
     # ``False`` overrides the pickle. ``softcore_kwargs`` overrides the
@@ -242,8 +370,24 @@ class NeuralILBackendSpec(BaseBackendSpec):
     # ``SoftCoreNeuralIL`` subclass which shares the descriptor's
     # neighbor discovery (slightly cheaper); the wrapper field is
     # backend-agnostic.
-    softcore: Optional[bool] = None
-    softcore_kwargs: Optional[dict[str, float]] = None
+    softcore: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Enable NeuralIL's internal soft-core repulsion, which shares "
+            "the descriptor's neighbour discovery and so is slightly "
+            "cheaper than the generic ``softcore_repulsion`` wrapper.  "
+            "``null`` (default) uses whatever the pickle was trained with; "
+            "``true`` / ``false`` overrides it.  Mutually exclusive with "
+            "``softcore_repulsion``."
+        ),
+    )
+    softcore_kwargs: Optional[dict[str, float]] = Field(
+        default=None,
+        description=(
+            "Override the pickle-stored soft-core parameters, merged on "
+            "top of the package defaults."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_softcore_mutex(self) -> "NeuralILBackendSpec":
@@ -270,9 +414,25 @@ class NeuralILBackendSpec(BaseBackendSpec):
 
 
 class MACEBackendSpec(BaseBackendSpec):
-    type: Literal["mace"] = "mace"
-    checkpoint_path: str
-    supercell_trafo: tuple[int, int, int] = (2, 2, 2)
+    """MACE-JAX message-passing potential."""
+
+    type: Literal["mace"] = Field(
+        default="mace", description="Discriminator selecting this backend."
+    )
+    checkpoint_path: str = Field(
+        description=(
+            "Path to the MACE model file.  See the MACE models page for "
+            "how to convert a torch checkpoint into a JAX-loadable bundle."
+        ),
+    )
+    supercell_trafo: tuple[int, int, int] = Field(
+        default=(2, 2, 2),
+        description=(
+            "Periodic-image expansion for neighbour finding.  Must be "
+            "large enough that the cell spans twice the model's receptive "
+            "field; the default suits typical small unit cells."
+        ),
+    )
 
     def _backend_config_extras(self) -> dict:
         return {"checkpoint_path": self.checkpoint_path, "cutoff": None}
@@ -287,11 +447,24 @@ class MACEBackendSpec(BaseBackendSpec):
 
 
 class NequixBackendSpec(BaseBackendSpec):
-    type: Literal["nequix"] = "nequix"
-    # Either a path to a local ``.nqx`` checkpoint or a bundled-model name
-    # (e.g. ``"nequix-mp-1"``, auto-downloaded by the nequix package).
-    checkpoint_path: str
-    supercell_trafo: tuple[int, int, int] = (1, 1, 1)
+    type: Literal["nequix"] = Field(
+        default="nequix",
+        description="Discriminator selecting this backend.",
+    )
+    checkpoint_path: str = Field(
+        description=(
+            "Either a path to a local ``.nqx`` checkpoint, or a bundled "
+            "model name such as ``nequix-mp-1``, which the ``nequix`` "
+            "package downloads on first use."
+        ),
+    )
+    supercell_trafo: tuple[int, int, int] = Field(
+        default=(1, 1, 1),
+        description=(
+            "Periodic-image expansion for neighbour finding; raise it for "
+            "cells smaller than twice the model cutoff."
+        ),
+    )
 
     def _backend_config_extras(self) -> dict:
         return {"checkpoint_path": self.checkpoint_path, "cutoff": None}
@@ -313,11 +486,38 @@ class JaxMDBackendSpec(BaseBackendSpec):
     ``backends/jaxmd.py`` for the architectural rationale.
     """
 
-    type: Literal["jaxmd"] = "jaxmd"
-    potential: Literal["tersoff", "eam"]
-    tersoff_params: Optional[str] = None
-    tersoff_params_file: Optional[str] = None
-    eam_params_file: Optional[str] = None
+    type: Literal["jaxmd"] = Field(
+        default="jaxmd",
+        description="Discriminator selecting this backend.",
+    )
+    potential: Literal["tersoff", "eam"] = Field(
+        description=(
+            "Which analytic potential to build.  ``tersoff`` needs exactly "
+            "one of ``tersoff_params`` / ``tersoff_params_file``; ``eam`` "
+            "needs ``eam_params_file``."
+        ),
+    )
+    tersoff_params: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of a built-in Tersoff parameter set.  Mutually "
+            "exclusive with ``tersoff_params_file``."
+        ),
+    )
+    tersoff_params_file: Optional[str] = Field(
+        default=None,
+        description=(
+            "Path to a LAMMPS-format Tersoff parameter file.  Mutually "
+            "exclusive with ``tersoff_params``."
+        ),
+    )
+    eam_params_file: Optional[str] = Field(
+        default=None,
+        description=(
+            "Path to an EAM parameter file.  Required when "
+            "``potential: eam``, and must be unset otherwise."
+        ),
+    )
 
     @field_validator("potential")
     @classmethod
