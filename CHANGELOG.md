@@ -9,6 +9,83 @@ The version is derived from git tags by `setuptools-scm` (tag `v0.1.0` →
 version `0.1.0`). To cut a release: add a dated section below, merge to `main`,
 then `git tag -a vX.Y.Z`.
 
+## [0.4.0] — 2026-08-26
+
+A leaner `jaxrens validate`, a dedicated `analyze` subcommand for
+thermodynamic observables, and five numbered quickstart/advanced tutorials
+replace the previous one-off examples. No breaking changes to the config
+schema or the public Python API.
+
+### Added
+- **`jaxrens analyze <checkpoint>`.** New CLI subcommand computing a
+  thermodynamic observable (`heat_capacity`, `partition_function`,
+  `free_energy`) over a temperature sweep from a run's checkpoint + dead-point
+  energy log (via `Monitor.from_directory`). Writes data first — `--format
+  csv` (default, fixed-width aligned columns, meant to actually be read) or
+  `--format json` (self-describing, shape-agnostic for a future non-scalar
+  observable) — with `--plot` to additionally render the same figure
+  `jaxrens plot` would.
+- **`jaxrens validate` runs a cheap "plan" phase by default.** The resolver
+  is split into `resolve_plan` (topology, path existence, cell-prior/cutoff
+  geometry — no backend, no walkers) and the existing full `resolve`
+  ("materialize"). Default `validate` now answers the questions people
+  actually ask of it in ~0.4s on the LJ example (was ~15s); `--full` still
+  builds the backend, places walkers, and evaluates initial energies.
+- **RENS-toy backend and moves** (`backends.toy.RENSToyBackend`,
+  `sampling.moves.toy_1d`). Reproduces the two-particle periodic 1-D toy
+  model of Unglert, Pártay & Madsen, *J. Chem. Theory Comput.* **21**, 7304
+  (2025) — a genuinely multi-modal enthalpy surface in `(a, d)`, used to
+  demonstrate why replica exchange helps.
+- **Five numbered tutorials**, split into Quickstart (`00`–`02`) and Advanced
+  (`03`–`04`): a restructured Gaussian-2D walk, a new RENS-toy
+  replica-exchange walkthrough, a new non-periodic LJ-cluster heat-capacity
+  example (built around `jaxrens analyze`), and the LJ-periodic-NPT / MACE-Sn
+  tutorials rewritten as "validate, don't run" pages — real,
+  physically-motivated parameters with prose on why each is set the way it
+  is, not demo defaults.
+- **`run.n_cull > 1` unvalidated-feature marker.** `Monitor.from_directory`
+  and `postprocess.collection` hardcode `n_cull=1` when reconstructing
+  prior-mass weights from disk; a config with `n_cull > 1` now trips
+  `jaxrens.unvalidated.warn_unvalidated`, since every downstream
+  `analyze`/`plot` observable would otherwise be silently wrong.
+- **`jaxrens plot` on `.energies` now auto-discovers replica siblings.**
+  Pointing at any one `<prefix>.runNN.energies` file overlays every replica
+  in one figure with a legend, instead of plotting just the file named.
+  RE-swap acceptance now renders as one stacked lane per adjacent pair
+  instead of overlaid in a single `[0, 1]` band.
+- **`docs/reference/files.rst`** and a new Sphinx extension
+  (`docs/_ext/yaml_schema.py`) rendering the full YAML config reference
+  directly from the pydantic schema, alongside substantially expanded
+  `Field` descriptions across every `cli/schema/*.py` module.
+- **`docs/dev/contributing.md`: AI-assisted contributions.** Explicitly
+  permits agent-assisted code (Claude, Codex, Copilot, …) under the same
+  review bar as any other contribution.
+
+### Changed
+- **`docs/reference/notation.md`: H / L / β precision fix.** `H` is no
+  longer flatly called "the Hamiltonian" — it's ensemble-dependent (energy /
+  enthalpy / grand potential); `L = e^{-H}` is now stated as fixed and
+  temperature-independent, with a new `β` entry correctly attributing the
+  canonical-ensemble reweighting to postprocessing only, never the NS run
+  itself.
+- **`docs/dev/install.md` no longer bundles `dev` into every backend
+  extra.** `pip install -e ".[mace]"` etc. now install just what they say;
+  `pip install -e` is additive, so the base `.[dev]` step's tooling stays
+  installed regardless.
+- **`mace-jax` dependency reverted to upstream** `ACEsuit/mace-jax@main`
+  (from the `nunglert/mace-jax@fixes` fork pin).
+- **Figure-generation scripts split** (`docs/_static/figures/generate.py` →
+  `_common.py` / `generate_concepts.py` / `generate_treemap.py` /
+  `generate_tutorials.py`) and their JAX loops batched via
+  `jax.lax.map(..., batch_size=...)` to avoid OOM on the tutorial figures.
+- CI: removed the global pytest `addopts` flag from the workflow configs.
+
+### Fixed
+- **LJ cutoff-vs-cell-prior warning no longer fires for non-periodic
+  backends**, where periodic images (and hence the check) don't apply.
+- **Beartype errors from `NSCallback` typing** in
+  `sampling/nested_sampling.py` / `run_loop.py`.
+
 ## [0.3.0] — 2026-08-24
 
 Multi-component sampling gets two purpose-built moves, the codebase grows a way
