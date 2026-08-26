@@ -9,11 +9,6 @@ All of them share the ``output.out_file_prefix`` and land in
 unconditionally: trajectories follow ``output.format``, the diagnostic logs
 are opt-in, and the per-replica variants only appear for a multi-replica run.
 
-.. tip::
-
-   Four of these formats have a plot built in — ``jaxrens plot <file>``
-   dispatches on the suffix and needs no Python.  See :doc:`cli`.
-
 
 At a glance
 -----------

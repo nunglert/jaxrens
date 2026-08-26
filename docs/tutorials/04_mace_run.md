@@ -43,6 +43,47 @@ span at least twice the model's receptive field at the *tightest* cell
 Angstrom wide still needs more than the default `[2, 2, 2]` tiling to stay
 covered across the whole prior — hence `[3, 3, 3]`.
 
+### Backend: `max_neighbors_list`, `max_neighbors_offset`, `max_neighbors_shrink_dwell`
+
+MACE is a message-passing GNN, not a fixed-cutoff pair potential like
+{doc}`03_lj_npt`'s LJ backend: the energy needs an explicit neighbor graph,
+and `jax.jit`'s static-shape rule means the edge buffer has to be
+preallocated at some fixed per-atom capacity — `max_neighbors` — before any
+actual geometry is known. See {doc}`/user/concepts/backends`'s "The
+neighbor problem" for the full escalate/recompile mechanism; the three
+knobs here are its user-facing surface:
+
+- `max_neighbors_list: [20, 25, 30, 35, 40, 45, 50, 60]` is the allowed
+  bucket ladder. The resolver picks the smallest entry that fits the
+  starting geometry before the run begins; if a later MCMC step pushes the
+  true neighbor count past the current bucket, the outer loop rolls that
+  one step back, escalates to the next ladder entry, and retries — one JIT
+  recompile per distinct bucket, cached for the rest of the run. Eight
+  close-spaced entries bound the whole 800,000-iteration run to at most
+  eight recompiles.
+- `max_neighbors_offset: 4` is the headroom added to the observed peak when
+  picking a bucket, so a small fluctuation right after growing doesn't
+  immediately trip another escalation.
+- `max_neighbors_shrink_dwell: 10` lets the bucket shrink back down too —
+  after 10 consecutive iterations comfortably below the next-smaller entry,
+  the run steps down to it (reusing that bucket's already-compiled kernel).
+  Without this the ladder only ever grows.
+
+The shrink side matters more here than it would for a single-replica run:
+`max_neighbors` is one static field shared by the *entire* batched
+population passed to one JIT-compiled kernel, so with all 32 pressure
+replicas batched together, every replica runs at whichever bucket the
+*single tightest* replica currently needs — even the 0 GPa replica sitting
+in a loose, sparse configuration pays for the 15.5 GPa replica's dense one.
+Cell moves are exactly what drives this: with `ensemble.type: npt` (see
+{doc}`/user/concepts/backends`'s "Ensembles as additive corrections"),
+`volume`/`stretch`/`shear` are live moves, and every one of them changes
+the cell — which is what changes the true neighbor count, on top of
+whatever plain atomic motion does. Without `shrink_dwell`, one compressed
+excursion early in the run would pin every replica at the largest bucket
+it ever needed for the rest of it; with it, the ladder tracks the current
+tightest replica instead of the tightest one so far.
+
 ### `ensemble.pressure`: 32 replicas, not a handful
 
 One replica every 0.5 GPa from 0 to 15.5. This dense a ladder only pays for
@@ -98,13 +139,43 @@ brackets that with real headroom on both sides — compressed through
 expanded/molten — rather than a symmetric-looking range picked without
 reference to the material the potential is supposed to describe.
 
+### `init.pos_randomization_mode: grid`
+
+This is the default, made explicit here rather than left implicit. Each
+walker's 16 starting atoms are placed on a regular lattice spaced by
+`grid_distance: 3.0` Å, with 16 of those sites chosen at random — as
+opposed to `pos_randomization_mode: uniform`, which draws each atom's
+position independently and uniformly inside the cell. Every pair of grid
+sites is at least `grid_distance` apart *by construction*; a uniform draw
+carries no such guarantee and will, occasionally, place two atoms almost
+on top of each other.
+
+That distinction matters specifically for a foundation MLIP. A
+uniform-mode near-collision is normally caught after the fact by
+`init.start_energy_ceiling_per_atom` — reject the whole configuration if
+its energy is absurd — which works fine for a potential with an explicit
+short-range repulsive term, since the energy really does diverge as atoms
+approach and the ceiling reliably fires. MACE and other foundation models
+give no such guarantee: as the `constraints` section right below notes,
+they are not always well-behaved at very short range, and a configuration
+close enough can land in geometry the model was never
+trained on and report a spuriously low energy instead of a diverging one —
+an artificial minimum the ceiling has no way to catch, because nothing
+about the reported number looks wrong. `grid` avoids the region
+structurally rather than statistically: the starting population simply
+never visits short range in the first place, independent of what any
+energy-based check downstream would or wouldn't have caught.
+
 ### `constraints: minimum_distance, d_min: 1.7`
 
 Foundation MLIPs are not always well-behaved at very short range — without
 a proper short-range repulsive term, walkers can find configurations the
 model was never trained on and reports as spuriously low-energy. A hard
 floor at 1.7 Å is cheap insurance against exactly that, independent of
-whatever the model's forces say near contact.
+whatever the model's forces say near contact. `init.pos_randomization_mode:
+grid` above is the same defense at initialization time, before sampling
+ever starts; this constraint is what keeps every MCMC step afterward
+honest too.
 
 ### Output: debug logging and dense trajectory output, on purpose
 
@@ -150,6 +221,8 @@ real hardware before queuing the real thing.
 
 - {doc}`03_lj_npt` — the same shape without the scale: a single replica,
   a cheap backend, and validate output you actually run.
+- {doc}`/user/concepts/backends` — the neighbor-bucket escalation mechanism
+  and the per-ensemble energy terms in full.
 - {doc}`/user/mace_models` — converting a torch MACE checkpoint into the
   bundle format `checkpoint_path` expects.
 - {doc}`/user/concepts/replicas` — how the topology below `ensemble.pressure`

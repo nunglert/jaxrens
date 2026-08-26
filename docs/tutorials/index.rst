@@ -23,7 +23,9 @@ Advanced
 --------
 
 Real interatomic potentials, periodic cells with pressure, and
-multi-replica exchange across a pressure ladder.
+multi-replica exchange across a pressure ladder. These examples already require 
+a good chunk of simulation time, hence here we only discuss some practical 
+aspects of the input files.
 
 .. toctree::
    :maxdepth: 1

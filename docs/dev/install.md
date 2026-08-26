@@ -22,6 +22,12 @@ to it.
 
 ## Optional backends
 
+You can either directly install all supported backends via
+```bash
+pip install -e ".[all]"
+```
+or install them individually as shown below.
+
 ### MACE-JAX
 
 The `[mace]` extra installs the **runtime** MACE backend — everything
@@ -39,11 +45,10 @@ which pulls the Torch-side `mace-torch` package the converter imports:
 pip install -e ".[mace-convert]"
 ```
 
-`[all]` installs every optional backend plus the conversion tooling in
-one shot. See the {doc}`../user/mace_models` guide for the full
+See the {doc}`../user/mace_models` guide for the full
 download → convert → run workflow.
 
-The upstream `ACEsuit/mace-jax` package at the time of writing has
+<!-- The upstream `ACEsuit/mace-jax` package at the time of writing has
 two packaging bugs:
 
 - `mace_jax/adapters/` and `mace_jax/adapters/e3nn/` lack
@@ -55,7 +60,7 @@ two packaging bugs:
 
 jaxrens' `pyproject.toml` pins a patched fork
 (`nunglert/mace-jax@fixes`) that resolves both. If upstream lands the
-fixes, the pin can drop back to `ACEsuit/mace-jax@main`.
+fixes, the pin can drop back to `ACEsuit/mace-jax@main`. -->
 
 ### NeuralIL
 
@@ -76,7 +81,7 @@ that exposes the same `EnergyBackend` protocol as MACE/NeuralIL;
 nequix tests sit behind the `nequix` pytest marker (off by
 default, opt-in via `pytest -m nequix`).
 
-### Docs
+## Docs
 
 ```bash
 pip install -e ".[docs]"
@@ -98,26 +103,6 @@ Should list one or more `CudaDevice(...)` entries. If it prints
 `nvidia-smi`, `$LD_LIBRARY_PATH`, and that `jaxlib` installed
 the CUDA build (`pip show jaxlib` should show a `+cuda12...` tag
 on the version).
-
-## Running the test suite
-
-```bash
-cd /path/to/jaxrens
-pytest tests/ -v
-```
-
-Default run excludes the `heavy` marker. To include:
-
-```bash
-pytest tests/ -v -m heavy
-pytest tests/ -v -m ""    # all markers, including heavy / gpu
-```
-
-Markers:
-
-- `heavy` — slow tests (long example runs).
-- `gpu` — requires CUDA.
-- `multi_gpu` — requires 2+ CUDA devices.
 
 ## Scratch / temp paths on SLURM
 

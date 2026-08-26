@@ -44,6 +44,34 @@ Monte Carlo noise in the log-evidence and in anything computed from it
 (`jaxrens analyze`'s heat capacity, free energy, …), and 8 atoms is cheap
 enough that 200 costs nothing to justify.
 
+**`run.n_extra: 15` and `run.n_mcmc_steps: 20`** set two different things,
+easy to conflate since both sound like "more sampling":
+
+- `n_extra` is the **parallel batch width** — each outer NS iteration walks
+  `1 + n_extra` walkers side by side under one `vmap`: the walker that just
+  replaced the culled one, plus `n_extra` further survivors resampled from
+  the live population to decorrelate them too. It does not enlarge the
+  population (`n_live` alone governs that) and the extras never become dead
+  points; `0` leaves a GPU walking a single chain and mostly idle. At `15`
+  that's 16 walkers walked per iteration.
+- `n_mcmc_steps` is the **chain length** — how many sequential move
+  proposals each of those 16 walkers takes, one weighted draw from
+  `{gmc, volume, shear, stretch}` per step.
+
+So this config proposes `(1 + n_extra) × n_mcmc_steps = 16 × 20 = 320`
+moves per outer NS iteration — a number fixed by the config, independent of
+which moves actually get drawn. What that costs in backend evaluations is
+not fixed: `volume`, `shear`, and `stretch` each spend one evaluation per
+proposal, but `gmc` runs its own `n_reflect`-step trajectory internally
+(`n_reflect: 6` here) — every reflection is a full energy-and-force call, so
+one gmc proposal costs 6 evaluations, not 1. With gmc drawn at weight `4`
+out of `4 + 1 + 1 + 1 = 7`, the *expected* cost per iteration is roughly
+`320 × (4/7 × 6 + 3/7 × 1) ≈ 1200` evaluations — an estimate, not an exact
+count, since which move gets drawn each step is random. The actual running
+total is what a live run's `nE`/`nG` counters report (see the printed log
+in {doc}`02_lj_cluster`, or `jaxrens plot`'s energies output), not
+something to hand-derive from the YAML alone.
+
 **`termination: prior_mass, threshold: 1.0e-5`**, tighter than a demo's
 `1.0e-3`: the run stops when the remaining prior mass genuinely cannot move
 `log_Z` further, not after an arbitrary iteration count. `run.max_iterations:
