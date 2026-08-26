@@ -1,4 +1,4 @@
-# RENS on a periodic toy model
+# 2. RENS toy — replica exchange
 
 The cheapest possible `jaxrens` run, and the only one small enough that you
 can see what replica exchange is actually doing. Two particles in a periodic
@@ -193,7 +193,7 @@ jaxrens run -c config.yaml --set 'ensemble.pressure=[0.5,0.75,1.0,1.25,1.5]'
 jaxrens run -c config.yaml --set backend.mu=1.5
 ```
 
-- {doc}`02_lj_run` — the same workflow on a real interatomic potential.
+- {doc}`02_lj_cluster` — the same workflow on a real interatomic potential.
 - {doc}`/user/concepts/replicas` — how the topology is derived, and what the
   swap actually does.
 - {doc}`/reference/config` — the `inter_re:` and `ensemble:` surfaces in full.

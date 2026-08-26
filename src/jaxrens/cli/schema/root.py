@@ -249,3 +249,52 @@ class RootSpec(BaseModel):
                 )
 
         return self
+
+    @model_validator(mode="after")
+    def _warn_n_cull_postprocessing_unvalidated(self) -> "RootSpec":
+        """Flag ``run.n_cull > 1`` as unvalidated on the postprocessing path.
+
+        The sampler itself culls ``n_cull`` walkers per iteration correctly
+        for any value.  But ``Monitor.from_directory`` — the loader every
+        ``jaxrens analyze``/``jaxrens plot`` observable goes through — and
+        ``postprocess.collection`` both reconstruct a run's ``Monitor`` with
+        ``n_cull`` hardcoded to ``1``, not read back from the config or the
+        checkpoint.  For ``n_cull == 1`` (the default) that hardcoding is
+        correct by construction; for ``n_cull > 1`` it silently mismatches
+        the run that actually produced the data, biasing every downstream
+        prior-mass weight, log Z, and thermodynamic observable — no
+        production run has exercised that combination, hence
+        :func:`~jaxrens.unvalidated.warn_unvalidated` rather than a plain
+        warning: it is tracked in the same registry as everything else this
+        codebase doesn't yet trust, controllable via ``JAXRENS_UNVALIDATED``,
+        and (once a run actually starts) stamped into the output file's
+        metadata rather than only flashing past on stderr.
+        """
+        if self.run.n_cull > 1:
+            from jaxrens.unvalidated import warn_unvalidated
+
+            warn_unvalidated(
+                "run.n_cull > 1",
+                concern=(
+                    f"n_cull={self.run.n_cull}: the sampler culls "
+                    f"{self.run.n_cull} walkers per iteration correctly, "
+                    "but Monitor.from_directory (used by `jaxrens analyze` "
+                    "and `jaxrens plot`) hardcodes n_cull=1 when "
+                    "reconstructing prior-mass weights from disk, so "
+                    "downstream log Z / heat-capacity / free-energy "
+                    "estimates from the CLI will be wrong for this run "
+                    "unless you call the lower-level "
+                    "postprocess.thermodynamics functions yourself with "
+                    "the correct n_cull."
+                ),
+                since="0.3.1",
+                clears_when=(
+                    "Monitor.from_directory reads n_cull from the "
+                    "checkpoint/config instead of hardcoding 1, and a "
+                    "production run with n_cull > 1 has had its "
+                    "postprocessed observables checked against the raw "
+                    "dead-point ladder."
+                ),
+                stacklevel=2,
+            )
+        return self

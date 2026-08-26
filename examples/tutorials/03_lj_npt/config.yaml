@@ -1,0 +1,92 @@
+# 8-atom Lennard-Jones cluster, periodic NPT at P = 0.1 eps/sigma^3.
+#
+# Same 8 atoms as 02_lj_cluster, with the cell back: periodic images,
+# pressure, and the moves that act on a cell. Parameters here are chosen for
+# a physically sound result (a cell prior that actually reaches close-packed
+# density, enough live points and MCMC steps to resolve it, a tight
+# convergence threshold) rather than for a fast demo -- see the tutorial
+# page for why each one is set the way it is. Runs to convergence in a few
+# minutes on one GPU; not something to run from a laptop between commands.
+#
+# Validate it with:
+#     jaxrens validate -c config.yaml --full
+
+run:
+  n_live: 200           # enough to resolve an 8-atom system's phase behaviour
+                         # with low Monte Carlo noise in log Z
+  max_iterations: 200000
+  n_mcmc_steps: 20      # LJ energy evals are nearly free -- decorrelate generously
+  n_extra: 15
+  seed: 42
+
+backend:
+  type: lj
+  epsilon: 1.0
+  sigma: 1.0
+  cutoff: 2.5
+  periodic: true
+  # Must satisfy worst-case-perpendicular-distance * supercell_trafo >=
+  # 2*cutoff at the *tightest* cell the prior allows (see cell: below) --
+  # not just at some typical volume. [4, 4, 4] is what that tight floor
+  # actually needs; [2, 2, 2] (fine for a loose, gas-like prior) is not
+  # enough once the floor is pulled down to close-packed density.
+  supercell_trafo: [4, 4, 4]
+
+ensemble:
+  type: npt            # adds P*V, so the cell moves below do work
+  pressure: 0.1
+  pressure_units: eva3
+
+moves:
+  - {type: gmc, n_reflect: 6, step_size: 0.1, weight: 4.0}
+  - {type: volume, step_size: 0.2, weight: 1.0}
+  - {type: shear, step_size: 0.08, weight: 1.0}
+  - {type: stretch, step_size: 0.08, weight: 1.0}
+
+termination:
+  # Tight enough that the remaining prior mass genuinely cannot move log_Z
+  # further, as opposed to a demo's "stop after N iterations regardless".
+  - type: prior_mass
+    threshold: 1.0e-5
+
+adaptation:
+  full_auto: true
+  adjust_interval: 50
+  defaults: {min_rate: 0.3, max_rate: 0.5, adjust_factor: 1.5, step_size_max: 0.2}
+  per_move:
+    gmc: {step_size_max: 0.5}
+
+init:
+  start_species: "18 8"           # 8 argon atoms
+  random_initialise_pos: true
+  pos_randomization_mode: grid
+  grid_distance: 1.0
+  random_initialise_cell: true
+  initial_walk: {n_walks: 3, walklength: 20, adjust_interval: 1, emax_offset_per_atom: 1.0}
+
+constraints:
+  # A hard floor on top of the LJ repulsive core: cheap insurance against a
+  # proposal landing two atoms on top of each other before the potential's
+  # own repulsion has a chance to reject it.
+  - type: minimum_distance
+    d_min: 0.8
+
+cell:
+  # min_volume_per_atom is the parameter that actually determines whether
+  # this run can see the solid phase: an LJ solid's close-packed volume is
+  # ~1.0 sigma^3/atom (FCC nearest-neighbour distance 2^(1/6) sigma), so a
+  # floor left at a demo's "comfortably gas-like" value (e.g. 10+) would
+  # never let the sampler reach it. 1.2 sits just above that floor -- close
+  # enough to resolve the solid, with a little headroom so walkers are not
+  # pinned exactly at a hard boundary.
+  max_volume_per_atom: 30.0
+  min_volume_per_atom: 1.2
+  min_aspect_ratio: 0.7
+
+output:
+  format: extxyz
+  working_dir: ./output
+  out_file_prefix: lj8
+  info_interval: 50
+  traj_interval: 1
+  checkpoint_interval: 250

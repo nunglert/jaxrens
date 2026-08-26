@@ -1,4 +1,4 @@
-# NS for a simple non-periodic 2D example
+# 1. Gaussian mixture — single particle
 
 The smallest thing nested sampling can be asked to do, and the best place to
 see what it *is* before any materials complexity arrives. One particle, a

@@ -399,14 +399,21 @@ def _warn_if_lj_cutoff_unsafe(
 ) -> None:
     """Warn if the LJ cutoff cannot be honoured by the smallest legal cell.
 
-    Triggers only for the LJ backend with a finite cutoff. The smallest cell
-    permitted by the prior is the one at ``min_volume_per_atom`` with the
-    worst-case aspect ratio. For an isotropic cubic cell at that volume, the
-    perpendicular distance equals the cube side; allowing the aspect ratio to
-    drop to ``min_aspect_ratio`` shrinks this proportionally. The MIC + image
-    sum is correct iff ``perp · min(supercell_trafo) >= 2 · cutoff``.
+    Triggers only for the LJ backend with a finite cutoff *and* periodic
+    images in play. The smallest cell permitted by the prior is the one at
+    ``min_volume_per_atom`` with the worst-case aspect ratio. For an
+    isotropic cubic cell at that volume, the perpendicular distance equals
+    the cube side; allowing the aspect ratio to drop to ``min_aspect_ratio``
+    shrinks this proportionally. The MIC + image sum is correct iff
+    ``perp · min(supercell_trafo) >= 2 · cutoff``.
     """
     if not isinstance(backend_spec, LJBackendSpec):
+        return
+    if not backend_spec.periodic:
+        # No periodic images -- the cell only bounds where atoms are drawn
+        # from, so the cutoff/cell-prior/supercell_trafo interaction this
+        # check is about does not exist.  Without this the warning fired
+        # (misleadingly) even for a cluster in vacuum.
         return
     if backend_spec.cutoff is None:
         return

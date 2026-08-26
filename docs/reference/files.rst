@@ -32,7 +32,7 @@ At a glance
      - the dead-point ladder — the input to every estimator
    * - ``<prefix>.traj.extxyz`` / ``.traj.h5``
      - extxyz / HDF5
-     - ``output.format``
+     - ``traj_interval``
      - the culled walker at each iteration
    * - ``<prefix>.traj.snap.<iter>.extxyz``
      - extxyz

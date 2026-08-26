@@ -721,6 +721,41 @@ class TestIntervalUnitsField:
             RootSpec.model_validate(d)
 
 
+class TestNCullPostprocessingWarning:
+    """``run.n_cull > 1`` is sampled correctly but silently mis-analysed:
+
+    ``Monitor.from_directory`` hardcodes ``n_cull=1`` when reconstructing
+    prior-mass weights from disk, so downstream ``jaxrens analyze``/``plot``
+    would be wrong for such a run.  Routed through :mod:`jaxrens.unvalidated`
+    (not a plain warning) since this is exactly that module's concern: a path
+    nobody has checked against a real run's output.  The marker mechanism
+    itself (registry, one-shot, env policy) is covered by
+    ``tests/test_unvalidated.py``; these two just confirm this call site
+    trips it under the right condition and stays quiet otherwise.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_markers(self):
+        """One-shot suppression is process-global; clear it around each test."""
+        from jaxrens.unvalidated import reset
+
+        reset()
+        yield
+        reset()
+
+    def test_default_n_cull_is_silent(self, recwarn):
+        RootSpec.model_validate(_minimal_dict())
+        assert not [w for w in recwarn if issubclass(w.category, UserWarning)]
+
+    def test_n_cull_above_one_warns(self):
+        from jaxrens.unvalidated import UnvalidatedFeatureWarning
+
+        d = _minimal_dict()
+        d["run"]["n_cull"] = 2
+        with pytest.warns(UnvalidatedFeatureWarning, match=r"run\.n_cull > 1"):
+            RootSpec.model_validate(d)
+
+
 # ---------------------------------------------------------------------------
 # 26. EnsembleSpec — schema-level tests
 # (resolver tests moved to test_resolve.py::TestEnsembleResolver)

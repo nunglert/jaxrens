@@ -27,7 +27,7 @@ jaxrens run -c examples/tutorials/00_gaussian_2d/config.yaml
 That runs the smallest example there is — a single particle in a landscape of
 Gaussian wells, a few seconds on a CPU — writing a trajectory, energy log and
 checkpoints to `./output/`.  For a real potential, try
-`examples/tutorials/02_lj_npt/` (8-atom Lennard-Jones at constant pressure).
+`examples/tutorials/03_lj_npt/` (8-atom Lennard-Jones at constant pressure).
 
 A config is one YAML file. The pieces you will touch most:
 

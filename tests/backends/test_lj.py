@@ -483,3 +483,29 @@ class TestStartupCutoffWarning:
         assert not any(
             "LJ cutoff vs cell-prior bounds" in m for m in msgs
         ), msgs
+
+    def test_no_warning_when_non_periodic(self, caplog):
+        """A cluster in vacuum has no periodic images, so the cutoff/cell/
+        supercell_trafo interaction this warning is about does not exist --
+        even with the same tight cell prior that triggers it when periodic.
+        """
+        from jaxrens.cli.resolve import resolve
+        from jaxrens.cli.schema.root import RootSpec
+
+        cfg = self._minimal_config()
+        cfg["backend"]["periodic"] = False
+        # Same tight cell prior as test_warns_on_tight_cell_prior -- would
+        # warn if this were periodic.
+        cfg["cell"] = {
+            "max_volume_per_atom": 10.0,
+            "min_volume_per_atom": 1.5,
+            "min_aspect_ratio": 0.6,
+            "flat_V_prior": False,
+        }
+        root = RootSpec.model_validate(cfg)
+        with caplog.at_level("WARNING", logger="jaxrens.cli.resolve"):
+            resolve(root)
+        msgs = [r.getMessage() for r in caplog.records]
+        assert not any(
+            "LJ cutoff vs cell-prior bounds" in m for m in msgs
+        ), msgs

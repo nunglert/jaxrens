@@ -622,6 +622,46 @@ def _cmd_plot(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_analyze(args: argparse.Namespace) -> int:
+    """Write a thermodynamic observable (Cv / log Z / F) vs temperature.
+
+    Unlike ``plot``, dispatches on a checkpoint file rather than a single
+    self-contained artefact: the sibling ``.energies`` log in the same
+    directory is loaded too, via ``Monitor.from_directory``.  ``--plot``
+    additionally renders a PNG of the same data.
+    """
+    from pathlib import Path
+
+    from jaxrens.cli.analyze import analyze_file
+
+    in_path = Path(args.file)
+    out_path = Path(args.output) if args.output is not None else None
+    plot_path = Path(args.plot_output) if args.plot_output is not None else None
+    try:
+        data_path, png_path = analyze_file(
+            in_path,
+            observable=args.observable,
+            t_min=args.t_min,
+            t_max=args.t_max,
+            n_t=args.n_t,
+            k_b=args.k_b,
+            fmt=args.format,
+            output_path=out_path,
+            plot=args.plot,
+            plot_path=plot_path,
+        )
+    except ValueError as exc:
+        print(f"jaxrens analyze: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as exc:
+        print(f"jaxrens analyze: file not found: {exc}", file=sys.stderr)
+        return 2
+    print(f"Wrote {data_path}")
+    if png_path is not None:
+        print(f"Wrote {png_path}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -764,6 +804,102 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output PNG path.  Default: sibling <stem>.<kind>.png.",
     )
 
+    # -- analyze --
+    p_analyze = sub.add_parser(
+        "analyze",
+        help=(
+            "Write a thermodynamic observable (heat capacity, log partition "
+            "function, or free energy) vs temperature, as CSV or JSON, from "
+            "a run's checkpoint."
+        ),
+    )
+    p_analyze.add_argument(
+        "file",
+        metavar="CHECKPOINT",
+        help=(
+            "<prefix>.checkpoint.h5 or <prefix>.final.checkpoint.h5.  The "
+            "sibling <prefix>.energies file in the same directory supplies "
+            "the dead-point energies."
+        ),
+    )
+    p_analyze.add_argument(
+        "--observable",
+        choices=["heat_capacity", "partition_function", "free_energy"],
+        default="heat_capacity",
+        help="Which quantity to compute vs T (default: heat_capacity).",
+    )
+    p_analyze.add_argument(
+        "--t-min",
+        type=float,
+        required=True,
+        metavar="T",
+        help=(
+            "Lower end of the temperature sweep, in the run's energy units "
+            "divided by --k-b.  No default: the right scale depends on the "
+            "backend."
+        ),
+    )
+    p_analyze.add_argument(
+        "--t-max",
+        type=float,
+        required=True,
+        metavar="T",
+        help="Upper end of the temperature sweep.",
+    )
+    p_analyze.add_argument(
+        "--n-t",
+        type=int,
+        default=200,
+        metavar="N",
+        help="Number of temperature points (default: 200).",
+    )
+    p_analyze.add_argument(
+        "--k-b",
+        type=float,
+        default=1.0,
+        metavar="K_B",
+        help=(
+            "Boltzmann constant in the run's energy units per unit of T, "
+            "e.g. 8.617e-5 (eV/K) if energies are in eV and T should read "
+            "in Kelvin.  Default 1.0 (reduced units)."
+        ),
+    )
+    p_analyze.add_argument(
+        "--format",
+        choices=["csv", "json"],
+        default="csv",
+        help=(
+            "Data format: csv (default, fixed-width aligned columns; "
+            "scalar observables only) or json (nests any shape, "
+            "self-describing)."
+        ),
+    )
+    p_analyze.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        metavar="OUTPUT",
+        help=(
+            "Output data-file path.  Default: sibling "
+            "<prefix>.<observable>.{csv,json}, matching --format."
+        ),
+    )
+    p_analyze.add_argument(
+        "--plot",
+        action="store_true",
+        default=False,
+        help="Also render a PNG of the same data.",
+    )
+    p_analyze.add_argument(
+        "--plot-output",
+        default=None,
+        metavar="PLOT.png",
+        help=(
+            "PNG path when --plot is set.  Default: sibling "
+            "<prefix>.<observable>.png."
+        ),
+    )
+
     return parser
 
 
@@ -893,6 +1029,7 @@ def main(argv: list[str] | None = None) -> None:
         "validate": _cmd_validate,
         "dump-schema": _cmd_dump_schema,
         "plot": _cmd_plot,
+        "analyze": _cmd_analyze,
     }
     from jaxrens.cli.style import style
 
