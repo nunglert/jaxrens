@@ -1,8 +1,8 @@
 # CLI reference
 
 `jaxrens` is installed as a console script (`jaxrens`) and as
-`python -m jaxrens.cli.cli`. Four subcommands are available:
-`run`, `validate`, `dump-schema`, and `plot`.
+`python -m jaxrens.cli.cli`. Five subcommands are available:
+`run`, `validate`, `dump-schema`, `plot`, and `analyze`.
 
 Before the per-command details: every CLI invocation flows through
 the **schema → resolve → run** pipeline — pydantic validates the
@@ -137,6 +137,50 @@ are recognised:
 This is the "quick look at one file" utility. For full multi-run
 cohort analysis, use `MonitorCollection.from_multi_run_directory` and
 the methods on the collection (see {doc}`index`).
+
+## `jaxrens analyze`
+
+Turn a run's dead-point energy ladder into a thermodynamic observable —
+heat capacity, log partition function, or free energy — over a
+temperature sweep. Unlike `plot`, which dispatches on a single
+self-contained artefact, `analyze` dispatches on a **checkpoint** file
+and pulls the sibling `.energies` log from the same directory (via
+`Monitor.from_directory`), since the live-walker energies and the
+dead-point history live in different files.
+
+```bash
+jaxrens analyze output/run.final.checkpoint.h5 --t-min 0.05 --t-max 3.0
+```
+
+The primary output is data, not a picture — `T` against the observable,
+ready for a notebook or another run's comparison without a detour
+through a PNG:
+
+```text
+Wrote output/run.heat_capacity.csv
+```
+
+```text
+               T,              Cv
+            0.05,      0.44239143
+     0.064824121,      0.72091224
+...
+```
+
+| Flag | Effect |
+|---|---|
+| `CHECKPOINT` (positional) | `<prefix>.checkpoint.h5` or `<prefix>.final.checkpoint.h5`. |
+| `--observable` | `heat_capacity` (default), `partition_function`, or `free_energy`. |
+| `--t-min` / `--t-max` | Temperature sweep bounds, in the run's energy units divided by `--k-b`. **Required, no default** — the right scale depends on the backend's energy units, so the CLI asks rather than guesses. |
+| `--n-t` | Number of temperature points (default 200). |
+| `--k-b` | Boltzmann constant in energy-units-per-T, e.g. `8.617e-5` (eV/K) for a MACE run reporting eV so `T` reads in Kelvin. Default `1.0` (reduced units). |
+| `--format` | `csv` (default) — fixed-width, right-aligned columns, meant to be opened and actually read, not just parsed; scalar observables only. `json` — self-describing (`observable`, `column`, `prefix`, `k_b`, `T`, `<column>` keys), and nests whatever shape the observable has, so it also covers a future non-scalar observable CSV's fixed columns can't. |
+| `-o`/`--output` | Data-file path. Default: sibling `<prefix>.<observable>.{csv,json}`. |
+| `--plot` | Also render a PNG of the same data, via the same `plot_*` functions `jaxrens plot` uses elsewhere. |
+| `--plot-output` | PNG path when `--plot` is set. Default: sibling `<prefix>.<observable>.png`. |
+
+See {doc}`../tutorials/02_lj_cluster` for a worked example, including the
+`--format json` output shape.
 
 ## The YAML surface
 
