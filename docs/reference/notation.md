@@ -39,13 +39,14 @@ to $(K, A, 3)$.
 |---|---|
 | $r$ | A single configuration in parameter space. In atomistic NS this bundles positions $\mathbf q$, cell $h$, and species $\sigma$. |
 | $\pi(r)$ | Prior density on configurations. |
-| $L(r)$ | Likelihood. In jaxrens we work with $L = e^{-H}$, where $H$ is the Hamiltonian (energy-like). |
-| $H(r)$ | Hamiltonian / target. For NPT, $H = U + P V$; for NVT, $H = U$; for semi-grand, $H = U - \boldsymbol\mu \cdot \mathbf N$. |
+| $H(r)$ | The nested-sampling **target** — whatever ensemble-appropriate scalar the $H(r) < E_{\max}$ constraint enforces. Despite the name it is not a mechanical Hamiltonian in general: it's the bare energy $U$ for NVT, an enthalpy $U + PV$ for NPT, and a grand potential $U - \boldsymbol\mu \cdot \mathbf N$ for semi-grand. "$H$" is standard NS-literature shorthand carried over here — read it as "the thing $L$ decreases in," not literally $p^2/2m + V(q)$. |
+| $L(r)$ | Nested-sampling likelihood, $L(r) = e^{-H(r)}$ — fixed for the whole run and **temperature-independent**: NS orders and retires configurations by $H$ alone, so no $\beta$ ever appears while sampling. This is *not* the canonical-ensemble likelihood $e^{-\beta H}$; that only appears in postprocessing (see $\beta$ below). $L$ is what defines the prior-mass transform $X(L^\star)$. |
 | $U(r)$ | Bare potential energy (no $PV$ or $-\mu N$ term). What backends return. |
-| $Z$ | Evidence — the integral $\int L(r)\,\pi(r)\,\mathrm d r$. NS estimates this. |
+| $\beta$ | Inverse temperature, $\beta = 1/(k_B T)$. Used **only in postprocessing** — `partition_function`, `heat_capacity`, `free_energy` in {mod}`jaxrens.postprocess.thermodynamics` reweight the recorded $H_i$ as $Z(\beta) = \sum_i w_i\,e^{-\beta H_i}$ over the dead+live ensemble. The NS run itself never sees $\beta$; it is swept over afterwards, on data collected once. |
+| $Z$ | Evidence — the integral $\int L(r)\,\pi(r)\,\mathrm d r$, i.e. $Z(\beta = 1)$. NS estimates this directly; $Z(\beta)$ at other $\beta$ is the postprocessing reweighting above. |
 | $X$ | Prior mass in the constrained-likelihood transform: $X(L^\star) = \int_{L > L^\star} \pi\,\mathrm d r$. Maps the multi-D integral onto $X \in [0, 1]$. |
 | $L_i^\star$ | Likelihood threshold at iteration $i$. Equals the *worst* live walker's likelihood when the walker was retired. |
-| $E_{\max}$ | Hamiltonian threshold equivalent to $L_i^\star$. The constraint MCMC enforces is $H(r) < E_{\max}$. |
+| $E_{\max}$ | $H$-threshold equivalent to $L_i^\star$ (since $L = e^{-H}$ is monotonic in $-H$). The constraint MCMC enforces is $H(r) < E_{\max}$. |
 | $X_i$ | Prior mass remaining at iteration $i$. Expectation $X_i \approx \exp(-i / N)$ for $K = N$ live walkers and $n_\text{cull} = 1$. |
 | $w_i$ | Trapezoid quadrature weight: $w_i = \tfrac{1}{2}(X_{i-1} - X_{i+1})$. |
 | $i$ | Outer-loop iteration index (Python). Used in `manager.fires(i)` and similar. |

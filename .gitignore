@@ -15,7 +15,7 @@ build/
 !tests/fixtures/**/*.extxyz
 !tests/fixtures/**/*.nqx
 .venv/
-experiments/*
+experiments
 # Allowlist the lj8_npt postprocessing fixture used by
 # tests/postprocess/test_monitor.py::TestSmokeRealRun.
 !tests/data/**/*.h5

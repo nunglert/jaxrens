@@ -27,7 +27,8 @@ dependencies = [
 [project.optional-dependencies]
 neuralil = ["neuralil @ git+https://github.com/nunglert/neuralil-jaxrens.git@jaxrens"]
 mace = [
-    "mace-jax[jax-cuda12,torch-cuda12] @ git+https://github.com/nunglert/mace-jax.git@fixes"
+    "mace-jax[jax-cuda12,torch-cuda12] @ git+https://github.com/ACEsuit/mace-jax@main"
+    # "mace-jax[jax-cuda12,torch-cuda12] @ git+https://github.com/nunglert/mace-jax.git@fixes"
 ]
 nequix = ["nequix @ git+https://github.com/atomicarchitects/nequix.git@main"]
 jaxmd = ["jax-md>=0.2.28"]
