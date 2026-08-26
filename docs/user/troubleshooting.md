@@ -20,7 +20,7 @@ The fix is therefore to **narrow that batch**.
 |---|---|---|---|
 | Burn-in / initial walk | **`walker_batch_size`** | `init.initial_walk` | Chunks the per-walker vmap via `lax.map` instead of vmapping all walkers at once. Set to e.g. `8` or `4`; smaller = less memory, slightly slower. `None` (default) vmaps everything. |
 | NS main loop | **`n_extra`** | `run` | Extra walkers cloned + walked each iteration. Each one is a full backend evaluation held in memory — drop it toward `0`. |
-| Step-size adaptation (bisection) | **`trial_batch_size`** | `adaptation` | Each bisection round vmaps a batch of **trial** walkers; this chunks that vmap via `lax.map` (the adaptation analog of `walker_batch_size`). `None` (default) vmaps all trials at once. Alternatively lower **`adjust_n_samples`** (trial walkers per round, default `50`) to shrink the batch itself.
+| Step-size adaptation (bisection) | **`trial_batch_size`** | `adaptation` | Each bisection round vmaps a batch of **trial** walkers; this chunks that vmap via `lax.map` (the adaptation analog of `walker_batch_size`). Defaults to `8`; lower it further if adaptation is where you OOM, or set `None` to vmap all trials at once. Alternatively lower **`adjust_n_samples`** (trial walkers per round, default `50`) to shrink the batch itself.
 
 ## Neighbor-buffer overflow
 
@@ -69,6 +69,25 @@ large can itself jam walkers against an artificial wall (they get stuck at
 `r_core_cut` instead of exploring), which can masquerade as a freezing
 transition — so start near a real close-contact distance and only raise it if
 collapse persists.
+
+**The other tool for the same failure** is a hard minimum-distance
+constraint, which rejects any proposal bringing two atoms closer than a floor
+you set instead of penalising it energetically:
+
+```yaml
+constraints:
+  - type: minimum_distance
+    d_min: 0.8            # uniform floor (Angstrom)
+```
+
+`d_min` also accepts per-species-pair floors (`{default: 1.0, Si-Si: 2.0}`).
+The two approaches differ in kind: the soft-core term deforms the potential
+everywhere below `r_core_cut`, so it changes the sampled distribution; a
+constraint restricts the prior instead, exactly like the likelihood
+threshold, and costs nothing where it isn't violated. Reach for the
+constraint when you want a hard floor without touching the energetics, and
+the soft core when the model itself needs repairing at short range. See
+{doc}`/reference/config` for the full constraint surface.
 
 ## Still stuck?
 

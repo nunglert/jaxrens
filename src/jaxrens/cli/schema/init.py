@@ -43,12 +43,54 @@ class InitialWalkSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    n_walks: int = 0
-    walklength: int = 100
-    adjust_interval: int = 10
-    emax_offset_per_atom: float = 0.0
-    only: str | None = None
-    write_initial_walkers: bool = False
+    n_walks: int = Field(
+        default=0,
+        description=(
+            "Number of fixed-``E_max`` burn-in walks run between "
+            "initialisation and nested sampling, to decorrelate the live "
+            "population from grid or rejection-sampling artefacts.  ``0`` "
+            "(default) skips burn-in; it is always skipped on restart."
+        ),
+    )
+    walklength: int = Field(
+        default=100,
+        description=(
+            "MCMC steps per burn-in walk.  Together with ``n_walks`` this "
+            "sets the total burn-in cost."
+        ),
+    )
+    adjust_interval: int = Field(
+        default=10,
+        description=(
+            "Step-size adjustment cadence *within* burn-in, in walk "
+            "steps.  Independent of ``adaptation.adjust_interval``, which "
+            "governs the sampling run."
+        ),
+    )
+    emax_offset_per_atom: float = Field(
+        default=0.0,
+        description=(
+            "Raise the fixed burn-in energy ceiling by this much per atom "
+            "above the initial maximum walker energy.  A small positive "
+            "offset gives the burn-in room to move when the initial "
+            "population sits right at the ceiling."
+        ),
+    )
+    only: str | None = Field(
+        default=None,
+        description=(
+            "Restrict burn-in to a single named move.  **Deferred** — "
+            "raises ``NotImplementedError`` at run time."
+        ),
+    )
+    write_initial_walkers: bool = Field(
+        default=False,
+        description=(
+            "Dump the post-burn-in walker population before sampling "
+            "starts.  **Deferred** — accepted but not yet consumed by the "
+            "runtime."
+        ),
+    )
     walker_batch_size: int | None = Field(
         default=None,
         description=(
@@ -165,25 +207,137 @@ class InitSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     # -- Source of atoms (mutually exclusive) --
-    start_species: str | None = None
-    start_config_file: Path | None = None
-    start_walker_set: Path | None = None
-    restart_file: Path | None = None
+    start_species: str | None = Field(
+        default=None,
+        description=(
+            "Build the system from a composition string of the form "
+            '``"Z N[, Z N]*"``, where ``Z`` is an atomic number and '
+            '``N`` a count — e.g. ``"18 8"`` for 8 argon atoms, '
+            '``"1 6, 3 6"`` for 6 H plus 6 Li.  Positions and cell are '
+            "then generated per the randomisation settings below."
+        ),
+    )
+    start_config_file: Path | None = Field(
+        default=None,
+        description=(
+            "Read one structure from this file (any ASE-readable format) "
+            "and replicate it across all walkers."
+        ),
+    )
+    start_walker_set: Path | None = Field(
+        default=None,
+        description=(
+            "Read a full, pre-built walker population from this file — one "
+            "frame per walker.  The frame count must match ``run.n_live`` "
+            "(plus ``run.n_extra``)."
+        ),
+    )
+    restart_file: Path | None = Field(
+        default=None,
+        description=(
+            "Resume from this checkpoint.  Restores walkers, iteration "
+            "counter, and log-evidence; burn-in is skipped and the "
+            "compatibility validator checks the config against what the "
+            "checkpoint was written with."
+        ),
+    )
 
     # -- Energy ceiling --
-    start_energy_ceiling_per_atom: float = 1e9
+    start_energy_ceiling_per_atom: float = Field(
+        default=1e9,
+        description=(
+            "Reject initial configurations whose energy per atom exceeds "
+            "this value, in the backend's energy units.  Guards against "
+            "seeding the population with overlapping atoms.  The default "
+            "is effectively no ceiling; lower it when initialisation keeps "
+            "producing unphysical starts."
+        ),
+    )
 
     # -- Randomization --
-    random_initialise_pos: bool = True
-    random_initialise_cell: bool = True
-    pos_randomization_mode: Literal["grid", "uniform"] = "grid"
-    grid_distance: float = 1.5
-    init_distance_criterion: float = 1.0
-    random_init_max_n_tries: int = 100
-    pos_autoscale_cells: bool = False
+    random_initialise_pos: bool = Field(
+        default=True,
+        description=(
+            "Draw fresh random positions for every walker.  Set ``false`` "
+            "to keep the positions exactly as read from "
+            "``start_config_file`` / ``start_walker_set``."
+        ),
+    )
+    random_initialise_cell: bool = Field(
+        default=True,
+        description=(
+            "Draw a fresh random cell for every walker, within the "
+            "``cell:`` volume and aspect-ratio bounds.  Set ``false`` to "
+            "keep the input cell."
+        ),
+    )
+    cell_randomization_mode: Literal["shape_walk", "linear_1d"] = Field(
+        default="shape_walk",
+        description=(
+            "How random cells are drawn.  ``shape_walk`` (default) runs a "
+            "shear/stretch random walk per walker, giving general triclinic "
+            "cells.  ``linear_1d`` instead draws a box length ``a`` per "
+            "walker and builds ``diag(a, 1, 1)``, the embedding the "
+            "``rens_toy`` backend needs so that ``det(cell) == a``; the draw "
+            "spans ``cell.initial_min_volume_per_atom`` (falling back to "
+            "``min_volume_per_atom``) up to ``cell.max_volume_per_atom``, "
+            "which is how the RENS paper biases its initial population "
+            "toward the high-enthalpy end."
+        ),
+    )
+    pos_randomization_mode: Literal["grid", "uniform"] = Field(
+        default="grid",
+        description=(
+            "How random positions are drawn.  ``grid`` (default) places "
+            "atoms on a jittered lattice with spacing ``grid_distance``, "
+            "which reliably avoids overlaps; ``uniform`` draws uniformly "
+            "in the cell and relies on rejection against "
+            "``init_distance_criterion``."
+        ),
+    )
+    grid_distance: float = Field(
+        default=1.5,
+        description=(
+            "Lattice spacing for ``pos_randomization_mode: grid`` "
+            "(Angstrom).  Must be large enough that the grid fits the "
+            "atoms inside the initial cell."
+        ),
+    )
+    init_distance_criterion: float = Field(
+        default=1.0,
+        description=(
+            "Minimum interatomic distance a drawn configuration must "
+            "satisfy to be accepted (Angstrom).  Distinct from the "
+            "``constraints:`` section, which is enforced for the whole "
+            "run rather than only at initialisation."
+        ),
+    )
+    random_init_max_n_tries: int = Field(
+        default=100,
+        description=(
+            "Rejection-sampling attempts per walker before initialisation "
+            "gives up and raises.  Raise it, loosen "
+            "``init_distance_criterion``, or start at a larger volume if "
+            "you hit the limit."
+        ),
+    )
+    pos_autoscale_cells: bool = Field(
+        default=False,
+        description=(
+            "Rescale each walker's cell so the drawn positions fit inside "
+            "it, instead of rejecting draws that do not fit.  Helpful for "
+            "dense compositions where the grid barely fits."
+        ),
+    )
 
     # -- Burn-in (active when n_walks > 0; skipped for restart_file) --
-    initial_walk: InitialWalkSpec = Field(default_factory=InitialWalkSpec)
+    initial_walk: InitialWalkSpec = Field(
+        default_factory=InitialWalkSpec,
+        description=(
+            "Fixed-``E_max`` burn-in settings, active when "
+            "``initial_walk.n_walks > 0``."
+        ),
+    )
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> "InitSpec":

@@ -43,28 +43,32 @@ logger = logging.getLogger(__name__)
 
 @runtime_checkable
 class NSCallback(Protocol):
-    """Protocol for NS loop callbacks.
+    """The hooks an NS loop callback may implement.
 
-    Called at the outer loop boundary (Python level, outside JIT/pmap) by
-    ``_dispatch_callbacks`` below.  ``@runtime_checkable`` is required, not
-    decorative: ``jaxrens.sampling`` is instrumented by jaxtyping/beartype
-    (see ``--jaxtyping-packages`` in pyproject.toml), which isinstance-checks
-    every annotation, and a plain Protocol raises at decoration time.  Note it
-    checks method *presence* only, which is exactly what the dispatcher's
-    ``hasattr`` guards already assume.  Implementations live in
-    ``jaxrens.cli.monitor``.  Every method is optional in practice — the
-    dispatcher checks with ``hasattr`` before calling.
+    Called at the outer loop boundary (Python level, outside JIT/pmap):
+    ``on_start`` once after init, ``on_iteration`` per iteration via
+    ``_dispatch_callbacks`` below, and ``on_finish`` once at the end.
+    Implementations live in ``jaxrens.cli.monitor``.
+
+    **Every hook is optional.**  Each dispatch site guards with ``hasattr``,
+    so a callback implements whichever subset it needs — most implement
+    ``on_iteration`` and ``on_finish`` only.  That is why the runtime
+    signatures below annotate ``callbacks`` as ``list[Any]`` rather than
+    ``list[NSCallback]``: ``jaxrens.sampling`` is instrumented by
+    jaxtyping/beartype (see ``--jaxtyping-packages`` in pyproject.toml),
+    which isinstance-checks every annotation, and ``isinstance`` against a
+    Protocol requires *all* members to be present.  A Protocol cannot express
+    optional members, so annotating with this one rejected every callback in
+    the codebase — see the note in ``_dispatch_callbacks``.
+
+    Use it for explicit opt-in checks and for static type checkers; treat it
+    as the documented shape, not as an enforced one.
     """
 
     def on_start(self, ns_state: Any, start_info: dict | None = None) -> None:
         ...
 
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
-        ...
-
-    def on_dead_point(
-        self, iteration: int, dead_walker: Any, energy: float
-    ) -> None:
         ...
 
     def on_finish(self, ns_state: Any) -> None:
@@ -278,7 +282,11 @@ def _scalarize_sharded_info(info: dict[str, Any]) -> dict[str, Any]:
 
 
 def _dispatch_callbacks(
-    callbacks: list[NSCallback],
+    # Annotated ``list[Any]``, not ``list[NSCallback]``: beartype turns the
+    # latter into an isinstance check against the Protocol, which demands
+    # every hook be present.  Callbacks implement whichever subset they need,
+    # so that check rejects all of them.  See ``NSCallback``.
+    callbacks: list[Any],
     iteration: int,
     ns_state: NSState,
     info: dict[str, Any],
@@ -321,7 +329,7 @@ def _run_loop(
     n_mcmc_steps: int,
     n_extra: int,
     termination_criteria: list,
-    callbacks: list[NSCallback],
+    callbacks: list[Any],
     n_moves: int,
     move_descriptors: list[MoveKernel] | None,
     rng_key: Key[Array, "*B"],

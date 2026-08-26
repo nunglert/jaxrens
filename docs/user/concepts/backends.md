@@ -17,25 +17,43 @@ flowchart LR
     B --> H["H = U + PV − μ·N<br/>(ensemble-corrected)"]
 ```
 
-Every backend — LJ, MACE-JAX, NeuralIL, and the toy potentials —
-exposes the same call signature:
+Every backend — LJ, MACE-JAX, NeuralIL, Nequix, jax-md and the toy
+potentials — exposes the same call signature:
 
 ```python
-energy, neighbor_count, overflow = backend(
+result = backend(
     positions,        # (A, 3)
     species,          # (A,)   z-table indices
     cell,             # (3, 3) lattice vectors as rows
     max_neighbors,    # int    MLIP-side buffer size
     ensemble_params,  # dict   {"pressure": ..., "mu": ...} or None
 )
+result.energy              # scalar per walker — the only universal field
+result.max_neighbor_count  # largest neighbor count seen this call
+result.overflow            # did that exceed the max_neighbors buffer?
 ```
 
-Returning a `neighbor_count` and `overflow` flag alongside the
-energy is how the NS outer loop handles MLIP neighbor-buffer
-overflow: when a move pushes atoms closer together than
-`max_neighbors` can hold, the backend signals the overflow, the
-loop retries at a bigger bucket, and JAX reuses the JIT'd kernel
-compiled for that bucket size.
+The return value is a
+{class}`~jaxrens.backends.base.BackendResult` — a `NamedTuple`, so it
+threads through `jit` / `vmap` / `scan` as a pytree unchanged.  Only
+`energy` is universally meaningful; the rest are backend-specific and
+carry sentinel defaults (`0` / `False` / `None`) where a backend cannot
+produce them.  A backend must return the **same field set on every
+call**: `None`-versus-array is part of the pytree treedef, and a
+structure that changes between calls would break `lax.scan` /
+`lax.cond`.
+
+Carrying `max_neighbor_count` and `overflow` alongside the energy is
+how the NS outer loop handles MLIP neighbor-buffer overflow: when a
+move pushes atoms closer together than `max_neighbors` can hold, the
+backend signals the overflow, the loop retries at a bigger bucket, and
+JAX reuses the JIT'd kernel compiled for that bucket size.  Backends
+without a neighbor list (LJ, the toy potentials, all-pairs jax-md)
+leave both at their sentinels.
+
+`forces` is populated only on the `energy_and_forces` path, not on the
+energy-only `__call__` above; `energy_members` / `forces_members` are
+reserved for active-learning uncertainty and unpopulated for now.
 
 Built-in backends:
 
@@ -44,6 +62,8 @@ Built-in backends:
 | `lj` | {class}`jaxrens.backends.lj.LJBackend` | periodic or finite, static cutoff |
 | `mace` | {class}`jaxrens.backends.mace.MACEBackend` | mace-jax, supercell neighbor expansion, pins float32 globally (see {doc}`../../dev/install`) |
 | `neuralil` | `jaxrens.backends.neuralil.NeuralILBackend` | bucketed `max_neighbors_list` JIT cache (lazy per-bucket compile) |
+| `nequix` | `jaxrens.backends.nequix.NequixBackend` | local `.nqx` checkpoint or a bundled model name |
+| `jaxmd` | `jaxrens.backends.jaxmd.JaxMDBackend` | Tersoff / EAM, all-pairs — ignores `max_neighbors_list` |
 | `harmonic`, `double_well`, `gaussian_mixture` | `jaxrens.backends.toy` | analytical test potentials |
 
 ## The neighbor problem

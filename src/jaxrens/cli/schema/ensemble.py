@@ -53,16 +53,66 @@ class BaseEnsembleSpec(BaseModel):
 
 
 class NVTEnsembleSpec(BaseEnsembleSpec):
-    type: Literal["nvt"] = "nvt"
+    """Canonical NVT — fixed cell, no ensemble correction (``H = U``).
+
+    The default when ``ensemble:`` is omitted entirely.  Drop the cell moves
+    (``volume`` / ``shear`` / ``stretch``) from ``moves:`` here: without a
+    ``P*V`` term nothing balances a volume change, and the cell will drift to
+    whichever bound the prior allows.
+
+    ::
+
+        ensemble:
+          type: nvt
+    """
+
+    type: Literal["nvt"] = Field(
+        default="nvt", description="Discriminator selecting this ensemble."
+    )
 
     def to_ensemble_params(self, *, cohort_index: int = 0) -> dict:
         return {}
 
 
 class NPTEnsembleSpec(BaseEnsembleSpec):
-    type: Literal["npt"] = "npt"
-    pressure: float | list[float]
-    pressure_units: Literal["gpa", "eva3"] = "eva3"
+    """Isothermal-isobaric NPT — the backend adds ``P*V`` to the energy.
+
+    A **list** of pressures is what fans the run out across replicas, one per
+    entry — the usual way to set up a pressure-RENS ladder alongside
+    ``inter_re``.
+
+    ::
+
+        ensemble:
+          type: npt
+          pressure: 0.1
+          pressure_units: eva3
+
+    ::
+
+        ensemble:
+          type: npt
+          pressure: [0.01, 0.1, 1.0, 10.0]   # 4 replicas
+          pressure_units: gpa
+    """
+
+    type: Literal["npt"] = Field(
+        default="npt", description="Discriminator selecting this ensemble."
+    )
+    pressure: float | list[float] = Field(
+        description=(
+            "Applied pressure, in ``pressure_units``.  A **list** fans the "
+            "run out across replicas — one replica per entry, at that "
+            "pressure — which is how a pressure-RENS ladder is declared."
+        ),
+    )
+    pressure_units: Literal["gpa", "eva3"] = Field(
+        default="eva3",
+        description=(
+            "Units of ``pressure``: ``eva3`` (eV/Angstrom^3, the internal "
+            "unit, default) or ``gpa``, converted at parse time."
+        ),
+    )
 
     def _pressure_list(self) -> list[float]:
         p = self.pressure
@@ -97,12 +147,56 @@ class SemiGrandEnsembleSpec(BaseEnsembleSpec):
     ``pressure`` is optional (default 0 → no ``P·V`` term) and may itself be a
     list for a pressure replica axis.  When both are lists their lengths must
     match; a scalar/single-vector broadcasts across the other's replicas.
+
+    The composition fluctuates here, so pair it with a move that can change
+    species — ``species_swap`` conserves composition, ``alchemical_morph``
+    does not.
+
+    ::
+
+        ensemble:
+          type: semi_grand
+          chemical_potentials: [0.0, 0.5]    # one vector, 2 species
+          pressure: 0.0
+
+    ::
+
+        ensemble:
+          type: semi_grand
+          chemical_potentials:               # 3 replicas
+            - [0.0, 0.0]
+            - [0.0, 0.5]
+            - [0.0, 1.0]
     """
 
-    type: Literal["semi_grand"] = "semi_grand"
-    chemical_potentials: list[float] | list[list[float]]
-    pressure: float | list[float] = 0.0
-    pressure_units: Literal["gpa", "eva3"] = "eva3"
+    type: Literal["semi_grand"] = Field(
+        default="semi_grand",
+        description="Discriminator selecting this ensemble.",
+    )
+    chemical_potentials: list[float] | list[list[float]] = Field(
+        description=(
+            "Per-species chemical potentials ``[mu_0, mu_1, ...]`` (eV), "
+            "one entry per species in type-code order.  Pass a **list of "
+            "vectors** to fan out across replicas, one mu-vector each."
+        ),
+    )
+    pressure: float | list[float] = Field(
+        default=0.0,
+        description=(
+            "Applied pressure in ``pressure_units``; ``0`` (default) drops "
+            "the ``P*V`` term.  May itself be a list for a pressure "
+            "replica axis — when both this and ``chemical_potentials`` are "
+            "lists their lengths must match, otherwise the scalar "
+            "broadcasts."
+        ),
+    )
+    pressure_units: Literal["gpa", "eva3"] = Field(
+        default="eva3",
+        description=(
+            "Units of ``pressure``: ``eva3`` (eV/Angstrom^3, default) or "
+            "``gpa``."
+        ),
+    )
 
     def _mu_list(self) -> list[list[float]]:
         """Normalise ``chemical_potentials`` to a list of μ-vectors."""

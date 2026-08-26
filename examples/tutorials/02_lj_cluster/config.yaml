@@ -1,0 +1,68 @@
+# 8-atom Lennard-Jones cluster in vacuum, NVT.
+#
+# The same 8 atoms as 03_lj_npt, with the cell dropped: no periodic images,
+# no pressure, no volume/shear/stretch moves. What is left is the classic
+# nested-sampling cluster problem, and its heat capacity -- computed with
+# `jaxrens analyze` -- is the point of this tutorial.
+#
+# Finishes in well under a minute even on a CPU.
+#
+# Run it with:
+#     jaxrens validate -c config.yaml --full
+#     jaxrens run -c config.yaml
+
+run:
+  n_live: 128
+  max_iterations: 4000
+  n_mcmc_steps: 10     # decorrelation per replacement walker
+  # Walkers MCMC-walked in parallel each iteration is 1 + n_extra, so this
+  # is the batch width the GPU actually sees. Left at 0 only one chain
+  # runs and the device idles; it does not change the population size.
+  n_extra: 15
+  seed: 42
+
+backend:
+  type: lj
+  epsilon: 1.0
+  sigma: 1.0
+  cutoff: 2.5
+  periodic: false       # a cluster in vacuum -- no cell, no images
+
+ensemble:
+  type: nvt             # no cell, so no P*V term to speak of
+
+moves:
+  # One move is the whole sampler: no cell means no volume / shear /
+  # stretch, since there is nothing for them to act on.
+  - {type: gmc, n_reflect: 6, step_size: 0.1, weight: 1.0}
+
+termination:
+  - type: prior_mass
+    threshold: 1.0e-3
+
+adaptation:
+  full_auto: true
+  adjust_interval: 50
+  defaults: {min_rate: 0.3, max_rate: 0.5, adjust_factor: 1.5, step_size_max: 0.5}
+
+init:
+  start_species: "18 8"           # 8 argon atoms
+  random_initialise_pos: true
+  pos_randomization_mode: grid
+  grid_distance: 1.0
+  random_initialise_cell: false
+  initial_walk: {n_walks: 3, walklength: 20, adjust_interval: 1, emax_offset_per_atom: 1.0}
+
+cell:
+  # Not sampled: it only bounds where the initial positions are drawn from.
+  max_volume_per_atom: 24.0
+  min_volume_per_atom: 16.0
+  min_aspect_ratio: 0.6
+
+output:
+  format: extxyz
+  working_dir: ./output
+  out_file_prefix: lj8cluster
+  info_interval: 200
+  traj_interval: 1                # every dead point -- the thermodynamics need them
+  checkpoint_interval: 4000

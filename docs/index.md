@@ -22,6 +22,7 @@ tutorials/index
 reference/index
 reference/cli
 reference/config
+reference/files
 reference/notation
 ```
 

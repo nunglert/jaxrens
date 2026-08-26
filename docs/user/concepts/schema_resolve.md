@@ -57,8 +57,10 @@ flowchart TB
 Two asymmetries worth knowing:
 
 - **Schema doesn't import JAX.** `jaxrens validate --parse-only -c
-  config.yaml` runs pydantic-only and is cheap; the full `validate`
-  (without `--parse-only`) runs the resolver and may build a backend.
+  config.yaml` runs pydantic-only. The resolver itself splits in two:
+  `validate` (the default) runs only the *plan* phase — topology,
+  divisibility, path existence, geometry bounds — while
+  `validate --full` goes on to build the backend and place walkers.
 - **Core doesn't import pydantic.** `run_ns(positions, types, …)`
   takes arrays and a `NSConfig` dataclass. Tests in
   `tests/test_nested_sampling.py` never touch the schema layer, so

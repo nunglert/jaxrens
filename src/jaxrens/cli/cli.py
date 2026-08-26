@@ -37,11 +37,12 @@ logger = logging.getLogger(__name__)
 
 # Wordmark rendered with figlet's "small" font.  Kept as a literal so the
 # --help / --version paths stay dependency-free and JAX-free.
-_WORDMARK = r"""  _
- (_)__ ___ ___ _ ___ _ _  ___
- | / _` \ \ / '_/ -_) ' \(_-<
-_/ \__,_/_\_\_| \___|_||_/__/
-|__/"""
+_WORDMARK = r"""                                         
+    __ _____ __ __ _____ _____ _____ _____ 
+ __|  |  _  |  |  | __  |   __|   | |   __|
+|  |  |     |-   -|    -|   __| | | |__   |
+|_____|__|__|__|__|__|__|_____|_|___|_____|
+"""
 
 _TAGLINE = "JAX-based nested sampling for atomistic systems"
 
@@ -492,6 +493,46 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if not args.full:
+        # Default tier: every check that needs neither an energy model nor a
+        # walker population.  The full resolve costs ~15 s on the toy LJ
+        # example and minutes on an MLIP, almost all of it building a backend
+        # and JIT-compiling an energy kernel that validation never calls.
+        from jaxrens.cli.resolve import resolve_plan
+
+        plan = resolve_plan(root)
+        n_moves = len(plan.root.moves)
+        move_types = ", ".join(m.move_type for m in plan.root.moves)
+        backend_line = plan.root.backend.backend_type
+        if plan.n_atoms is not None:
+            backend_line += f", n_atoms={plan.n_atoms}"
+        print(
+            "\n".join(
+                [
+                    _ok_header("configuration plan valid"),
+                    _kv("topology", plan.topology),
+                    _kv(
+                        "run",
+                        f"n_live={plan.root.run.n_live}, "
+                        f"max_iterations={plan.root.run.max_iterations}",
+                    ),
+                    _kv("moves", f"{n_moves} move(s) [{move_types}]"),
+                    _kv("backend", backend_line),
+                    _kv(
+                        "output",
+                        f"format={plan.root.output.format}, "
+                        f"prefix={plan.root.output.out_file_prefix}",
+                    ),
+                    _kv(
+                        "skipped",
+                        "backend build, walker placement, initial energies "
+                        "— rerun with --full to check those",
+                    ),
+                ]
+            )
+        )
+        return 0
+
     from jaxrens.cli.resolve import resolve
     from jaxrens.sampling.batch_descriptor import ShardedSingleRun, SingleRun
 
@@ -578,6 +619,46 @@ def _cmd_plot(args: argparse.Namespace) -> int:
         print(f"jaxrens plot: file not found: {exc}", file=sys.stderr)
         return 2
     print(f"Wrote {written}")
+    return 0
+
+
+def _cmd_analyze(args: argparse.Namespace) -> int:
+    """Write a thermodynamic observable (Cv / log Z / F) vs temperature.
+
+    Unlike ``plot``, dispatches on a checkpoint file rather than a single
+    self-contained artefact: the sibling ``.energies`` log in the same
+    directory is loaded too, via ``Monitor.from_directory``.  ``--plot``
+    additionally renders a PNG of the same data.
+    """
+    from pathlib import Path
+
+    from jaxrens.cli.analyze import analyze_file
+
+    in_path = Path(args.file)
+    out_path = Path(args.output) if args.output is not None else None
+    plot_path = Path(args.plot_output) if args.plot_output is not None else None
+    try:
+        data_path, png_path = analyze_file(
+            in_path,
+            observable=args.observable,
+            t_min=args.t_min,
+            t_max=args.t_max,
+            n_t=args.n_t,
+            k_b=args.k_b,
+            fmt=args.format,
+            output_path=out_path,
+            plot=args.plot,
+            plot_path=plot_path,
+        )
+    except ValueError as exc:
+        print(f"jaxrens analyze: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as exc:
+        print(f"jaxrens analyze: file not found: {exc}", file=sys.stderr)
+        return 2
+    print(f"Wrote {data_path}")
+    if png_path is not None:
+        print(f"Wrote {png_path}")
     return 0
 
 
@@ -674,9 +755,21 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Stop after pydantic schema validation; skip the resolver "
-            "(no structure file read, no backend build, no walker placement). "
-            "Fast — for catching typos / wrong field names without paying "
-            "for heavy-backend initialization."
+            "entirely. The cheapest tier — catches typos and wrong field "
+            "names and nothing else."
+        ),
+    )
+    p_val.add_argument(
+        "--full",
+        action="store_true",
+        default=False,
+        help=(
+            "Also build the backend, place the walker population and "
+            "evaluate its initial energies — i.e. rehearse startup. Proves "
+            "the model file loads and that a valid initial configuration "
+            "exists, at the cost of seconds (toy backends) to minutes "
+            "(MLIPs). Without it, validation stops at the resolver plan: "
+            "topology, divisibility, path existence, geometry bounds."
         ),
     )
 
@@ -709,6 +802,102 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="OUTPUT.png",
         help="Output PNG path.  Default: sibling <stem>.<kind>.png.",
+    )
+
+    # -- analyze --
+    p_analyze = sub.add_parser(
+        "analyze",
+        help=(
+            "Write a thermodynamic observable (heat capacity, log partition "
+            "function, or free energy) vs temperature, as CSV or JSON, from "
+            "a run's checkpoint."
+        ),
+    )
+    p_analyze.add_argument(
+        "file",
+        metavar="CHECKPOINT",
+        help=(
+            "<prefix>.checkpoint.h5 or <prefix>.final.checkpoint.h5.  The "
+            "sibling <prefix>.energies file in the same directory supplies "
+            "the dead-point energies."
+        ),
+    )
+    p_analyze.add_argument(
+        "--observable",
+        choices=["heat_capacity", "partition_function", "free_energy"],
+        default="heat_capacity",
+        help="Which quantity to compute vs T (default: heat_capacity).",
+    )
+    p_analyze.add_argument(
+        "--t-min",
+        type=float,
+        required=True,
+        metavar="T",
+        help=(
+            "Lower end of the temperature sweep, in the run's energy units "
+            "divided by --k-b.  No default: the right scale depends on the "
+            "backend."
+        ),
+    )
+    p_analyze.add_argument(
+        "--t-max",
+        type=float,
+        required=True,
+        metavar="T",
+        help="Upper end of the temperature sweep.",
+    )
+    p_analyze.add_argument(
+        "--n-t",
+        type=int,
+        default=200,
+        metavar="N",
+        help="Number of temperature points (default: 200).",
+    )
+    p_analyze.add_argument(
+        "--k-b",
+        type=float,
+        default=1.0,
+        metavar="K_B",
+        help=(
+            "Boltzmann constant in the run's energy units per unit of T, "
+            "e.g. 8.617e-5 (eV/K) if energies are in eV and T should read "
+            "in Kelvin.  Default 1.0 (reduced units)."
+        ),
+    )
+    p_analyze.add_argument(
+        "--format",
+        choices=["csv", "json"],
+        default="csv",
+        help=(
+            "Data format: csv (default, fixed-width aligned columns; "
+            "scalar observables only) or json (nests any shape, "
+            "self-describing)."
+        ),
+    )
+    p_analyze.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        metavar="OUTPUT",
+        help=(
+            "Output data-file path.  Default: sibling "
+            "<prefix>.<observable>.{csv,json}, matching --format."
+        ),
+    )
+    p_analyze.add_argument(
+        "--plot",
+        action="store_true",
+        default=False,
+        help="Also render a PNG of the same data.",
+    )
+    p_analyze.add_argument(
+        "--plot-output",
+        default=None,
+        metavar="PLOT.png",
+        help=(
+            "PNG path when --plot is set.  Default: sibling "
+            "<prefix>.<observable>.png."
+        ),
     )
 
     return parser
@@ -840,6 +1029,7 @@ def main(argv: list[str] | None = None) -> None:
         "validate": _cmd_validate,
         "dump-schema": _cmd_dump_schema,
         "plot": _cmd_plot,
+        "analyze": _cmd_analyze,
     }
     from jaxrens.cli.style import style
 
@@ -855,6 +1045,9 @@ def main(argv: list[str] | None = None) -> None:
         _err(_format_validation_error(exc, cfg))
         sys.exit(2)
     except FileNotFoundError as exc:
+        _err(f"jaxrens: {exc}")
+        sys.exit(2)
+    except PermissionError as exc:
         _err(f"jaxrens: {exc}")
         sys.exit(2)
     except yaml.YAMLError as exc:

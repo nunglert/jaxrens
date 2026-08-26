@@ -6,7 +6,12 @@ import importlib.metadata
 import os
 import sys
 
+import sphinx.util.logging
+
 sys.path.insert(0, os.path.abspath("../src"))
+# Local Sphinx extensions (docs/_ext/): yaml_schema renders the config
+# specs as YAML-keyed tables for the configuration guide.
+sys.path.insert(0, os.path.abspath("_ext"))
 
 # nbsphinx calls `pandoc` via subprocess; the pypandoc_binary wheel
 # installs the binary inside site-packages and doesn't add it to PATH,
@@ -43,6 +48,7 @@ extensions = (
     "sphinx_design",
     "sphinx_copybutton",
     "sphinxcontrib.mermaid",
+    "yaml_schema",
 )
 
 mermaid_output_format = "raw"
@@ -60,7 +66,16 @@ mermaid_include_elk = True
 mermaid_elk_version = "0.2.0"
 
 templates_path = ["_templates"]
-exclude_patterns = ["Thumbs.db", ".DS_Store", "_build", "test*.py"]
+# TODO.md is a working scratch list that lives beside the docs but is not
+# one of them -- excluded so it stops raising "not included in any
+# toctree" on every build.
+exclude_patterns = [
+    "Thumbs.db",
+    ".DS_Store",
+    "_build",
+    "test*.py",
+    "TODO.md",
+]
 
 source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
 
@@ -120,12 +135,14 @@ autodoc_pydantic_settings_show_validator_summary = False
 autodoc_pydantic_settings_member_order = "bysource"
 autodoc_pydantic_field_list_validators = False
 autodoc_pydantic_field_show_constraints = False
-# Suppress the prose ``Field(description=...)`` text in the config reference so
-# the page stays a scannable overview (name · type · default · constraints).
-# The schema fields carry no attribute docstrings, so the "docstring" policy
-# renders no body. Descriptions still live in the schema and ``dump-schema``
-# JSON; prose explanations live in the concept pages.
-autodoc_pydantic_field_doc_policy = "docstring"
+# Render each field's ``Field(description=...)`` as its body text. Every
+# schema field carries one (enforced by tests/cli/test_schema.py), and the
+# same string is what ``jaxrens dump-schema`` emits and what pydantic quotes
+# in validation errors — so the docs, the JSON schema, and the error messages
+# all read from one source. The previous "docstring" policy rendered nothing,
+# because the specs use ``Field(description=...)`` rather than attribute
+# docstrings, which is why this page used to be a bare type dump.
+autodoc_pydantic_field_doc_policy = "description"
 
 
 # Notebook execution toggle. "auto" runs every tutorial at build time
@@ -147,7 +164,7 @@ python_use_unqualified_type_names = True
 
 language = "en"
 html_static_path = ["_static"]
-html_css_files: list[str] = ["mermaid-zoom.css"]
+html_css_files: list[str] = ["mermaid-zoom.css", "yaml-schema.css"]
 html_js_files: list[str] = ["mermaid-zoom.js"]
 
 html_theme = "furo"
@@ -226,8 +243,48 @@ def _clean_autodoc_docstring(app, what, name, obj, options, lines):
             lines[i] = line.replace("*", "\\*")
 
 
+# ---------------------------------------------------------------------------
+# Package treemap regeneration (see setup())
+# ---------------------------------------------------------------------------
+
+
+def _regen_treemap(app):
+    """Rebuild ``_static/figures/pkg_treemap.{html,svg}`` from ``src/jaxrens``.
+
+    The treemap is derived from the live package layout (module count, LoC,
+    classes, functions), so a committed copy goes stale the moment a module is
+    added or removed.  Regenerating it on every build keeps the API-reference
+    landing figure honest; the walk is pure stdlib plus plotly/squarify and
+    takes under a second, so it costs nothing.
+
+    The two artefacts are gitignored — this hook is the only thing that
+    produces them.  A failure is therefore a real problem (the ``<iframe>`` in
+    ``reference/index.rst`` and ``user/introduction.md`` would 404), so it is
+    reported as a Sphinx warning rather than swallowed.  The other figures
+    (``generate_concepts.py``, ``generate_tutorials.py``) are synthetic /
+    tutorial-derived and stay committed.
+    """
+    figdir = os.path.join(os.path.dirname(__file__), "_static", "figures")
+    sys.path.insert(0, figdir)
+    try:
+        import generate_treemap  # type: ignore[import-not-found]
+
+        generate_treemap.fig_pkg_treemap()
+    except Exception as exc:  # pragma: no cover - build-time diagnostic
+        logger = sphinx.util.logging.getLogger(__name__)
+        logger.warning(
+            "could not regenerate the package treemap (%s); "
+            "reference/index and user/introduction will show a broken frame. "
+            "Install the docs extra: pip install -e '.[docs]'",
+            exc,
+        )
+    finally:
+        sys.path.remove(figdir)
+
+
 def setup(app):
     app.connect(
         "autodoc-process-docstring", _clean_autodoc_docstring, priority=600
     )
+    app.connect("builder-inited", _regen_treemap)
     return {"parallel_read_safe": True, "parallel_write_safe": True}

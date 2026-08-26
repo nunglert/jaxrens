@@ -39,13 +39,14 @@ to $(K, A, 3)$.
 |---|---|
 | $r$ | A single configuration in parameter space. In atomistic NS this bundles positions $\mathbf q$, cell $h$, and species $\sigma$. |
 | $\pi(r)$ | Prior density on configurations. |
-| $L(r)$ | Likelihood. In jaxrens we work with $L = e^{-H}$, where $H$ is the Hamiltonian (energy-like). |
-| $H(r)$ | Hamiltonian / target. For NPT, $H = U + P V$; for NVT, $H = U$; for semi-grand, $H = U - \boldsymbol\mu \cdot \mathbf N$. |
+| $H(r)$ | The nested-sampling **target** — whatever ensemble-appropriate scalar the $H(r) < E_{\max}$ constraint enforces. Despite the name it is not a mechanical Hamiltonian in general: it's the bare energy $U$ for NVT, an enthalpy $U + PV$ for NPT, and a grand potential $U - \boldsymbol\mu \cdot \mathbf N$ for semi-grand. "$H$" is standard NS-literature shorthand carried over here — read it as "the thing $L$ decreases in," not literally $p^2/2m + V(q)$. |
+| $L(r)$ | Nested-sampling likelihood, $L(r) = e^{-H(r)}$ — fixed for the whole run and **temperature-independent**: NS orders and retires configurations by $H$ alone, so no $\beta$ ever appears while sampling. This is *not* the canonical-ensemble likelihood $e^{-\beta H}$; that only appears in postprocessing (see $\beta$ below). $L$ is what defines the prior-mass transform $X(L^\star)$. |
 | $U(r)$ | Bare potential energy (no $PV$ or $-\mu N$ term). What backends return. |
-| $Z$ | Evidence — the integral $\int L(r)\,\pi(r)\,\mathrm d r$. NS estimates this. |
+| $\beta$ | Inverse temperature, $\beta = 1/(k_B T)$. Used **only in postprocessing** — `partition_function`, `heat_capacity`, `free_energy` in {mod}`jaxrens.postprocess.thermodynamics` reweight the recorded $H_i$ as $Z(\beta) = \sum_i w_i\,e^{-\beta H_i}$ over the dead+live ensemble. The NS run itself never sees $\beta$; it is swept over afterwards, on data collected once. |
+| $Z$ | Evidence — the integral $\int L(r)\,\pi(r)\,\mathrm d r$, i.e. $Z(\beta = 1)$. NS estimates this directly; $Z(\beta)$ at other $\beta$ is the postprocessing reweighting above. |
 | $X$ | Prior mass in the constrained-likelihood transform: $X(L^\star) = \int_{L > L^\star} \pi\,\mathrm d r$. Maps the multi-D integral onto $X \in [0, 1]$. |
 | $L_i^\star$ | Likelihood threshold at iteration $i$. Equals the *worst* live walker's likelihood when the walker was retired. |
-| $E_{\max}$ | Hamiltonian threshold equivalent to $L_i^\star$. The constraint MCMC enforces is $H(r) < E_{\max}$. |
+| $E_{\max}$ | $H$-threshold equivalent to $L_i^\star$ (since $L = e^{-H}$ is monotonic in $-H$). The constraint MCMC enforces is $H(r) < E_{\max}$. |
 | $X_i$ | Prior mass remaining at iteration $i$. Expectation $X_i \approx \exp(-i / N)$ for $K = N$ live walkers and $n_\text{cull} = 1$. |
 | $w_i$ | Trapezoid quadrature weight: $w_i = \tfrac{1}{2}(X_{i-1} - X_{i+1})$. |
 | $i$ | Outer-loop iteration index (Python). Used in `manager.fires(i)` and similar. |
@@ -107,44 +108,3 @@ Replicas share state shape; what differs is `ensemble_params`.
 | $\alpha_{ij}$ | Swap acceptance. Form depends on flavor — see {doc}`/user/concepts/replicas` for the three derived expressions (Pressure-RENS, XRENS, semi-grand). |
 | $\mathcal{M}_{\mathbf c}(\sigma, \xi)$ | Random morph operator: re-permutes species labels of $\sigma$ to a new vector with composition exactly $\mathbf c$. $\xi$ is the auxiliary randomness. |
 | $\tilde U_i$ | Re-evaluated potential after a morph: $\tilde U_i = U(\mathbf q_j, \mathcal{M}_{\mathbf c_i}(\sigma_j), h_j)$. Two such evaluations per XRENS swap pair. |
-
-## Known overloads (read these once)
-
-A handful of letters are reused across domains. Context is
-unambiguous in any single paragraph, but if a sentence crosses
-domains, use the disambiguator.
-
-- **`N`** — three meanings:
-  1. number of live walkers ($K$ in code-shape sections);
-  2. number of atoms in a configuration ($A$);
-  3. species-count vector $\mathbf N(\sigma)$ (boldface; only in
-     semi-grand / XRENS contexts).
-
-  *Disambiguator:* prefer $K$, $A$, or $\mathbf N(\sigma)$ when
-  the generic $N$ would be ambiguous.
-
-- **`P`** — two meanings:
-  1. pressure (thermodynamics);
-  2. `n_per_gpu` (code shapes).
-
-  *Disambiguator:* the pressure $P$ always carries a replica
-  subscript ($P_i$) in multi-replica contexts; the shape `P` only
-  ever appears inside a `(G, P, K, …)` shape signature.
-
-- **`r`** — two meanings:
-  1. a single configuration $r = (\mathbf q, h, \sigma)$ — the
-     argument to $\pi, L, H, U$;
-  2. when subscripted with a replica index ($r_i$), the
-     configuration *of replica $i$*.
-
-  *Disambiguator:* never use $r$ for positions — those are
-  $\mathbf q$. The unsubscripted $r$ is a generic configuration;
-  $r_i$ implies a replica subscript.
-
-- **`i`** — outer-loop iteration index *and* replica index. We use
-  the same letter because conflict is rare; when both appear in
-  the same paragraph, write the loop iteration as `i` and the
-  replica index parenthetically.
-
-- **`K`** — the walker batch dimension. **Never** used for the
-  move-kernel index — that's $k$ (lowercase).

@@ -1,6 +1,6 @@
 # Core concepts
 
-Six ideas hold up the rest of the library. Each maps to a small set
+Seven ideas hold up the rest of the library. Each maps to a small set
 of files and a configuration section; once you know these you can
 read everything else. Each has a dedicated subpage with the
 relevant mathematics, diagrams, and pointers into the code:
@@ -14,7 +14,7 @@ relevant mathematics, diagrams, and pointers into the code:
 - {doc}`concepts/moves_mwg` — individual move kernels and how MWG
   composes them into a single step function.
 - {doc}`concepts/backends` — the `EnergyBackend` protocol and how
-  `EnsembleBackend` adds NPT/μVT corrections per call.
+  `EnsembleBackend` adds NPT / semi-grand μPT corrections per call.
 - {doc}`concepts/replicas` — how `n_total`, `n_gpu`, `n_per_gpu`
   are derived and how inter-replica exchange (RENS) swaps work.
 - {doc}`concepts/restart` — fresh-vs-restart lifecycle, output-dir gate,
@@ -36,7 +36,25 @@ concepts/restart
 The summaries below are the 30-second version of each; follow the
 links for detail.
 
-## 1. The two-loop NS structure
+## 1. YAML becomes a run in three layers
+
+A config file reaches the sampler through three layers with strictly
+separated jobs: the **schema** (pydantic models in
+{mod}`jaxrens.cli.schema`) validates shape, types and ranges without
+importing JAX; the **resolver** ({mod}`jaxrens.cli.resolve`) turns the
+validated spec into runtime objects — backend instance, initial walker
+positions, move descriptors, per-replica ensemble params — without
+importing pydantic; and the **core** consumes frozen dataclasses and
+JAX arrays, knowing nothing about YAML.
+
+The resolver splits further, into a *plan* phase that only makes
+decisions (topology, divisibility, path existence) and a *materialise*
+phase that builds the backend and places walkers. That is what lets
+`jaxrens validate` be near-instant by default and pay the full startup
+cost only under `--full`. Every field you can write is documented at
+{doc}`/reference/config`.
+
+## 2. The two-loop NS structure
 
 Nested sampling in jaxrens runs as an **outer Python loop** around
 an **inner `lax.scan`**. The boundary is load-bearing:
@@ -51,7 +69,7 @@ an **inner `lax.scan`**. The boundary is load-bearing:
 Code: {mod}`jaxrens.sampling.nested_sampling`, especially
 `run_ns`, `run_ns_parallel`, `run_ns_multi_gpu`.
 
-## 2. Walkers are JAX pytrees
+## 3. Walkers are JAX pytrees
 
 The per-walker state is a {class}`~jaxrens.state.mc_state.MCState`
 dataclass — positions, cell, species, step-size, energy,
@@ -68,13 +86,21 @@ Static fields (compile-time constants like `n_atoms`, `max_neighbors`)
 are tagged with `static_field()` so changing them triggers
 recompilation, while dynamic fields are leaves.
 
-## 3. Moves compose through MWG
+## 4. Moves compose through MWG
 
 Individual MCMC kernels live under
 {mod}`jaxrens.sampling.moves` — `random_walk`, `galilean`, `hmc`,
-`single_atom`, `alchemical`, `volume`, `shear`, `stretch`,
-`replica_exchange`. Each implements the `MoveKernel` protocol
-(init / build_kernel / as_top_level_api).
+`single_atom`, `alchemical`, `swap`, `volume`, `shear`, `stretch`,
+`replica_exchange`. Each exposes a `build_kernel(energy_fn, params,
+**kernel_kwargs)` factory returning a `step_fn(rng_key, state,
+likelihood_constraint) -> (state, MoveInfo)`.
+
+A kernel is handed to the sampler wrapped in a
+{class}`~jaxrens.sampling.move_kernel.MoveKernel` descriptor — a
+dataclass carrying the kernel's `name`, its `build_kernel`, the
+`kernel_kwargs` to bake in, its `weight` and `step_size`, any
+`extra_state_fields` it needs on `MCState`, and which state aspects it
+`mutates` (so the constraint machinery knows which moves to gate).
 
 `build_mwg(backend, descriptors)` in
 {mod}`jaxrens.sampling.mwg` composes any list of them into a
@@ -84,18 +110,23 @@ controlling dispatch probabilities.
 YAML: the `moves:` section is an ordered list; each entry's `type`
 selects the kernel and `weight` sets its MWG probability.
 
-## 4. Backends and ensembles
+## 5. Backends and ensembles
 
 An energy model is anything implementing the
 {class}`~jaxrens.backends.base.EnergyBackend` protocol:
-`(positions, species, cell, max_neighbors, ensemble_params) →
-(energy, neighbor_count, overflow)`.
+`(positions, species, cell, max_neighbors, ensemble_params) →`
+{class}`~jaxrens.backends.base.BackendResult`, a `NamedTuple` whose
+`energy` field is the only universally-meaningful one —
+`max_neighbor_count` and `overflow` drive the neighbor-bucket manager,
+and `forces` is filled only on the `energy_and_forces` path.
 
 Built-ins:
 
 - **`lj`** — Lennard-Jones with periodic cutoff.
 - **`mace`** — MACE-JAX wrapper with supercell neighbor expansion.
 - **`neuralil`** — NeuralIL with bucketed kernel compilation.
+- **`nequix`** — Nequix, from a local checkpoint or a bundled model.
+- **`jaxmd`** — jax-md analytic potentials (Tersoff, EAM), all-pairs.
 - **`harmonic`**, **`double_well`**, **`gaussian_mixture`** — toy
   potentials for testing.
 
@@ -110,7 +141,7 @@ Ensemble corrections are applied by a thin wrapper,
 at different pressures / chemical potentials without rebuilding the
 backend.
 
-## 5. Replica axes: n_total, n_gpu, n_per_gpu
+## 6. Replica axes: n_total, n_gpu, n_per_gpu
 
 Multi-run dispatch activates when the YAML config implies more than
 one replica via a **replica-differentiating list**:
@@ -130,8 +161,23 @@ The NS state then has shape `(n_gpu, n_per_gpu, n_walkers, ...)` on
 every dynamic field, and execution is `pmap(vmap(vmap(ns_step)))`.
 
 See the {doc}`../tutorials/index` for a concrete multi-GPU
-example and the config reference (follow-up PR) for the exact
-divisibility rules.
+example, and {doc}`/reference/config` for the exact divisibility
+rules and every field that can drive a replica axis.
+
+## 7. Restart, resume, and the output-dir gate
+
+A run is either **fresh** or a **restart**, and the two are kept apart
+deliberately. A fresh run refuses to start if `working_dir` already
+holds artifacts under the same `out_file_prefix`, so a second run can
+never silently append to or overwrite the first — pass `--force` to
+clear them intentionally.
+
+A restart either names its checkpoint explicitly
+(`init.restart_file`) or lets `--resume` auto-discover the newest one
+in `working_dir`. Either way a compatibility validator checks the
+config against what the checkpoint was written with and refuses
+mismatches that would corrupt the estimate, rather than continuing
+from an inconsistent state. Burn-in is skipped on restart.
 
 ## What's where — quick map
 

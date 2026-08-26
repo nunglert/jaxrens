@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from jaxrens.state.config import InterREConfig
 
@@ -56,13 +62,54 @@ class InterRESpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    flavor: str = "pressure"
+    flavor: str = Field(
+        default="pressure",
+        description=(
+            "Which exchange protocol to run.  ``pressure`` swaps walkers "
+            "between replicas held at different pressures (pressure-RENS); "
+            "``xrens`` swaps between different target compositions and "
+            "requires ``composition_targets``; ``semi_grand`` swaps "
+            "between chemical-potential vectors and requires "
+            "``chemical_potentials``."
+        ),
+    )
     # Widened to int|float for RootSpec.interval_units='per_walker'; resolver
     # scales+casts to int before constructing InterREConfig.
-    re_interval: int | float = 1
-    n_swap_cycles: int = 1
-    composition_targets: Optional[List[List[int]]] = None
-    chemical_potentials: Optional[List[List[float]]] = None
+    re_interval: int | float = Field(
+        default=1,
+        description=(
+            "Fire a swap attempt every N NS iterations.  Honours "
+            "``interval_units``; in ``per_walker`` mode values below ~0.05 "
+            "sweeps are almost always a mistake and are warned about."
+        ),
+    )
+    n_swap_cycles: int = Field(
+        default=1,
+        description=(
+            "Swap cycles performed per fire.  Each cycle offers every "
+            "adjacent replica pair once, so more cycles move walkers "
+            "further along the ladder per fire."
+        ),
+    )
+    composition_targets: Optional[List[List[int]]] = Field(
+        default=None,
+        description=(
+            "Required for ``flavor: xrens``: one target composition per "
+            "replica, as per-species atom counts (e.g. "
+            "``[[8, 0], [4, 4]]`` for two replicas of an 8-atom binary "
+            "system).  Every row must have the same length and sum.  "
+            "Ignored — with a warning — by the other flavors."
+        ),
+    )
+    chemical_potentials: Optional[List[List[float]]] = Field(
+        default=None,
+        description=(
+            "Required for ``flavor: semi_grand``: one per-species "
+            "chemical-potential vector per replica (eV), e.g. "
+            "``[[0.0, 0.0], [0.5, 1.0]]``.  All rows must have the same "
+            "length.  Ignored — with a warning — by the other flavors."
+        ),
+    )
 
     @field_validator("flavor")
     @classmethod
@@ -103,6 +150,7 @@ class InterRESpec(BaseModel):
             # Warn if chemical_potentials is also set.
             if self.chemical_potentials is not None:
                 import warnings
+
                 warnings.warn(
                     "inter_re.chemical_potentials is set but flavor='xrens'. "
                     "chemical_potentials will be ignored.",
@@ -133,6 +181,7 @@ class InterRESpec(BaseModel):
             # Warn if composition_targets is also set.
             if self.composition_targets is not None:
                 import warnings
+
                 warnings.warn(
                     "inter_re.composition_targets is set but flavor='semi_grand'. "
                     "composition_targets will be ignored.",
@@ -144,6 +193,7 @@ class InterRESpec(BaseModel):
             # pressure flavor
             if self.composition_targets is not None:
                 import warnings
+
                 warnings.warn(
                     f"inter_re.composition_targets is set but flavor={self.flavor!r} "
                     f"(not 'xrens'). composition_targets will be ignored.",
@@ -152,6 +202,7 @@ class InterRESpec(BaseModel):
                 )
             if self.chemical_potentials is not None:
                 import warnings
+
                 warnings.warn(
                     f"inter_re.chemical_potentials is set but flavor={self.flavor!r} "
                     f"(not 'semi_grand'). chemical_potentials will be ignored.",
@@ -164,11 +215,16 @@ class InterRESpec(BaseModel):
         """Convert to the frozen :class:`InterREConfig` dataclass."""
         comp_targets = None
         if self.composition_targets is not None:
-            comp_targets = tuple(tuple(row) for row in self.composition_targets)
+            comp_targets = tuple(
+                tuple(row) for row in self.composition_targets
+            )
 
         chem_pots = None
         if self.chemical_potentials is not None:
-            chem_pots = tuple(tuple(float(v) for v in row) for row in self.chemical_potentials)
+            chem_pots = tuple(
+                tuple(float(v) for v in row)
+                for row in self.chemical_potentials
+            )
 
         return InterREConfig(
             flavor=self.flavor,

@@ -16,6 +16,7 @@ methods on the collection.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -89,13 +90,18 @@ def plot_re_stats(input_path: Path, output_path: Path) -> Path:
     import matplotlib.pyplot as plt
 
     from jaxrens.io.re_stats_log import RELogger
-    from jaxrens.postprocess.plotting import plot_re_acceptance
+    from jaxrens.postprocess.plotting import plot_re_acceptance_stacked
 
     trace = RELogger.read(input_path)
-    fig, ax = plt.subplots(figsize=(9, 5))
-    plot_re_acceptance(trace, ax=ax, per_pair=True)
+    # Stacked, not overlaid: every adjacent pair gets its own lane, so a rung
+    # whose acceptance dies is visible instead of being hidden under the
+    # others in a single [0, 1] band.  Tuning a pressure ladder means reading
+    # the pairs individually.
+    n_pairs = int(trace.n_pairs)
+    fig, ax = plt.subplots(figsize=(9, 2.0 + 1.1 * max(n_pairs, 1)))
+    plot_re_acceptance_stacked(trace, ax=ax)
     ax.set_title(
-        f"RE swap acceptance ({trace.flavor}) · {input_path.name}",
+        f"RE swap acceptance per pair ({trace.flavor}) · {input_path.name}",
         fontsize=10,
     )
     ax.grid(alpha=0.3)
@@ -138,6 +144,33 @@ def plot_max_neighbors_file(input_path: Path, output_path: Path) -> Path:
     return output_path
 
 
+_REPLICA_RE = re.compile(r"^(?P<prefix>.+)\.run(?P<idx>\d+)\.energies$")
+
+
+def _replica_label(path: Path) -> str:
+    """``toy.run02.energies`` -> ``run02``."""
+    m = _REPLICA_RE.match(path.name)
+    return f"run{m.group('idx')}" if m else path.stem
+
+
+def _replica_siblings(input_path: Path) -> list[Path]:
+    """Every per-replica energies log belonging to the same run.
+
+    A multi-replica run writes one ``<prefix>.runNN.energies`` per replica.
+    Plotting a single one hides exactly the comparison you opened the plot
+    for, so pointing at any of them picks up all of them, in replica order.
+    A single-run log (no ``.runNN.`` infix) is returned on its own.
+    """
+    m = _REPLICA_RE.match(input_path.name)
+    if m is None:
+        return [input_path]
+    siblings = sorted(
+        input_path.parent.glob(f"{m.group('prefix')}.run*.energies"),
+        key=lambda p: int(_REPLICA_RE.match(p.name).group("idx")),
+    )
+    return siblings or [input_path]
+
+
 def plot_energies(input_path: Path, output_path: Path) -> Path:
     """Render the dead-point energy (and volume if NPT) trail from a
     ``.energies`` log."""
@@ -146,33 +179,61 @@ def plot_energies(input_path: Path, output_path: Path) -> Path:
 
     from jaxrens.io.energy_log import EnergyLogger
 
-    elog = EnergyLogger.read(input_path)
-    iters = np.asarray(elog.iterations)
-    Es = np.asarray(elog.energies)
-    Vs = np.asarray(elog.volumes)
-    has_volume = bool(np.any(Vs != 0.0))
+    paths = _replica_siblings(input_path)
+    logs = [(p, EnergyLogger.read(p)) for p in paths]
+    has_volume = any(
+        bool(np.any(np.asarray(e.volumes) != 0.0)) for _, e in logs
+    )
 
     n_panels = 2 if has_volume else 1
     fig, axes = plt.subplots(n_panels, 1, figsize=(9, 4 * n_panels))
     if n_panels == 1:
         axes = [axes]
 
-    axes[0].plot(iters, Es, lw=0.8, color="C0")
+    for i, (path, elog) in enumerate(logs):
+        iters = np.asarray(elog.iterations)
+        label = _replica_label(path) if len(logs) > 1 else None
+        axes[0].plot(
+            iters,
+            np.asarray(elog.energies),
+            lw=0.8,
+            color=f"C{i % 10}",
+            label=label,
+        )
+        if has_volume:
+            axes[1].plot(
+                iters,
+                np.asarray(elog.volumes),
+                lw=0.8,
+                color=f"C{i % 10}",
+                label=label,
+            )
+
+    ref = logs[0][1]
+    title = (
+        f"dead-point energy trail · {input_path.name}"
+        if len(logs) == 1
+        else f"dead-point energy trail · {len(logs)} replicas"
+    )
     axes[0].set_xlabel("NS iteration")
     axes[0].set_ylabel("dead-point energy  [model units]")
     axes[0].set_title(
-        f"dead-point energy trail · {input_path.name}\n"
-        f"n_walkers={elog.n_walkers}, n_cull={elog.n_cull}, n_atoms={elog.n_atoms}",
+        f"{title}\n"
+        f"n_walkers={ref.n_walkers}, n_cull={ref.n_cull}, "
+        f"n_atoms={ref.n_atoms}",
         fontsize=10,
     )
     axes[0].grid(alpha=0.3)
+    if len(logs) > 1:
+        axes[0].legend(fontsize=8, ncol=min(len(logs), 4))
 
     if has_volume:
-        axes[1].plot(iters, Vs, lw=0.8, color="C2")
         axes[1].set_xlabel("NS iteration")
         axes[1].set_ylabel("dead-point cell volume  [Å³]")
         axes[1].set_title("dead-point volume trail (NPT)", fontsize=10)
         axes[1].grid(alpha=0.3)
+        if len(logs) > 1:
+            axes[1].legend(fontsize=8, ncol=min(len(logs), 4))
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)

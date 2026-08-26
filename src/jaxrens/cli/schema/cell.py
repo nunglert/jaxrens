@@ -8,7 +8,7 @@ stretch move kernels accept.  The resolver threads these values into
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CellSpec(BaseModel):
@@ -22,18 +22,54 @@ class CellSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    max_volume_per_atom: float = 1e4
-    min_volume_per_atom: float = 1.0
-    #: Lower floor on the *initial* cell-volume draw (Angstrom^3 per atom),
-    #: decoupled from the sampling constraint ``min_volume_per_atom``.  This
-    #: lets walkers be initialised on a low-density grid (large volume/atom, so
-    #: atoms start well separated) while the sampler is still free to compress
-    #: down to a smaller ``min_volume_per_atom`` during the run.  ``None`` (the
-    #: default) falls back to ``min_volume_per_atom`` so initial draws never
-    #: violate the sampling constraint.  See ``effective_initial_min_volume_per_atom``.
-    initial_min_volume_per_atom: float | None = None
-    min_aspect_ratio: float = 0.8
-    flat_V_prior: bool = False
+    max_volume_per_atom: float = Field(
+        default=1e4,
+        description=(
+            "Upper bound on cell volume per atom (Angstrom^3).  Caps the "
+            "cell prior: volume, shear, and stretch proposals above it are "
+            "rejected.  The default is deliberately loose — tighten it to "
+            "stop a gas-phase run from expanding without limit."
+        ),
+    )
+    min_volume_per_atom: float = Field(
+        default=1.0,
+        description=(
+            "Lower bound on cell volume per atom (Angstrom^3) enforced "
+            "throughout sampling.  Stops the cell collapsing into a "
+            "region where the energy model is unphysical."
+        ),
+    )
+    initial_min_volume_per_atom: float | None = Field(
+        default=None,
+        description=(
+            "Lower floor on the *initial* cell-volume draw (Angstrom^3 per "
+            "atom), decoupled from the sampling constraint "
+            "``min_volume_per_atom``.  Lets walkers be initialised on a "
+            "low-density grid (large volume/atom, so atoms start well "
+            "separated) while the sampler stays free to compress down to "
+            "``min_volume_per_atom`` during the run.  ``null`` (default) "
+            "falls back to ``min_volume_per_atom``, so initial draws never "
+            "violate the sampling constraint."
+        ),
+    )
+    min_aspect_ratio: float = Field(
+        default=0.8,
+        description=(
+            "Minimum ratio of the shortest to the longest cell-vector "
+            "perpendicular distance.  Rejects proposals that would flatten "
+            "the cell into a sliver, which breaks the minimum-image "
+            "convention and starves neighbour lists."
+        ),
+    )
+    flat_V_prior: bool = Field(
+        default=False,
+        description=(
+            "Sample volume under a flat prior in ``V`` instead of the "
+            "default flat-in-``log V`` prior.  Changes the volume-move "
+            "acceptance ratio; pick the one your reference implementation "
+            "uses when comparing equations of state."
+        ),
+    )
 
     @property
     def effective_initial_min_volume_per_atom(self) -> float:

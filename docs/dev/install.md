@@ -13,9 +13,20 @@ pip install -e ".[dev]"
 ```
 
 This pulls `jax[cuda12]`, `jaxlib`, numpy, h5py, ASE, pydantic,
-pyyaml, and the dev tooling (`pytest`, `pytest-xdist`).
+pyyaml, and the dev tooling (`pytest`, `pytest-xdist`, `pre-commit`, ...).
+`pip install -e` is additive — installing another extra afterwards
+doesn't remove what `[dev]` already put in the environment, so the
+snippets below only add the extra they need. Drop `dev` from any of
+them if you just want to run jaxrens rather than test or contribute
+to it.
 
 ## Optional backends
+
+You can either directly install all supported backends via
+```bash
+pip install -e ".[all]"
+```
+or install them individually as shown below.
 
 ### MACE-JAX
 
@@ -23,7 +34,7 @@ The `[mace]` extra installs the **runtime** MACE backend — everything
 needed to *load and evaluate* a converted JAX model:
 
 ```bash
-pip install -e ".[dev,mace]"
+pip install -e ".[mace]"
 ```
 
 To also **convert** a Torch MACE checkpoint (or download + convert a
@@ -31,14 +42,13 @@ foundation model) into a JAX model, add the `[mace-convert]` extra,
 which pulls the Torch-side `mace-torch` package the converter imports:
 
 ```bash
-pip install -e ".[dev,mace-convert]"
+pip install -e ".[mace-convert]"
 ```
 
-`[all]` installs every optional backend plus the conversion tooling in
-one shot. See the {doc}`../user/mace_models` guide for the full
+See the {doc}`../user/mace_models` guide for the full
 download → convert → run workflow.
 
-The upstream `ACEsuit/mace-jax` package at the time of writing has
+<!-- The upstream `ACEsuit/mace-jax` package at the time of writing has
 two packaging bugs:
 
 - `mace_jax/adapters/` and `mace_jax/adapters/e3nn/` lack
@@ -50,12 +60,12 @@ two packaging bugs:
 
 jaxrens' `pyproject.toml` pins a patched fork
 (`nunglert/mace-jax@fixes`) that resolves both. If upstream lands the
-fixes, the pin can drop back to `ACEsuit/mace-jax@main`.
+fixes, the pin can drop back to `ACEsuit/mace-jax@main`. -->
 
 ### NeuralIL
 
 ```bash
-pip install -e ".[dev,neuralil]"
+pip install -e ".[neuralil]"
 ```
 
 Pulls a jaxrens-compatible fork (`nunglert/neuralil-jaxrens@jaxrens`).
@@ -63,7 +73,7 @@ Pulls a jaxrens-compatible fork (`nunglert/neuralil-jaxrens@jaxrens`).
 ### Nequix
 
 ```bash
-pip install -e ".[dev,nequix]"
+pip install -e ".[nequix]"
 ```
 
 Pulls upstream `atomicarchitects/nequix@main`. Optional backend
@@ -71,7 +81,7 @@ that exposes the same `EnergyBackend` protocol as MACE/NeuralIL;
 nequix tests sit behind the `nequix` pytest marker (off by
 default, opt-in via `pytest -m nequix`).
 
-### Docs
+## Docs
 
 ```bash
 pip install -e ".[docs]"
@@ -94,30 +104,10 @@ Should list one or more `CudaDevice(...)` entries. If it prints
 the CUDA build (`pip show jaxlib` should show a `+cuda12...` tag
 on the version).
 
-## Running the test suite
-
-```bash
-cd /path/to/jaxrens
-pytest tests/ -v
-```
-
-Default run excludes the `heavy` marker. To include:
-
-```bash
-pytest tests/ -v -m heavy
-pytest tests/ -v -m ""    # all markers, including heavy / gpu
-```
-
-Markers:
-
-- `heavy` — slow tests (long example runs).
-- `gpu` — requires CUDA.
-- `multi_gpu` — requires 2+ CUDA devices.
-
 ## Scratch / temp paths on SLURM
 
 Some GPU nodes deny writes to `/tmp`, which breaks XLA's PTX
-compile cache. SLURM submit scripts in `experiments/` redirect
+compile cache. SLURM submit scripts can redirect
 temp I/O into the job directory via `TMPDIR`:
 
 ```bash
@@ -128,4 +118,4 @@ mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" "$JAX_COMPILATION_CACHE_DIR"
 trap 'rm -rf "$TMPDIR"' EXIT
 ```
 
-Copy that block into any new submit script.
+Copy that block into any new submit script before launching JAXRENS.

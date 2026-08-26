@@ -32,14 +32,23 @@ modules sized by lines of code — sets the stage:
 
 .. currentmodule:: jaxrens
 
-.. note::
+.. important::
 
-   The curated **top-level API** (``from jaxrens import run_ns``,
-   ``jaxrens.free_energy``, …) is currently **disabled** — see the
-   commented lazy-export block in ``src/jaxrens/__init__.py``.  Import
-   public symbols from their subpackage instead (browse the
-   :ref:`Subpackages <subpackages>` tree below).  When it was enabled, the
-   top of this page listed these symbols grouped by theme:
+   There is no curated top-level API right now: ``import jaxrens`` exposes
+   only ``__version__``.  Import public symbols from their subpackage —
+   ``from jaxrens.sampling.nested_sampling import run_ns`` — and browse the
+   :ref:`Subpackages <subpackages>` tree below to find them.
+
+.. dropdown:: Maintainer note — reinstating the top-level API
+   :class-title: sd-fs-6
+
+   The curated top-level API (``from jaxrens import run_ns``,
+   ``jaxrens.free_energy``, …) is disabled; see the commented lazy-export
+   block in ``src/jaxrens/__init__.py``.  Keeping it off is deliberate:
+   ``import jaxrens`` must not import JAX (see :doc:`../dev/contributing`),
+   and a lazy re-export surface is easy to break that rule with.
+
+   When it was enabled this page listed these symbols grouped by theme:
 
    * *High-level entry points:* ``run_ns``, ``run_from_config``,
      ``init_ns``, ``ns_step``, ``build_mwg``, ``load_backend``

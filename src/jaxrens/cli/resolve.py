@@ -16,6 +16,7 @@ There is no longer a separate "cohort" (independent sequential) path.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -289,6 +290,25 @@ def _build_cells(
     """
     _CELL_SHAPE_EQUIL_STEPS = 50
 
+    if init.cell_randomization_mode == "linear_1d":
+        # 1-D embedding: the cell is diag(a, 1, 1), so det(cell) == a and the
+        # standard NPT term P*V is the paper's P*a.  A 3-D shape walk would
+        # destroy that structure on the first shear.  Draw one box length per
+        # walker so the population starts spread out in a.
+        a_lo = cell_cfg.effective_initial_min_volume_per_atom * n_atoms
+        a_hi = cell_cfg.max_volume_per_atom * n_atoms
+        logger.info(
+            "[resolve] 1-D cell init: n_walkers=%d, a in [%.4g, %.4g]",
+            n_live,
+            a_lo,
+            a_hi,
+        )
+        a = jax.random.uniform(
+            shape_key, shape=(n_live,), minval=a_lo, maxval=a_hi
+        )
+        cells = jnp.broadcast_to(jnp.eye(3), (n_live, 3, 3))
+        return cells.at[:, 0, 0].set(a)
+
     if init.random_initialise_cell:
         logger.info(
             "[resolve] cell-shape random walk: n_walkers=%d, n_steps=%d",
@@ -379,14 +399,21 @@ def _warn_if_lj_cutoff_unsafe(
 ) -> None:
     """Warn if the LJ cutoff cannot be honoured by the smallest legal cell.
 
-    Triggers only for the LJ backend with a finite cutoff. The smallest cell
-    permitted by the prior is the one at ``min_volume_per_atom`` with the
-    worst-case aspect ratio. For an isotropic cubic cell at that volume, the
-    perpendicular distance equals the cube side; allowing the aspect ratio to
-    drop to ``min_aspect_ratio`` shrinks this proportionally. The MIC + image
-    sum is correct iff ``perp · min(supercell_trafo) >= 2 · cutoff``.
+    Triggers only for the LJ backend with a finite cutoff *and* periodic
+    images in play. The smallest cell permitted by the prior is the one at
+    ``min_volume_per_atom`` with the worst-case aspect ratio. For an
+    isotropic cubic cell at that volume, the perpendicular distance equals
+    the cube side; allowing the aspect ratio to drop to ``min_aspect_ratio``
+    shrinks this proportionally. The MIC + image sum is correct iff
+    ``perp · min(supercell_trafo) >= 2 · cutoff``.
     """
     if not isinstance(backend_spec, LJBackendSpec):
+        return
+    if not backend_spec.periodic:
+        # No periodic images -- the cell only bounds where atoms are drawn
+        # from, so the cutoff/cell-prior/supercell_trafo interaction this
+        # check is about does not exist.  Without this the warning fired
+        # (misleadingly) even for a cluster in vacuum.
         return
     if backend_spec.cutoff is None:
         return
@@ -1871,6 +1898,166 @@ def _resolve_multi_replica(
     )
 
 
+# ---------------------------------------------------------------------------
+# Plan phase — decisions the resolver can make without building or running
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ResolvedPlan:
+    """What the resolver can decide without materialising anything.
+
+    Splitting the resolver in two lets ``jaxrens validate`` answer the
+    questions people actually ask of it — is the topology legal, do the
+    referenced files exist, does the cell prior fit the cutoff — without
+    loading an energy model, placing walkers, or compiling a kernel.  On the
+    Lennard-Jones example that is ~0.4 s of work instead of ~15 s, and the
+    gap is far wider for an MLIP backend.
+
+    A plan is *not* enough to run: it deliberately holds no backend, no
+    positions and no energies.  :func:`resolve` builds on top of it.
+
+    Attributes:
+        root: The config after interval-unit scaling — every iteration-counted
+            field is in absolute iterations.
+        n_total: Total replica count implied by the config.
+        n_gpu: Devices the replicas are spread over.
+        n_per_gpu: Replicas per device (``n_total // n_gpu``).
+        ensemble_params_per_run: Per-replica ensemble params; empty when
+            ``n_total == 1`` (see ``_derive_replica_axes``).
+        n_atoms: Atom count when it is derivable from the config alone, else
+            ``None`` — a walker-set or restart file carries it in the data,
+            and reading that is materialisation.
+        topology: Human-readable one-line description of the dispatch shape.
+    """
+
+    root: RootSpec
+    n_total: int
+    n_gpu: int
+    n_per_gpu: int
+    ensemble_params_per_run: list[dict]
+    n_atoms: int | None
+    topology: str
+
+
+def _plan_n_atoms(root: RootSpec) -> int | None:
+    """Atom count from the config alone, or ``None`` if it needs the data.
+
+    ``start_species`` carries the counts outright; a structure file gives them
+    up for a single cheap read.  A walker set or a restart bundle stores the
+    count inside arrays whose loading is exactly the work the plan phase
+    exists to avoid, so those report ``None``.
+    """
+    init = root.init
+    if init.start_species is not None:
+        return sum(init.parsed_species().values())
+    if init.start_config_file is not None:
+        try:
+            from ase.io import read as ase_read
+
+            return len(ase_read(str(init.start_config_file), index=0))
+        except Exception:  # unreadable / bad format -> reported by _plan_paths
+            return None
+    return None
+
+
+def _plan_paths(root: RootSpec) -> None:
+    """Check that every path the config names exists and is readable.
+
+    Cheap stand-in for the confidence the old full-resolve default gave: it
+    catches the mistyped checkpoint or structure path — by far the most
+    common way a config fails minutes into a job — without paying to load
+    what is behind it.  It cannot tell you the file is *valid*; only
+    ``resolve`` can.
+
+    Raises:
+        FileNotFoundError: If a referenced path does not exist.
+        PermissionError: If it exists but cannot be read.
+    """
+    candidates: list[tuple[str, object]] = [
+        ("init.start_config_file", root.init.start_config_file),
+        ("init.start_walker_set", root.init.start_walker_set),
+        ("init.restart_file", root.init.restart_file),
+    ]
+    checkpoint = getattr(root.backend, "checkpoint_path", None)
+    # A Nequix ``checkpoint_path`` may name a bundled model rather than a
+    # file on disk, so only check it when it looks like a path.
+    if isinstance(checkpoint, str) and (
+        os.sep in checkpoint or checkpoint.endswith((".pkl", ".model", ".nqx"))
+    ):
+        candidates.append(("backend.checkpoint_path", Path(checkpoint)))
+    for key, value in candidates:
+        if value is None:
+            continue
+        path = Path(str(value))
+        if not path.exists():
+            raise FileNotFoundError(f"{key}: {path} does not exist.")
+        if not os.access(path, os.R_OK):
+            raise PermissionError(f"{key}: {path} exists but is not readable.")
+
+
+def _describe_topology(
+    root: RootSpec, n_total: int, n_gpu: int, n_per_gpu: int
+) -> str:
+    """One-line description of the dispatch shape this config implies."""
+    if n_total == 1:
+        if root.run.shard_n_gpu > 1:
+            return (
+                f"ShardedSingleRun (1 replica, sharded across "
+                f"{root.run.shard_n_gpu} GPUs)"
+            )
+        return "SingleRun (1 replica, 1 GPU)"
+    return f"n_gpu={n_gpu} × n_per_gpu={n_per_gpu} = {n_total} replica(s)"
+
+
+def resolve_plan(
+    root: RootSpec, *, geometry_checks: bool = True
+) -> ResolvedPlan:
+    """Make every resolver decision that needs no backend and no walkers.
+
+    Args:
+        root: Fully validated pydantic config.
+        geometry_checks: Run the cell-prior geometry warnings here.  Set
+            ``False`` from :func:`resolve`, which runs them further down with
+            an exact ``n_atoms`` and would otherwise emit each twice.
+
+    Returns:
+        The :class:`ResolvedPlan` for this config.
+
+    Raises:
+        ValueError: On an illegal topology, an incompatible ``shard_n_gpu``,
+            or a referenced path that is missing or unreadable.
+    """
+    root = _apply_interval_units(root)
+    n_total, n_gpu, n_per_gpu, params_per_run = _derive_replica_axes(root)
+
+    if n_total > 1 and root.run.shard_n_gpu > 1:
+        raise ValueError(
+            f"run.shard_n_gpu ({root.run.shard_n_gpu}) is incompatible "
+            f"with the multi-replica topology implied by this config "
+            f"(n_total = {n_total} > 1).  Sharded single-run holds one "
+            f"population spread across GPUs; multi-replica runs hold "
+            f"n_total *independent* populations.  Pick one — remove the "
+            f"replica-axis list (ensemble.pressure / inter_re.*) or set "
+            f"shard_n_gpu = 1."
+        )
+
+    _plan_paths(root)
+    n_atoms = _plan_n_atoms(root)
+    if geometry_checks and n_atoms is not None:
+        _warn_if_lj_cutoff_unsafe(root.backend, root.cell, n_atoms)
+
+    return ResolvedPlan(
+        root=root,
+        n_total=n_total,
+        n_gpu=n_gpu,
+        n_per_gpu=n_per_gpu,
+        ensemble_params_per_run=params_per_run,
+        n_atoms=n_atoms,
+        topology=_describe_topology(root, n_total, n_gpu, n_per_gpu),
+    )
+
+
 def resolve(root: RootSpec) -> ResolvedConfig:
     """Translate a validated ``RootSpec`` into one unified :class:`ResolvedConfig`.
 
@@ -1897,11 +2084,16 @@ def resolve(root: RootSpec) -> ResolvedConfig:
             divisible by the detected device count, or a ``pressure``-flavor
             inter-RE has a scalar ``ensemble.pressure``.
     """
-    # Scale iteration-counted fields once up-front so every downstream read
-    # sees absolute-iter values (see ``_apply_interval_units``).
-    root = _apply_interval_units(root)
-
-    n_total, n_gpu, n_per_gpu, params_per_run = _derive_replica_axes(root)
+    # Every decision that needs neither a backend nor walkers is made by the
+    # plan phase; this function is the materialisation on top of it.  Geometry
+    # checks are deferred: the plan may not know ``n_atoms`` (walker-set and
+    # restart configs carry it in the data), whereas the branches below always
+    # do, and running them in both places would double every warning.
+    plan = resolve_plan(root, geometry_checks=False)
+    root = plan.root
+    n_total = plan.n_total
+    n_gpu, n_per_gpu = plan.n_gpu, plan.n_per_gpu
+    params_per_run = plan.ensemble_params_per_run
 
     if n_total == 1:
         # SingleRun (or sharded-single) path.  ``params_per_run`` is
@@ -1914,17 +2106,6 @@ def resolve(root: RootSpec) -> ResolvedConfig:
             root,
             ensemble_params=ensemble_params,
             shard_n_gpu=root.run.shard_n_gpu,
-        )
-
-    if root.run.shard_n_gpu > 1:
-        raise ValueError(
-            f"run.shard_n_gpu ({root.run.shard_n_gpu}) is incompatible "
-            f"with the multi-replica topology implied by this config "
-            f"(n_total = {n_total} > 1).  Sharded single-run holds one "
-            f"population spread across GPUs; multi-replica runs hold "
-            f"n_total *independent* populations.  Pick one — remove the "
-            f"replica-axis list (ensemble.pressure / inter_re.*) or set "
-            f"shard_n_gpu = 1."
         )
 
     return _resolve_multi_replica(

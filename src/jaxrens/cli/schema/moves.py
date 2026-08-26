@@ -24,6 +24,7 @@ from jaxrens.sampling.moves import (
     single_atom,
     stretch,
     swap,
+    toy_1d,
     volume,
 )
 from jaxrens.state.config import MoveConfig
@@ -60,11 +61,49 @@ class BaseMoveSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    step_size: float = 0.1
-    weight: float = 1.0
-    adaptation_warmup: int = 100
-    target_acceptance: float = 0.5
-    name: str | None = None
+    step_size: float = Field(
+        default=0.1,
+        description=(
+            "Initial proposal magnitude, in the move's own units "
+            "(Angstrom for displacement moves, a relative fraction for "
+            "cell moves).  A starting point only when adaptation is on — "
+            "``adaptation.adjust_interval`` then drives it toward "
+            "``target_acceptance``."
+        ),
+    )
+    weight: float = Field(
+        default=1.0,
+        description=(
+            "Relative dispatch probability within the "
+            "Metropolis-within-Gibbs scheduler.  Weights are normalised "
+            "across the whole ``moves:`` list, so only their ratios "
+            "matter."
+        ),
+    )
+    adaptation_warmup: int = Field(
+        default=100,
+        description=(
+            "Iterations before this move's step size starts adapting, "
+            "letting the acceptance statistics settle first."
+        ),
+    )
+    target_acceptance: float = Field(
+        default=0.5,
+        description=(
+            "Acceptance rate the adaptation aims for.  Ignored by moves "
+            "with no continuous magnitude, such as ``species_swap``."
+        ),
+    )
+    name: str | None = Field(
+        default=None,
+        description=(
+            "Label for this move.  Defaults to its ``type``.  Keys the "
+            "monitor's per-move columns, the adaptation diagnostics, and "
+            "``adaptation.per_move`` overrides — so give two moves of the "
+            "same type distinct names, otherwise they collide in all "
+            "three."
+        ),
+    )
 
     @property
     def move_type(self) -> str:
@@ -184,7 +223,23 @@ class BaseMoveSpec(BaseModel):
 
 
 class RandomWalkMoveSpec(BaseMoveSpec):
-    type: Literal["random_walk"] = "random_walk"
+    """Gaussian displacement of every atom at once.
+
+    The cheapest move available — one energy evaluation per proposal, no
+    forces — but it decorrelates slowly, since every atom moves at once and
+    a single bad contact rejects the whole configuration.  Useful as a
+    low-weight background move alongside ``gmc``.
+
+    ::
+
+        moves:
+          - {type: random_walk, step_size: 0.1, weight: 1}
+    """
+
+    type: Literal["random_walk"] = Field(
+        default="random_walk",
+        description="Discriminator selecting this move.",
+    )
 
     def _build_kernel(self) -> Callable:
         return random_walk.build_kernel
@@ -224,9 +279,28 @@ class GMCMoveSpec(BaseMoveSpec):
       ``n_reflect``.  Use ``weight`` to spend the budget where it pays.
     """
 
-    type: Literal["gmc"] = "gmc"
-    n_reflect: int = 5
-    species: tuple[str, ...] | None = None
+    type: Literal["gmc"] = Field(
+        default="gmc", description="Discriminator selecting this move."
+    )
+    n_reflect: int = Field(
+        default=5,
+        description=(
+            "Reflections per Galilean trajectory.  Each costs one "
+            "energy-and-force evaluation, so this multiplies the move's "
+            "price; more reflections travel further per proposal."
+        ),
+    )
+    species: tuple[str, ...] | None = Field(
+        default=None,
+        description=(
+            "Restrict the move to the named element(s), holding the rest "
+            "fixed.  A bare symbol (``species: Ge``) is accepted as "
+            "shorthand for a one-element list.  Declaring one scoped move "
+            "per element gives each sublattice an independently adapted "
+            "step size — worth it when one sublattice melts well before "
+            "the other.  Scoped moves are auto-named ``gmc_<symbols>``."
+        ),
+    )
 
     @field_validator("species", mode="before")
     @classmethod
@@ -320,8 +394,30 @@ class GMCMoveSpec(BaseMoveSpec):
 
 
 class HMCMoveSpec(BaseMoveSpec):
-    type: Literal["hmc"] = "hmc"
-    n_leapfrog: int = 10
+    """Hamiltonian Monte Carlo with a leapfrog integrator.
+
+    Draws fresh momenta, integrates the equations of motion for
+    ``n_leapfrog`` steps, and accepts on the energy error.  Travels much
+    further per proposal than a random walk, at ``n_leapfrog``
+    energy-and-force evaluations each.
+
+    ::
+
+        moves:
+          - {type: hmc, n_leapfrog: 20, step_size: 0.05, weight: 1}
+    """
+
+    type: Literal["hmc"] = Field(
+        default="hmc", description="Discriminator selecting this move."
+    )
+    n_leapfrog: int = Field(
+        default=10,
+        description=(
+            "Leapfrog steps per trajectory.  Each costs one "
+            "energy-and-force evaluation; longer trajectories decorrelate "
+            "further per proposal but cost proportionally more."
+        ),
+    )
 
     def _n_steps(self) -> int:
         return self.n_leapfrog
@@ -339,14 +435,50 @@ class HMCMoveSpec(BaseMoveSpec):
 
 
 class SingleAtomMoveSpec(BaseMoveSpec):
-    type: Literal["single_atom"] = "single_atom"
+    """Displace one randomly chosen atom per proposal.
+
+    Acceptance does not collapse as the system grows — only one atom risks
+    a bad contact — so this stays usable at densities where whole-system
+    moves are rejected almost always.  It also costs a full energy
+    evaluation per atom moved, which is why it is usually a supporting move
+    rather than the main one.
+
+    ::
+
+        moves:
+          - {type: single_atom, step_size: 0.2, weight: 1}
+    """
+
+    type: Literal["single_atom"] = Field(
+        default="single_atom",
+        description="Discriminator selecting this move.",
+    )
 
     def _build_kernel(self) -> Callable:
         return single_atom.build_kernel
 
 
 class SingleAtomSweepMoveSpec(BaseMoveSpec):
-    type: Literal["single_atom_sweep"] = "single_atom_sweep"
+    """Displace every atom once per proposal, in a random order.
+
+    One sweep is ``n_atoms`` single-atom proposals, each accepted or
+    rejected on its own — so it gets the good acceptance of
+    ``single_atom`` while advancing the whole configuration per dispatch.
+    Correspondingly it costs ``n_atoms`` energy evaluations.
+
+    ``n_atoms`` is supplied by the resolver from the initial positions, so
+    it is not a YAML key.
+
+    ::
+
+        moves:
+          - {type: single_atom_sweep, step_size: 0.2, weight: 1}
+    """
+
+    type: Literal["single_atom_sweep"] = Field(
+        default="single_atom_sweep",
+        description="Discriminator selecting this move.",
+    )
 
     def _build_kernel(self) -> Callable:
         return single_atom.build_sweep_kernel
@@ -388,8 +520,20 @@ class SpeciesSwapMoveSpec(BaseMoveSpec):
     here.
     """
 
-    type: Literal["species_swap"] = "species_swap"
-    species: tuple[str, ...] | None = None
+    type: Literal["species_swap"] = Field(
+        default="species_swap",
+        description="Discriminator selecting this move.",
+    )
+    species: tuple[str, ...] | None = Field(
+        default=None,
+        description=(
+            "Restrict the exchange to the named elements, e.g. "
+            "``[Ge, Si]``.  Must name at least two distinct elements — a "
+            "one-element scope has nothing to exchange and is rejected at "
+            "parse time.  Omit to allow any unlike pair.  Scoped moves are "
+            "auto-named ``species_swap_<symbols>``."
+        ),
+    )
 
     @field_validator("species", mode="before")
     @classmethod
@@ -469,7 +613,27 @@ class SpeciesSwapMoveSpec(BaseMoveSpec):
 
 
 class VolumeMoveSpec(BaseMoveSpec):
-    type: Literal["volume"] = "volume"
+    """Isotropic cell-volume change, co-transforming atom positions.
+
+    Required for any NPT run — without it the cell never breathes and the
+    ``P*V`` term does no work.  ``step_size`` is a relative volume scale,
+    not a length, so it is not comparable with the displacement moves.
+
+    Bounds come from the ``cell:`` section, not from this spec.
+
+    ::
+
+        moves:
+          - {type: volume, step_size: 0.3, weight: 1}
+
+        cell:
+          max_volume_per_atom: 20.0
+          min_volume_per_atom: 0.5
+    """
+
+    type: Literal["volume"] = Field(
+        default="volume", description="Discriminator selecting this move."
+    )
 
     def _reject_reasons(self) -> frozenset[str]:
         return frozenset({"energy", "cell", "prior"})
@@ -506,7 +670,25 @@ class VolumeMoveSpec(BaseMoveSpec):
 
 
 class ShearMoveSpec(BaseMoveSpec):
-    type: Literal["shear"] = "shear"
+    """Volume-preserving shear of the cell, co-transforming positions.
+
+    Lets the cell change shape at fixed volume, which is what allows a
+    walker to find a non-cubic crystal structure.  Pair it with
+    ``stretch``; neither alone spans the full space of cell shapes.
+    Proposals violating ``cell.min_aspect_ratio`` are rejected.
+
+    Bounds come from the ``cell:`` section, not from this spec.
+
+    ::
+
+        moves:
+          - {type: shear, step_size: 0.1, weight: 1}
+          - {type: stretch, step_size: 0.1, weight: 1}
+    """
+
+    type: Literal["shear"] = Field(
+        default="shear", description="Discriminator selecting this move."
+    )
 
     def _reject_reasons(self) -> frozenset[str]:
         return frozenset({"energy", "cell"})
@@ -542,7 +724,23 @@ class ShearMoveSpec(BaseMoveSpec):
 
 
 class StretchMoveSpec(BaseMoveSpec):
-    type: Literal["stretch"] = "stretch"
+    """Volume-preserving anisotropic stretch, co-transforming positions.
+
+    Lengthens one cell axis and compresses the others to keep the volume
+    fixed.  The complement to ``shear``: together they explore cell shape,
+    while ``volume`` explores cell size.
+
+    Bounds come from the ``cell:`` section, not from this spec.
+
+    ::
+
+        moves:
+          - {type: stretch, step_size: 0.1, weight: 1}
+    """
+
+    type: Literal["stretch"] = Field(
+        default="stretch", description="Discriminator selecting this move."
+    )
 
     def _reject_reasons(self) -> frozenset[str]:
         return frozenset({"energy", "cell"})
@@ -578,8 +776,28 @@ class StretchMoveSpec(BaseMoveSpec):
 
 
 class AlchemicalMorphMoveSpec(BaseMoveSpec):
-    type: Literal["alchemical_morph"] = "alchemical_morph"
-    n_species: int
+    """Continuously morph one atom's identity toward another species.
+
+    Unlike ``species_swap``, which exchanges two existing atoms and so
+    conserves the composition, a morph changes it — use it for semi-grand
+    runs where the composition is meant to fluctuate.
+
+    ::
+
+        moves:
+          - {type: alchemical_morph, n_species: 2, step_size: 0.1, weight: 1}
+    """
+
+    type: Literal["alchemical_morph"] = Field(
+        default="alchemical_morph",
+        description="Discriminator selecting this move.",
+    )
+    n_species: int = Field(
+        description=(
+            "Number of species the morph can select among.  Must match "
+            "the species count of the initialised system."
+        ),
+    )
     # NOTE: n_species could in principle be derived from len(symbol_map) in
     # init_resolved, but that would require threading symbol_map through the
     # resolver to to_descriptor().  Since it is single-valued and small, keeping
@@ -600,6 +818,74 @@ class AlchemicalMorphMoveSpec(BaseMoveSpec):
         return frozenset({"types"})
 
 
+class Lattice1DMoveSpec(BaseMoveSpec):
+    """Change the box length of the 1-D toy model.
+
+    The 1-D analogue of a volume move, and the counterpart to
+    ``distance_1d``; the RENS paper runs the two in a 1:1 ratio.  Bounds come
+    from the ``cell:`` section, read as bounds on ``a / n_atoms``.  Only for
+    ``backend: rens_toy``.
+
+    ::
+
+        moves:
+          - {type: lattice_1d, step_size: 0.3, weight: 1.0}
+          - {type: distance_1d, step_size: 0.3, weight: 1.0}
+    """
+
+    type: Literal["lattice_1d"] = Field(
+        default="lattice_1d",
+        description="Discriminator selecting this move.",
+    )
+
+    def _reject_reasons(self) -> frozenset[str]:
+        return frozenset({"energy", "cell"})
+
+    def _mutates(self) -> frozenset[str]:
+        return frozenset({"positions", "cell"})
+
+    def _build_kernel(self) -> Callable:
+        return toy_1d.build_lattice_kernel
+
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        symbol_map: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        if n_atoms is None or cell_cfg is None:
+            raise ValueError(
+                "Lattice1DMoveSpec.to_descriptor() requires n_atoms and "
+                "cell_cfg from the resolver."
+            )
+        return {
+            "n_atoms": n_atoms,
+            "max_vol_per_atom": cell_cfg.max_volume_per_atom,
+            "min_vol_per_atom": cell_cfg.min_volume_per_atom,
+        }
+
+
+class Distance1DMoveSpec(BaseMoveSpec):
+    """Displace one particle of the 1-D toy model along the axis.
+
+    Counterpart to ``lattice_1d``.  Only ``x`` moves — ``y`` and ``z`` are
+    not arguments of the toy energy.  Only for ``backend: rens_toy``.
+
+    ::
+
+        moves:
+          - {type: distance_1d, step_size: 0.3, weight: 1.0}
+    """
+
+    type: Literal["distance_1d"] = Field(
+        default="distance_1d",
+        description="Discriminator selecting this move.",
+    )
+
+    def _build_kernel(self) -> Callable:
+        return toy_1d.build_distance_kernel
+
+
 # ---------------------------------------------------------------------------
 # Discriminated union
 # ---------------------------------------------------------------------------
@@ -612,6 +898,8 @@ MoveSpec = Annotated[
         SingleAtomMoveSpec,
         SingleAtomSweepMoveSpec,
         SpeciesSwapMoveSpec,
+        Lattice1DMoveSpec,
+        Distance1DMoveSpec,
         VolumeMoveSpec,
         ShearMoveSpec,
         StretchMoveSpec,

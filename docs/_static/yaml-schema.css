@@ -1,0 +1,79 @@
+/* Tables emitted by the docs/_ext/yaml_schema.py directives.
+ *
+ * The Description column carries long inline literals (whole key paths such
+ * as `output.{info,traj,snapshot}_interval`). Without an explicit break rule
+ * those are unbreakable words: the table grows past its container and Furo's
+ * wrapper turns the whole row group into a horizontal scroller, which hides
+ * the Description column on narrow screens.
+ */
+
+table.yaml-schema-table {
+  width: 100%;
+  table-layout: fixed;
+}
+
+table.yaml-schema-table td,
+table.yaml-schema-table th {
+  vertical-align: top;
+  /* Long dotted key paths and Literal unions must be allowed to break. */
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+/* The Key column is the scan target — keep it visually distinct from the
+ * literals that appear inside prose in the Description column. */
+table.yaml-schema-table td:first-child code {
+  white-space: normal;
+  font-weight: 600;
+}
+
+/* The Default column must be allowed to wrap.  With `table-layout: fixed` a
+ * cell that cannot break does not widen its column — it overflows, painting
+ * over the Description column next to it.  Docutils already splits a literal
+ * into one `<span class="pre">` per whitespace-separated token, so a list
+ * default like `[30, 35, 40, 45, 50]` breaks cleanly after a comma; the
+ * inherited `overflow-wrap: anywhere` above catches single unbreakable
+ * tokens such as `8.6173324e-05`. */
+table.yaml-schema-table td:nth-child(3) {
+  white-space: normal;
+}
+
+/* ------------------------------------------------------------------------
+ * Variant tab panels emitted by the `yaml-variants` directive.
+ *
+ * sphinx-design marks the panel with only a hairline box-shadow above and
+ * below. That is enough for short, uniform panels, but the move and backend
+ * variants differ hugely in length — `gmc` runs many paragraphs while
+ * `random_walk` is a few lines — so on a long one the reader cannot tell
+ * where the selected variant stops and the next section begins. Drawing the
+ * panel as an enclosed, tinted box makes its extent unambiguous.
+ *
+ * The box is deliberately self-contained rather than visually joined to its
+ * tab: `.sd-tab-set` is a wrapping flexbox and the panel carries `order: 99`,
+ * so with ten move types the labels occupy several rows and the active one is
+ * usually nowhere near the top edge of the panel.
+ * ---------------------------------------------------------------------- */
+
+.yaml-variant-tabs {
+  margin-bottom: 1.75rem;
+}
+
+.yaml-variant-tabs > .sd-tab-content {
+  box-sizing: border-box;
+  /* Replaces the theme's hairline shadow; keeping both double-draws the
+   * top and bottom edges. */
+  box-shadow: none;
+  border: 1px solid var(--color-background-border, #ccc);
+  border-top: 2px solid var(--color-brand-primary, #2980b9);
+  border-radius: 0.3rem;
+  background-color: var(--color-background-secondary, #f8f8f8);
+  padding: 1rem 1.15rem;
+}
+
+/* The example block closes each panel. Give it air above so it reads as a
+ * summary of the variant rather than a continuation of the prose, and let
+ * it keep its own code background — that contrast against the panel tint is
+ * what makes it legible as the panel's final element. */
+.yaml-variant-tabs > .sd-tab-content > div[class^="highlight"] {
+  margin-top: 1rem;
+}

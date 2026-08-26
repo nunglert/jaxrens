@@ -21,7 +21,8 @@ Add the relevant backend extra(s) only if you touch code that imports them
 
 ```bash
 pip install -e ".[docs]"
-bash docs/autobuild.sh       # sphinx-autobuild docs docs/_build/html -j auto
+bash docs/autobuild.sh       # sphinx-autobuild docs docs/_build/html, minus
+                              # the treemap's self-regenerated output
 ```
 
 ## Where code belongs
@@ -133,6 +134,17 @@ What we expect of a contribution:
   the logic can be isolated.
 - **Tests must self-skip, never hard-fail, when a capability is missing** (no
   GPU, no backend package). Follow the existing marker conventions.
+
+## AI-assisted contributions
+
+Code written with the help of an AI coding agent (Claude, Codex, Copilot,
+…) is welcome. Nested sampling for atomistic systems is enough work by
+itself without also hand-typing every line of YAML-schema boilerplate —
+use the hammer, not your bare hands. What we ask is the same bar as any
+other contribution, agent-written or not: you understood the change,
+you've actually read the diff rather than skimmed the summary, and you'd
+put your name on every line of it. Run the test suite yourself; don't
+commit output you haven't personally checked.
 
 ## Submitting changes
 

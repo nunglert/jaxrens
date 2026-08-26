@@ -668,8 +668,8 @@ class TestAdaptationSpec:
         from jaxrens.cli.schema.adaptation import AdaptationSpec
 
         cfg = AdaptationSpec()
-        assert cfg.full_auto is False
-        assert cfg.adjust_interval == 0
+        assert cfg.full_auto is True
+        assert cfg.adjust_interval == 100
         assert cfg.per_move == {}
         assert cfg.defaults.min_rate is None
 
@@ -693,7 +693,7 @@ class TestAdaptationSpec:
     def test_default_adaptation_config_round_trip(self):
         d = _minimal_dict()
         root = RootSpec.model_validate(d)
-        assert root.adaptation.full_auto is False
+        assert root.adaptation.full_auto is True
         assert root.adaptation.defaults.min_rate is None
 
 
@@ -718,6 +718,41 @@ class TestIntervalUnitsField:
         d = _minimal_dict()
         d["interval_units"] = "sweep"
         with pytest.raises(ValidationError):
+            RootSpec.model_validate(d)
+
+
+class TestNCullPostprocessingWarning:
+    """``run.n_cull > 1`` is sampled correctly but silently mis-analysed:
+
+    ``Monitor.from_directory`` hardcodes ``n_cull=1`` when reconstructing
+    prior-mass weights from disk, so downstream ``jaxrens analyze``/``plot``
+    would be wrong for such a run.  Routed through :mod:`jaxrens.unvalidated`
+    (not a plain warning) since this is exactly that module's concern: a path
+    nobody has checked against a real run's output.  The marker mechanism
+    itself (registry, one-shot, env policy) is covered by
+    ``tests/test_unvalidated.py``; these two just confirm this call site
+    trips it under the right condition and stays quiet otherwise.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_markers(self):
+        """One-shot suppression is process-global; clear it around each test."""
+        from jaxrens.unvalidated import reset
+
+        reset()
+        yield
+        reset()
+
+    def test_default_n_cull_is_silent(self, recwarn):
+        RootSpec.model_validate(_minimal_dict())
+        assert not [w for w in recwarn if issubclass(w.category, UserWarning)]
+
+    def test_n_cull_above_one_warns(self):
+        from jaxrens.unvalidated import UnvalidatedFeatureWarning
+
+        d = _minimal_dict()
+        d["run"]["n_cull"] = 2
+        with pytest.warns(UnvalidatedFeatureWarning, match=r"run\.n_cull > 1"):
             RootSpec.model_validate(d)
 
 
@@ -1155,3 +1190,261 @@ class TestFullConfigFixture:
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
         assert "OK" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Field description coverage
+# ---------------------------------------------------------------------------
+
+_SCHEMA_MODULES = (
+    "adaptation",
+    "backend",
+    "cell",
+    "constraints",
+    "ensemble",
+    "init",
+    "inter_re",
+    "moves",
+    "output",
+    "root",
+    "run",
+    "termination",
+)
+
+
+def _all_spec_models():
+    """Every pydantic model declared in ``jaxrens.cli.schema.*``."""
+    import importlib
+    import inspect
+
+    from pydantic import BaseModel
+
+    for mod_name in _SCHEMA_MODULES:
+        module = importlib.import_module(f"jaxrens.cli.schema.{mod_name}")
+        for name, obj in vars(module).items():
+            if (
+                inspect.isclass(obj)
+                and issubclass(obj, BaseModel)
+                and obj.__module__ == module.__name__
+            ):
+                yield module.__name__, name, obj
+
+
+class TestFieldDescriptions:
+    """Every config field must carry a ``Field(description=...)``.
+
+    The description is the single source for three separate outputs: the
+    generated tables on ``docs/reference/config``, the ``jaxrens
+    dump-schema`` JSON, and the text pydantic quotes back in validation
+    errors.  A field added without one silently renders as a blank cell in
+    the configuration reference, which is exactly the failure mode this
+    test exists to prevent.
+    """
+
+    def test_every_field_has_a_description(self):
+        missing = [
+            f"{module}.{cls}.{field}"
+            for module, cls, model in _all_spec_models()
+            for field, info in model.model_fields.items()
+            if not (info.description or "").strip()
+        ]
+        assert not missing, (
+            "config schema fields without Field(description=...): "
+            + ", ".join(sorted(missing))
+        )
+
+    def test_descriptions_reach_the_json_schema(self):
+        """dump-schema must carry the same prose the docs render.
+
+        Compared against the model field rather than a fixed phrase: the
+        point is that the plumbing carries the description through, not
+        that any particular sentence survives an edit.
+        """
+        schema = RootSpec.model_json_schema()
+        assert schema["properties"]["run"]["description"] == (
+            RootSpec.model_fields["run"].description
+        )
+        from jaxrens.cli.schema.run import RunSpec
+
+        run_props = schema["$defs"]["RunSpec"]["properties"]
+        for name, info in RunSpec.model_fields.items():
+            assert run_props[name]["description"] == info.description
+
+
+class TestDocumentedExampleConfig:
+    """The 'A complete config' block in the docs must actually parse.
+
+    ``docs/reference/config.rst`` opens with a single YAML skeleton covering
+    every top-level section.  It is the first thing a new user copies, so a
+    key renamed in the schema without updating it is a real breakage — and
+    one nothing else would catch, since the surrounding tables are generated
+    while that block is hand-written.
+    """
+
+    _DOC = (
+        Path(__file__).resolve().parents[2]
+        / "docs"
+        / "reference"
+        / "config.rst"
+    )
+
+    def _example_yaml(self) -> str:
+        text = self._DOC.read_text()
+        start = text.index(
+            ".. code-block:: yaml", text.index("A complete config")
+        )
+        body, started = [], False
+        for line in text[start:].splitlines()[1:]:
+            if not line.strip():
+                body.append("")
+            elif line.startswith("   "):
+                started = True
+                body.append(line[3:])
+            elif started:
+                break
+        return "\n".join(body)
+
+    @pytest.mark.skipif(
+        not _DOC.exists(), reason="docs tree not present in this checkout"
+    )
+    def test_example_validates_without_warnings(self, recwarn):
+        root = RootSpec.model_validate(yaml.safe_load(self._example_yaml()))
+        assert [m.type for m in root.moves] == [
+            "gmc",
+            "volume",
+            "shear",
+            "stretch",
+        ]
+        assert root.backend.type == "lj"
+        assert root.ensemble.type == "npt"
+        assert [t.type for t in root.termination] == ["prior_mass"]
+        assert not [w for w in recwarn if issubclass(w.category, UserWarning)]
+
+    @pytest.mark.skipif(
+        not _DOC.exists(), reason="docs tree not present in this checkout"
+    )
+    def test_example_covers_every_top_level_key(self):
+        documented = set(yaml.safe_load(self._example_yaml()))
+        declared = set(RootSpec.model_fields) - {"interval_units"}
+        assert declared - documented == set(), (
+            "config sections missing from the documented example: "
+            f"{sorted(declared - documented)}"
+        )
+
+
+# Discriminated-union sections whose variants are rendered as tabs in the
+# configuration reference: (YAML section, module, union alias).
+_VARIANT_UNIONS = [
+    ("moves", "jaxrens.cli.schema.moves", "MoveSpec"),
+    ("backend", "jaxrens.cli.schema.backend", "BackendSpec"),
+    ("ensemble", "jaxrens.cli.schema.ensemble", "EnsembleSpec"),
+    ("termination", "jaxrens.cli.schema.termination", "TerminationSpec"),
+    ("constraints", "jaxrens.cli.schema.constraints", "ConstraintSpec"),
+]
+
+
+def _union_members(module_path: str, attr: str):
+    """Concrete variant classes behind a discriminated-union alias."""
+    import importlib
+    import inspect as _inspect
+    import typing
+
+    union = getattr(importlib.import_module(module_path), attr)
+    args = typing.get_args(union)
+    members = [m for m in typing.get_args(args[0]) if _inspect.isclass(m)]
+    return members or [args[0]]
+
+
+def _variant_cases():
+    """One parametrize case per (section, concrete variant) pair.
+
+    Driven off the unions themselves, so a newly added variant shows up as a
+    failing case until it carries an example -- rather than being silently
+    left out of the sweep.
+    """
+    for section, module_path, attr in _VARIANT_UNIONS:
+        for spec in _union_members(module_path, attr):
+            yield pytest.param(section, spec, id=f"{section}-{spec.__name__}")
+
+
+class TestDocstringExamples:
+    """Every variant spec must carry a YAML example, and it must parse.
+
+    The configuration reference renders each variant's docstring into its
+    tab, so these snippets are what a reader copies when picking a move
+    type, a backend, an ensemble or a stopping criterion.  They are
+    hand-written prose inside otherwise-generated pages, which makes them
+    the one part of that page that can silently rot when a field is renamed.
+    """
+
+    @staticmethod
+    def _examples(model, section: str) -> list[str]:
+        """Pull indented ``<section>:`` literal blocks out of a docstring."""
+        import inspect as _inspect
+        import textwrap
+
+        doc = _inspect.getdoc(model) or ""
+        blocks, current = [], None
+        for line in doc.splitlines():
+            if current is not None:
+                if not line.strip() or line.startswith((" ", "\t")):
+                    current.append(line)
+                    continue
+                blocks.append(current)
+                current = None
+            # reST opens a literal block either with a bare ``::`` line or
+            # with ``::`` appended to the preceding sentence; the move
+            # docstrings use both spellings.
+            if line.strip().endswith("::"):
+                current = []
+        if current is not None:
+            blocks.append(current)
+        return [
+            textwrap.dedent("\n".join(b))
+            for b in blocks
+            if f"{section}:" in "\n".join(b)
+        ]
+
+    @pytest.mark.parametrize("section,spec", list(_variant_cases()))
+    def test_example_present_and_valid(self, section, spec):
+        examples = self._examples(spec, section)
+        assert examples, (
+            f"{spec.__name__} has no ``{section}:`` example in its "
+            "docstring; the config reference renders that docstring as the "
+            "variant's tab, so the tab would show no usage snippet."
+        )
+        declared = spec.model_fields["type"].default
+        for text in examples:
+            fragment = yaml.safe_load(text)
+            base = _minimal_dict()
+            base.update(fragment)
+            root = RootSpec.model_validate(base)
+            entries = getattr(root, section)
+            if not isinstance(entries, list):
+                entries = [entries]
+            assert any(e.type == declared for e in entries), (
+                f"{spec.__name__} example declares no `type: {declared}` "
+                f"entry; got {[e.type for e in entries]}"
+            )
+
+
+class TestTutorialConfigs:
+    """Every tutorial config must parse against the current schema.
+
+    The docs pages ``literalinclude`` these files, so a renamed field would
+    otherwise ship a broken copy-pasteable example — the tutorials are the
+    first thing a new user runs.
+    """
+
+    _TUTORIALS = sorted(
+        (Path(__file__).resolve().parents[2] / "examples" / "tutorials").glob(
+            "*/config.yaml"
+        )
+    )
+
+    def test_tutorials_are_discovered(self):
+        assert self._TUTORIALS, "no examples/tutorials/*/config.yaml found"
+
+    @pytest.mark.parametrize("path", _TUTORIALS, ids=lambda p: p.parent.name)
+    def test_tutorial_config_validates(self, path):
+        RootSpec.model_validate(yaml.safe_load(path.read_text()))

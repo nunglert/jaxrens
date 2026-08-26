@@ -15,14 +15,14 @@ from jaxrens.sampling.termination import (
     EnergyTermination,
     IterationTermination,
     PriorMassTermination,
-    TerminationCriterion,
     TempTermination,
+    TerminationCriterion,
 )
-
 
 # ---------------------------------------------------------------------------
 # Base spec
 # ---------------------------------------------------------------------------
+
 
 class BaseTerminationSpec(BaseModel):
     """Fields shared by every termination criterion.
@@ -47,11 +47,34 @@ class BaseTerminationSpec(BaseModel):
 # Concrete specs
 # ---------------------------------------------------------------------------
 
+
 class IterationTerminationSpec(BaseTerminationSpec):
-    type: Literal["iteration"] = "iteration"
+    """Stop after a fixed number of NS iterations.
+
+    The blunt instrument — useful to bound a job's wall time, but the
+    iteration count that reaches a given temperature scales with ``n_live``,
+    so this does not transfer between configs.  Prefer ``prior_mass``.
+
+    ::
+
+        termination:
+          - type: iteration
+            max_iterations: 20000
+    """
+
+    type: Literal["iteration"] = Field(
+        default="iteration",
+        description="Discriminator selecting this criterion.",
+    )
     # Widened to int|float so RootSpec.interval_units='per_walker' can express
     # the cap in walker-sweeps; resolver scales+casts before to_criterion.
-    max_iterations: int | float
+    max_iterations: int | float = Field(
+        description=(
+            "Stop once the NS iteration counter reaches this value.  "
+            "Honours ``interval_units``, so in ``per_walker`` mode it is a "
+            "number of walker-sweeps."
+        ),
+    )
 
     def to_criterion(
         self,
@@ -63,8 +86,32 @@ class IterationTerminationSpec(BaseTerminationSpec):
 
 
 class PriorMassTerminationSpec(BaseTerminationSpec):
-    type: Literal["prior_mass"] = "prior_mass"
-    threshold: float = 0.1
+    """Stop once the remaining prior mass falls below ``threshold``.
+
+    The usual choice: prior mass contracts as ``exp(-i / n_live)``, so the
+    same threshold means the same depth of exploration regardless of
+    ``n_live``.  Smaller values sample further into the low-energy tail.
+
+    ::
+
+        termination:
+          - type: prior_mass
+            threshold: 1.e-5
+    """
+
+    type: Literal["prior_mass"] = Field(
+        default="prior_mass",
+        description="Discriminator selecting this criterion.",
+    )
+    threshold: float = Field(
+        default=0.1,
+        description=(
+            "Stop once the remaining prior mass ``X_i = exp(-i / n_live)`` "
+            "falls below this fraction.  The usual way to terminate: it "
+            "adapts the iteration count to ``n_live`` instead of pinning "
+            "it.  Smaller values sample further into the low-energy tail."
+        ),
+    )
 
     def to_criterion(
         self,
@@ -81,9 +128,41 @@ class PriorMassTerminationSpec(BaseTerminationSpec):
 
 
 class TemperatureTerminationSpec(BaseTerminationSpec):
-    type: Literal["temperature"] = "temperature"
-    target_temp: float
-    threshold: float = 10.0
+    """Stop once the NS temperature estimate cools to ``target_temp``.
+
+    Use when the physics sets the endpoint — "sample down to 100 K" — rather
+    than a count.  Relies on the finite-difference estimator, so set
+    ``output.temperature_kB`` to match your backend's energy units or the
+    target is meaningless.
+
+    ::
+
+        termination:
+          - type: temperature
+            target_temp: 100.0
+            threshold: 10.0
+    """
+
+    type: Literal["temperature"] = Field(
+        default="temperature",
+        description="Discriminator selecting this criterion.",
+    )
+    target_temp: float = Field(
+        description=(
+            "Stop once the finite-difference NS temperature estimate has "
+            "cooled to this value (Kelvin).  Useful when you care about "
+            "reaching a physical temperature rather than an iteration "
+            "count."
+        ),
+    )
+    threshold: float = Field(
+        default=10.0,
+        description=(
+            "Tolerance band around ``target_temp`` (Kelvin).  The run "
+            "stops when the estimate first falls within it, absorbing the "
+            "noise in the finite-difference estimator."
+        ),
+    )
 
     def to_criterion(
         self,
@@ -105,8 +184,33 @@ class TemperatureTerminationSpec(BaseTerminationSpec):
 
 
 class EnergyTerminationSpec(BaseTerminationSpec):
-    type: Literal["energy"] = "energy"
-    min_energy: float
+    """Stop once ``E_max`` drops below ``min_energy``.
+
+    In the backend's own energy units, so the value does not carry across
+    backends or system sizes.  Handy as a safety net next to another
+    criterion — the run stops when *any* of them fires.
+
+    ::
+
+        termination:
+          - type: prior_mass
+            threshold: 1.e-5
+          - type: energy
+            min_energy: -1000.0
+    """
+
+    type: Literal["energy"] = Field(
+        default="energy",
+        description="Discriminator selecting this criterion.",
+    )
+    min_energy: float = Field(
+        description=(
+            "Stop once the highest live-walker energy (the NS ``E_max`` "
+            "threshold) drops below this value, in the backend's own "
+            "energy units.  Backend-specific — a hard floor, not a "
+            "portable one."
+        ),
+    )
 
     def to_criterion(
         self,
