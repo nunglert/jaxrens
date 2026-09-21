@@ -14,8 +14,13 @@ authors = [
     { name = "Nico Unglert" },
 ]
 dependencies = [
-    "jax[cuda12]>=0.9.0",
-    "jaxlib>=0.9.0",
+    # TEMPORARY upper bound: jax >=0.11.2 conflicts with flax (unresolved
+    # upstream).  jax[cuda12] pins jax-cuda12-plugin/pjrt to the jax version,
+    # so bounding jax bounds the CUDA plugins too; jaxlib is bounded
+    # explicitly because jax and jaxlib must stay version-matched.
+    # Drop both upper bounds once flax ships a compatible release.
+    "jax[cuda12]>=0.9.0,<0.11.2",
+    "jaxlib>=0.9.0,<0.11.2",
     "numpy>=1.26",
     "h5py>=3.10",
     "ase>=3.22",
