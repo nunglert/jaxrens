@@ -33,6 +33,7 @@ from jaxrens.sampling.batch_descriptor import (
     SingleRun,
     VmapRuns,
 )
+from jaxrens.sampling.mesh import build_mesh, pmap_like
 from jaxrens.sampling.moves.replica_exchange import (
     PressureRENSSwap,
     SemiGrandSwap,
@@ -208,7 +209,8 @@ class InterREManager:
                     -> (new_pos, new_types, new_ene, new_cells, swap_info)
 
             ``jit_pmap_swap`` operates on ``(G, P, K, ...)`` shaped inputs via
-            ``pmap(vmap_all_gather_swap, axis_name="gpu")``.
+            a ``"gpu"``-axis ``shard_map`` (pmap-equivalent, see
+            :mod:`jaxrens.sampling.mesh`) wrapping an all_gather swap body.
             ``jit_vmap_swap`` operates on ``(n_runs, K, ...)`` shaped inputs.
 
             For XRENS, the signature is extended with ``composition_targets``::
@@ -548,7 +550,13 @@ class InterREManager:
 
                 return shard_pos, shard_typ, shard_ene, shard_bxs, swap_info
 
-        jit_pmap = jax.pmap(_pmap_body, axis_name="gpu")
+        # jit_pmap is only ever invoked for PmapVmapRuns (see `apply`); other
+        # batchers don't carry an n_gpu to build a mesh from and don't need
+        # this callable, so leave it unbuilt.
+        jit_pmap = None
+        if isinstance(self._batcher, PmapVmapRuns):
+            mesh = build_mesh("gpu", self._batcher.n_gpu)
+            jit_pmap = jax.jit(pmap_like(_pmap_body, "gpu", mesh))
 
         return jit_vmap, jit_pmap
 

@@ -29,6 +29,8 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float, Shaped
 
+from jaxrens.sampling.mesh import build_mesh, pmap_like
+
 
 class BatchDescriptor(ABC):
     """Encapsulates the single/vmap/pmap differences for the NS outer loop.
@@ -207,7 +209,9 @@ class BatchDescriptor(ABC):
         return jnp.take(pop.step_sizes, 0, axis=self.walker_axis)
 
     def broadcast_step_sizes(
-        self, per_move_ss: jnp.ndarray, n_walkers: int,
+        self,
+        per_move_ss: jnp.ndarray,
+        n_walkers: int,
     ) -> jnp.ndarray:
         """Inverse of :meth:`extract_step_sizes` — re-insert the walker axis.
 
@@ -221,9 +225,7 @@ class BatchDescriptor(ABC):
             target_shape,
         )
 
-    def reduce_emax(
-        self, energy: Float[Array, "*P K"]
-    ) -> Float[Array, "*P"]:
+    def reduce_emax(self, energy: Float[Array, "*P K"]) -> Float[Array, "*P"]:
         """Per-replica Emax: ``max`` along the walker axis.
 
         Returns scalar for SingleRun, ``(*shape_prefix,)`` otherwise.
@@ -270,7 +272,9 @@ class BatchDescriptor(ABC):
 
         * **SingleRun** — ``jax.jit(per_element_fn)``.
         * **VmapRuns** — ``jax.jit(jax.vmap(per_element_fn))``.
-        * **PmapVmapRuns** — ``jax.pmap(jax.vmap(per_element_fn), axis_name="gpu")``.
+        * **PmapVmapRuns** — ``jax.jit(shard_map(jax.vmap(per_element_fn)))``,
+          outer ``"gpu"``-axis shard_map (pmap-equivalent, see
+          :mod:`jaxrens.sampling.mesh`) over G, inner vmap over P.
 
         Default implementation routes by ``shape_prefix`` length so concrete
         classes inherit unchanged.
@@ -280,9 +284,11 @@ class BatchDescriptor(ABC):
             return jax.jit(per_element_fn)
         if n_prefix == 1:
             return jax.jit(jax.vmap(per_element_fn))
-        # n_prefix == 2 (PmapVmapRuns): outer pmap over G, inner vmap over P.
-        # pmap is self-JIT-compiling — do NOT wrap in jax.jit.
-        return jax.pmap(jax.vmap(per_element_fn), axis_name="gpu")
+        # n_prefix == 2 (PmapVmapRuns): outer shard_map over G, inner vmap
+        # over P. Unlike jax.pmap, shard_map composes with jax.jit.
+        n_gpu = self.shape_prefix[0]
+        mesh = build_mesh("gpu", n_gpu)
+        return jax.jit(pmap_like(jax.vmap(per_element_fn), "gpu", mesh))
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +401,7 @@ class VmapRuns(BatchDescriptor):
 
         which matches the current ``run_ns_parallel`` inner step pattern.
         """
+
         def step_all_runs(ns_states):
             return jax.vmap(
                 lambda s: ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)
@@ -417,9 +424,7 @@ class VmapRuns(BatchDescriptor):
         jax.Array
             Shape ``(n_runs, n_sub_keys)`` with typed-key dtype.
         """
-        return jax.vmap(
-            lambda k: jax.random.split(k, n_sub_keys)
-        )(rng_key)
+        return jax.vmap(lambda k: jax.random.split(k, n_sub_keys))(rng_key)
 
     def reduce_for_termination(
         self,
@@ -453,16 +458,18 @@ class PmapVmapRuns(BatchDescriptor):
     For ``n_gpu=1`` this degenerates to ``(1, P, K, ...)`` and pmap runs on
     the single available device, which is useful for testing.
 
-    **wrap_step** composes ``jax.pmap`` (G axis) over ``jax.vmap`` (P axis):
+    **wrap_step** composes a ``"gpu"``-axis ``jax.shard_map`` (G axis, via
+    :func:`jaxrens.sampling.mesh.pmap_like`, pmap-equivalent) over
+    ``jax.vmap`` (P axis):
 
     .. code-block:: python
 
-        per_run   = lambda s: ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)
+        per_run    = lambda s: ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)
         per_device = jax.vmap(per_run)
-        jit_step   = jax.pmap(per_device, axis_name="gpu")
+        jit_step   = jax.jit(pmap_like(per_device, "gpu", mesh))
 
-    ``jax.pmap`` is self-JIT-compiling; do **not** wrap in an additional
-    ``jax.jit`` — that causes XLA sharding conflicts.
+    Unlike the ``jax.pmap`` this replaces, ``shard_map`` composes cleanly
+    with ``jax.jit``, so the result is explicitly jit-wrapped.
 
     **split_keys** produces ``(G, P, n_sub_keys)``-shaped key arrays via two
     nested splits: first ``(G,)`` per-GPU keys, then ``(P, n_sub_keys)`` per
@@ -485,7 +492,7 @@ class PmapVmapRuns(BatchDescriptor):
 
     n_gpu: int
     n_per_gpu: int
-    n_runs: int = 0           # set by __post_init__
+    n_runs: int = 0  # set by __post_init__
     shape_prefix: tuple[int, ...] = ()  # set by __post_init__
 
     def __post_init__(self) -> None:
@@ -504,7 +511,7 @@ class PmapVmapRuns(BatchDescriptor):
         n_mcmc_steps: int,
         n_extra: int,
     ):
-        """Return a pmap(vmap(...)) NS step callable.
+        """Return a shard_map(vmap(...)) NS step callable (pmap-equivalent).
 
         The returned callable has signature::
 
@@ -512,8 +519,11 @@ class PmapVmapRuns(BatchDescriptor):
 
         where ``ns_states`` has leading shape ``(G, P, ...)``.
 
-        ``jax.pmap`` is already JIT-compiled internally; the returned
-        function is **not** additionally wrapped in ``jax.jit``.
+        Built on ``jax.shard_map`` via :func:`jaxrens.sampling.mesh.pmap_like`
+        rather than ``jax.pmap`` — this is the ``"gpu"``-axis leg of the
+        pmap -> shard_map migration. Unlike ``jax.pmap``, ``shard_map``
+        composes with ``jax.jit``, so the returned callable is explicitly
+        jit-wrapped.
 
         Parameters
         ----------
@@ -529,16 +539,17 @@ class PmapVmapRuns(BatchDescriptor):
         Returns
         -------
         callable
-            ``jax.pmap(jax.vmap(per_run), axis_name="gpu")`` where
+            ``jax.jit(pmap_like(jax.vmap(per_run), "gpu", mesh))`` where
             ``per_run(s) = ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)``.
         """
-        # Close over Python-level statics to avoid static_argnums under pmap.
+
+        # Close over Python-level statics, same as under the old pmap path.
         def per_run(s):
             return ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)
 
         per_device = jax.vmap(per_run)
-        # pmap handles JIT internally — do NOT add jax.jit here.
-        return jax.pmap(per_device, axis_name="gpu")
+        mesh = build_mesh("gpu", self.n_gpu)
+        return jax.jit(pmap_like(per_device, "gpu", mesh))
 
     def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
         """Split a per-replica PRNG key array into ``(G, P, n_sub_keys)``.
@@ -561,9 +572,9 @@ class PmapVmapRuns(BatchDescriptor):
         jax.Array
             Shape ``(G, P, n_sub_keys)`` with typed-key dtype.
         """
-        return jax.vmap(jax.vmap(
-            lambda k: jax.random.split(k, n_sub_keys)
-        ))(rng_key)
+        return jax.vmap(jax.vmap(lambda k: jax.random.split(k, n_sub_keys)))(
+            rng_key
+        )
 
     def reduce_for_termination(
         self,
@@ -671,6 +682,7 @@ class ShardedSingleRun(BatchDescriptor):
 
         with leading shape ``(G, ...)`` on every leaf.
         """
+
         def per_shard(ns_state):
             return ns_step_fn(ns_state, step_fn, n_mcmc_steps, n_extra)
 
@@ -707,7 +719,7 @@ class ShardedSingleRun(BatchDescriptor):
         # ``extract_step_sizes`` so the per-move pmap accepts every
         # input uniformly without per-call ``jax.device_put``.
         shard_mesh = NamedSharding(
-            Mesh(jax.local_devices()[:self.n_gpu], ("shard",)),
+            Mesh(jax.local_devices()[: self.n_gpu], ("shard",)),
             PartitionSpec("shard"),
         )
         return jax.device_put(broadcast, shard_mesh)
@@ -732,9 +744,7 @@ class ShardedSingleRun(BatchDescriptor):
     # Override base helpers where the (G,) prefix needs special treatment
     # ------------------------------------------------------------------
 
-    def reduce_emax(
-        self, energy: Float[Array, "G K"]
-    ) -> Float[Array, "G"]:
+    def reduce_emax(self, energy: Float[Array, "G K"]) -> Float[Array, "G"]:
         """Global ``max`` over the entire (G, K_per_gpu) population, broadcast to (G,).
 
         Returns shape ``(G,)`` (every entry identical) on the
@@ -756,7 +766,7 @@ class ShardedSingleRun(BatchDescriptor):
         scalar = jnp.max(energy)
         broadcast = jnp.broadcast_to(scalar[None], (self.n_gpu,))
         shard_mesh = NamedSharding(
-            Mesh(jax.local_devices()[:self.n_gpu], ("shard",)),
+            Mesh(jax.local_devices()[: self.n_gpu], ("shard",)),
             PartitionSpec("shard"),
         )
         return jax.device_put(broadcast, shard_mesh)
@@ -778,7 +788,9 @@ class ShardedSingleRun(BatchDescriptor):
         self, arr_flat: Shaped[np.ndarray | Array, "1 ..."]
     ) -> Shaped[np.ndarray | Array, "G ..."]:
         """Re-broadcast a length-1 leading axis to (G, ...)."""
-        return jnp.broadcast_to(arr_flat[0:1], (self.n_gpu,) + arr_flat.shape[1:])
+        return jnp.broadcast_to(
+            arr_flat[0:1], (self.n_gpu,) + arr_flat.shape[1:]
+        )
 
     def wrap_for_batch(self, per_element_fn):
         """Wrap a per-replica callable in ``pmap`` over the shard axis.
@@ -809,9 +821,10 @@ class ShardedSingleRun(BatchDescriptor):
         Returns shape ``(G,)`` typed-key array sharded along axis 0.
         """
         from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
         keys = jax.random.split(rng_key, self.n_gpu)
         shard_mesh = NamedSharding(
-            Mesh(jax.local_devices()[:self.n_gpu], ("shard",)),
+            Mesh(jax.local_devices()[: self.n_gpu], ("shard",)),
             PartitionSpec("shard"),
         )
         return jax.device_put(keys, shard_mesh)
