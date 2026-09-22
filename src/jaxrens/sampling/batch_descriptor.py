@@ -633,12 +633,14 @@ class ShardedSingleRun(BatchDescriptor):
     value after the in-step collectives.
 
     Inputs to :meth:`wrap_for_batch`-wrapped callables are scalar
-    (ss / emax / key); the wrapper broadcasts to (G,) before
-    ``pmap`` and takes ``[0]`` of the result on the way out.  This
-    keeps the per-replica callable signature identical to
-    SingleRun so :func:`build_adapt_step` doesn't need a different
-    closure shape — only the underlying ``adjust_step_size_sharded``
-    call needs to know it's running under pmap.
+    (ss / emax / key); the wrapper broadcasts to (G,) before the
+    mapped call (``jax.shard_map`` via
+    :func:`jaxrens.sampling.mesh.pmap_like`) and takes ``[0]`` of the
+    result on the way out.  This keeps the per-replica callable
+    signature identical to SingleRun so :func:`build_adapt_step`
+    doesn't need a different closure shape — only the underlying
+    ``adjust_step_size_sharded`` call needs to know it's running
+    under a mapped ``"shard"`` context.
 
     Attributes
     ----------
@@ -669,24 +671,28 @@ class ShardedSingleRun(BatchDescriptor):
         n_mcmc_steps: int,
         n_extra: int,
     ):
-        """Return a ``pmap``-compiled NS step callable.
+        """Return a shard_map-compiled NS step callable (pmap-equivalent).
 
         ``ns_step_fn`` here should be ``ns_step_sharded`` (not the
         plain ``ns_step``) — it uses ``lax.all_gather`` / ``lax.psum``
-        collectives that only work inside a ``pmap`` context with
-        matching ``axis_name="shard"``.
+        collectives that only work inside a mapped context with
+        matching ``axis_name="shard"`` (``jax.shard_map`` via
+        :func:`jaxrens.sampling.mesh.pmap_like`, same as ``jax.pmap``
+        provided).
 
         The returned callable has signature::
 
-            pmap_step(ns_state)  ->  (ns_state, info)
+            step(ns_state)  ->  (ns_state, info)
 
-        with leading shape ``(G, ...)`` on every leaf.
+        with leading shape ``(G, ...)`` on every leaf. Unlike the
+        ``jax.pmap`` this replaces, the result composes with ``jax.jit``.
         """
 
         def per_shard(ns_state):
             return ns_step_fn(ns_state, step_fn, n_mcmc_steps, n_extra)
 
-        return jax.pmap(per_shard, axis_name="shard")
+        mesh = build_mesh("shard", self.n_gpu)
+        return jax.jit(pmap_like(per_shard, "shard", mesh))
 
     def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
         """Split a (G,)-broadcast key into ``(G, n_sub_keys)`` sub-keys.
@@ -793,7 +799,7 @@ class ShardedSingleRun(BatchDescriptor):
         )
 
     def wrap_for_batch(self, per_element_fn):
-        """Wrap a per-replica callable in ``pmap`` over the shard axis.
+        """Wrap a per-replica callable in shard_map over the shard axis.
 
         Signature contract: every input has a leading ``(G,)`` axis on
         the ``'shard'``-named mesh; outputs preserve that axis.  This
@@ -808,8 +814,14 @@ class ShardedSingleRun(BatchDescriptor):
         ``split_keys``, ``extract_step_sizes``) all return shape
         ``(G, ...)`` on the shard mesh, so callers don't need to
         massage shapes themselves.
+
+        Built on ``jax.shard_map`` via
+        :func:`jaxrens.sampling.mesh.pmap_like` (pmap-equivalent); unlike
+        the ``jax.pmap`` this replaces, the result composes with
+        ``jax.jit``.
         """
-        return jax.pmap(per_element_fn, axis_name="shard")
+        mesh = build_mesh("shard", self.n_gpu)
+        return jax.jit(pmap_like(per_element_fn, "shard", mesh))
 
     def distinct_keys(self, rng_key: jax.Array) -> jax.Array:
         """Split a scalar key into G INDEPENDENT keys on the shard mesh.
