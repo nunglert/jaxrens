@@ -1056,11 +1056,14 @@ def run_ns(
     n_atoms = positions.shape[1] if positions.ndim >= 2 else None
 
     logger.info(
-        "Starting NS run: %d walkers, %s atoms, max_iter=%s, n_mcmc=%d",
+        "Starting NS run: %d walkers, %s atoms, max_iter=%s, n_mcmc=%d, "
+        "n_extra=%d, total_mcmc_steps_per_iter=%d",
         n_walkers,
         n_atoms,
         max_iterations,
         n_mcmc_steps,
+        n_extra,
+        (1 + n_extra) * n_mcmc_steps,
     )
 
     batcher = SingleRun()
@@ -1306,12 +1309,14 @@ def run_ns_parallel(
     )
 
     logger.info(
-        "Starting parallel NS: %d runs, %d walkers, max_iter=%s, n_mcmc=%d, n_extra=%d",
+        "Starting parallel NS: %d runs, %d walkers, max_iter=%s, n_mcmc=%d, "
+        "n_extra=%d, total_mcmc_steps_per_iter=%d (per run)",
         n_runs,
         n_walkers,
         max_iterations,
         n_mcmc_steps,
         n_extra,
+        (1 + n_extra) * n_mcmc_steps,
     )
 
     batcher = VmapRuns(n_runs=n_runs)
@@ -1943,7 +1948,8 @@ def run_ns_multi_gpu(
 
     logger.info(
         "Starting multi-GPU NS: n_gpu=%d, n_per_gpu=%d (%d total runs), "
-        "n_walkers=%d, max_iter=%s, n_mcmc=%d, n_extra=%d",
+        "n_walkers=%d, max_iter=%s, n_mcmc=%d, n_extra=%d, "
+        "total_mcmc_steps_per_iter=%d (per run)",
         n_gpu,
         n_per_gpu,
         n_total,
@@ -1951,6 +1957,7 @@ def run_ns_multi_gpu(
         max_iterations,
         n_mcmc_steps,
         n_extra,
+        (1 + n_extra) * n_mcmc_steps,
     )
 
     if batcher is None:
@@ -2299,13 +2306,15 @@ def run_ns_sharded(
 
     logger.info(
         "Starting sharded-single NS: n_gpu=%d, n_walkers=%d "
-        "(K_per_gpu=%d), max_iter=%s, n_mcmc=%d, n_extra=%d",
+        "(K_per_gpu=%d), max_iter=%s, n_mcmc=%d, n_extra=%d, "
+        "total_mcmc_steps_per_iter=%d",
         n_gpu,
         n_walkers,
         n_walkers // n_gpu,
         max_iterations,
         n_mcmc_steps,
         n_extra,
+        (1 + n_extra) * n_mcmc_steps,
     )
 
     if batcher is None:

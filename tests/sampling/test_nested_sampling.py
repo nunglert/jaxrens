@@ -9,17 +9,18 @@ Verifies:
 - Different pressures produce different evidence
 """
 
+import logging
+
 import jax
 import jax.numpy as jnp
 import pytest
 
-from jaxrens.backends.toy import create_harmonic
 from jaxrens.backends.ensemble import EnsembleBackend
+from jaxrens.backends.toy import create_harmonic
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import run_ns, run_ns_parallel
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -30,9 +31,12 @@ from jaxrens.sampling.nested_sampling import run_ns, run_ns_parallel
 def harmonic_setup():
     """Single-run harmonic oscillator NS problem."""
     backend = create_harmonic(k=1.0)
-    init_fn, step_fn, _ = build_mwg(backend, [
-        MoveKernel("random_walk", random_walk.build_kernel),
-    ])
+    init_fn, step_fn, _ = build_mwg(
+        backend,
+        [
+            MoveKernel("random_walk", random_walk.build_kernel),
+        ],
+    )
 
     n_walkers = 50
     n_atoms = 1
@@ -63,9 +67,12 @@ def harmonic_setup():
 def parallel_setup():
     """2-run parallel harmonic oscillator NS problem."""
     backend = create_harmonic(k=1.0)
-    init_fn, step_fn, _ = build_mwg(backend, [
-        MoveKernel("random_walk", random_walk.build_kernel),
-    ])
+    init_fn, step_fn, _ = build_mwg(
+        backend,
+        [
+            MoveKernel("random_walk", random_walk.build_kernel),
+        ],
+    )
 
     n_runs = 2
     n_walkers = 20
@@ -73,7 +80,9 @@ def parallel_setup():
 
     keys = jax.random.split(jax.random.key(0), n_runs)
     positions = jax.vmap(
-        lambda k: jax.random.uniform(k, (n_walkers, n_atoms, 3), minval=-3.0, maxval=3.0)
+        lambda k: jax.random.uniform(
+            k, (n_walkers, n_atoms, 3), minval=-3.0, maxval=3.0
+        )
     )(keys)
 
     types = jnp.zeros((n_atoms,), dtype=jnp.int32)
@@ -107,7 +116,9 @@ class TestRunNS:
     def test_runs_to_completion(self, harmonic_setup):
         s = harmonic_setup
         result = run_ns(
-            s["positions"], s["types"], s["energies"],
+            s["positions"],
+            s["types"],
+            s["energies"],
             cells=None,
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
@@ -123,9 +134,12 @@ class TestRunNS:
     @pytest.mark.heavy
     def test_harmonic_evidence_accuracy(self):
         backend = create_harmonic(k=1.0)
-        init_fn, step_fn, _ = build_mwg(backend, [
-            MoveKernel("random_walk", random_walk.build_kernel),
-        ])
+        init_fn, step_fn, _ = build_mwg(
+            backend,
+            [
+                MoveKernel("random_walk", random_walk.build_kernel),
+            ],
+        )
 
         n_walkers = 30
         L = 5.0
@@ -141,7 +155,9 @@ class TestRunNS:
         )(positions)
 
         result = run_ns(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -158,9 +174,9 @@ class TestRunNS:
         log_prior_volume = 3.0 * jnp.log(2.0 * L)
         log_Z_analytical = 1.5 * jnp.log(2.0 * jnp.pi) - log_prior_volume
 
-        assert abs(log_evidence - float(log_Z_analytical)) < 1.5, (
-            f"log_evidence={log_evidence:.3f} vs analytical={float(log_Z_analytical):.3f}"
-        )
+        assert (
+            abs(log_evidence - float(log_Z_analytical)) < 1.5
+        ), f"log_evidence={log_evidence:.3f} vs analytical={float(log_Z_analytical):.3f}"
 
     def test_callbacks_invoked(self, harmonic_setup):
         s = harmonic_setup
@@ -175,7 +191,9 @@ class TestRunNS:
                 iterations_seen.append("finish")
 
         result = run_ns(
-            s["positions"], s["types"], s["energies"],
+            s["positions"],
+            s["types"],
+            s["energies"],
             cells=None,
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
@@ -189,6 +207,30 @@ class TestRunNS:
         assert iterations_seen[-1] == "finish"
         assert 0 in iterations_seen
 
+    def test_logs_total_mcmc_steps_per_iteration(self, harmonic_setup, caplog):
+        """(1 + n_extra) * n_mcmc_steps, matching ns_step's own
+        ``total_steps`` (the acceptance-rate denominator) -- not a
+        separately-invented number."""
+        s = harmonic_setup
+        with caplog.at_level(
+            logging.INFO, logger="jaxrens.sampling.nested_sampling"
+        ):
+            run_ns(
+                s["positions"],
+                s["types"],
+                s["energies"],
+                cells=None,
+                init_fn=s["init_fn"],
+                step_fn=s["step_fn"],
+                rng_key=s["key"],
+                max_iterations=1,
+                n_mcmc_steps=4,
+                n_extra=2,
+            )
+        assert any(
+            "total_mcmc_steps_per_iter=12" in r.message for r in caplog.records
+        )
+
 
 # ---------------------------------------------------------------------------
 # run_ns_parallel (multi-run)
@@ -199,7 +241,9 @@ class TestRunNsParallel:
     def test_basic_completion(self, parallel_setup):
         s = parallel_setup
         result = run_ns_parallel(
-            s["positions"], s["types"], s["energies"],
+            s["positions"],
+            s["types"],
+            s["energies"],
             cells=None,
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
@@ -221,7 +265,9 @@ class TestRunNsParallel:
         n_mcmc = 5
 
         result_par = run_ns_parallel(
-            s["positions"], s["types"], s["energies"],
+            s["positions"],
+            s["types"],
+            s["energies"],
             cells=None,
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
@@ -232,7 +278,9 @@ class TestRunNsParallel:
         )
 
         result_seq_0 = run_ns(
-            s["positions"][0], s["types"], s["energies"][0],
+            s["positions"][0],
+            s["types"],
+            s["energies"][0],
             cells=None,
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
@@ -248,9 +296,9 @@ class TestRunNsParallel:
         # (vmap split vs straight split). Same problem + same seed should
         # land at most ~1 log-unit apart; anything larger is a real
         # regression, not RNG noise.
-        assert abs(log_Z_par - log_Z_seq) < 1.0, (
-            f"Parallel log_Z={log_Z_par:.3f} vs sequential log_Z={log_Z_seq:.3f}"
-        )
+        assert (
+            abs(log_Z_par - log_Z_seq) < 1.0
+        ), f"Parallel log_Z={log_Z_par:.3f} vs sequential log_Z={log_Z_seq:.3f}"
 
 
 class TestAdjustmentInfoKeys:
@@ -261,9 +309,12 @@ class TestAdjustmentInfoKeys:
         backend = create_harmonic(k=1.0)
         descriptors = [
             MoveKernel(
-                "random_walk", random_walk.build_kernel,
-                step_size=0.1, step_size_max=5.0,
-                min_rate=0.2, max_rate=0.7,
+                "random_walk",
+                random_walk.build_kernel,
+                step_size=0.1,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
             ),
         ]
         init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
@@ -300,7 +351,9 @@ class TestAdjustmentInfoKeys:
                 pass
 
         run_ns(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -315,21 +368,39 @@ class TestAdjustmentInfoKeys:
         )
 
         # At least one adjust iteration must have fired
-        assert len(adjust_iterations) > 0, "Expected at least one adjust iteration"
+        assert (
+            len(adjust_iterations) > 0
+        ), "Expected at least one adjust iteration"
         # Adjust iterations should be multiples of adjust_interval
         for it in adjust_iterations:
-            assert it % adjust_interval == 0, f"iter {it} not multiple of {adjust_interval}"
+            assert (
+                it % adjust_interval == 0
+            ), f"iter {it} not multiple of {adjust_interval}"
         # Non-adjust iterations must NOT have adjustment keys
-        assert len(other_iterations) > 0, "Expected at least some non-adjust iterations"
+        assert (
+            len(other_iterations) > 0
+        ), "Expected at least some non-adjust iterations"
 
     def test_adjustment_arrays_have_correct_shapes(self):
         """Adjustment info arrays have shape (n_moves,) and correct dtypes."""
         backend = create_harmonic(k=1.0)
         descriptors = [
-            MoveKernel("rw0", random_walk.build_kernel, step_size=0.1, step_size_max=5.0,
-                       min_rate=0.2, max_rate=0.7),
-            MoveKernel("rw1", random_walk.build_kernel, step_size=0.2, step_size_max=5.0,
-                       min_rate=0.2, max_rate=0.7),
+            MoveKernel(
+                "rw0",
+                random_walk.build_kernel,
+                step_size=0.1,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
+            ),
+            MoveKernel(
+                "rw1",
+                random_walk.build_kernel,
+                step_size=0.2,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
+            ),
         ]
         init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
 
@@ -353,7 +424,9 @@ class TestAdjustmentInfoKeys:
                 pass
 
         run_ns(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -367,7 +440,9 @@ class TestAdjustmentInfoKeys:
             callbacks=[_CaptureCallback()],
         )
 
-        assert len(captured_infos) > 0, "Need at least one captured adjustment info"
+        assert (
+            len(captured_infos) > 0
+        ), "Need at least one captured adjustment info"
         info = captured_infos[0]
 
         n_moves = len(descriptors)
@@ -375,7 +450,9 @@ class TestAdjustmentInfoKeys:
         assert jnp.asarray(info["adjustment_converged"]).shape == (n_moves,)
         assert jnp.asarray(info["adjustment_cap_hits"]).shape == (n_moves,)
         assert jnp.asarray(info["adjustment_floor_hits"]).shape == (n_moves,)
-        assert jnp.asarray(info["adjustment_bracket_detected"]).shape == (n_moves,)
+        assert jnp.asarray(info["adjustment_bracket_detected"]).shape == (
+            n_moves,
+        )
 
         # Sanity: n_rounds and cap_hits must be non-negative
         assert jnp.all(jnp.asarray(info["adjustment_n_rounds"]) >= 0)
@@ -397,10 +474,22 @@ class TestAdjustmentInfoKeysBatched:
     def test_batched_info_has_per_replica_shapes(self):
         backend = create_harmonic(k=1.0)
         descriptors = [
-            MoveKernel("rw0", random_walk.build_kernel, step_size=0.1,
-                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
-            MoveKernel("rw1", random_walk.build_kernel, step_size=0.2,
-                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+            MoveKernel(
+                "rw0",
+                random_walk.build_kernel,
+                step_size=0.1,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
+            ),
+            MoveKernel(
+                "rw1",
+                random_walk.build_kernel,
+                step_size=0.2,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
+            ),
         ]
         init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
 
@@ -411,7 +500,9 @@ class TestAdjustmentInfoKeysBatched:
 
         keys = jax.random.split(jax.random.key(0), n_runs)
         positions = jax.vmap(
-            lambda k: jax.random.uniform(k, (n_walkers, n_atoms, 3), minval=-3.0, maxval=3.0)
+            lambda k: jax.random.uniform(
+                k, (n_walkers, n_atoms, 3), minval=-3.0, maxval=3.0
+            )
         )(keys)
         energies = jax.vmap(
             lambda pos: jax.vmap(
@@ -425,26 +516,31 @@ class TestAdjustmentInfoKeysBatched:
         class _Capture:
             def on_iteration(self, iteration, ns_state, info):
                 if "adjustment_n_rounds" in info:
-                    captured.append({
-                        k: info[k] for k in (
-                            "step_sizes_per_move",
-                            "acceptance_rates_per_move",
-                            "reject_counts_per_move",
-                            "adjustment_n_rounds",
-                            "adjustment_converged",
-                            "adjustment_cap_hits",
-                            "adjustment_floor_hits",
-                            "adjustment_bracket_detected",
-                            "trial_n_evaluations_per_move",
-                            "trial_n_grad_evaluations_per_move",
-                        )
-                    })
+                    captured.append(
+                        {
+                            k: info[k]
+                            for k in (
+                                "step_sizes_per_move",
+                                "acceptance_rates_per_move",
+                                "reject_counts_per_move",
+                                "adjustment_n_rounds",
+                                "adjustment_converged",
+                                "adjustment_cap_hits",
+                                "adjustment_floor_hits",
+                                "adjustment_bracket_detected",
+                                "trial_n_evaluations_per_move",
+                                "trial_n_grad_evaluations_per_move",
+                            )
+                        }
+                    )
 
             def on_finish(self, ns_state):
                 pass
 
         run_ns_parallel(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -458,13 +554,25 @@ class TestAdjustmentInfoKeysBatched:
             callbacks=[_Capture()],
         )
 
-        assert len(captured) >= 1, "expected at least one adjust iter under run_ns_parallel"
+        assert (
+            len(captured) >= 1
+        ), "expected at least one adjust iter under run_ns_parallel"
         info = captured[0]
         n_moves = len(descriptors)
 
-        assert jnp.asarray(info["step_sizes_per_move"]).shape == (n_runs, n_moves)
-        assert jnp.asarray(info["acceptance_rates_per_move"]).shape == (n_runs, n_moves)
-        assert jnp.asarray(info["reject_counts_per_move"]).shape == (n_runs, n_moves, 4)
+        assert jnp.asarray(info["step_sizes_per_move"]).shape == (
+            n_runs,
+            n_moves,
+        )
+        assert jnp.asarray(info["acceptance_rates_per_move"]).shape == (
+            n_runs,
+            n_moves,
+        )
+        assert jnp.asarray(info["reject_counts_per_move"]).shape == (
+            n_runs,
+            n_moves,
+            4,
+        )
         for k in (
             "adjustment_n_rounds",
             "adjustment_converged",
@@ -490,10 +598,22 @@ class TestAdjustmentInfoKeysBatched:
 
         backend = create_harmonic(k=1.0)
         descriptors = [
-            MoveKernel("rw0", random_walk.build_kernel, step_size=0.1,
-                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
-            MoveKernel("rw1", random_walk.build_kernel, step_size=0.2,
-                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+            MoveKernel(
+                "rw0",
+                random_walk.build_kernel,
+                step_size=0.1,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
+            ),
+            MoveKernel(
+                "rw1",
+                random_walk.build_kernel,
+                step_size=0.2,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
+            ),
         ]
         init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
 
@@ -503,7 +623,9 @@ class TestAdjustmentInfoKeysBatched:
         types = jnp.zeros((n_atoms,), dtype=jnp.int32)
         keys = jax.random.split(jax.random.key(0), n_runs)
         positions = jax.vmap(
-            lambda k: jax.random.uniform(k, (n_walkers, n_atoms, 3), minval=-3.0, maxval=3.0)
+            lambda k: jax.random.uniform(
+                k, (n_walkers, n_atoms, 3), minval=-3.0, maxval=3.0
+            )
         )(keys)
         energies = jax.vmap(
             lambda pos: jax.vmap(
@@ -521,7 +643,9 @@ class TestAdjustmentInfoKeysBatched:
         adaptation_cb = AdaptationCallback(adaptation_logger)
 
         run_ns_parallel(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -553,9 +677,16 @@ class TestAdjustmentInfoKeysBatched:
         assert log.acceptance_rates.shape == (n_entries, n_runs, n_moves)
         # v2 adjustment_stats present
         assert log.adjustment_stats is not None
-        assert log.adjustment_stats["n_rounds"].shape == (n_entries, n_runs, n_moves)
+        assert log.adjustment_stats["n_rounds"].shape == (
+            n_entries,
+            n_runs,
+            n_moves,
+        )
         assert log.adjustment_stats["reject_reason_counts"].shape == (
-            n_entries, n_runs, n_moves, 4,
+            n_entries,
+            n_runs,
+            n_moves,
+            4,
         )
         # v3 evaluation counts present
         assert log.n_evaluations is not None
@@ -589,8 +720,14 @@ class TestAdaptationIter0BaselineRow:
 
         backend = create_harmonic(k=1.0)
         descriptors = [
-            MoveKernel("rw", random_walk.build_kernel, step_size=0.25,
-                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+            MoveKernel(
+                "rw",
+                random_walk.build_kernel,
+                step_size=0.25,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
+            ),
         ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
@@ -598,7 +735,9 @@ class TestAdaptationIter0BaselineRow:
         types = jnp.zeros((1,), dtype=jnp.int32)
         key = jax.random.key(11)
         key, init_key = jax.random.split(key)
-        positions = jax.random.uniform(init_key, (n_walkers, 1, 3), minval=-2, maxval=2)
+        positions = jax.random.uniform(
+            init_key, (n_walkers, 1, 3), minval=-2, maxval=2
+        )
         energies = jax.vmap(
             lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
         )(positions)
@@ -611,7 +750,9 @@ class TestAdaptationIter0BaselineRow:
         )
 
         run_ns(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -626,15 +767,16 @@ class TestAdaptationIter0BaselineRow:
         )
         adapt_logger.close()
 
-        assert adapt_log_path.exists(), (
-            "iter-0 baseline row must produce the file even without adaptation"
-        )
+        assert (
+            adapt_log_path.exists()
+        ), "iter-0 baseline row must produce the file even without adaptation"
         log = AdaptationLogger.read(adapt_log_path)
         assert log.iterations.shape == (1,)
         assert int(log.iterations[0]) == 0
         # Row 0 carries the initial ss as passed to run_ns.
         np.testing.assert_allclose(
-            log.step_sizes[0, 0], np.array([0.25], dtype=np.float32),
+            log.step_sizes[0, 0],
+            np.array([0.25], dtype=np.float32),
             rtol=1e-5,
         )
         # Adjustment-event fields signal "no bisection ran".
@@ -651,10 +793,22 @@ class TestAdaptationIter0BaselineRow:
 
         backend = create_harmonic(k=1.0)
         descriptors = [
-            MoveKernel("rw0", random_walk.build_kernel, step_size=0.1,
-                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
-            MoveKernel("rw1", random_walk.build_kernel, step_size=0.3,
-                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+            MoveKernel(
+                "rw0",
+                random_walk.build_kernel,
+                step_size=0.1,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
+            ),
+            MoveKernel(
+                "rw1",
+                random_walk.build_kernel,
+                step_size=0.3,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
+            ),
         ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
@@ -662,7 +816,9 @@ class TestAdaptationIter0BaselineRow:
         types = jnp.zeros((1,), dtype=jnp.int32)
         keys = jax.random.split(jax.random.key(0), n_runs)
         positions = jax.vmap(
-            lambda k: jax.random.uniform(k, (n_walkers, 1, 3), minval=-2, maxval=2)
+            lambda k: jax.random.uniform(
+                k, (n_walkers, 1, 3), minval=-2, maxval=2
+            )
         )(keys)
         energies = jax.vmap(
             lambda pos: jax.vmap(
@@ -679,7 +835,9 @@ class TestAdaptationIter0BaselineRow:
         )
 
         run_ns_parallel(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -719,8 +877,14 @@ class TestAccRatesCallbackEndToEnd:
 
         backend = create_harmonic(k=1.0)
         descriptors = [
-            MoveKernel("rw", random_walk.build_kernel, step_size=0.25,
-                       step_size_max=5.0, min_rate=0.2, max_rate=0.7),
+            MoveKernel(
+                "rw",
+                random_walk.build_kernel,
+                step_size=0.25,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
+            ),
         ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
@@ -728,7 +892,9 @@ class TestAccRatesCallbackEndToEnd:
         types = jnp.zeros((1,), dtype=jnp.int32)
         keys = jax.random.split(jax.random.key(0), n_runs)
         positions = jax.vmap(
-            lambda k: jax.random.uniform(k, (n_walkers, 1, 3), minval=-2, maxval=2)
+            lambda k: jax.random.uniform(
+                k, (n_walkers, 1, 3), minval=-2, maxval=2
+            )
         )(keys)
         energies = jax.vmap(
             lambda pos: jax.vmap(
@@ -746,7 +912,9 @@ class TestAccRatesCallbackEndToEnd:
 
         max_iter = 12
         run_ns_parallel(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -790,9 +958,12 @@ class TestParityNRunsOne:
     def test_n_runs_1_matches_run_ns_no_adaptation(self):
         """Without adaptation, both paths must agree exactly (same step sizes)."""
         backend = create_harmonic(k=1.0)
-        init_fn, step_fn, _ = build_mwg(backend, [
-            MoveKernel("random_walk", random_walk.build_kernel),
-        ])
+        init_fn, step_fn, _ = build_mwg(
+            backend,
+            [
+                MoveKernel("random_walk", random_walk.build_kernel),
+            ],
+        )
 
         n_walkers = 20
         n_atoms = 1
@@ -811,7 +982,9 @@ class TestParityNRunsOne:
 
         # Sequential: no adaptation
         result_seq = run_ns(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -826,7 +999,7 @@ class TestParityNRunsOne:
         result_par = run_ns_parallel(
             positions[None],  # (1, n_walkers, n_atoms, 3)
             types,
-            energies[None],   # (1, n_walkers)
+            energies[None],  # (1, n_walkers)
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -853,9 +1026,12 @@ class TestParityNRunsOne:
         backend = create_harmonic(k=1.0)
         descriptors = [
             MoveKernel(
-                "random_walk", random_walk.build_kernel,
-                step_size=0.1, step_size_max=5.0,
-                min_rate=0.2, max_rate=0.7,
+                "random_walk",
+                random_walk.build_kernel,
+                step_size=0.1,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
             ),
         ]
         init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
@@ -874,7 +1050,9 @@ class TestParityNRunsOne:
 
         rng_keys = jax.random.split(key, 1)
         result = run_ns_parallel(
-            positions[None], types, energies[None],
+            positions[None],
+            types,
+            energies[None],
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -900,9 +1078,12 @@ class TestParallelFullAuto:
         backend = create_harmonic(k=1.0)
         descriptors = [
             MoveKernel(
-                "random_walk", random_walk.build_kernel,
-                step_size=0.1, step_size_max=5.0,
-                min_rate=0.2, max_rate=0.7,
+                "random_walk",
+                random_walk.build_kernel,
+                step_size=0.1,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
             ),
         ]
         init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
@@ -912,7 +1093,9 @@ class TestParallelFullAuto:
         n_atoms = 1
         keys = jax.random.split(jax.random.key(11), n_runs + 1)
         positions = jax.vmap(
-            lambda k: jax.random.uniform(k, (n_walkers, n_atoms, 3), minval=-2.0, maxval=2.0)
+            lambda k: jax.random.uniform(
+                k, (n_walkers, n_atoms, 3), minval=-2.0, maxval=2.0
+            )
         )(keys[:n_runs])
         types = jnp.zeros((n_atoms,), dtype=jnp.int32)
         energies = jax.vmap(
@@ -922,7 +1105,9 @@ class TestParallelFullAuto:
         )(positions)
 
         result = run_ns_parallel(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -950,14 +1135,20 @@ class TestMoveRejectReasons:
         backend = create_harmonic(k=1.0)
         descriptors = [
             MoveKernel(
-                "rw0", random_walk.build_kernel,
-                step_size=0.1, step_size_max=5.0,
-                min_rate=0.2, max_rate=0.7,
+                "rw0",
+                random_walk.build_kernel,
+                step_size=0.1,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
             ),
             MoveKernel(
-                "rw1", random_walk.build_kernel,
-                step_size=0.2, step_size_max=5.0,
-                min_rate=0.2, max_rate=0.7,
+                "rw1",
+                random_walk.build_kernel,
+                step_size=0.2,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
             ),
         ]
         init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
@@ -977,11 +1168,14 @@ class TestMoveRejectReasons:
             def on_iteration(self, iteration, ns_state, info):
                 if "move_reject_reasons" in info:
                     captured_infos.append(dict(info))
+
             def on_finish(self, ns_state):
                 pass
 
         run_ns(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -995,7 +1189,9 @@ class TestMoveRejectReasons:
             callbacks=[_Capture()],
         )
 
-        assert len(captured_infos) > 0, "Expected at least one adjust iteration with move_reject_reasons"
+        assert (
+            len(captured_infos) > 0
+        ), "Expected at least one adjust iteration with move_reject_reasons"
         info = captured_infos[0]
 
         # move_reject_reasons should be a tuple of frozensets, length == n_moves
@@ -1014,9 +1210,12 @@ class TestMoveRejectReasons:
         n_moves = 3
         descriptors = [
             MoveKernel(
-                f"rw{i}", random_walk.build_kernel,
-                step_size=0.1, step_size_max=5.0,
-                min_rate=0.2, max_rate=0.7,
+                f"rw{i}",
+                random_walk.build_kernel,
+                step_size=0.1,
+                step_size_max=5.0,
+                min_rate=0.2,
+                max_rate=0.7,
             )
             for i in range(n_moves)
         ]
@@ -1037,11 +1236,14 @@ class TestMoveRejectReasons:
             def on_iteration(self, iteration, ns_state, info):
                 if "move_reject_reasons" in info:
                     captured.append(dict(info))
+
             def on_finish(self, ns_state):
                 pass
 
         run_ns(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -1068,14 +1270,19 @@ class TestDifferentPressures:
         backend_p0 = EnsembleBackend(base_backend, pressure=0.0)
         backend_p1 = EnsembleBackend(base_backend, pressure=0.1)
 
-        init_fn_p0, step_fn_p0, _ = build_mwg(backend_p0, [
-            MoveKernel("random_walk", random_walk.build_kernel),
-        ])
+        init_fn_p0, step_fn_p0, _ = build_mwg(
+            backend_p0,
+            [
+                MoveKernel("random_walk", random_walk.build_kernel),
+            ],
+        )
 
         n_walkers = 15
         n_atoms = 1
         key = jax.random.key(99)
-        positions = jax.random.uniform(key, (n_walkers, n_atoms, 3), minval=-2.0, maxval=2.0)
+        positions = jax.random.uniform(
+            key, (n_walkers, n_atoms, 3), minval=-2.0, maxval=2.0
+        )
         types = jnp.zeros((n_atoms,), dtype=jnp.int32)
         cells = jnp.tile(5.0 * jnp.eye(3), (n_walkers, 1, 1))
 
