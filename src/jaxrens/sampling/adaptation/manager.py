@@ -314,7 +314,17 @@ def _build_per_move(
             axis_name=_axis_name,
         )
 
-    return batcher.wrap_for_batch(_per_replica, check_vma=True)
+    # check_vma=False (not True): unlike ShardedSingleRun's adaptation
+    # (_build_sharded_per_move below), nothing in this "gpu"-axis,
+    # zero-collective path ever collective-reduces `counts`/etc., so
+    # whether a given carry component is "reduced" or "varying" in
+    # practice depends on the specific move kernel's trace -- a fixed
+    # axis_name-driven pcast list (see adjust_step_size's docstring)
+    # worked for a toy harmonic+random_walk problem but broke on a real
+    # LJ/NPT pipeline the opposite way (pcasting `counts` to varying when
+    # its real trace was reduced there). Reverted to the safe pmap-trust
+    # default rather than chase a per-move-kernel-correct type list.
+    return batcher.wrap_for_batch(_per_replica, check_vma=False)
 
 
 def _build_sharded_per_move(

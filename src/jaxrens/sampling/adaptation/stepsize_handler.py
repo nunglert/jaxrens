@@ -170,17 +170,22 @@ def adjust_step_size(
             called inside a ``jax.shard_map`` (``PmapVmapRuns``'s
             ``"gpu"``-axis wrap; see :mod:`jaxrens.sampling.mesh`).
             ``None`` (default) for SingleRun/VmapRuns, which never run
-            inside a mapped context. When set, several ``while_loop``
-            carry entries that start as Python-literal constants but
-            become per-device-varying inside the loop body (``rate_prev``,
-            ``converged``, ``cap_hits``, ``floor_hits``, ``saw_too_high``,
-            ``saw_too_low`` — everything downstream of ``rate``, which is
-            never reduced by a collective here, unlike in
-            :func:`adjust_step_size_sharded`) are pre-cast to the
-            ``varying`` VMA type via ``jax.lax.pcast`` so the loop's
-            input/output carry types match under ``shard_map``'s stricter
-            checking. ``jax.lax.pcast`` errors outside a mapped context,
-            which is why this can't be applied unconditionally.
+            inside a mapped context. When set, every ``while_loop`` carry
+            entry downstream of ``rate``/``reasons``/the per-round eval
+            counts (``rate_prev``, ``converged``, ``counts``, ``cap_hits``,
+            ``floor_hits``, ``saw_too_high``, ``saw_too_low``,
+            cumulative eval counters) is pre-cast to the ``varying`` VMA
+            type via ``jax.lax.pcast`` before the loop, so its input/
+            output carry types match under ``shard_map``'s stricter
+            checking — nothing in this function ever collective-reduces
+            those, unlike :func:`adjust_step_size_sharded`. Cast broadly
+            rather than cherry-picked: an earlier, narrower version (only
+            the entries one toy harmonic+random_walk test happened to
+            surface as mismatched) passed that test but still failed on
+            a real LJ/NPT pipeline run, where ``counts`` (not in the
+            narrower list) also turned out to need it. ``jax.lax.pcast``
+            errors outside a mapped context, which is why this can't be
+            applied unconditionally.
 
     Returns:
         ``(new_step_size, final_rate, final_counts, n_rounds, converged,
@@ -348,13 +353,26 @@ def adjust_step_size(
 
     rate_prev0 = jnp.array(-1.0)  # sentinel: no previous rate
     converged0 = jnp.array(False)
+    counts0 = jnp.zeros(4, dtype=jnp.int32)
     cap_hits0 = jnp.array(0, dtype=jnp.int32)
     floor_hits0 = jnp.array(0, dtype=jnp.int32)
     saw_too_high0 = jnp.array(False)
     saw_too_low0 = jnp.array(False)
+    cum_evals0 = jnp.array(0, dtype=jnp.int32)
+    cum_grad_evals0 = jnp.array(0, dtype=jnp.int32)
     if axis_name is not None:
+        # Every one of these is derived (directly or via counts/eval sums)
+        # from `rate`, which nothing in this function ever collective-
+        # reduces -- unlike adjust_step_size_sharded's psum'd counterparts.
+        # Cast all of them, not just the ones one particular move-kernel/
+        # config happened to surface as mismatched: a real LJ/NPT pipeline
+        # run tripped over `counts` (carry[6]) even though a toy
+        # harmonic+random_walk repro never exercised that path. Widening
+        # an already-reduced value to varying is always safe (see the
+        # axis_name docstring), so being this inclusive costs nothing.
         rate_prev0 = _varying(rate_prev0)
         converged0 = _varying(converged0)
+        counts0 = _varying(counts0)
         cap_hits0 = _varying(cap_hits0)
         floor_hits0 = _varying(floor_hits0)
         saw_too_high0 = _varying(saw_too_high0)
@@ -367,13 +385,13 @@ def adjust_step_size(
         rng_key,
         jnp.array(0, dtype=jnp.int32),
         converged0,
-        jnp.zeros(4, dtype=jnp.int32),
+        counts0,
         cap_hits0,  # cap_hits
         floor_hits0,  # floor_hits
         saw_too_high0,  # saw_too_high
         saw_too_low0,  # saw_too_low
-        jnp.array(0, dtype=jnp.int32),  # cumulative_n_evals
-        jnp.array(0, dtype=jnp.int32),  # cumulative_n_grad_evals
+        cum_evals0,  # cumulative_n_evals
+        cum_grad_evals0,  # cumulative_n_grad_evals
     )
 
     final = jax.lax.while_loop(cond_fn, body_fn, init_carry)
