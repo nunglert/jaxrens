@@ -1,27 +1,34 @@
-"""BatchDescriptor abstraction for the NS outer loop.
+"""Execution-topology descriptors for the NS outer loop.
 
-Encapsulates the single-run vs. multi-run (vmap) vs. pmap dispatch so that
-``run_ns`` and ``run_ns_parallel`` can share the same three concerns without
-duplicating them:
+Four execution topologies exist — ``SingleRun``, ``VmapRuns``,
+``PmapVmapRuns``, ``ShardedSingleRun`` — encapsulating the shape/RNG/
+reduction bookkeeping so ``_run_loop`` (``run_loop.py``) and its callbacks
+can share one orchestration body without per-topology ``isinstance``
+branching for most concerns:
 
-1. **wrap_step** — JIT-compiles (and optionally vmaps) ``ns_step``.
+1. **wrap_step** — JIT-compiles (and vmaps/shard_maps as appropriate) the NS
+   step.
 2. **split_keys** — Splits a PRNG key appropriately for the batch shape.
 3. **reduce_for_termination** — Reduces batched scalars to a single scalar
    for ``PriorMassTermination`` / ``IterationTermination``.
 
-Design intent
--------------
-This module is commit 2 of the nested_sampling.py modularization plan.  The
-three concrete subclasses mirror the three execution modes:
-
-* ``SingleRun``      — ``run_ns``          uses this.
-* ``VmapRuns``       — ``run_ns_parallel`` uses this.
-* ``PmapVmapRuns``   — stub only; commit 4 (``run_loop.py``) will flesh it out.
+``BatchDescriptor`` (bottom of this module) is the ``SingleRun | VmapRuns |
+PmapVmapRuns | ShardedSingleRun`` type used to annotate "any of the four" —
+not a base class. ``SingleRun``, ``VmapRuns``, and ``PmapVmapRuns`` share a
+concrete (non-abstract) base, ``_UniformBatcher``, because they genuinely
+share behavior: each satisfies ``n_runs == prod(shape_prefix)`` and treats
+its leading shape axes as independent-replica axes. ``ShardedSingleRun``
+does **not** inherit from it — its ``shape_prefix = (n_gpu,)`` is a
+*sharding* axis, not a replica axis (``n_runs`` is always 1), so several of
+``_UniformBatcher``'s methods don't apply to it as written (see its own
+docstring). Rather than force it to override most of a shared contract to
+fit a hierarchy whose invariants it breaks, it stands alone with its own
+implementations — some duplicated from ``_UniformBatcher`` where the
+generic, shape_prefix-driven logic happens to still be correct for it.
 """
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import jax
@@ -32,12 +39,15 @@ from jaxtyping import Array, Float, Shaped
 from jaxrens.sampling.mesh import build_mesh, pmap_like
 
 
-class BatchDescriptor(ABC):
-    """Encapsulates the single/vmap/pmap differences for the NS outer loop.
+class _UniformBatcher:
+    """Shared behavior for the three "uniform shape-prefix" topologies.
 
-    Single: identity wrap, scalar termination reductions.
-    Vmap:   jax.vmap wrap over n_runs, worst-of reductions.
-    Pmap:   pmap(vmap(...)) wrap, not implemented yet.
+    ``SingleRun``, ``VmapRuns``, and ``PmapVmapRuns`` all treat their
+    leading ``shape_prefix`` axes as independent-replica axes, with
+    ``n_runs == prod(shape_prefix)`` holding exactly. That shared
+    invariant is what the "derived helpers" below rely on. ``ShardedSingleRun``
+    intentionally does not inherit from this class — see the module
+    docstring.
 
     Attributes
     ----------
@@ -51,117 +61,6 @@ class BatchDescriptor(ABC):
 
     n_runs: int
     shape_prefix: tuple[int, ...]
-
-    # ------------------------------------------------------------------
-    # Abstract interface
-    # ------------------------------------------------------------------
-
-    @property
-    @abstractmethod
-    def is_batched(self) -> bool:
-        """True when this descriptor represents multiple parallel NS runs.
-
-        Used by ``_run_loop`` to attach ``info["_batcher"]`` and by
-        ``_is_batched`` in ``cli/monitor.py`` to prefer a descriptor-based
-        check over the ndim-sniff fallback.
-
-        * ``SingleRun.is_batched``    → ``False``
-        * ``VmapRuns.is_batched``     → ``True``
-        * ``PmapVmapRuns.is_batched`` → ``True`` (stub, raises on use)
-        """
-
-    @abstractmethod
-    def wrap_step(
-        self,
-        ns_step_fn,
-        step_fn,
-        n_mcmc_steps: int,
-        n_extra: int,
-    ):
-        """Return a JIT-compiled callable for the NS step.
-
-        Called *once* before the outer loop to produce ``jit_ns_step``.
-
-        Parameters
-        ----------
-        ns_step_fn : callable
-            The raw ``ns_step`` function (or any compatible replacement).
-        step_fn : callable
-            MCMC step function from ``build_mwg()``; passed as a static arg
-            to ``ns_step_fn``.
-        n_mcmc_steps : int
-            Number of MCMC steps per walker (static).
-        n_extra : int
-            Number of additional walkers to walk per iteration (static).
-
-        Returns
-        -------
-        callable
-            * **SingleRun** — ``jax.jit(ns_step_fn, static_argnums=(1, 2, 3))``
-              so the returned callable has signature
-              ``jit_step(ns_state, step_fn, n_mcmc_steps, n_extra)``.
-            * **VmapRuns** — ``jax.jit(lambda ns_states: jax.vmap(lambda s:
-              ns_step_fn(s, step_fn, n_mcmc_steps, n_extra))(ns_states))``
-              so the returned callable has signature
-              ``jit_step(ns_states)``.
-            * **PmapVmapRuns** — raises ``NotImplementedError``.
-        """
-
-    @abstractmethod
-    def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
-        """Split a PRNG key appropriate for this batch shape.
-
-        Called inside the outer loop whenever fresh sub-keys are needed
-        (e.g. for per-move adaptation key splitting).
-
-        Parameters
-        ----------
-        rng_key : jax.Array
-            * **SingleRun** — a scalar JAX key (shape ``(2,)`` for typed-key
-              arrays or ``()`` for new-style keys).
-            * **VmapRuns** — an ``(n_runs,)`` array of per-run keys.
-        n_sub_keys : int
-            Number of sub-keys to generate per run.
-
-        Returns
-        -------
-        jax.Array
-            * **SingleRun** — shape ``(n_sub_keys,)`` with typed-key dtype
-              (matches ``jax.random.split(rng_key, n_sub_keys)``).
-            * **VmapRuns** — shape ``(n_runs, n_sub_keys)`` with typed-key dtype
-              (``vmap(jax.random.split)`` applied to each run key).
-            * **PmapVmapRuns** — raises ``NotImplementedError``.
-        """
-
-    @abstractmethod
-    def reduce_for_termination(
-        self,
-        log_evidence: jax.typing.ArrayLike,
-        hmax: jax.typing.ArrayLike,
-    ) -> tuple[float, float]:
-        """Reduce batched scalars for the termination-check interface.
-
-        ``PriorMassTermination.update_evidence`` and
-        ``check_any`` / ``IterationTermination.check`` both require plain
-        Python floats.  This method performs any worst-case aggregation
-        and returns Python floats ready to pass to those interfaces.
-
-        Parameters
-        ----------
-        log_evidence : jax.Array
-            * **SingleRun** — scalar.
-            * **VmapRuns** — shape ``(n_runs,)``.
-        hmax : jax.Array
-            Same shape as ``log_evidence``.
-
-        Returns
-        -------
-        (log_evidence_scalar, hmax_scalar) : tuple[float, float]
-            * **SingleRun** — identity: ``(float(log_evidence), float(hmax))``.
-            * **VmapRuns** — worst-of:
-              ``(float(jnp.min(log_evidence)), float(jnp.max(hmax)))``.
-            * **PmapVmapRuns** — raises ``NotImplementedError``.
-        """
 
     # ------------------------------------------------------------------
     # Derived helpers (shape-prefix-driven; concrete classes inherit)
@@ -248,24 +147,23 @@ class BatchDescriptor(ABC):
 
         Distinct from :meth:`split_keys`: that one returns COHERENT
         (same-key-broadcast for ShardedSingleRun) sub-keys for adapt
-        bisection.  This one returns INDEPENDENT keys — each replica /
-        shard gets a different RNG stream.  Used by burn-in's walking
-        step where each replica's walkers evolve independently.
+        bisection.  This one returns INDEPENDENT keys — each replica
+        gets a different RNG stream.  Used by burn-in's walking step
+        where each replica's walkers evolve independently.
 
-        Default: ``jax.random.split(rng_key, n_runs).reshape(shape_prefix)``
-        for batched batchers; identity for SingleRun.  ShardedSingleRun
-        overrides to place the result on the ``'shard'``-named mesh.
+        ``jax.random.split(rng_key, n_runs).reshape(shape_prefix)`` for
+        batched batchers; identity for SingleRun.
         """
-        if not self.is_batched:
+        if not self.is_batched:  # type: ignore[attr-defined]
             return rng_key
         return jax.random.split(rng_key, self.n_runs).reshape(
             self.shape_prefix,
         )
 
     def wrap_for_batch(self, per_element_fn):
-        """Wrap a per-replica callable with jit/vmap/pmap as appropriate.
+        """Wrap a per-replica callable with jit/vmap/shard_map as appropriate.
 
-        Generic version of :meth:`wrap_step` for callables that don't take
+        Generic version of ``wrap_step`` for callables that don't take
         ``static_argnums``-style sentinels.  *per_element_fn* receives its
         arguments at single-replica shape; the returned callable accepts
         them at ``(*shape_prefix, ...)`` shape:
@@ -297,7 +195,7 @@ class BatchDescriptor(ABC):
 
 
 @dataclass(frozen=True)
-class SingleRun(BatchDescriptor):
+class SingleRun(_UniformBatcher):
     """Descriptor for a single NS run (no batching).
 
     Used by ``run_ns``.  All three methods are identity / thin wrappers
@@ -358,7 +256,7 @@ class SingleRun(BatchDescriptor):
 
 
 @dataclass(frozen=True)
-class VmapRuns(BatchDescriptor):
+class VmapRuns(_UniformBatcher):
     """Descriptor for n_runs independent NS runs batched via ``jax.vmap``.
 
     Used by ``run_ns_parallel``.
@@ -446,17 +344,17 @@ class VmapRuns(BatchDescriptor):
 
 
 @dataclass(frozen=True)
-class PmapVmapRuns(BatchDescriptor):
-    """Descriptor for ``pmap(vmap(...))`` multi-GPU multi-run NS.
+class PmapVmapRuns(_UniformBatcher):
+    """Descriptor for ``shard_map(vmap(...))`` multi-GPU multi-run NS.
 
     Shape convention: ``(G, P, K, ...)`` where
 
-    * ``G = n_gpu`` — pmap axis (one shard per GPU device).
+    * ``G = n_gpu`` — sharded axis (one shard per GPU device).
     * ``P = n_per_gpu`` — vmap axis (independent NS runs per GPU).
     * ``K`` — walker axis (already handled inside ``ns_step`` via vmap).
 
-    For ``n_gpu=1`` this degenerates to ``(1, P, K, ...)`` and pmap runs on
-    the single available device, which is useful for testing.
+    For ``n_gpu=1`` this degenerates to ``(1, P, K, ...)`` and runs on the
+    single available device, which is useful for testing.
 
     **wrap_step** composes a ``"gpu"``-axis ``jax.shard_map`` (G axis, via
     :func:`jaxrens.sampling.mesh.pmap_like`, pmap-equivalent) over
@@ -468,8 +366,8 @@ class PmapVmapRuns(BatchDescriptor):
         per_device = jax.vmap(per_run)
         jit_step   = jax.jit(pmap_like(per_device, "gpu", mesh))
 
-    Unlike the ``jax.pmap`` this replaces, ``shard_map`` composes cleanly
-    with ``jax.jit``, so the result is explicitly jit-wrapped.
+    Unlike ``jax.pmap``, ``shard_map`` composes cleanly with ``jax.jit``, so
+    the result is explicitly jit-wrapped.
 
     **split_keys** produces ``(G, P, n_sub_keys)``-shaped key arrays via two
     nested splits: first ``(G,)`` per-GPU keys, then ``(P, n_sub_keys)`` per
@@ -554,10 +452,9 @@ class PmapVmapRuns(BatchDescriptor):
     def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
         """Split a per-replica PRNG key array into ``(G, P, n_sub_keys)``.
 
-        Matches the ABC contract: input shape equals ``shape_prefix``
-        (``(G, P)`` here), output prepends an ``n_sub_keys`` axis at the end.
-        Implemented as a 2-D vmap (one for each prefix axis) of
-        ``jax.random.split``.
+        Input shape equals ``shape_prefix`` (``(G, P)`` here), output
+        prepends an ``n_sub_keys`` axis at the end.  Implemented as a 2-D
+        vmap (one for each prefix axis) of ``jax.random.split``.
 
         Parameters
         ----------
@@ -599,7 +496,7 @@ class PmapVmapRuns(BatchDescriptor):
 
 
 @dataclass(frozen=True)
-class ShardedSingleRun(BatchDescriptor):
+class ShardedSingleRun:
     """Descriptor for a single NS run sharded across ``n_gpu`` GPUs.
 
     Logically one NS run; physically the ``K``-walker population is
@@ -615,18 +512,25 @@ class ShardedSingleRun(BatchDescriptor):
     *independent* NS replicas.  ``ShardedSingleRun`` runs one
     population spread across G devices.
 
+    Deliberately does **not** inherit from ``_UniformBatcher`` (see the
+    module docstring): ``n_runs`` is always 1 here, so the
+    ``n_runs == prod(shape_prefix)`` invariant the other three batchers
+    share does not hold — the leading ``G`` axis is a *sharding* axis, not
+    a replica axis. Four small, purely shape_prefix-driven methods
+    (``walker_axis``, ``extract_step_sizes``, ``broadcast_step_sizes``,
+    ``scalar_key``) are still correct as written for this shape and are
+    duplicated below rather than shared through inheritance, to avoid
+    pretending this class belongs to that family.
+
     Shape conventions:
 
     * Population leaves: ``(G, K // G, ...)``.
     * ``shape_prefix = (n_gpu,)`` — matches the physical layout.
-      The ``n_runs == prod(shape_prefix)`` invariant that the other
-      batchers happen to satisfy does NOT hold here: ``n_runs = 1``
-      logically, but the leading ``G`` axis is the sharding axis,
-      not a replica axis.  Consumers iterating ``shape_prefix`` (the
-      cumulative counters in ``_run_loop``, the per-move
-      ``stack_axis`` in ``build_adapt_step``) end up with a length-G
-      axis where each row is identical post-``lax.psum``.  Correct;
-      G× redundant memory on small counters.  Acceptable cost.
+      Consumers iterating ``shape_prefix`` (the cumulative counters in
+      ``_run_loop``, the per-move ``stack_axis`` in ``build_adapt_step``)
+      end up with a length-G axis where each row is identical post-
+      ``lax.psum``.  Correct; G× redundant memory on small counters.
+      Acceptable cost.
 
     Reductions (``reduce_emax``, ``reduce_for_termination``) collapse
     the (G,) axis to a scalar — every shard sees the same global
@@ -663,6 +567,49 @@ class ShardedSingleRun(BatchDescriptor):
     def is_batched(self) -> bool:
         """Always ``True`` — the population is distributed across G devices."""
         return True
+
+    # ------------------------------------------------------------------
+    # Small shape_prefix-driven helpers — same logic as _UniformBatcher's,
+    # duplicated (not inherited) since this class isn't part of that family.
+    # ------------------------------------------------------------------
+
+    @property
+    def walker_axis(self) -> int:
+        """Axis index of the per-walker (K) dimension — always ``1`` here."""
+        return len(self.shape_prefix)
+
+    def extract_step_sizes(self, pop) -> jnp.ndarray:
+        """Per-replica step sizes from ``pop.step_sizes (G, K, n_moves)``.
+
+        Returns shape ``(G, n_moves)`` — walker axis dropped.
+        """
+        return jnp.take(pop.step_sizes, 0, axis=self.walker_axis)
+
+    def broadcast_step_sizes(
+        self,
+        per_move_ss: jnp.ndarray,
+        n_walkers: int,
+    ) -> jnp.ndarray:
+        """Inverse of :meth:`extract_step_sizes` — re-insert the walker axis."""
+        n_moves = per_move_ss.shape[-1]
+        target_shape = self.shape_prefix + (n_walkers, n_moves)
+        return jnp.broadcast_to(
+            jnp.expand_dims(per_move_ss, axis=self.walker_axis),
+            target_shape,
+        )
+
+    def scalar_key(self, rng_key: jax.Array) -> jax.Array:
+        """Reduce a per-shard key array to a single scalar key.
+
+        Every shard carries an identical broadcast key by construction, so
+        taking entry 0 is exact — same as ``_UniformBatcher.scalar_key``.
+        """
+        arr = jnp.asarray(rng_key)
+        return arr if arr.ndim == 0 else arr.reshape(-1)[0]
+
+    # ------------------------------------------------------------------
+    # Regime-specific behavior
+    # ------------------------------------------------------------------
 
     def wrap_step(
         self,
@@ -746,10 +693,6 @@ class ShardedSingleRun(BatchDescriptor):
         h = hmax_arr[0] if hmax_arr.ndim > 0 else hmax_arr
         return float(log_z), float(h)
 
-    # ------------------------------------------------------------------
-    # Override base helpers where the (G,) prefix needs special treatment
-    # ------------------------------------------------------------------
-
     def reduce_emax(self, energy: Float[Array, "G K"]) -> Float[Array, "G"]:
         """Global ``max`` over the entire (G, K_per_gpu) population, broadcast to (G,).
 
@@ -826,7 +769,8 @@ class ShardedSingleRun(BatchDescriptor):
     def distinct_keys(self, rng_key: jax.Array) -> jax.Array:
         """Split a scalar key into G INDEPENDENT keys on the shard mesh.
 
-        Overrides the base default (``split + reshape``) to also
+        Overrides the ``_UniformBatcher`` default (``split + reshape``,
+        duplicated here since this class doesn't inherit from it) to also
         ``device_put`` the result onto the ``'shard'``-named mesh so
         the per-shard pmap accepts it alongside the sharded NSState.
 
@@ -843,8 +787,16 @@ class ShardedSingleRun(BatchDescriptor):
 
 
 # ---------------------------------------------------------------------------
-# Module-level factory
+# "Any of the four" type, and the module-level factory
 # ---------------------------------------------------------------------------
+
+# Not a base class — SingleRun / VmapRuns / PmapVmapRuns / ShardedSingleRun
+# are four independent concrete types (three sharing _UniformBatcher because
+# their behavior genuinely overlaps; ShardedSingleRun standalone because it
+# doesn't). This alias is what code elsewhere means by "any batcher" — it
+# supports isinstance() checks against it directly (`isinstance(x, A | B)`
+# is valid since Python 3.10) exactly like the old ABC did.
+BatchDescriptor = SingleRun | VmapRuns | PmapVmapRuns | ShardedSingleRun
 
 
 def from_shape_prefix(shape_prefix: tuple[int, ...]) -> BatchDescriptor:
@@ -857,6 +809,11 @@ def from_shape_prefix(shape_prefix: tuple[int, ...]) -> BatchDescriptor:
     Used by ``init/restart.py``, ``io/checkpoint.py``, and ``cli/monitor.py``
     to recover the batcher from a stored array's leading shape (``log_evidence``
     is the canonical witness — its shape is always exactly the prefix).
+
+    Note: ``ShardedSingleRun`` checkpoints are stored in the SingleRun
+    ``(1, ...)``/scalar on-disk convention (via its own ``flatten``), so
+    they never round-trip through the rank-1 branch here — restoring them
+    is handled separately by ``run.shard_n_gpu``, not by shape-sniffing.
 
     Raises
     ------
