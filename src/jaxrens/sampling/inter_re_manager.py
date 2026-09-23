@@ -34,7 +34,6 @@ from jaxrens.sampling.batch_descriptor import (
     SingleRun,
     VmapRuns,
 )
-from jaxrens.sampling.mesh import build_mesh
 from jaxrens.sampling.moves.replica_exchange import (
     PressureRENSSwap,
     SemiGrandSwap,
@@ -619,12 +618,15 @@ class InterREManager:
                 return shard_pos, shard_typ, shard_ene, shard_bxs, swap_info
 
         # jit_pmap is only ever invoked for PmapVmapRuns (see `apply`); other
-        # batchers don't carry an n_gpu to build a mesh from and don't need
-        # this callable, so leave it unbuilt.
+        # batchers don't carry a mesh to build from and don't need this
+        # callable, so leave it unbuilt.
         jit_pmap = None
         if isinstance(self._batcher, PmapVmapRuns):
-            mesh = build_mesh("gpu", self._batcher.n_gpu)
-            jit_pmap = jax.jit(_wrap_swap_body(_pmap_body, "gpu", mesh))
+            # self._batcher.mesh: the same cached Mesh object wrap_step /
+            # wrap_for_batch use for this batcher, not a fresh equivalent one.
+            jit_pmap = jax.jit(
+                _wrap_swap_body(_pmap_body, "gpu", self._batcher.mesh)
+            )
 
         return jit_vmap, jit_pmap
 

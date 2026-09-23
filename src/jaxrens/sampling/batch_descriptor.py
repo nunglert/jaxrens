@@ -30,6 +30,7 @@ generic, shape_prefix-driven logic happens to still be correct for it.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 
 import jax
 import jax.numpy as jnp
@@ -189,8 +190,9 @@ class _UniformBatcher:
             return jax.jit(jax.vmap(per_element_fn))
         # n_prefix == 2 (PmapVmapRuns): outer shard_map over G, inner vmap
         # over P. Unlike jax.pmap, shard_map composes with jax.jit.
-        n_gpu = self.shape_prefix[0]
-        mesh = build_mesh("gpu", n_gpu)
+        # self.mesh: only PmapVmapRuns reaches this branch, and it defines
+        # the cached `mesh` property this base class doesn't declare.
+        mesh = self.mesh  # type: ignore[attr-defined]
         return jax.jit(
             pmap_like(
                 jax.vmap(per_element_fn), "gpu", mesh, check_vma=check_vma
@@ -411,6 +413,17 @@ class PmapVmapRuns(_UniformBatcher):
         """Always ``True`` — multiple NS runs are distributed across G×P."""
         return True
 
+    @cached_property
+    def mesh(self):
+        """The ``"gpu"``-axis :class:`jax.sharding.Mesh` for this topology.
+
+        Built once per instance (not per ``wrap_step``/``wrap_for_batch``
+        call) and shared by every consumer — ``InterREManager`` pulls this
+        same object rather than building its own equivalent-but-distinct
+        mesh.
+        """
+        return build_mesh("gpu", self.n_gpu)
+
     def wrap_step(
         self,
         ns_step_fn,
@@ -455,8 +468,7 @@ class PmapVmapRuns(_UniformBatcher):
             return ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)
 
         per_device = jax.vmap(per_run)
-        mesh = build_mesh("gpu", self.n_gpu)
-        return jax.jit(pmap_like(per_device, "gpu", mesh))
+        return jax.jit(pmap_like(per_device, "gpu", self.mesh))
 
     def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
         """Split a per-replica PRNG key array into ``(G, P, n_sub_keys)``.
@@ -577,6 +589,15 @@ class ShardedSingleRun:
         """Always ``True`` — the population is distributed across G devices."""
         return True
 
+    @cached_property
+    def mesh(self):
+        """The ``"shard"``-axis :class:`jax.sharding.Mesh` for this topology.
+
+        Built once per instance and shared by every consumer, same as
+        :attr:`PmapVmapRuns.mesh`.
+        """
+        return build_mesh("shard", self.n_gpu)
+
     # ------------------------------------------------------------------
     # Small shape_prefix-driven helpers — same logic as _UniformBatcher's,
     # duplicated (not inherited) since this class isn't part of that family.
@@ -647,8 +668,7 @@ class ShardedSingleRun:
         def per_shard(ns_state):
             return ns_step_fn(ns_state, step_fn, n_mcmc_steps, n_extra)
 
-        mesh = build_mesh("shard", self.n_gpu)
-        return jax.jit(pmap_like(per_shard, "shard", mesh))
+        return jax.jit(pmap_like(per_shard, "shard", self.mesh))
 
     def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
         """Split a (G,)-broadcast key into ``(G, n_sub_keys)`` sub-keys.
@@ -773,9 +793,8 @@ class ShardedSingleRun:
         ``jax.jit``. ``check_vma`` is forwarded to ``pmap_like`` — see
         that function's docstring.
         """
-        mesh = build_mesh("shard", self.n_gpu)
         return jax.jit(
-            pmap_like(per_element_fn, "shard", mesh, check_vma=check_vma)
+            pmap_like(per_element_fn, "shard", self.mesh, check_vma=check_vma)
         )
 
     def distinct_keys(self, rng_key: jax.Array) -> jax.Array:
