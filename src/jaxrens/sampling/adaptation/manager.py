@@ -39,6 +39,7 @@ from jaxrens.sampling.adaptation.stepsize_handler import (
 )
 from jaxrens.sampling.batch_descriptor import (
     BatchDescriptor,
+    PmapVmapRuns,
     ShardedSingleRun,
 )
 from jaxrens.sampling.move_kernel import MoveKernel
@@ -75,10 +76,13 @@ def build_adapt_step(
     adjust_max_rounds: int,
     adjust_interval: int,
     trial_batch_size: int | None = None,
-) -> Callable[
-    [Any, Float[Array, "*B"], Key[Array, "*B"]],
-    tuple[Any, dict, Key[Array, "*B"]],
-] | None:
+) -> (
+    Callable[
+        [Any, Float[Array, "*B"], Key[Array, "*B"]],
+        tuple[Any, dict, Key[Array, "*B"]],
+    ]
+    | None
+):
     """Build the per-iteration adapt step.
 
     Returns ``None`` when adaptation is inactive — when ``per_move_fns``
@@ -147,8 +151,12 @@ def build_adapt_step(
     builder = _build_sharded_per_move if is_sharded else _build_per_move
     per_move_jit = [
         builder(
-            desc, fn, batcher,
-            adjust_n_samples, adjust_factor, adjust_max_rounds,
+            desc,
+            fn,
+            batcher,
+            adjust_n_samples,
+            adjust_factor,
+            adjust_max_rounds,
             trial_batch_size,
         )
         for desc, fn in zip(descriptors, move_fns)
@@ -189,10 +197,13 @@ def build_adapt_step(
                     "adapted %s: ss=%.3e±%.1e  rate=%.3f±%.3f  "
                     "rounds=%d (max)  conv=%d/%d  bracket=%d  floor=%d  cap=%d",
                     desc.name,
-                    float(new_ss_flat.mean()), float(new_ss_flat.std()),
-                    float(rate_flat.mean()), float(rate_flat.std()),
+                    float(new_ss_flat.mean()),
+                    float(new_ss_flat.std()),
+                    float(rate_flat.mean()),
+                    float(rate_flat.std()),
                     int(n_rounds_flat.max()),
-                    int(converged_flat.sum()), n_total,
+                    int(converged_flat.sum()),
+                    n_total,
                     int(bracket_flat.sum()),
                     int(floor_hits_flat.sum()),
                     int(cap_hits_flat.sum()),
@@ -203,7 +214,8 @@ def build_adapt_step(
         diag: dict = {}
         for k, name in enumerate(_DIAG_KEYS):
             diag[name] = jnp.stack(
-                [r[k] for r in per_move_results], axis=stack_axis,
+                [r[k] for r in per_move_results],
+                axis=stack_axis,
             )
 
         n_walkers = pop.step_sizes.shape[walker_axis]
@@ -240,9 +252,17 @@ def _build_per_move(
     max_r = desc.max_rate
     max_ss = desc.step_size_max
     name = desc.name
+    # Only PmapVmapRuns runs this closure inside a mapped ("gpu"-axis)
+    # context; SingleRun/VmapRuns run it under plain jit/vmap. axis_name
+    # gates the while_loop-carry pcast fix in adjust_step_size, which
+    # errors if applied outside a mapped context.
+    axis_name = "gpu" if isinstance(batcher, PmapVmapRuns) else None
 
     def _per_replica(
-        pop, ss, emax, key,
+        pop,
+        ss,
+        emax,
+        key,
         _move_fn=move_fn,
         _n_samp=n_samp,
         _min_r=min_r,
@@ -252,6 +272,7 @@ def _build_per_move(
         _max_rounds=max_rounds,
         _trial_chunk=trial_chunk,
         _desc_name=name,
+        _axis_name=axis_name,
     ):
         logger.info(
             "adapt tracing: move=%s  pop_shape=%s  max_neighbors=%d  "
@@ -264,16 +285,36 @@ def _build_per_move(
         )
         if _trial_chunk is None:
             return adjust_step_size(
-                pop, _move_fn, ss, emax, key,
-                _n_samp, _min_r, _max_r, _afac, _max_ss, _max_rounds,
+                pop,
+                _move_fn,
+                ss,
+                emax,
+                key,
+                _n_samp,
+                _min_r,
+                _max_r,
+                _afac,
+                _max_ss,
+                _max_rounds,
+                axis_name=_axis_name,
             )
         return adjust_step_size(
-            pop, _move_fn, ss, emax, key,
-            _n_samp, _min_r, _max_r, _afac, _max_ss, _max_rounds,
+            pop,
+            _move_fn,
+            ss,
+            emax,
+            key,
+            _n_samp,
+            _min_r,
+            _max_r,
+            _afac,
+            _max_ss,
+            _max_rounds,
             trial_batch_size=_trial_chunk,
+            axis_name=_axis_name,
         )
 
-    return batcher.wrap_for_batch(_per_replica)
+    return batcher.wrap_for_batch(_per_replica, check_vma=True)
 
 
 def _build_sharded_per_move(
@@ -297,7 +338,10 @@ def _build_sharded_per_move(
     name = desc.name
 
     def _per_replica(
-        pop, ss, emax, key,
+        pop,
+        ss,
+        emax,
+        key,
         _move_fn=move_fn,
         _n_samp=n_samp,
         _min_r=min_r,
@@ -319,13 +363,33 @@ def _build_sharded_per_move(
         )
         if _trial_chunk is None:
             return adjust_step_size_sharded(
-                pop, _move_fn, ss, emax, key,
-                _n_samp, _min_r, _max_r, _afac, _max_ss, _max_rounds,
+                pop,
+                _move_fn,
+                ss,
+                emax,
+                key,
+                _n_samp,
+                _min_r,
+                _max_r,
+                _afac,
+                _max_ss,
+                _max_rounds,
+                axis_name="shard",
             )
         return adjust_step_size_sharded(
-            pop, _move_fn, ss, emax, key,
-            _n_samp, _min_r, _max_r, _afac, _max_ss, _max_rounds,
+            pop,
+            _move_fn,
+            ss,
+            emax,
+            key,
+            _n_samp,
+            _min_r,
+            _max_r,
+            _afac,
+            _max_ss,
+            _max_rounds,
             trial_batch_size=_trial_chunk,
+            axis_name="shard",
         )
 
-    return batcher.wrap_for_batch(_per_replica)
+    return batcher.wrap_for_batch(_per_replica, check_vma=True)

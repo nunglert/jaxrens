@@ -41,7 +41,9 @@ def build_mesh(axis_name: str, n_devices: int) -> Mesh:
     return Mesh(jax.local_devices()[:n_devices], (axis_name,))
 
 
-def pmap_like(fn: Callable, axis_name: str, mesh: Mesh) -> Callable:
+def pmap_like(
+    fn: Callable, axis_name: str, mesh: Mesh, *, check_vma: bool = False
+) -> Callable:
     """Wrap *fn* so ``jax.shard_map`` reproduces ``jax.pmap``'s calling
     convention for it.
 
@@ -55,14 +57,19 @@ def pmap_like(fn: Callable, axis_name: str, mesh: Mesh) -> Callable:
     matching ``jax.pmap``'s default ``in_axes=0``/``out_axes=0`` behavior.
     Unlike ``jax.pmap``, the result composes with ``jax.jit``.
 
-    ``check_vma=False`` is passed to ``shard_map``: jax's "varying manual
-    axis" type checker (new relative to ``pmap``, see
-    https://docs.jax.dev/en/latest/notebooks/shard_map.html#scan-vma)
-    rejects some ``lax.while_loop``/``lax.scan`` carries that mix a
-    Python-literal initial value with a per-device-varying value produced
-    inside the loop body — a pattern jaxrens's step-size bisection loops use
-    and that was always legal under ``pmap``. Disabling it here keeps
-    ``pmap_like`` call sites a faithful, unmodified port of pmap semantics.
+    ``check_vma`` controls whether ``shard_map``'s "varying manual axis"
+    type checker (new relative to ``pmap``, see
+    https://docs.jax.dev/en/latest/notebooks/shard_map.html#scan-vma) is
+    enabled. It rejects some ``lax.while_loop``/``lax.scan`` carries that
+    mix a Python-literal initial value with a per-device-varying value
+    produced inside the loop body — a pattern that was always legal under
+    ``pmap``, which never tracked this distinction. Defaults to ``False``
+    (pmap's old "trust the caller" model) so ``pmap_like`` is a faithful,
+    unmodified port by default; callers whose wrapped function has been
+    updated to type-check under it (e.g. via ``jax.lax.pcast`` on the
+    affected carry entries — see
+    ``jaxrens.sampling.adaptation.stepsize_handler.adjust_step_size``) can
+    pass ``check_vma=True`` to get the checker's safety net back.
     """
 
     def _squeeze(x):
@@ -78,5 +85,5 @@ def pmap_like(fn: Callable, axis_name: str, mesh: Mesh) -> Callable:
 
     spec = PartitionSpec(axis_name)
     return jax.shard_map(
-        wrapped, mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False
+        wrapped, mesh=mesh, in_specs=spec, out_specs=spec, check_vma=check_vma
     )

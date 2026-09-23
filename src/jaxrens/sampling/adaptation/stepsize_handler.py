@@ -28,8 +28,8 @@ from jaxtyping import Array, Bool, Float, Int, Key
 
 from jaxrens.utils.padding import pad_to_multiple
 
+FLOOR_THRESHOLD = 1.0e-7
 
-FLOOR_THRESHOLD = 1.e-7
 
 def _process_rate_jax(
     rate: Float[Array, ""],
@@ -41,8 +41,12 @@ def _process_rate_jax(
     adjust_factor: float,
     max_step_size: float,
 ) -> tuple[
-    Float[Array, ""], Bool[Array, ""], Bool[Array, ""],
-    Bool[Array, ""], Bool[Array, ""], Bool[Array, ""],
+    Float[Array, ""],
+    Bool[Array, ""],
+    Bool[Array, ""],
+    Bool[Array, ""],
+    Bool[Array, ""],
+    Bool[Array, ""],
 ]:
     """Branchless rate processing for step size adjustment.
 
@@ -116,10 +120,18 @@ def adjust_step_size(
     max_rounds: int,
     *,
     trial_batch_size: int | None = None,
+    axis_name: str | None = None,
 ) -> tuple[
-    Float[Array, ""], Float[Array, ""], Int[Array, "4"],
-    Int[Array, ""], Bool[Array, ""], Int[Array, ""], Int[Array, ""], Bool[Array, ""],
-    Int[Array, ""], Int[Array, ""],
+    Float[Array, ""],
+    Float[Array, ""],
+    Int[Array, "4"],
+    Int[Array, ""],
+    Bool[Array, ""],
+    Int[Array, ""],
+    Int[Array, ""],
+    Bool[Array, ""],
+    Int[Array, ""],
+    Int[Array, ""],
 ]:
     """Adjust step size for one move type until acceptance rate is in window.
 
@@ -154,6 +166,21 @@ def adjust_step_size(
             If ``n_samples`` is not a multiple of ``trial_batch_size`` the
             trial population is padded with copies of the last sample and
             the pad is sliced off before rate/count aggregation.
+        axis_name: Mesh axis name to run under, when this function is
+            called inside a ``jax.shard_map`` (``PmapVmapRuns``'s
+            ``"gpu"``-axis wrap; see :mod:`jaxrens.sampling.mesh`).
+            ``None`` (default) for SingleRun/VmapRuns, which never run
+            inside a mapped context. When set, several ``while_loop``
+            carry entries that start as Python-literal constants but
+            become per-device-varying inside the loop body (``rate_prev``,
+            ``converged``, ``cap_hits``, ``floor_hits``, ``saw_too_high``,
+            ``saw_too_low`` — everything downstream of ``rate``, which is
+            never reduced by a collective here, unlike in
+            :func:`adjust_step_size_sharded`) are pre-cast to the
+            ``varying`` VMA type via ``jax.lax.pcast`` so the loop's
+            input/output carry types match under ``shard_map``'s stricter
+            checking. ``jax.lax.pcast`` errors outside a mapped context,
+            which is why this can't be applied unconditionally.
 
     Returns:
         ``(new_step_size, final_rate, final_counts, n_rounds, converged,
@@ -167,14 +194,29 @@ def adjust_step_size(
         return ~converged & (round_idx < max_rounds)
 
     def body_fn(carry):
-        (ss, ss_prev, rate_prev, key, round_idx, converged, _,
-         cap_hits, floor_hits, saw_too_high, saw_too_low,
-         cum_evals, cum_grad_evals) = carry
+        (
+            ss,
+            ss_prev,
+            rate_prev,
+            key,
+            round_idx,
+            converged,
+            _,
+            cap_hits,
+            floor_hits,
+            saw_too_high,
+            saw_too_low,
+            cum_evals,
+            cum_grad_evals,
+        ) = carry
 
         # 1. Sample walkers from the K-population.
         key, key_sample, key_trials = jax.random.split(key, 3)
         indices = jax.random.choice(
-            key_sample, n_walkers, shape=(n_samples,), replace=True,
+            key_sample,
+            n_walkers,
+            shape=(n_samples,),
+            replace=True,
         )
         sample = jax.tree.map(lambda x: x[indices], population)
 
@@ -187,7 +229,8 @@ def adjust_step_size(
         sample = sample.set(
             step_size=jnp.full(n_samples, ss),
             step_sizes=jnp.broadcast_to(
-                ss[None, None], (n_samples, sample.step_sizes.shape[-1]),
+                ss[None, None],
+                (n_samples, sample.step_sizes.shape[-1]),
             ),
         )
 
@@ -197,22 +240,36 @@ def adjust_step_size(
         def trial_one(state, trial_key):
             _, info = move_fn(state, trial_key, emax)
             return (
-                info.accepted, info.reject_reason,
-                info.n_evaluations, info.n_grad_evaluations,
+                info.accepted,
+                info.reject_reason,
+                info.n_evaluations,
+                info.n_grad_evaluations,
             )
 
         if trial_batch_size is None:
-            accepted, reasons, n_evals_per_sample, n_grad_evals_per_sample = jax.vmap(
-                trial_one
-            )(sample, trial_keys)
+            (
+                accepted,
+                reasons,
+                n_evals_per_sample,
+                n_grad_evals_per_sample,
+            ) = jax.vmap(trial_one)(sample, trial_keys)
         else:
             padded_sample, n_pad = pad_to_multiple(
-                sample, n_samples, trial_batch_size,
+                sample,
+                n_samples,
+                trial_batch_size,
             )
             padded_trial_keys, _ = pad_to_multiple(
-                trial_keys, n_samples, trial_batch_size,
+                trial_keys,
+                n_samples,
+                trial_batch_size,
             )
-            accepted, reasons, n_evals_per_sample, n_grad_evals_per_sample = jax.lax.map(
+            (
+                accepted,
+                reasons,
+                n_evals_per_sample,
+                n_grad_evals_per_sample,
+            ) = jax.lax.map(
                 lambda x: trial_one(x[0], x[1]),
                 (padded_sample, padded_trial_keys),
                 batch_size=trial_batch_size,
@@ -225,12 +282,15 @@ def adjust_step_size(
         rate = jnp.mean(accepted.astype(jnp.float32))
 
         # Per-reason counts (code 0=accepted, 1=energy, 2=cell, 3=prior)
-        counts = jnp.array([
-            jnp.sum(reasons == 0),
-            jnp.sum(reasons == 1),
-            jnp.sum(reasons == 2),
-            jnp.sum(reasons == 3),
-        ], dtype=jnp.int32)
+        counts = jnp.array(
+            [
+                jnp.sum(reasons == 0),
+                jnp.sum(reasons == 1),
+                jnp.sum(reasons == 2),
+                jnp.sum(reasons == 3),
+            ],
+            dtype=jnp.int32,
+        )
 
         # Accumulate evaluation counts over all trial rounds
         round_evals = jnp.sum(n_evals_per_sample.astype(jnp.int32))
@@ -239,9 +299,22 @@ def adjust_step_size(
         new_cum_grad_evals = cum_grad_evals + round_grad_evals
 
         # 4. Process rate → new step size + convergence flag + diagnostics
-        new_ss, new_converged, cap_hit, floor_hit, too_high, too_low = _process_rate_jax(
-            rate, ss, ss_prev, rate_prev,
-            min_rate, max_rate, adjust_factor, max_step_size,
+        (
+            new_ss,
+            new_converged,
+            cap_hit,
+            floor_hit,
+            too_high,
+            too_low,
+        ) = _process_rate_jax(
+            rate,
+            ss,
+            ss_prev,
+            rate_prev,
+            min_rate,
+            max_rate,
+            adjust_factor,
+            max_step_size,
         )
 
         new_cap_hits = cap_hits + cap_hit.astype(jnp.int32)
@@ -249,38 +322,91 @@ def adjust_step_size(
         new_saw_too_high = saw_too_high | too_high
         new_saw_too_low = saw_too_low | too_low
 
-        return (new_ss, ss, rate, key, round_idx + 1,
-                converged | new_converged, counts,
-                new_cap_hits, new_floor_hits,
-                new_saw_too_high, new_saw_too_low,
-                new_cum_evals, new_cum_grad_evals)
+        return (
+            new_ss,
+            ss,
+            rate,
+            key,
+            round_idx + 1,
+            converged | new_converged,
+            counts,
+            new_cap_hits,
+            new_floor_hits,
+            new_saw_too_high,
+            new_saw_too_low,
+            new_cum_evals,
+            new_cum_grad_evals,
+        )
+
+    def _varying(x):
+        # Widen a Python-literal-constant initial carry value to the VMA
+        # "varying" type so it matches the loop body's output type once
+        # rate-derived quantities (never collective-reduced in this
+        # function) taint it. Always a safe widening -- see the axis_name
+        # docstring above for exactly which slots need this and why.
+        return jax.lax.pcast(jnp.asarray(x), axis_name, to="varying")
+
+    rate_prev0 = jnp.array(-1.0)  # sentinel: no previous rate
+    converged0 = jnp.array(False)
+    cap_hits0 = jnp.array(0, dtype=jnp.int32)
+    floor_hits0 = jnp.array(0, dtype=jnp.int32)
+    saw_too_high0 = jnp.array(False)
+    saw_too_low0 = jnp.array(False)
+    if axis_name is not None:
+        rate_prev0 = _varying(rate_prev0)
+        converged0 = _varying(converged0)
+        cap_hits0 = _varying(cap_hits0)
+        floor_hits0 = _varying(floor_hits0)
+        saw_too_high0 = _varying(saw_too_high0)
+        saw_too_low0 = _varying(saw_too_low0)
 
     init_carry = (
         step_size,
         step_size,
-        jnp.array(-1.0),  # sentinel: no previous rate
+        rate_prev0,
         rng_key,
         jnp.array(0, dtype=jnp.int32),
-        jnp.array(False),
+        converged0,
         jnp.zeros(4, dtype=jnp.int32),
-        jnp.array(0, dtype=jnp.int32),   # cap_hits
-        jnp.array(0, dtype=jnp.int32),   # floor_hits
-        jnp.array(False),                 # saw_too_high
-        jnp.array(False),                 # saw_too_low
-        jnp.array(0, dtype=jnp.int32),   # cumulative_n_evals
-        jnp.array(0, dtype=jnp.int32),   # cumulative_n_grad_evals
+        cap_hits0,  # cap_hits
+        floor_hits0,  # floor_hits
+        saw_too_high0,  # saw_too_high
+        saw_too_low0,  # saw_too_low
+        jnp.array(0, dtype=jnp.int32),  # cumulative_n_evals
+        jnp.array(0, dtype=jnp.int32),  # cumulative_n_grad_evals
     )
 
     final = jax.lax.while_loop(cond_fn, body_fn, init_carry)
-    (final_ss, _, final_rate, _, n_rounds, converged, final_counts,
-     cap_hits, floor_hits, saw_too_high, saw_too_low,
-     trial_n_evals, trial_n_grad_evals) = final
+    (
+        final_ss,
+        _,
+        final_rate,
+        _,
+        n_rounds,
+        converged,
+        final_counts,
+        cap_hits,
+        floor_hits,
+        saw_too_high,
+        saw_too_low,
+        trial_n_evals,
+        trial_n_grad_evals,
+    ) = final
 
     bracket_detected = saw_too_high & saw_too_low
 
-    return (final_ss, final_rate, final_counts,
-            n_rounds, converged, cap_hits, floor_hits, bracket_detected,
-            trial_n_evals, trial_n_grad_evals)
+    return (
+        final_ss,
+        final_rate,
+        final_counts,
+        n_rounds,
+        converged,
+        cap_hits,
+        floor_hits,
+        bracket_detected,
+        trial_n_evals,
+        trial_n_grad_evals,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -302,10 +428,18 @@ def adjust_step_size_sharded(
     max_rounds: int,
     *,
     trial_batch_size: int | None = None,
+    axis_name: str | None = None,
 ) -> tuple[
-    Float[Array, ""], Float[Array, ""], Int[Array, "4"],
-    Int[Array, ""], Bool[Array, ""], Int[Array, ""], Int[Array, ""], Bool[Array, ""],
-    Int[Array, ""], Int[Array, ""],
+    Float[Array, ""],
+    Float[Array, ""],
+    Int[Array, "4"],
+    Int[Array, ""],
+    Bool[Array, ""],
+    Int[Array, ""],
+    Int[Array, ""],
+    Bool[Array, ""],
+    Int[Array, ""],
+    Int[Array, ""],
 ]:
     """Adjust step size with the population sharded across ``n_gpu`` GPUs.
 
@@ -330,6 +464,23 @@ def adjust_step_size_sharded(
     Returns ``(final_ss, final_rate, final_counts, n_rounds, converged,
     cap_hits, floor_hits, bracket_detected, trial_n_evals,
     trial_n_grad_evals)`` — values are identical on every shard.
+
+    Args:
+        axis_name: Mesh axis name to run under (``"shard"`` in production —
+            see :mod:`jaxrens.sampling.mesh`). ``None`` (default) is for
+            testing this function outside a mapped context. When set,
+            ``cap_hits``/``floor_hits`` are pre-cast to the ``varying`` VMA
+            type via ``jax.lax.pcast``. Unlike :func:`adjust_step_size`,
+            most carry entries here (``rate_prev``, ``converged``,
+            ``saw_too_high``, ``saw_too_low``) do *not* need this: ``rate``
+            is ``lax.psum``-reduced every round, so everything derived
+            purely from ``rate`` stays the "reduced" VMA type and already
+            matches its constant initial value. Only ``cap_hits``/
+            ``floor_hits`` also depend on ``step_size`` itself, which
+            enters this function as a genuinely varying-typed value (it's
+            merely numerically identical across shards "by construction",
+            not collective-proven so) -- see
+            ``experiments/shard_map_rewrite.md`` for the distinction.
     """
     n_walkers_local = population.energy.shape[0]
 
@@ -338,9 +489,21 @@ def adjust_step_size_sharded(
         return ~converged & (round_idx < max_rounds)
 
     def body_fn(carry):
-        (ss, ss_prev, rate_prev, key, round_idx, converged, _,
-         cap_hits, floor_hits, saw_too_high, saw_too_low,
-         cum_evals, cum_grad_evals) = carry
+        (
+            ss,
+            ss_prev,
+            rate_prev,
+            key,
+            round_idx,
+            converged,
+            _,
+            cap_hits,
+            floor_hits,
+            saw_too_high,
+            saw_too_low,
+            cum_evals,
+            cum_grad_evals,
+        ) = carry
 
         # 1. Sample walkers from LOCAL population.  RNG is independent
         # across shards (split_keys broadcast a single key to all shards
@@ -351,7 +514,10 @@ def adjust_step_size_sharded(
         # already drawn from disjoint walker subsets).
         key, key_sample, key_trials = jax.random.split(key, 3)
         indices = jax.random.choice(
-            key_sample, n_walkers_local, shape=(n_samples,), replace=True,
+            key_sample,
+            n_walkers_local,
+            shape=(n_samples,),
+            replace=True,
         )
         sample = jax.tree.map(lambda x: x[indices], population)
 
@@ -359,7 +525,8 @@ def adjust_step_size_sharded(
         sample = sample.set(
             step_size=jnp.full(n_samples, ss),
             step_sizes=jnp.broadcast_to(
-                ss[None, None], (n_samples, sample.step_sizes.shape[-1]),
+                ss[None, None],
+                (n_samples, sample.step_sizes.shape[-1]),
             ),
         )
 
@@ -368,20 +535,37 @@ def adjust_step_size_sharded(
 
         def trial_one(state, trial_key):
             _, info = move_fn(state, trial_key, emax)
-            return info.accepted, info.reject_reason, info.n_evaluations, info.n_grad_evaluations
+            return (
+                info.accepted,
+                info.reject_reason,
+                info.n_evaluations,
+                info.n_grad_evaluations,
+            )
 
         if trial_batch_size is None:
-            accepted, reasons, n_evals_per_sample, n_grad_evals_per_sample = jax.vmap(
-                trial_one
-            )(sample, trial_keys)
+            (
+                accepted,
+                reasons,
+                n_evals_per_sample,
+                n_grad_evals_per_sample,
+            ) = jax.vmap(trial_one)(sample, trial_keys)
         else:
             padded_sample, n_pad = pad_to_multiple(
-                sample, n_samples, trial_batch_size,
+                sample,
+                n_samples,
+                trial_batch_size,
             )
             padded_trial_keys, _ = pad_to_multiple(
-                trial_keys, n_samples, trial_batch_size,
+                trial_keys,
+                n_samples,
+                trial_batch_size,
             )
-            accepted, reasons, n_evals_per_sample, n_grad_evals_per_sample = jax.lax.map(
+            (
+                accepted,
+                reasons,
+                n_evals_per_sample,
+                n_grad_evals_per_sample,
+            ) = jax.lax.map(
                 lambda x: trial_one(x[0], x[1]),
                 (padded_sample, padded_trial_keys),
                 batch_size=trial_batch_size,
@@ -398,30 +582,53 @@ def adjust_step_size_sharded(
         local_accepted = jnp.sum(accepted.astype(jnp.int32))
         global_accepted = jax.lax.psum(local_accepted, axis_name="shard")
         global_n = jax.lax.psum(
-            jnp.array(n_samples, dtype=jnp.int32), axis_name="shard",
+            jnp.array(n_samples, dtype=jnp.int32),
+            axis_name="shard",
         )
-        rate = global_accepted.astype(jnp.float32) / global_n.astype(jnp.float32)
+        rate = global_accepted.astype(jnp.float32) / global_n.astype(
+            jnp.float32
+        )
 
-        local_counts = jnp.array([
-            jnp.sum(reasons == 0),
-            jnp.sum(reasons == 1),
-            jnp.sum(reasons == 2),
-            jnp.sum(reasons == 3),
-        ], dtype=jnp.int32)
+        local_counts = jnp.array(
+            [
+                jnp.sum(reasons == 0),
+                jnp.sum(reasons == 1),
+                jnp.sum(reasons == 2),
+                jnp.sum(reasons == 3),
+            ],
+            dtype=jnp.int32,
+        )
         counts = jax.lax.psum(local_counts, axis_name="shard")
 
         local_round_evals = jnp.sum(n_evals_per_sample.astype(jnp.int32))
-        local_round_grad_evals = jnp.sum(n_grad_evals_per_sample.astype(jnp.int32))
+        local_round_grad_evals = jnp.sum(
+            n_grad_evals_per_sample.astype(jnp.int32)
+        )
         round_evals = jax.lax.psum(local_round_evals, axis_name="shard")
-        round_grad_evals = jax.lax.psum(local_round_grad_evals, axis_name="shard")
+        round_grad_evals = jax.lax.psum(
+            local_round_grad_evals, axis_name="shard"
+        )
         new_cum_evals = cum_evals + round_evals
         new_cum_grad_evals = cum_grad_evals + round_grad_evals
 
         # 5. Process rate → new step size + convergence flag (identical
         # decision on every shard because `rate` is post-psum).
-        new_ss, new_converged, cap_hit, floor_hit, too_high, too_low = _process_rate_jax(
-            rate, ss, ss_prev, rate_prev,
-            min_rate, max_rate, adjust_factor, max_step_size,
+        (
+            new_ss,
+            new_converged,
+            cap_hit,
+            floor_hit,
+            too_high,
+            too_low,
+        ) = _process_rate_jax(
+            rate,
+            ss,
+            ss_prev,
+            rate_prev,
+            min_rate,
+            max_rate,
+            adjust_factor,
+            max_step_size,
         )
 
         new_cap_hits = cap_hits + cap_hit.astype(jnp.int32)
@@ -429,11 +636,27 @@ def adjust_step_size_sharded(
         new_saw_too_high = saw_too_high | too_high
         new_saw_too_low = saw_too_low | too_low
 
-        return (new_ss, ss, rate, key, round_idx + 1,
-                converged | new_converged, counts,
-                new_cap_hits, new_floor_hits,
-                new_saw_too_high, new_saw_too_low,
-                new_cum_evals, new_cum_grad_evals)
+        return (
+            new_ss,
+            ss,
+            rate,
+            key,
+            round_idx + 1,
+            converged | new_converged,
+            counts,
+            new_cap_hits,
+            new_floor_hits,
+            new_saw_too_high,
+            new_saw_too_low,
+            new_cum_evals,
+            new_cum_grad_evals,
+        )
+
+    cap_hits0 = jnp.array(0, dtype=jnp.int32)
+    floor_hits0 = jnp.array(0, dtype=jnp.int32)
+    if axis_name is not None:
+        cap_hits0 = jax.lax.pcast(cap_hits0, axis_name, to="varying")
+        floor_hits0 = jax.lax.pcast(floor_hits0, axis_name, to="varying")
 
     init_carry = (
         step_size,
@@ -443,8 +666,8 @@ def adjust_step_size_sharded(
         jnp.array(0, dtype=jnp.int32),
         jnp.array(False),
         jnp.zeros(4, dtype=jnp.int32),
-        jnp.array(0, dtype=jnp.int32),
-        jnp.array(0, dtype=jnp.int32),
+        cap_hits0,
+        floor_hits0,
         jnp.array(False),
         jnp.array(False),
         jnp.array(0, dtype=jnp.int32),
@@ -452,12 +675,33 @@ def adjust_step_size_sharded(
     )
 
     final = jax.lax.while_loop(cond_fn, body_fn, init_carry)
-    (final_ss, _, final_rate, _, n_rounds, converged, final_counts,
-     cap_hits, floor_hits, saw_too_high, saw_too_low,
-     trial_n_evals, trial_n_grad_evals) = final
+    (
+        final_ss,
+        _,
+        final_rate,
+        _,
+        n_rounds,
+        converged,
+        final_counts,
+        cap_hits,
+        floor_hits,
+        saw_too_high,
+        saw_too_low,
+        trial_n_evals,
+        trial_n_grad_evals,
+    ) = final
 
     bracket_detected = saw_too_high & saw_too_low
 
-    return (final_ss, final_rate, final_counts,
-            n_rounds, converged, cap_hits, floor_hits, bracket_detected,
-            trial_n_evals, trial_n_grad_evals)
+    return (
+        final_ss,
+        final_rate,
+        final_counts,
+        n_rounds,
+        converged,
+        cap_hits,
+        floor_hits,
+        bracket_detected,
+        trial_n_evals,
+        trial_n_grad_evals,
+    )

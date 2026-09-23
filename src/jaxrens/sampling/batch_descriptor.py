@@ -160,7 +160,7 @@ class _UniformBatcher:
             self.shape_prefix,
         )
 
-    def wrap_for_batch(self, per_element_fn):
+    def wrap_for_batch(self, per_element_fn, *, check_vma: bool = False):
         """Wrap a per-replica callable with jit/vmap/shard_map as appropriate.
 
         Generic version of ``wrap_step`` for callables that don't take
@@ -174,6 +174,11 @@ class _UniformBatcher:
           outer ``"gpu"``-axis shard_map (pmap-equivalent, see
           :mod:`jaxrens.sampling.mesh`) over G, inner vmap over P.
 
+        ``check_vma`` is forwarded to :func:`jaxrens.sampling.mesh.pmap_like`
+        for the PmapVmapRuns case (ignored otherwise, since SingleRun/
+        VmapRuns never enter a mapped context) — see that function's
+        docstring.
+
         Default implementation routes by ``shape_prefix`` length so concrete
         classes inherit unchanged.
         """
@@ -186,7 +191,11 @@ class _UniformBatcher:
         # over P. Unlike jax.pmap, shard_map composes with jax.jit.
         n_gpu = self.shape_prefix[0]
         mesh = build_mesh("gpu", n_gpu)
-        return jax.jit(pmap_like(jax.vmap(per_element_fn), "gpu", mesh))
+        return jax.jit(
+            pmap_like(
+                jax.vmap(per_element_fn), "gpu", mesh, check_vma=check_vma
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -741,7 +750,7 @@ class ShardedSingleRun:
             arr_flat[0:1], (self.n_gpu,) + arr_flat.shape[1:]
         )
 
-    def wrap_for_batch(self, per_element_fn):
+    def wrap_for_batch(self, per_element_fn, *, check_vma: bool = False):
         """Wrap a per-replica callable in shard_map over the shard axis.
 
         Signature contract: every input has a leading ``(G,)`` axis on
@@ -761,10 +770,13 @@ class ShardedSingleRun:
         Built on ``jax.shard_map`` via
         :func:`jaxrens.sampling.mesh.pmap_like` (pmap-equivalent); unlike
         the ``jax.pmap`` this replaces, the result composes with
-        ``jax.jit``.
+        ``jax.jit``. ``check_vma`` is forwarded to ``pmap_like`` — see
+        that function's docstring.
         """
         mesh = build_mesh("shard", self.n_gpu)
-        return jax.jit(pmap_like(per_element_fn, "shard", mesh))
+        return jax.jit(
+            pmap_like(per_element_fn, "shard", mesh, check_vma=check_vma)
+        )
 
     def distinct_keys(self, rng_key: jax.Array) -> jax.Array:
         """Split a scalar key into G INDEPENDENT keys on the shard mesh.
