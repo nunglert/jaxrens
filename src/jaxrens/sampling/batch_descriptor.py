@@ -35,6 +35,7 @@ from functools import cached_property
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import PartitionSpec
 from jaxtyping import Array, Float, Shaped
 
 from jaxrens.sampling.mesh import build_mesh, pmap_like
@@ -553,19 +554,22 @@ class ShardedSingleRun:
       ``lax.psum``.  Correct; G× redundant memory on small counters.
       Acceptable cost.
 
-    Reductions (``reduce_emax``, ``reduce_for_termination``) collapse
-    the (G,) axis to a scalar — every shard sees the same global
-    value after the in-step collectives.
+    ``reduce_for_termination`` collapses the (G,) axis to a scalar —
+    every shard sees the same global value after the in-step
+    collectives, so taking ``[0]`` is exact.
 
-    Inputs to :meth:`wrap_for_batch`-wrapped callables are scalar
-    (ss / emax / key); the wrapper broadcasts to (G,) before the
-    mapped call (``jax.shard_map`` via
-    :func:`jaxrens.sampling.mesh.pmap_like`) and takes ``[0]`` of the
-    result on the way out.  This keeps the per-replica callable
-    signature identical to SingleRun so :func:`build_adapt_step`
-    doesn't need a different closure shape — only the underlying
-    ``adjust_step_size_sharded`` call needs to know it's running
-    under a mapped ``"shard"`` context.
+    ``split_keys`` returns a plain, unbroadcast ``(n_sub_keys,)`` array
+    rather than a redundant ``(G,)`` copy — :meth:`wrap_for_batch`'s
+    ``replicated=`` argument tells ``shard_map`` to hand it to every
+    device as-is (``in_specs=P()``), so no pre-broadcast/``device_put``
+    is needed. ``reduce_emax`` keeps its ``(G,)`` broadcast (see its own
+    docstring for why — its output sometimes substitutes for a value
+    that's genuinely ``(G,)``-shaped elsewhere, unlike ``split_keys``'s
+    output). ``distinct_keys`` is different again — it returns
+    *genuinely independent* per-shard keys, a real ``(G,)``-sharded
+    array, not a coherent broadcast, so it keeps its ``device_put``-onto-
+    the-mesh placement. See ``experiments/shard_map_rewrite.md`` (item 4)
+    for the full account, including what was tried and reverted.
 
     Attributes
     ----------
@@ -671,40 +675,28 @@ class ShardedSingleRun:
         return jax.jit(pmap_like(per_shard, "shard", self.mesh))
 
     def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
-        """Split a (G,)-broadcast key into ``(G, n_sub_keys)`` sub-keys.
+        """Split a key into ``n_sub_keys`` coherent (shard-independent) sub-keys.
 
         ``rng_key`` may be either:
 
-        * A scalar key — auto-broadcast to ``(G,)`` (every shard then
-          gets the same sub-keys post-split).
-        * A ``(G,)`` array of identical broadcast keys — same outcome,
-          just skips the broadcast step.
+        * A scalar key.
+        * A ``(G,)`` array of identical broadcast keys (legacy callers) —
+          collapsed via ``[0]`` before splitting.
 
         The load-bearing invariant for ``ns_step_sharded`` and
         ``adjust_step_size_sharded`` is that every shard makes the
-        *same* RNG decisions, so the broadcast-then-split pattern is
-        equivalent to "every shard splits the same key" — used by
-        the ``adapt_step`` closure (which sees a ``(G,)``-shaped
-        key from its ``rng_key`` parameter).
+        *same* RNG decisions — this returns one plain, unbroadcast
+        ``(n_sub_keys,)`` array rather than a redundant ``(G,)``-broadcast
+        copy of it, since ``wrap_for_batch``'s ``replicated=`` argument
+        marks it as a replicated (``in_specs=P()``) input instead: no
+        pre-broadcast/``device_put`` needed, ``shard_map`` hands the same
+        value to every device directly. See ``experiments/shard_map_rewrite.md``
+        ("Per-argument in_specs instead of force-broadcasting scalars").
 
-        Returns shape ``(G, n_sub_keys)`` with typed-key dtype.
+        Returns shape ``(n_sub_keys,)`` with typed-key dtype.
         """
-        from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
-        # Collapse (G,) → scalar so jax.random.split (which only accepts
-        # a single key) works.  All G entries are identical by
-        # construction (broadcast upstream); take [0] is exact.
         scalar_key = rng_key[0] if rng_key.ndim > 0 else rng_key
-        sub = jax.random.split(scalar_key, n_sub_keys)  # (n_sub_keys,)
-        broadcast = jnp.broadcast_to(sub[None, ...], (self.n_gpu,) + sub.shape)
-        # Place on the same shard mesh as ``reduce_emax`` /
-        # ``extract_step_sizes`` so the per-move pmap accepts every
-        # input uniformly without per-call ``jax.device_put``.
-        shard_mesh = NamedSharding(
-            Mesh(jax.local_devices()[: self.n_gpu], ("shard",)),
-            PartitionSpec("shard"),
-        )
-        return jax.device_put(broadcast, shard_mesh)
+        return jax.random.split(scalar_key, n_sub_keys)
 
     def reduce_for_termination(
         self,
@@ -729,15 +721,17 @@ class ShardedSingleRun:
         ``'shard'``-named mesh — same convention as
         :meth:`VmapRuns.reduce_emax` returning ``(R,)`` and
         :meth:`PmapVmapRuns.reduce_emax` returning ``(G, P)``.
-        Following the shape_prefix convention everywhere lets
-        consumers (the ``adapt_step`` closure, `_run_loop`'s
-        adaptation block) handle every batcher uniformly without
-        per-batcher emax broadcast/reshape.
 
-        The G entries are physically identical (one logical Emax for
-        one logical population); the redundancy is G floats per
-        adapt call — trivial vs. the per-shard isinstance branches it
-        eliminates.
+        Unlike :meth:`split_keys`, this one keeps its ``(G,)`` broadcast
+        rather than returning a plain scalar for ``wrap_for_batch``'s
+        ``replicated=`` — burn-in's ``initial_walk`` feeds this value into
+        the *same* ``adapt_step`` machinery that the regular NS loop feeds
+        with ``ns_state.emax`` (a real, structurally ``(G,)``-shaped
+        field). Simplifying this to a scalar was tried and reverted: it
+        broke burn-in's adaptation call, since the shared
+        ``_build_sharded_per_move`` closure can't use a different
+        ``replicated`` mask depending on which caller supplied ``emax``.
+        See ``experiments/shard_map_rewrite.md`` (item 4) for the finding.
         """
         from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
@@ -770,31 +764,67 @@ class ShardedSingleRun:
             arr_flat[0:1], (self.n_gpu,) + arr_flat.shape[1:]
         )
 
-    def wrap_for_batch(self, per_element_fn, *, check_vma: bool = False):
+    def wrap_for_batch(
+        self,
+        per_element_fn,
+        *,
+        check_vma: bool = False,
+        replicated: tuple[bool, ...] = (),
+    ):
         """Wrap a per-replica callable in shard_map over the shard axis.
 
-        Signature contract: every input has a leading ``(G,)`` axis on
-        the ``'shard'``-named mesh; outputs preserve that axis.  This
-        matches :meth:`VmapRuns.wrap_for_batch` and
-        :meth:`PmapVmapRuns.wrap_for_batch`'s contracts (each "row"
-        of the leading axis is fed to ``per_element_fn``).
+        Default signature contract (``replicated=()``): every input has a
+        leading ``(G,)`` axis on the ``'shard'``-named mesh; outputs
+        preserve that axis. This matches :meth:`VmapRuns.wrap_for_batch`
+        and :meth:`PmapVmapRuns.wrap_for_batch`'s contracts (each "row" of
+        the leading axis is fed to ``per_element_fn``).
 
-        For ShardedSingleRun the per-shard "row" of every coherent
-        input (ss / emax / key) is identical by construction — that's
-        the load-bearing invariant for ``adjust_step_size_sharded``'s
-        coherent bisection.  Producers (``reduce_emax``,
-        ``split_keys``, ``extract_step_sizes``) all return shape
-        ``(G, ...)`` on the shard mesh, so callers don't need to
-        massage shapes themselves.
+        ``replicated``: one bool per positional argument of
+        *per_element_fn*, in order; ``True`` marks that argument as an
+        already-replicated plain value (no ``(G,)`` axis at all — e.g.
+        :meth:`reduce_emax` / :meth:`split_keys`'s outputs, post-
+        simplification) rather than a genuinely ``(G, ...)``-sharded one.
+        Those arguments get ``in_specs=P()`` (handed to every device
+        as-is, no squeeze/broadcast) instead of ``P("shard")``. Leaving
+        it empty preserves the old uniform-``P("shard")``-for-everything
+        contract exactly. Outputs are always ``P("shard")`` — this only
+        changes how *inputs* are described, not outputs (see
+        ``experiments/shard_map_rewrite.md``, item 4, for why the
+        output-replication case needs a different, costlier approach).
 
-        Built on ``jax.shard_map`` via
-        :func:`jaxrens.sampling.mesh.pmap_like` (pmap-equivalent); unlike
-        the ``jax.pmap`` this replaces, the result composes with
-        ``jax.jit``. ``check_vma`` is forwarded to ``pmap_like`` — see
-        that function's docstring.
+        Not built on :func:`jaxrens.sampling.mesh.pmap_like` when
+        ``replicated`` is non-empty — that helper's contract is one
+        uniform spec for every argument, which can't express this.
         """
+        if not replicated:
+            return jax.jit(
+                pmap_like(
+                    per_element_fn, "shard", self.mesh, check_vma=check_vma
+                )
+            )
+
+        def wrapped(*args):
+            squeezed = tuple(
+                a
+                if is_rep
+                else jax.tree.map(lambda x: jnp.squeeze(x, axis=0), a)
+                for a, is_rep in zip(args, replicated)
+            )
+            out = per_element_fn(*squeezed)
+            return jax.tree.map(lambda x: x[None, ...], out)
+
+        in_specs = tuple(
+            PartitionSpec() if is_rep else PartitionSpec("shard")
+            for is_rep in replicated
+        )
         return jax.jit(
-            pmap_like(per_element_fn, "shard", self.mesh, check_vma=check_vma)
+            jax.shard_map(
+                wrapped,
+                mesh=self.mesh,
+                in_specs=in_specs,
+                out_specs=PartitionSpec("shard"),
+                check_vma=check_vma,
+            )
         )
 
     def distinct_keys(self, rng_key: jax.Array) -> jax.Array:

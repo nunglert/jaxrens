@@ -392,4 +392,9 @@ def _build_sharded_per_move(
             axis_name="shard",
         )
 
-    return batcher.wrap_for_batch(_per_replica, check_vma=True)
+    # key comes from split_keys, now a plain replicated value (no (G,)
+    # broadcast) -- see batch_descriptor.py's ShardedSingleRun.split_keys.
+    # pop/ss/emax stay genuinely (G, ...)-sharded.
+    return batcher.wrap_for_batch(
+        _per_replica, check_vma=True, replicated=(False, False, False, True)
+    )
