@@ -23,6 +23,7 @@ from typing import Any, TypedDict
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import PartitionSpec
 from jaxtyping import Array, Key
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ from jaxrens.sampling.batch_descriptor import (
     SingleRun,
     VmapRuns,
 )
-from jaxrens.sampling.mesh import build_mesh, pmap_like
+from jaxrens.sampling.mesh import build_mesh
 from jaxrens.sampling.moves.replica_exchange import (
     PressureRENSSwap,
     SemiGrandSwap,
@@ -75,6 +76,64 @@ _EMPTY_STATS: SwapStats = {
     "n_accepted_per_pair": np.zeros(0, dtype=np.int32),
     "n_attempted_per_pair": np.zeros(0, dtype=np.int32),
 }
+
+
+def _certify_replicated(tree, axis_name: str, n_devices: int):
+    """psum-then-divide every leaf of *tree* across *axis_name*.
+
+    All devices already hold numerically identical values here (same RNG +
+    same all-gathered data => same swap decision on every device), but
+    ``shard_map``'s VMA type checker doesn't take that on faith — it only
+    trusts a handful of collectives (``psum`` among them) as *proof* of
+    replication, which ``out_specs=PartitionSpec()`` requires. Summing G
+    identical integer copies and dividing by G recovers the exact original
+    value while producing a provably-reduced type. See
+    ``experiments/shard_map_rewrite.md`` ("out_specs=P() ... with a
+    caveat") for the discovery that motivated this.
+    """
+    return jax.tree.map(
+        lambda x: jax.lax.psum(x, axis_name=axis_name) // n_devices, tree
+    )
+
+
+def _wrap_swap_body(fn, axis_name: str, mesh):
+    """``pmap_like``-equivalent for the ``"gpu"``-axis swap body, except the
+    5th return value (the swap-stats dict) is replicated (``out_specs=P()``)
+    rather than concatenated across devices.
+
+    *fn* must be written like :func:`jaxrens.sampling.mesh.pmap_like`'s
+    contract for its first 4 (sharded) return values, and must have already
+    run its swap-stats dict through :func:`_certify_replicated` before
+    returning it — this wrapper does not unsqueeze/re-shape that 5th value
+    at all, it passes it straight through shard_map's replicated path.
+
+    ``check_vma=False``: the swap kernels this wraps (``replica_exchange_step``
+    / ``xrens_replica_exchange_step`` / ``semi_grand_replica_exchange_step``,
+    and ``morph.py`` underneath the XRENS/semi-grand composition swap) have
+    their own internal ``lax.scan``/``lax.cond`` control flow that has not
+    been audited for VMA-correctness — turning this on surfaced a real,
+    unrelated ``lax.cond`` branch-type mismatch inside
+    ``morph.py:pick_from_donor_species`` on real 2-GPU hardware. Auditing
+    and fixing that is a separate, larger undertaking than this wrapper's
+    swap-info replication; ``_certify_replicated`` still makes the
+    ``out_specs=P()`` promise numerically correct (every device provably
+    computed the identical swap), it just isn't statically checked here.
+    """
+
+    def wrapped(*args):
+        args = jax.tree.map(lambda x: jnp.squeeze(x, axis=0), args)
+        shard_pos, shard_typ, shard_ene, shard_bxs, swap_info = fn(*args)
+        sharded_outs = jax.tree.map(
+            lambda x: x[None, ...],
+            (shard_pos, shard_typ, shard_ene, shard_bxs),
+        )
+        return (*sharded_outs, swap_info)
+
+    spec = PartitionSpec(axis_name)
+    out_specs = (spec, spec, spec, spec, PartitionSpec())
+    return jax.shard_map(
+        wrapped, mesh=mesh, in_specs=spec, out_specs=out_specs, check_vma=False
+    )
 
 
 class InterREManager:
@@ -398,6 +457,9 @@ class InterREManager:
                 shard_bxs = (
                     new_bxs_full[dev_idx] if new_bxs_full is not None else None
                 )
+                # Certify swap_info as provably-replicated (see
+                # _certify_replicated) so out_specs=P() is valid below.
+                swap_info = _certify_replicated(swap_info, "gpu", G)
                 return shard_pos, shard_typ, shard_ene, shard_bxs, swap_info
 
         elif self._is_semi_grand:
@@ -474,6 +536,9 @@ class InterREManager:
                 shard_bxs = (
                     new_bxs_full[dev_idx] if new_bxs_full is not None else None
                 )
+                # Certify swap_info as provably-replicated (see
+                # _certify_replicated) so out_specs=P() is valid below.
+                swap_info = _certify_replicated(swap_info, "gpu", G)
                 return shard_pos, shard_typ, shard_ene, shard_bxs, swap_info
 
         else:
@@ -547,6 +612,9 @@ class InterREManager:
                 shard_bxs = (
                     new_bxs_full[dev_idx] if new_bxs_full is not None else None
                 )
+                # Certify swap_info as provably-replicated (see
+                # _certify_replicated) so out_specs=P() is valid below.
+                swap_info = _certify_replicated(swap_info, "gpu", G)
 
                 return shard_pos, shard_typ, shard_ene, shard_bxs, swap_info
 
@@ -556,7 +624,7 @@ class InterREManager:
         jit_pmap = None
         if isinstance(self._batcher, PmapVmapRuns):
             mesh = build_mesh("gpu", self._batcher.n_gpu)
-            jit_pmap = jax.jit(pmap_like(_pmap_body, "gpu", mesh))
+            jit_pmap = jax.jit(_wrap_swap_body(_pmap_body, "gpu", mesh))
 
         return jit_vmap, jit_pmap
 
@@ -829,21 +897,10 @@ class InterREManager:
         )
         new_ns_state = ns_state.set(population=new_pop)
 
-        # All devices ran the same swap (same RNG + same data after all_gather),
-        # so device 0's swap_info is representative.
-        device0_info: dict[str, Any] = {
-            "n_accepted": swap_info_sharded["n_accepted"][0],
-            "n_attempted": swap_info_sharded["n_attempted"][0],
-            "n_accepted_per_pair": swap_info_sharded["n_accepted_per_pair"][0],
-            "n_attempted_per_pair": swap_info_sharded["n_attempted_per_pair"][
-                0
-            ],
-        }
-        if "n_energy_evals" in swap_info_sharded:
-            device0_info["n_energy_evals"] = swap_info_sharded[
-                "n_energy_evals"
-            ][0]
-        stats = self._build_stats(device0_info)
+        # swap_info_sharded arrives already replicated (out_specs=P() in
+        # _wrap_swap_body, certified via _certify_replicated) -- no more
+        # per-device axis to index away, unlike the old pmap path.
+        stats = self._build_stats(swap_info_sharded)
         return new_ns_state, stats
 
     @staticmethod
