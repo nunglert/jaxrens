@@ -7,3 +7,4 @@
 - [] re_stats plot in CLI is outdated
 - [] Log total expected numer of MCMC steps per iteration in output
 - [] Log version number of JAXRENS used for the run, for reproducibility
+- [] Check how the initial_checkpoint hdf5 is handled upon a resume restart

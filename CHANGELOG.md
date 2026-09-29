@@ -9,6 +9,43 @@ The version is derived from git tags by `setuptools-scm` (tag `v0.1.0` →
 version `0.1.0`). To cut a release: add a dated section below, merge to `main`,
 then `git tag -a vX.Y.Z`.
 
+## [0.5.0] — 2026-09-29
+
+Multi-device parallelization migrated from `jax.pmap` to `jax.shard_map`,
+plus run-log additions for reproducibility. No changes to the config schema.
+
+### Added
+- **Run logs record the `jaxrens` version.** `jaxrens run` logs the installed
+  package version (from `setuptools-scm`), so a log file identifies the build
+  that produced it.
+- **Run logs record total MCMC steps per iteration.** The "Starting … NS"
+  line of every run mode (`run_ns`, `run_ns_parallel`, `run_ns_multi_gpu`,
+  `run_ns_sharded`) now also reports `n_extra` and
+  `total_mcmc_steps_per_iter = (1 + n_extra) * n_mcmc`.
+- **`jaxrens.sampling.mesh`**, holding `build_mesh` (one shared place to
+  build the 1-D `Mesh`) and `pmap_like` (a `shard_map` adapter that keeps
+  `jax.pmap`'s calling convention, so per-device bodies run unchanged).
+
+### Changed
+- **`PmapVmapRuns` and `ShardedSingleRun` use `jax.shard_map` instead of
+  `jax.pmap`.** Unlike `pmap`, the wrapped functions compose with `jax.jit`.
+  The batcher now builds the `Mesh` once and caches it (`batcher.mesh`)
+  rather than rebuilding it on every call. `ShardedSingleRun.wrap_for_batch`
+  accepts per-argument `in_specs`, and both batchers' `wrap_for_batch` take
+  a `check_vma` flag.
+- **Step-size adaptation runs with `shard_map`'s `check_vma` enabled.** Loop
+  carries are marked device-varying with `jax.lax.pcast` so the checker
+  accepts them. The batched-run step-size adapter still runs with
+  `check_vma=False`.
+- **`InterREManager` swap internals.** Swap statistics are now replicated
+  across devices via `out_specs=P()` instead of `[0]`-indexing. The pressure,
+  XRENS, and semi-grand swap builders now share one parametrized
+  implementation instead of three copies.
+- **`BatchDescriptor` is now a type alias** (`SingleRun | VmapRuns |
+  PmapVmapRuns | ShardedSingleRun`) instead of an abstract base class.
+  `isinstance` checks against it still work, but code that subclassed
+  `BatchDescriptor` must be updated.
+
 ## [0.4.0] — 2026-08-26
 
 A leaner `jaxrens validate`, a dedicated `analyze` subcommand for
