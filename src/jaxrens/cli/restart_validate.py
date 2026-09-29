@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from jaxrens.cli.output_gate import read_config_snapshot
 

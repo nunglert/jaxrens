@@ -14,7 +14,8 @@ Functions:
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -2336,11 +2337,12 @@ def run_ns_sharded(
         trial_batch_size=trial_batch_size,
     )
 
-    # ``adapt_step`` expects rng_key shape == shape_prefix.  For
-    # ShardedSingleRun shape_prefix == (n_gpu,) so we need a (G,) key.
-    # All shards must see identical decisions → broadcast the same key.
-    adapt_key = jax.random.split(rng_key)[0]
-    adapt_keys = jnp.broadcast_to(adapt_key[None], (n_gpu,) + adapt_key.shape)
+    # A single scalar key, not a (G,) broadcast: ShardedSingleRun.split_keys
+    # returns plain replicated keys (fed to shard_map via in_specs=P()), so
+    # adapt_step hands back a scalar carry. Starting from a (G,) key would
+    # change the carry's shape after the first adapt and break _run_loop's
+    # ``Key[Array, "*B"]`` in/out annotation.
+    adapt_keys = jax.random.split(rng_key)[0]
 
     # Pass ns_step_sharded explicitly so _run_loop wraps it (instead
     # of the default ``ns_step``) when calling ``batcher.wrap_step``.

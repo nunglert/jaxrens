@@ -27,7 +27,8 @@ follow-up.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -405,6 +406,14 @@ def _build_sharded_per_move(
     # key comes from split_keys, now a plain replicated value (no (G,)
     # broadcast) -- see batch_descriptor.py's ShardedSingleRun.split_keys.
     # pop/ss/emax stay genuinely (G, ...)-sharded.
+    #
+    # check_vma=False (not True): the checker extends into the backend's
+    # energy function, which we don't control. NeuralIL's Bessel
+    # descriptors use `lax.cond(r < r_c, <compute>, lambda _: zeros)`,
+    # whose branches come out varying vs. unvarying, so tracing fails
+    # with "cond branches must have equal output types". Same reasoning
+    # as _build_per_move above: trust pmap semantics rather than require
+    # every backend to be VMA-clean.
     return batcher.wrap_for_batch(
-        _per_replica, check_vma=True, replicated=(False, False, False, True)
+        _per_replica, check_vma=False, replicated=(False, False, False, True)
     )

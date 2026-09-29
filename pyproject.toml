@@ -96,6 +96,12 @@ addopts = "-m 'not heavy and not mace and not neuralil and not nequix and not ja
 # runs.  Silence the category suite-wide; markers are cleared by hand.
 filterwarnings = [
     "ignore::jaxrens.unvalidated.UnvalidatedFeatureWarning",
+    # ase.Atoms internals assign `ndarray.shape` in place, deprecated in
+    # NumPy 2.5; nothing to fix on our side until ase updates.
+    "ignore:Setting the shape on a NumPy array:DeprecationWarning:ase.atoms",
+    # Raised from inside mace/e3nn's torch model loading, not our code.
+    # (FutureWarning or DeprecationWarning depending on torch version.)
+    "ignore:`torch.jit.script` is deprecated",
 ]
 markers = [
     "heavy: marks tests as heavy/slow (run with '-m heavy' or '-m \"\"' to include)",

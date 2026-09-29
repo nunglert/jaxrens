@@ -27,7 +27,8 @@ each take one such closure and stay flavor-agnostic.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, TypedDict
+from collections.abc import Callable
+from typing import Any, TypedDict
 
 import jax
 import jax.numpy as jnp

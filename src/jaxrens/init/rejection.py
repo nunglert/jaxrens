@@ -7,8 +7,9 @@ it raises ``RuntimeError`` with per-reason counters.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import partial
-from typing import Callable, Literal
+from typing import Literal
 
 import jax
 import jax.numpy as jnp

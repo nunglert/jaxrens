@@ -9,7 +9,8 @@ side-channel that used to live in ``cli/run.py``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Any, Callable, Literal, Union
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Union
 
 import jax.numpy as jnp
 from pydantic import BaseModel, ConfigDict, Field, field_validator

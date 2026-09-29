@@ -9,17 +9,17 @@ is pure data-loading and numpy-level orchestration.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 
+from jaxrens.postprocess.thermodynamics import calc_log_weights
+from jaxrens.postprocess.thermodynamics import expectation as _expectation
+from jaxrens.postprocess.thermodynamics import free_energy as _free_energy
+from jaxrens.postprocess.thermodynamics import heat_capacity as _heat_capacity
+from jaxrens.postprocess.thermodynamics import log_evidence as _log_evidence
 from jaxrens.postprocess.thermodynamics import (
-    calc_log_weights,
-    expectation as _expectation,
-    free_energy as _free_energy,
-    heat_capacity as _heat_capacity,
-    log_evidence as _log_evidence,
     partition_function as _partition_function,
 )
 
@@ -120,7 +120,9 @@ class Monitor:
         # Pre-load the energies log when present — used for both the dead-
         # array fallback and the iteration trace below.
         energies_log = (
-            EnergyLogger.read(energies_path) if energies_path.exists() else None
+            EnergyLogger.read(energies_path)
+            if energies_path.exists()
+            else None
         )
 
         if energies_log is not None:
@@ -130,7 +132,9 @@ class Monitor:
             # drop it when ``live_volumes`` is also absent (NVT signal).
             dead_energies = np.asarray(energies_log.energies, dtype=np.float64)
             if live_volumes is not None:
-                dead_volumes = np.asarray(energies_log.volumes, dtype=np.float64)
+                dead_volumes = np.asarray(
+                    energies_log.volumes, dtype=np.float64
+                )
             else:
                 dead_volumes = None
         else:
@@ -164,6 +168,7 @@ class Monitor:
         adaptation_path = path / f"{prefix}.adaptation.h5"
         if adaptation_path.exists():
             from jaxrens.io.adaptation_log import AdaptationLogger
+
             adaptation_trace = AdaptationLogger.read(adaptation_path)
 
         # Optional inter-RE swap trace.
@@ -171,6 +176,7 @@ class Monitor:
         re_path = path / f"{prefix}.re_stats.h5"
         if re_path.exists():
             from jaxrens.io.re_stats_log import RELogger
+
             re_trace = RELogger.read(re_path)
 
         # Optional max-neighbors diagnostic trace.
@@ -178,6 +184,7 @@ class Monitor:
         mn_path = path / f"{prefix}.max_neighbors.h5"
         if mn_path.exists():
             from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
+
             max_neighbors_trace = MaxNeighborsLogger.read(mn_path)
 
         return cls(
@@ -286,11 +293,13 @@ class Monitor:
                 "live_e": np.asarray(self.live_energies, dtype=np.float64),
                 "dead_v": (
                     np.asarray(self.dead_volumes, dtype=np.float64)
-                    if self.dead_volumes is not None else None
+                    if self.dead_volumes is not None
+                    else None
                 ),
                 "live_v": (
                     np.asarray(self.live_volumes, dtype=np.float64)
-                    if self.live_volumes is not None else None
+                    if self.live_volumes is not None
+                    else None
                 ),
             }
         return self._cached_np
@@ -314,9 +323,13 @@ class Monitor:
 
         def scalar_fn(beta):
             return _partition_function(
-                beta, arrs["dead_e"], arrs["live_e"],
-                n_live=self.n_live, n_cull=self.n_cull,
-                dead_volumes=arrs["dead_v"], live_volumes=arrs["live_v"],
+                beta,
+                arrs["dead_e"],
+                arrs["live_e"],
+                n_live=self.n_live,
+                n_cull=self.n_cull,
+                dead_volumes=arrs["dead_v"],
+                live_volumes=arrs["live_v"],
             )
 
         results = self._map_over_beta(scalar_fn, betas)
@@ -333,8 +346,11 @@ class Monitor:
 
         def scalar_fn(beta):
             return _heat_capacity(
-                beta, arrs["dead_e"], arrs["live_e"],
-                n_live=self.n_live, n_cull=self.n_cull,
+                beta,
+                arrs["dead_e"],
+                arrs["live_e"],
+                n_live=self.n_live,
+                n_cull=self.n_cull,
             )
 
         results = self._map_over_beta(scalar_fn, betas)
@@ -369,15 +385,20 @@ class Monitor:
         arrs = self._arrays()
 
         live_obs = np.full(
-            self.live_energies.shape[0], float(np.mean(observable)),
+            self.live_energies.shape[0],
+            float(np.mean(observable)),
             dtype=np.float64,
         )
         obs_full = np.concatenate([observable, live_obs])
 
         def scalar_fn(beta):
             return _expectation(
-                obs_full, beta, arrs["dead_e"], arrs["live_e"],
-                n_live=self.n_live, n_cull=self.n_cull,
+                obs_full,
+                beta,
+                arrs["dead_e"],
+                arrs["live_e"],
+                n_live=self.n_live,
+                n_cull=self.n_cull,
             )
 
         results = self._map_over_beta(scalar_fn, betas)
@@ -394,9 +415,13 @@ class Monitor:
 
         def scalar_fn(beta):
             logZ = _partition_function(
-                beta, arrs["dead_e"], arrs["live_e"],
-                n_live=self.n_live, n_cull=self.n_cull,
-                dead_volumes=arrs["dead_v"], live_volumes=arrs["live_v"],
+                beta,
+                arrs["dead_e"],
+                arrs["live_e"],
+                n_live=self.n_live,
+                n_cull=self.n_cull,
+                dead_volumes=arrs["dead_v"],
+                live_volumes=arrs["live_v"],
             )
             return _free_energy(beta, logZ)
 
@@ -414,9 +439,13 @@ class Monitor:
 
         def scalar_fn(beta):
             return _partition_function(
-                beta, arrs["dead_e"], arrs["live_e"],
-                n_live=self.n_live, n_cull=self.n_cull,
-                dead_volumes=arrs["dead_v"], live_volumes=arrs["live_v"],
+                beta,
+                arrs["dead_e"],
+                arrs["live_e"],
+                n_live=self.n_live,
+                n_cull=self.n_cull,
+                dead_volumes=arrs["dead_v"],
+                live_volumes=arrs["live_v"],
             )
 
         results = self._map_over_beta(scalar_fn, betas)

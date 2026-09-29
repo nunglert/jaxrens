@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import logging
 import pickle
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import jax
 import jax.numpy as jnp
