@@ -7,7 +7,7 @@ atomistic systems. Its development was driven by the need for the
 following features, which JAXRENS supports:
 
 - **parallel NS on modern GPUs.** Multiple
-  independent runs (different pressures / compositions / seeds) can be run on a single gpu via `vmap(...)` or across multiple devices via `pmap(vmap(...))`.
+  independent runs (different pressures / compositions / seeds) can be run on a single gpu via `vmap(...)` or across multiple devices via `shard_map(vmap(...))`. A single run with a large walker population can also be sharded across GPUs.
 - **Replica-exchange nested sampling.** Pressure-RENS, composition-morphing
   XRENS, and chemical-potential RENS are naturally integrated.
 - **State-of-the-art ML force fields.** Interfaces for NeuralIL, MACE and

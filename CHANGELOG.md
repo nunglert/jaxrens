@@ -9,7 +9,7 @@ The version is derived from git tags by `setuptools-scm` (tag `v0.1.0` →
 version `0.1.0`). To cut a release: add a dated section below, merge to `main`,
 then `git tag -a vX.Y.Z`.
 
-## [0.5.0] — 2026-09-29
+## [0.5.0] — 2026-09-30
 
 Multi-device parallelization migrated from `jax.pmap` to `jax.shard_map`,
 plus run-log additions for reproducibility. No changes to the config schema.
@@ -33,10 +33,12 @@ plus run-log additions for reproducibility. No changes to the config schema.
   rather than rebuilding it on every call. `ShardedSingleRun.wrap_for_batch`
   accepts per-argument `in_specs`, and both batchers' `wrap_for_batch` take
   a `check_vma` flag.
-- **Step-size adaptation runs with `shard_map`'s `check_vma` enabled.** Loop
-  carries are marked device-varying with `jax.lax.pcast` so the checker
-  accepts them. The batched-run step-size adapter still runs with
-  `check_vma=False`.
+- **`shard_map`'s `check_vma` checker stays off everywhere.** All wrapped
+  steps run with `check_vma=False`, matching `pmap`'s old trust-the-caller
+  semantics. The checker also traces into backend energy functions (e.g.
+  NeuralIL's cutoff `lax.cond`), which aren't VMA-clean. `adjust_step_size`
+  still marks its loop carries device-varying with `jax.lax.pcast` inside a
+  mapped axis, which is harmless with the checker off.
 - **`InterREManager` swap internals.** Swap statistics are now replicated
   across devices via `out_specs=P()` instead of `[0]`-indexing. The pressure,
   XRENS, and semi-grand swap builders now share one parametrized
@@ -45,6 +47,9 @@ plus run-log additions for reproducibility. No changes to the config schema.
   PmapVmapRuns | ShardedSingleRun`) instead of an abstract base class.
   `isinstance` checks against it still work, but code that subclassed
   `BatchDescriptor` must be updated.
+- **Docs.** The concepts pages describe the `shard_map` execution model
+  (mesh caching, `pmap_like`, replicated specs, `check_vma`) and document
+  `ShardedSingleRun` alongside the other batch descriptors.
 
 ## [0.4.0] — 2026-08-26
 

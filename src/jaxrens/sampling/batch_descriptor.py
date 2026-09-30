@@ -833,7 +833,7 @@ class ShardedSingleRun:
         Overrides the ``_UniformBatcher`` default (``split + reshape``,
         duplicated here since this class doesn't inherit from it) to also
         ``device_put`` the result onto the ``'shard'``-named mesh so
-        the per-shard pmap accepts it alongside the sharded NSState.
+        the per-shard ``shard_map`` accepts it alongside the sharded NSState.
 
         Returns shape ``(G,)`` typed-key array sharded along axis 0.
         """
@@ -857,6 +857,7 @@ class ShardedSingleRun:
 # doesn't). This alias is what code elsewhere means by "any batcher" — it
 # supports isinstance() checks against it directly (`isinstance(x, A | B)`
 # is valid since Python 3.10) exactly like the old ABC did.
+#: Any of the four execution topologies (a type alias, not a base class).
 BatchDescriptor = SingleRun | VmapRuns | PmapVmapRuns | ShardedSingleRun
 
 

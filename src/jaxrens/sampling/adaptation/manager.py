@@ -244,7 +244,7 @@ def _build_per_move(
     """Per-move closure for SingleRun / VmapRuns / PmapVmapRuns.
 
     Wraps :func:`adjust_step_size` (single in-XLA ``lax.while_loop``
-    bisection) in the batcher's vmap/pmap. The trace-time ``logger.info``
+    bisection) in the batcher's vmap/shard_map. The trace-time ``logger.info``
     fires once per JIT cache miss for this move type — the gap between
     that line and the next iteration log is the compile + first-execution
     duration for this move's adapt kernel.
@@ -341,7 +341,7 @@ def _build_sharded_per_move(
 
     Wraps :func:`adjust_step_size_sharded` (in-XLA ``lax.while_loop`` with
     cross-shard ``lax.psum`` reductions inside the body) in the
-    sharded-pmap batcher.
+    sharded ``shard_map`` batcher.
     """
     min_r = desc.min_rate
     max_r = desc.max_rate

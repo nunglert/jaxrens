@@ -312,7 +312,7 @@ def initial_walk(
         adapt_step = None
 
     # --- Build one-walk function via the descriptor ---
-    # ``wrap_for_batch`` adds the right jit / vmap / pmap composition for
+    # ``wrap_for_batch`` adds the right jit / vmap / shard_map composition for
     # the chosen descriptor (identity for SingleRun, vmap for VmapRuns,
     # pmap-of-vmap for PmapVmapRuns).
     def _per_replica(k, run_state, run_emax):

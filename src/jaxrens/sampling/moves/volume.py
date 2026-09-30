@@ -1,7 +1,7 @@
 """Volume move: isotropic volume change with accept/reject.
 
 Proposes an isotropic scaling of the simulation cell and atom positions.
-Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
+Single-walker function, designed for shard_map(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations

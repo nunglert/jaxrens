@@ -70,7 +70,7 @@ continuous magnitude to tune.  Its acceptance rate is invariant under
 step-size bisection, so it should be excluded from step-size adaptation
 rather than bisected fruitlessly.
 
-Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
+Single-walker function, designed for shard_map(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations

@@ -10,7 +10,7 @@ Two production entry points, one per batcher regime:
 * :func:`adjust_step_size_sharded` — sibling for ShardedSingleRun.  Same
   in-XLA ``lax.while_loop`` structure, with cross-shard ``lax.psum``
   reductions inside the body so each shard sees the global trial rate.
-  Must be called inside ``jax.pmap(axis_name="shard")``.
+  Must be called inside a ``jax.shard_map`` over the ``"shard"`` mesh axis.
 
 Both share :func:`_process_rate_jax` (branchless rate-window decision).
 The outer loop (when to trigger, how to write back into the population)
@@ -463,7 +463,7 @@ def adjust_step_size_sharded(
     """Adjust step size with the population sharded across ``n_gpu`` GPUs.
 
     Sibling of :func:`adjust_step_size`.  Must be called inside a
-    ``jax.pmap`` with ``axis_name="shard"`` (see
+    ``jax.shard_map`` over the ``"shard"`` mesh axis (see
     :meth:`ShardedSingleRun.wrap_for_batch`).
 
     Sampling strategy: each shard independently samples ``n_samples``

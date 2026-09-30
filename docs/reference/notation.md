@@ -20,7 +20,7 @@ descriptor, with leading axes peeled off for simpler runs.
 
 | Symbol | Meaning | Where it lives |
 |---|---|---|
-| $G$ | `n_gpu` — number of devices in the pmap axis. `G = 1` for single-GPU runs. | leading axis under {class}`~jaxrens.sampling.batch_descriptor.PmapVmapRuns` |
+| $G$ | `n_gpu` — number of devices along the `"gpu"` mesh axis (the `shard_map` axis). `G = 1` for single-GPU runs. | leading axis under {class}`~jaxrens.sampling.batch_descriptor.PmapVmapRuns` |
 | $P$ | `n_per_gpu` — number of NS instances per device. **Not pressure** in this section. | second axis under `PmapVmapRuns` |
 | $R$ | `n_runs` — total parallel NS instances. Equal to $G \cdot P$ when both axes are flattened. | leading axis under {class}`~jaxrens.sampling.batch_descriptor.VmapRuns` |
 | $K$ | `n_walkers` — live walkers per NS instance. | walker batch axis on every state field |
@@ -59,7 +59,7 @@ the replica $i \in \{0, \dots, n_\text{total} - 1\}$.
 
 | Symbol | Meaning |
 |---|---|
-| $P$ | Pressure (NPT). When ambiguous with the pmap-axis `P`, this section uses $P_i$ explicitly. |
+| $P$ | Pressure (NPT). When ambiguous with the per-device replica axis `P`, this section uses $P_i$ explicitly. |
 | $V$ | Cell volume, $V(h) = \lvert \det h \rvert$ for cell matrix $h$. |
 | $T$ | Temperature. **Not a free parameter in NS** — the role of temperature is played by the threshold $E_{\max}$. Mentioned only in cross-references to ordinary MCMC. |
 | $\boldsymbol\mu$ | Per-species chemical potential vector, length $S$. |

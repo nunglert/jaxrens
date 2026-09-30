@@ -133,7 +133,7 @@ A mismatch on any of these is a `SystemExit(2)` with a per-field diff:
 | Field | Why it must match |
 |---|---|
 | `run.n_live` | walker-population shape; NS estimator depends on constant `n_live` |
-| `run.n_gpu`, `run.n_per_gpu` | `pmap × vmap` topology; checkpoint pytree shapes won't match otherwise |
+| `run.n_gpu`, `run.n_per_gpu` | `shard_map × vmap` topology; checkpoint pytree shapes won't match otherwise |
 | **replica count** (`len(ensemble.pressure)`, `len(inter_re.composition_targets)`, `len(inter_re.chemical_potentials)`) | sets `n_total`; changing it re-shapes the checkpoint's batch axis — a dedicated check fires before the broader ensemble/inter_re diff so the message names `n_total` directly |
 | `backend` subtree | energy function identity — including model file paths for ML backends |
 | `ensemble` subtree | pressure, temperature, volume limits — physical meaning of the trace |

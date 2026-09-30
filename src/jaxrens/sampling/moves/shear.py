@@ -1,7 +1,7 @@
 """Shear move: volume-preserving shear deformation of a cell vector.
 
 Proposes a shear of one cell vector within the plane spanned by the other two.
-Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
+Single-walker function, designed for shard_map(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations

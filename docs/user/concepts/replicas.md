@@ -169,9 +169,9 @@ flowchart TB
 
     DESC -- SingleRun --> NOOP["no-op<br/>(empty stats)"]
     DESC -- VmapRuns --> VMAP["_jit_vmap_swap<br/>(R, K, …) directly"]
-    DESC -- PmapVmapRuns --> AGG["lax.all_gather axis 'gpu'<br/>(P, K, …) → (G, P, K, …)<br/>on every device"]
+    DESC -- PmapVmapRuns --> AGG["shard_map on batcher.mesh ('gpu')<br/>lax.all_gather: (P, K, …) → (G, P, K, …)<br/>on every device"]
     AGG --> FLAT["reshape (G·P, K, …)<br/>same RNG ⇒ identical decisions"]
-    FLAT --> SWAP["_jit_pmap_swap"]
+    FLAT --> SWAP["_jit_pmap_swap<br/>(stats out_specs=P(), replicated)"]
 
     VMAP --> KFLAV{"swap kernel"}
     SWAP --> KFLAV
@@ -207,15 +207,24 @@ A few invariants worth pinning down:
 - **Cached compilation.** `_build_jit_fns` runs once in
   `__init__` and stores `_jit_vmap_swap` / `_jit_pmap_swap`.
   Subsequent `apply` calls hit the cache — no re-tracing per
-  iteration.
+  iteration. Despite its name, `_jit_pmap_swap` is a
+  `jax.jit(jax.shard_map(...))` over the batcher's cached `"gpu"`
+  mesh (`batcher.mesh`), the same mesh the NS step uses. See
+  {ref}`the shard_map notes <multi-device-shard-map>`.
 - **Identical swap decisions across devices.** For
   `PmapVmapRuns`, the same scalar `swap_key` is broadcast to all
-  devices before `pmap`. After the `all_gather` every device sees
-  the same `(G, P, K, …)` tensor and runs the same code, so all
-  shards agree on which pairs to swap; the per-device `axis_index`
-  slice at the end re-establishes the original sharding.
+  devices before the `shard_map` call. After the `all_gather` every
+  device sees the same `(G, P, K, …)` tensor and runs the same code,
+  so all shards agree on which pairs to swap. The per-device
+  `axis_index` slice at the end re-establishes the original
+  sharding.
+- **Swap statistics come back replicated.** The stats dict is
+  declared with `out_specs=PartitionSpec()`, so the caller gets one
+  copy instead of a `(G, …)` stack to index with `[0]`. It goes
+  through a `psum`-then-divide first, so every device provably holds
+  the same value.
 - **`n_gpu = 1` is free.** With one device the `all_gather` is a
-  no-op and `pmap` collapses to `vmap`. The same code path runs
+  no-op and the `shard_map` collapses to `vmap`. The same code path runs
   unconditionally so multi-GPU correctness is exercised by the
   single-GPU test suite.
 - **Kernel choice is set at construction.** `_is_xrens` /

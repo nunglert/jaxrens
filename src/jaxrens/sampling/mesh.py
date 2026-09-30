@@ -24,9 +24,10 @@ bodies).
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
-from beartype.typing import Callable
 from jax.sharding import Mesh, PartitionSpec
 
 

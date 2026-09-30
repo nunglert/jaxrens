@@ -601,7 +601,7 @@ def ns_step_sharded(
     ``lax.all_gather``.  ``ns_state.n_walkers`` carries the *global*
     walker count.
 
-    Must be called inside a ``jax.pmap`` with ``axis_name="shard"``
+    Must be called inside a ``jax.shard_map`` over the ``"shard"`` mesh axis
     (see :meth:`ShardedSingleRun.wrap_step`).  Uses ``lax.all_gather``
     to materialise the full population on every device for the
     worst-walker selection and the chain seed broadcast; then writes
@@ -1504,7 +1504,7 @@ def run_ns_parallel(
 
 
 # ---------------------------------------------------------------------------
-# Multi-GPU NS: pmap(vmap(ns_step))
+# Multi-GPU NS: shard_map(vmap(ns_step))
 # ---------------------------------------------------------------------------
 
 
@@ -1523,7 +1523,7 @@ def init_ns_multi_gpu(
     max_neighbors: int = 0,
     max_neighbor_counts: jnp.ndarray | None = None,
 ) -> NSState:
-    """Initialize a ``(G, P, ...)``-shaped NSState for pmap(vmap) execution.
+    """Initialize a ``(G, P, ...)``-shaped NSState for shard_map(vmap) execution.
 
     Delegates to ``init_ns_parallel`` with ``n_runs = G*P``, then reshapes
     all dynamic fields from ``(G*P, ...)`` to ``(G, P, ...)``.
@@ -1604,10 +1604,10 @@ def init_ns_multi_gpu(
     # Reshape all dynamic fields from (G*P, ...) to (G, P, ...) and explicitly
     # shard along the GPU axis. The explicit shard is load-bearing for the
     # post-burn-in path: when ``positions`` / ``energies`` / ``cells`` arrive
-    # already pmap-sharded (``NamedSharding(spec=P('gpu',))``),
+    # already gpu-sharded (``NamedSharding(spec=P('gpu',))``),
     # ``init_ns_parallel``'s per-run ``positions[i]`` + ``jnp.stack`` produces
     # replicated (``spec=P()``) leaves, which the downstream ``jit_ns_step``
-    # pmap rejects. ``jax.device_put`` with the gpu-axis sharding repairs the
+    # shard_map rejects. ``jax.device_put`` with the gpu-axis sharding repairs the
     # replicated leaves and is a no-op when the data is already correctly
     # sharded or uncommitted.
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -1653,7 +1653,7 @@ def init_ns_sharded(
     Builds a single-replica :class:`NSState` via :func:`init_ns`, then
     reshapes every population-axis leaf to ``(G, K // G, ...)`` and
     broadcasts every scalar / static leaf to ``(G,)`` so that
-    :class:`ShardedSingleRun.wrap_step` can ``pmap`` the resulting
+    :class:`ShardedSingleRun.wrap_step` can ``shard_map`` the resulting
     state across G devices.
 
     ``ns_state.n_walkers`` is set to the *global* walker count
@@ -1792,7 +1792,7 @@ def run_ns_multi_gpu(
     initial_max_neighbor_counts: jnp.ndarray | None = None,
     batcher: PmapVmapRuns | None = None,
 ) -> dict:
-    """Run NS with ``pmap(vmap(ns_step))`` dispatch across G GPUs × P runs each.
+    """Run NS with ``shard_map(vmap(ns_step))`` dispatch across G GPUs × P runs each.
 
     Shape convention: ``(G, P, ...)`` where G=n_gpu, P=n_per_gpu.
 
