@@ -9,11 +9,12 @@ dispatch — from the heavy NS execution that lives in ``cli.run``.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
 
-from jaxrens.cli.cli import main
+from jaxrens.cli.cli import _package_version, main
 
 _DATA = Path(__file__).parent.parent / "_assets" / "data" / "cli"
 
@@ -191,6 +192,27 @@ class TestRunDispatch:
         assert len(stub_orchestrators["single"]) == 1
         assert len(stub_orchestrators["sharded"]) == 0
         assert len(stub_orchestrators["multi_gpu"]) == 0
+
+    def test_logs_package_version_for_reproducibility(
+        self,
+        fresh_workdir,
+        single_device,
+        stub_orchestrators,
+        caplog,
+    ):
+        """The jaxrens version is logged once per run, regardless of which
+        orchestrator ends up handling it — so a run's log file alone is
+        enough to tell which build produced it."""
+        cfg = _write_minimal_yaml(
+            fresh_workdir / "cfg.yaml",
+            fresh_workdir / "out",
+        )
+        with caplog.at_level(logging.INFO, logger="jaxrens.cli.cli"):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["run", "-c", str(cfg)])
+        assert exc_info.value.code == 0
+        expected = f"jaxrens version: {_package_version()}"
+        assert any(expected in r.message for r in caplog.records)
 
     def test_multi_replica_dispatch(
         self,

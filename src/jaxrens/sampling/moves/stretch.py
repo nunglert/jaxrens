@@ -1,7 +1,7 @@
 """Stretch move: volume-preserving anisotropic cell deformation.
 
 Proposes a stretch along two random axes that preserves the cell volume.
-Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
+Single-walker function, designed for shard_map(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations

@@ -52,7 +52,7 @@ flowchart TB
 | Device-topology derivation from `jax.local_devices()` | **Resolver** | `_derive_replica_axes` |
 | Species mapping to backend z-table | **Resolver** | `_resolve_init_species` |
 | Pick `n_live`, `n_mcmc_steps` for the scan | **Core** | `run_ns` signature |
-| `jax.pmap(jax.vmap(...))` dispatch | **Core** | `sampling/batch_descriptor.py` |
+| `jax.shard_map(jax.vmap(...))` dispatch | **Core** | `sampling/batch_descriptor.py` |
 
 Two asymmetries worth knowing:
 
@@ -193,7 +193,7 @@ It is the resolver's only JIT-compiled work and the only place
 initial energies are priced. The `batcher` argument is the seam
 through which multi-GPU dispatch enters the resolver:
 `SingleRun()` → plain `jax.jit`; `PmapVmapRuns(G, P)` →
-`jax.pmap(jax.vmap(...))`. Both branches pass the backend's
+`jax.jit(jax.shard_map(jax.vmap(...)))`. Both branches pass the backend's
 `ladder` / `offset` so the chosen `init_bucket` matches what
 burn-in and the NS step will compile against (same JIT cache slot).
 
@@ -356,7 +356,7 @@ Reading the diagram:
 `inter_re.chemical_potentials` — checks they agree, looks up
 `jax.local_devices()` to pick `n_gpu`, and demands
 `n_total % n_gpu == 0`. The output is the `(n_gpu, n_per_gpu)` shape
-that the rest of the runtime (`pmap(vmap(...))`, `AdaptationManager`,
+that the rest of the runtime (`shard_map(vmap(...))`, `AdaptationManager`,
 `InterREManager`) inherits. Single-replica path skips most of this —
 its batcher is `SingleRun()` and there is no replica axis.
 
@@ -469,7 +469,7 @@ branches:
    inert for them.
 2. **`batcher.wrap_for_batch(per_replica_fn)` dispatch.** The same
    helper body works for all topologies because the `batcher` argument
-   chooses `jax.jit` / `jax.jit(vmap)` / `pmap(vmap)` underneath.
+   chooses `jax.jit` / `jax.jit(vmap)` / `jax.jit(shard_map(vmap))` underneath.
    Single-replica path passes `SingleRun()`; the multi-replica path
    passes the same `PmapVmapRuns(G, P)` instance it stores on
    `ResolvedConfig.batcher` — so the resolver, burn-in, and NS step
@@ -479,7 +479,7 @@ branches:
    and threads each replica's pressure through the per-call
    `ensemble_params={"pressure": p}` kwarg, vmapped over the replica
    axis. Avoiding N separate `EnsembleBackend(base, pressure=p)`
-   objects keeps the pmap call signature uniform — pressure is just
+   objects keeps the `shard_map` call signature uniform — pressure is just
    another array on the vmap axis.
 
 The end result is that for an 8-replica NeuralIL run on a 4-GPU
@@ -569,7 +569,7 @@ Step by step:
    `cli/run.py::run_multi_gpu_from_config` (the `PmapVmapRuns`
    branch). From here on, no schema, no resolver — just JAX arrays
    and dataclasses flowing through `run_ns_multi_gpu` with its
-   `pmap(vmap(ns_step))` dispatch.
+   `shard_map(vmap(ns_step))` dispatch.
 
 For a scalar-pressure version of the same config, steps 4–7 collapse
 to: `n_total = 1`, batcher is `SingleRun()`, resolver calls

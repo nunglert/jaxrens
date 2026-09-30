@@ -47,7 +47,7 @@ flip-on-reject still gives reversibility, and the ``Emax`` gate is still
 on the total energy.  Ergodicity comes from composing the per-species
 moves, exactly as it does for ``single_atom``.
 
-Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
+Single-walker function, designed for shard_map(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations

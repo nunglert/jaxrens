@@ -49,8 +49,9 @@ import logging
 import os
 import textwrap
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 __all__ = [
     "REGISTRY",

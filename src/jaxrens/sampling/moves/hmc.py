@@ -3,7 +3,7 @@
 Uses leapfrog integration to propose moves along Hamiltonian trajectories,
 with NS accept/reject based on the likelihood constraint (E < Emax).
 
-Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
+Single-walker function, designed for shard_map(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations

@@ -7,8 +7,9 @@ dispatch weights without the user touching build_kernel directly.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from dataclasses import field
-from typing import Any, Callable
+from typing import Any
 
 
 @dataclasses.dataclass(frozen=True)

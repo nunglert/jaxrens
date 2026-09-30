@@ -558,7 +558,7 @@ def _finalise_initial_energies_and_counts(
     """Compute per-walker initial ``(energies, max_neighbor_counts)``.
 
     Dispatch is routed through ``batcher.wrap_for_batch`` so the
-    compute uses ``jax.jit`` / ``jax.jit(vmap)`` / ``pmap(vmap)``
+    compute uses ``jax.jit`` / ``jax.jit(vmap)`` / ``jax.jit(shard_map(vmap))``
     appropriate for the call site:
 
     * SingleRun path (``_resolve_single_replica``) → ``SingleRun()``

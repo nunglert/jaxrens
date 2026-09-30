@@ -14,7 +14,8 @@ Functions:
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -600,7 +601,7 @@ def ns_step_sharded(
     ``lax.all_gather``.  ``ns_state.n_walkers`` carries the *global*
     walker count.
 
-    Must be called inside a ``jax.pmap`` with ``axis_name="shard"``
+    Must be called inside a ``jax.shard_map`` over the ``"shard"`` mesh axis
     (see :meth:`ShardedSingleRun.wrap_step`).  Uses ``lax.all_gather``
     to materialise the full population on every device for the
     worst-walker selection and the chain seed broadcast; then writes
@@ -1056,11 +1057,14 @@ def run_ns(
     n_atoms = positions.shape[1] if positions.ndim >= 2 else None
 
     logger.info(
-        "Starting NS run: %d walkers, %s atoms, max_iter=%s, n_mcmc=%d",
+        "Starting NS run: %d walkers, %s atoms, max_iter=%s, n_mcmc=%d, "
+        "n_extra=%d, total_mcmc_steps_per_iter=%d",
         n_walkers,
         n_atoms,
         max_iterations,
         n_mcmc_steps,
+        n_extra,
+        (1 + n_extra) * n_mcmc_steps,
     )
 
     batcher = SingleRun()
@@ -1306,12 +1310,14 @@ def run_ns_parallel(
     )
 
     logger.info(
-        "Starting parallel NS: %d runs, %d walkers, max_iter=%s, n_mcmc=%d, n_extra=%d",
+        "Starting parallel NS: %d runs, %d walkers, max_iter=%s, n_mcmc=%d, "
+        "n_extra=%d, total_mcmc_steps_per_iter=%d (per run)",
         n_runs,
         n_walkers,
         max_iterations,
         n_mcmc_steps,
         n_extra,
+        (1 + n_extra) * n_mcmc_steps,
     )
 
     batcher = VmapRuns(n_runs=n_runs)
@@ -1498,7 +1504,7 @@ def run_ns_parallel(
 
 
 # ---------------------------------------------------------------------------
-# Multi-GPU NS: pmap(vmap(ns_step))
+# Multi-GPU NS: shard_map(vmap(ns_step))
 # ---------------------------------------------------------------------------
 
 
@@ -1517,7 +1523,7 @@ def init_ns_multi_gpu(
     max_neighbors: int = 0,
     max_neighbor_counts: jnp.ndarray | None = None,
 ) -> NSState:
-    """Initialize a ``(G, P, ...)``-shaped NSState for pmap(vmap) execution.
+    """Initialize a ``(G, P, ...)``-shaped NSState for shard_map(vmap) execution.
 
     Delegates to ``init_ns_parallel`` with ``n_runs = G*P``, then reshapes
     all dynamic fields from ``(G*P, ...)`` to ``(G, P, ...)``.
@@ -1598,10 +1604,10 @@ def init_ns_multi_gpu(
     # Reshape all dynamic fields from (G*P, ...) to (G, P, ...) and explicitly
     # shard along the GPU axis. The explicit shard is load-bearing for the
     # post-burn-in path: when ``positions`` / ``energies`` / ``cells`` arrive
-    # already pmap-sharded (``NamedSharding(spec=P('gpu',))``),
+    # already gpu-sharded (``NamedSharding(spec=P('gpu',))``),
     # ``init_ns_parallel``'s per-run ``positions[i]`` + ``jnp.stack`` produces
     # replicated (``spec=P()``) leaves, which the downstream ``jit_ns_step``
-    # pmap rejects. ``jax.device_put`` with the gpu-axis sharding repairs the
+    # shard_map rejects. ``jax.device_put`` with the gpu-axis sharding repairs the
     # replicated leaves and is a no-op when the data is already correctly
     # sharded or uncommitted.
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -1647,7 +1653,7 @@ def init_ns_sharded(
     Builds a single-replica :class:`NSState` via :func:`init_ns`, then
     reshapes every population-axis leaf to ``(G, K // G, ...)`` and
     broadcasts every scalar / static leaf to ``(G,)`` so that
-    :class:`ShardedSingleRun.wrap_step` can ``pmap`` the resulting
+    :class:`ShardedSingleRun.wrap_step` can ``shard_map`` the resulting
     state across G devices.
 
     ``ns_state.n_walkers`` is set to the *global* walker count
@@ -1786,7 +1792,7 @@ def run_ns_multi_gpu(
     initial_max_neighbor_counts: jnp.ndarray | None = None,
     batcher: PmapVmapRuns | None = None,
 ) -> dict:
-    """Run NS with ``pmap(vmap(ns_step))`` dispatch across G GPUs × P runs each.
+    """Run NS with ``shard_map(vmap(ns_step))`` dispatch across G GPUs × P runs each.
 
     Shape convention: ``(G, P, ...)`` where G=n_gpu, P=n_per_gpu.
 
@@ -1943,7 +1949,8 @@ def run_ns_multi_gpu(
 
     logger.info(
         "Starting multi-GPU NS: n_gpu=%d, n_per_gpu=%d (%d total runs), "
-        "n_walkers=%d, max_iter=%s, n_mcmc=%d, n_extra=%d",
+        "n_walkers=%d, max_iter=%s, n_mcmc=%d, n_extra=%d, "
+        "total_mcmc_steps_per_iter=%d (per run)",
         n_gpu,
         n_per_gpu,
         n_total,
@@ -1951,6 +1958,7 @@ def run_ns_multi_gpu(
         max_iterations,
         n_mcmc_steps,
         n_extra,
+        (1 + n_extra) * n_mcmc_steps,
     )
 
     if batcher is None:
@@ -2299,13 +2307,15 @@ def run_ns_sharded(
 
     logger.info(
         "Starting sharded-single NS: n_gpu=%d, n_walkers=%d "
-        "(K_per_gpu=%d), max_iter=%s, n_mcmc=%d, n_extra=%d",
+        "(K_per_gpu=%d), max_iter=%s, n_mcmc=%d, n_extra=%d, "
+        "total_mcmc_steps_per_iter=%d",
         n_gpu,
         n_walkers,
         n_walkers // n_gpu,
         max_iterations,
         n_mcmc_steps,
         n_extra,
+        (1 + n_extra) * n_mcmc_steps,
     )
 
     if batcher is None:
@@ -2327,11 +2337,12 @@ def run_ns_sharded(
         trial_batch_size=trial_batch_size,
     )
 
-    # ``adapt_step`` expects rng_key shape == shape_prefix.  For
-    # ShardedSingleRun shape_prefix == (n_gpu,) so we need a (G,) key.
-    # All shards must see identical decisions → broadcast the same key.
-    adapt_key = jax.random.split(rng_key)[0]
-    adapt_keys = jnp.broadcast_to(adapt_key[None], (n_gpu,) + adapt_key.shape)
+    # A single scalar key, not a (G,) broadcast: ShardedSingleRun.split_keys
+    # returns plain replicated keys (fed to shard_map via in_specs=P()), so
+    # adapt_step hands back a scalar carry. Starting from a (G,) key would
+    # change the carry's shape after the first adapt and break _run_loop's
+    # ``Key[Array, "*B"]`` in/out annotation.
+    adapt_keys = jax.random.split(rng_key)[0]
 
     # Pass ns_step_sharded explicitly so _run_loop wraps it (instead
     # of the default ``ns_step``) when calling ``batcher.wrap_step``.
