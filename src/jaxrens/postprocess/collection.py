@@ -7,8 +7,9 @@ functions so there is no duplicated matplotlib logic here.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any
 
 import numpy as np
 

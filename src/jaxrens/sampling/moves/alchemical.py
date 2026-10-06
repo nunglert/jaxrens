@@ -2,7 +2,7 @@
 
 - build_morph_kernel: change one atom's species (semi-grand-canonical)
 
-Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
+Single-walker function, designed for shard_map(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations

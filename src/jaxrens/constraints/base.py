@@ -31,8 +31,9 @@ descriptors — that keeps them evaluated exactly once rather than twice.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from dataclasses import field
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 import jax.numpy as jnp
 

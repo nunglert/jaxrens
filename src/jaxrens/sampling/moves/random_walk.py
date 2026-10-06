@@ -3,7 +3,7 @@
 The simplest NS move. Proposes a random displacement of all atom positions,
 accepts if the new energy is below the likelihood constraint (Emax).
 
-Single-walker function, designed for pmap(vmap(vmap(...))) wrapping.
+Single-walker function, designed for shard_map(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations

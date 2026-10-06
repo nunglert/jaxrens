@@ -406,6 +406,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
             default_flow_style=False,
         ).rstrip(),
     )
+    # Version pinned to the log for reproducibility: given a log file, you
+    # can tell exactly which jaxrens build (git tag via setuptools-scm)
+    # produced it, without needing the environment that ran it.
+    logger.info("jaxrens version: %s", _package_version())
 
     from jaxrens.cli.run import (
         run_multi_gpu_from_config,
@@ -636,7 +640,9 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 
     in_path = Path(args.file)
     out_path = Path(args.output) if args.output is not None else None
-    plot_path = Path(args.plot_output) if args.plot_output is not None else None
+    plot_path = (
+        Path(args.plot_output) if args.plot_output is not None else None
+    )
     try:
         data_path, png_path = analyze_file(
             in_path,

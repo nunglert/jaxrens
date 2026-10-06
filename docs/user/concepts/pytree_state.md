@@ -4,7 +4,7 @@ A walker's state — positions, cell, species, step sizes, energy,
 ensemble parameters, and any move-specific extras — is a
 {class}`jaxrens.state.mc_state.MCState` dataclass registered with
 `jax.tree_util`. Every leaf is a JAX array; every leading axis is a
-batch axis. `jit`, `vmap`, and `pmap` operate on the whole pytree
+batch axis. `jit`, `vmap`, and `shard_map` operate on the whole pytree
 transparently, so going from one walker → many walkers → many
 independent NS runs → many GPUs requires **no code changes in the
 inner kernels** — only extra leading axes.
@@ -103,7 +103,7 @@ Two consequences:
   real kernels would request; `build_mwg(backend, descriptors)`
   returns a ready-made `init_fn` that does this for you.
 
-## Batch-axis shapes across the three descriptors
+## Batch-axis shapes across the descriptors
 
 Every array in the NS state has the same batch prefix — determined
 by which {class}`~jaxrens.sampling.batch_descriptor.BatchDescriptor`
@@ -121,11 +121,71 @@ so callbacks can branch on it.
   Used on CPU nodes or when `len(jax.local_devices()) == 1`.
 - **`PmapVmapRuns`** — `G × P` replicas distributed across `G` GPUs
   with `P = n_per_gpu` replicas on each. Execution is
-  `pmap(vmap(...))`.
+  `jax.jit(shard_map(vmap(...)))` over a `"gpu"`-named device mesh.
+- **`ShardedSingleRun`** — *one* NS run whose `K` walkers are split
+  into `G` chunks of `K / G`, one per GPU (`run.shard_n_gpu > 1`).
+  Population leaves are `(G, K / G, A, 3)`; the leading axis is a
+  *sharding* axis, not a replica axis, so `n_runs == 1`. The step is
+  `ns_step_sharded`, which uses `all_gather` / `psum` collectives over
+  a `"shard"`-named mesh to act on the global population. This is for
+  memory scaling when a heavy ML backend with a large `n_live` doesn't
+  fit on one device. (The figure above shows only the three replica
+  descriptors.)
 
-The loop body is identical in all three. Only the descriptor's
+The loop body is identical in all four. Only the descriptor's
 `wrap_step`, `split_keys`, and `reduce_for_termination` methods
 differ. See `sampling/batch_descriptor.py`.
+
+`BatchDescriptor` is a type alias
+(`SingleRun | VmapRuns | PmapVmapRuns | ShardedSingleRun`), not a
+base class. `isinstance(x, BatchDescriptor)` works, but you cannot
+subclass it. The three replica descriptors share their shape helpers
+through a private `_UniformBatcher` base, and `ShardedSingleRun`
+stands alone because `n_runs == prod(shape_prefix)` doesn't hold for
+it.
+
+(multi-device-shard-map)=
+### Multi-device execution: `shard_map`
+
+Both multi-device descriptors run on
+[`jax.shard_map`](https://docs.jax.dev/en/latest/notebooks/shard_map.html)
+rather than `jax.pmap`. Two pieces in
+{mod}`jaxrens.sampling.mesh` make this work:
+
+- **`build_mesh(axis_name, n_devices)`** builds the 1-D
+  `jax.sharding.Mesh` over the first `n_devices` local devices. Each
+  batcher builds its mesh once and caches it as `batcher.mesh`. Every
+  consumer (`wrap_step`, `wrap_for_batch`, the `InterREManager` swap
+  step) reuses that one object instead of building its own.
+- **`pmap_like(fn, axis_name, mesh)`** wraps `fn` in `shard_map` with
+  `in_specs = out_specs = PartitionSpec(axis_name)` on every leaf. It
+  also squeezes the size-1 per-device axis off the inputs and adds it
+  back to the outputs, so `fn` is written exactly as it would be for
+  `jax.pmap`. The per-device bodies (`ns_step_sharded`, the swap
+  kernels, `adjust_step_size`) are unchanged by the migration.
+  Collectives inside them (`all_gather`, `axis_index`, `psum`) behave
+  exactly as they did under `pmap`.
+
+The practical differences from `pmap`:
+
+- **Composes with `jax.jit`.** Every wrapped step is returned as
+  `jax.jit(shard_map(...))`, and it can be nested inside other jitted
+  code, which `pmap` doesn't support cleanly.
+- **Per-argument partition specs.** Where one uniform spec isn't
+  enough, the code calls `shard_map` directly.
+  `ShardedSingleRun.wrap_for_batch(..., replicated=...)` marks
+  arguments such as the coherent adaptation key as replicated
+  (`PartitionSpec()`), so `shard_map` hands the same value to every
+  device without a pre-broadcast. The `InterREManager` swap step
+  returns its statistics dict with `out_specs=PartitionSpec()`, so it
+  comes back replicated instead of stacked `G` times.
+- **`check_vma` is off.** `shard_map`'s varying-manual-axis type
+  checker has no `pmap` equivalent. JAXRENS runs with
+  `check_vma=False` (pmap's "trust the caller" model), because the
+  checker also traces into backend energy functions it doesn't
+  control. For example, NeuralIL's cutoff `lax.cond` has branches that
+  type as varying vs. unvarying. `wrap_for_batch` still takes a
+  `check_vma` flag for callers whose body is known to type-check.
 
 ## Why pytrees (and not, say, flat arrays)
 

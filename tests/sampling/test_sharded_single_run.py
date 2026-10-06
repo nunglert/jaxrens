@@ -23,10 +23,7 @@ import numpy as np
 import pytest
 
 from jaxrens.backends.toy import create_harmonic
-from jaxrens.sampling.batch_descriptor import (
-    ShardedSingleRun,
-    SingleRun,
-)
+from jaxrens.sampling.batch_descriptor import ShardedSingleRun, SingleRun
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
@@ -45,16 +42,22 @@ def _make_harmonic_problem(seed: int, n_walkers: int):
     backend = create_harmonic(k=1.0)
     descriptors = [
         MoveKernel(
-            "rw", random_walk.build_kernel,
-            step_size=0.2, step_size_max=5.0,
-            min_rate=0.2, max_rate=0.7,
+            "rw",
+            random_walk.build_kernel,
+            step_size=0.2,
+            step_size_max=5.0,
+            min_rate=0.2,
+            max_rate=0.7,
         ),
     ]
     init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
     key = jax.random.key(seed)
     key, pos_key = jax.random.split(key)
     positions = jax.random.uniform(
-        pos_key, (n_walkers, 1, 3), minval=-2.0, maxval=2.0,
+        pos_key,
+        (n_walkers, 1, 3),
+        minval=-2.0,
+        maxval=2.0,
     )
     types = jnp.zeros((1,), dtype=jnp.int32)
     energies = jax.vmap(
@@ -80,7 +83,8 @@ def _make_harmonic_problem(seed: int, n_walkers: int):
 
 @pytest.mark.parametrize("n_extra", [0, 4])
 @pytest.mark.parametrize(
-    "n_gpu", [1, pytest.param(2, marks=pytest.mark.multi_gpu)],
+    "n_gpu",
+    [1, pytest.param(2, marks=pytest.mark.multi_gpu)],
 )
 def test_run_ns_sharded_matches_single_run(n_gpu, n_extra):
     """Sharded run reproduces the SingleRun reference exactly.
@@ -146,7 +150,10 @@ def test_run_ns_sharded_matches_single_run(n_gpu, n_extra):
     sharded_sorted = np.sort(sharded_energies)
     ref_sorted = np.sort(ref_energies)
     np.testing.assert_allclose(
-        sharded_sorted, ref_sorted, rtol=1e-5, atol=1e-7,
+        sharded_sorted,
+        ref_sorted,
+        rtol=1e-5,
+        atol=1e-7,
     )
 
 
@@ -200,6 +207,7 @@ def _minimal_root(tmp_path, *, shard_n_gpu, n_live=8, pressures=None):
     full burn-in / adaptation machinery so resolve() runs quickly.
     """
     from jaxrens.cli.schema import RootSpec
+
     cfg = {
         "run": {
             "n_live": n_live,
@@ -295,7 +303,8 @@ def test_resolver_rejects_indivisible_n_live(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "n_gpu", [1, pytest.param(2, marks=pytest.mark.multi_gpu)],
+    "n_gpu",
+    [1, pytest.param(2, marks=pytest.mark.multi_gpu)],
 )
 def test_burn_in_sharded_completes_under_emax(n_gpu):
     """Sharded burn-in finishes; final energies stay below the fixed Emax.
@@ -314,15 +323,18 @@ def test_burn_in_sharded_completes_under_emax(n_gpu):
 
     ns_state = init_ns_sharded(
         setup["init_fn"],
-        setup["positions"], setup["types"], setup["energies"],
-        None, jax.random.key(7),
+        setup["positions"],
+        setup["types"],
+        setup["energies"],
+        None,
+        jax.random.key(7),
         n_gpu=n_gpu,
     )
 
     n_atoms = setup["positions"].shape[1]
     emax_offset_per_atom = 1.0
     batcher = ShardedSingleRun(n_gpu=n_gpu)
-    # ``reduce_emax`` now returns shape ``(G,)`` (every entry identical
+    # ``reduce_emax`` returns shape ``(G,)`` (every entry identical
     # by construction) — take ``[0]`` for the Python-scalar Emax used
     # in the assertion.
     fixed_emax = float(
@@ -331,8 +343,10 @@ def test_burn_in_sharded_completes_under_emax(n_gpu):
     )
 
     policy = ResolvedAdaptationPolicy(
-        min_rate=0.25, max_rate=0.75,
-        adjust_factor=1.5, step_size_max=10.0,
+        min_rate=0.25,
+        max_rate=0.75,
+        adjust_factor=1.5,
+        step_size_max=10.0,
     )
 
     ns_state_after = initial_walk(
@@ -353,9 +367,9 @@ def test_burn_in_sharded_completes_under_emax(n_gpu):
 
     final_energies = np.asarray(ns_state_after.population.energy)
     assert np.all(np.isfinite(final_energies))
-    assert np.all(final_energies <= fixed_emax + 1e-6), (
-        f"Some walkers exceed Emax={fixed_emax:.4g}: max={final_energies.max():.4g}"
-    )
+    assert np.all(
+        final_energies <= fixed_emax + 1e-6
+    ), f"Some walkers exceed Emax={fixed_emax:.4g}: max={final_energies.max():.4g}"
 
 
 @pytest.mark.multi_gpu
@@ -366,8 +380,11 @@ def test_burn_in_sharded_g2_shards_walk_independently():
     setup = _make_harmonic_problem(seed=2, n_walkers=8)
     ns_state = init_ns_sharded(
         setup["init_fn"],
-        setup["positions"], setup["types"], setup["energies"],
-        None, jax.random.key(0),
+        setup["positions"],
+        setup["types"],
+        setup["energies"],
+        None,
+        jax.random.key(0),
         n_gpu=2,
     )
 
@@ -407,14 +424,19 @@ def test_burn_in_sharded_g2_step_sizes_equal_across_shards():
     setup = _make_harmonic_problem(seed=3, n_walkers=8)
     ns_state = init_ns_sharded(
         setup["init_fn"],
-        setup["positions"], setup["types"], setup["energies"],
-        None, jax.random.key(0),
+        setup["positions"],
+        setup["types"],
+        setup["energies"],
+        None,
+        jax.random.key(0),
         n_gpu=2,
     )
 
     policy = ResolvedAdaptationPolicy(
-        min_rate=0.25, max_rate=0.75,
-        adjust_factor=1.5, step_size_max=10.0,
+        min_rate=0.25,
+        max_rate=0.75,
+        adjust_factor=1.5,
+        step_size_max=10.0,
     )
 
     ns_state_after = initial_walk(
@@ -437,7 +459,11 @@ def test_burn_in_sharded_g2_step_sizes_equal_across_shards():
     # values must agree along the leading G axis (post-`lax.psum`
     # bisection invariant).
     ss = np.asarray(ns_state_after.population.step_sizes)
-    np.testing.assert_allclose(ss[0], ss[1], rtol=0, atol=0,
+    np.testing.assert_allclose(
+        ss[0],
+        ss[1],
+        rtol=0,
+        atol=0,
         err_msg="Per-shard step sizes differ — adaptation broke "
         "the cross-shard `lax.psum` invariant.",
     )
@@ -461,8 +487,11 @@ def test_adapt_step_trial_batch_size_matches_full_vmap():
     setup = _make_harmonic_problem(seed=4, n_walkers=8)
     ns_state = init_ns(
         setup["init_fn"],
-        setup["positions"], setup["types"], setup["energies"],
-        None, jax.random.key(0),
+        setup["positions"],
+        setup["types"],
+        setup["energies"],
+        None,
+        jax.random.key(0),
     )
 
     common = dict(

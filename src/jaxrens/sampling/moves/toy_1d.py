@@ -12,7 +12,7 @@ relies on, which makes ``V = a`` and turns the standard NPT enthalpy into the
 paper's eq 18 — would immediately stop being diagonal-with-unit-yz. These
 kernels keep that structure exact.
 
-Both are single-walker functions, designed for pmap(vmap(vmap(...))) wrapping.
+Both are single-walker functions, designed for shard_map(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations

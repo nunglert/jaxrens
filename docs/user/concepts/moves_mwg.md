@@ -133,7 +133,8 @@ flowchart TB
     LOOPK --> DESC{"BatchDescriptor"}
     DESC -- SingleRun --> SR["adjust_step_size(...)<br/>scalar ss"]
     DESC -- VmapRuns --> VR["jax.vmap(adjust_step_size)<br/>(R, ...)"]
-    DESC -- PmapVmapRuns --> PR["jax.pmap(jax.vmap(adjust_step_size))<br/>(G, P, ...)"]
+    DESC -- PmapVmapRuns --> PR["jax.jit(shard_map(jax.vmap(adjust_step_size)))<br/>'gpu' mesh, (G, P, ...)"]
+    DESC -- ShardedSingleRun --> SH["jax.jit(shard_map(adjust_step_size_sharded))<br/>'shard' mesh, (G, K/G, ...)<br/>psum'd acceptance counts"]
 
     subgraph jit_box["adjust_step_size — JIT + lax.while_loop"]
         direction TB
@@ -157,6 +158,7 @@ flowchart TB
     SR --> SAMPLE
     VR --> SAMPLE
     PR --> SAMPLE
+    SH --> SAMPLE
 
     CONV --> WRITE["update step_sizes[k] ← new_ss<br/>+ collect 9 diagnostics<br/>(rate, n_rounds, cap_hits, …)"]
     WRITE --> NEXTK{"more moves?"}

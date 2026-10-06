@@ -10,7 +10,7 @@ relevant mathematics, diagrams, and pointers into the code:
 - {doc}`concepts/ns_loop` — the two-loop NS structure, prior-mass
   contraction, evidence estimator.
 - {doc}`concepts/pytree_state` — how walkers live as JAX pytrees
-  and how batch axes flow through `jit`/`vmap`/`pmap`.
+  and how batch axes flow through `jit`/`vmap`/`shard_map`.
 - {doc}`concepts/moves_mwg` — individual move kernels and how MWG
   composes them into a single step function.
 - {doc}`concepts/backends` — the `EnergyBackend` protocol and how
@@ -75,7 +75,7 @@ The per-walker state is a {class}`~jaxrens.state.mc_state.MCState`
 dataclass — positions, cell, species, step-size, energy,
 ensemble-params, plus any move-specific extra fields (e.g. a
 momentum for HMC, a velocity direction for galilean). It's
-registered with JAX's pytree machinery so `jit`, `vmap`, and `pmap`
+registered with JAX's pytree machinery so `jit`, `vmap`, and `shard_map`
 just work on it.
 
 NS-level state ({class}`~jaxrens.state.ns.NSState`) wraps the
@@ -158,7 +158,9 @@ the replicas evenly:
 - `n_per_gpu = n_total / n_gpu` — derived (must divide evenly).
 
 The NS state then has shape `(n_gpu, n_per_gpu, n_walkers, ...)` on
-every dynamic field, and execution is `pmap(vmap(vmap(ns_step)))`.
+every dynamic field, and execution is `shard_map(vmap(vmap(ns_step)))` — a `jax.shard_map` over a
+1-D `"gpu"` device mesh, wrapping a `vmap` over replicas and the
+per-walker `vmap` inside `ns_step`.
 
 See the {doc}`../tutorials/index` for a concrete multi-GPU
 example, and {doc}`/reference/config` for the exact divisibility

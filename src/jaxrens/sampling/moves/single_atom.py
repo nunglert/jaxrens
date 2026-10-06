@@ -6,7 +6,7 @@ displacing all atoms simultaneously has low acceptance.
 - build_kernel: move one random atom per step
 - build_sweep_kernel: sweep through all atoms sequentially via lax.scan
 
-Single-walker functions, designed for pmap(vmap(vmap(...))) wrapping.
+Single-walker functions, designed for shard_map(vmap(vmap(...))) wrapping.
 """
 
 from __future__ import annotations

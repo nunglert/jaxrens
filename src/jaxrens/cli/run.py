@@ -1175,7 +1175,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
     Burn-in (`initial_walk`) runs through ``ShardedSingleRun`` natively
     — adaptation goes through :func:`build_adapt_step` (which
     dispatches to ``adjust_step_size_sharded``) and the walking step
-    pmaps with per-shard distinct keys.  After burn-in the sharded
+    shard_maps with per-shard distinct keys.  After burn-in the sharded
     NSState's ``(G, K/G, ...)`` population is flattened back to
     ``(K, ...)`` for the post-burn-in neighbor-count refresh and for
     re-init by ``run_ns_sharded`` (which re-shards via

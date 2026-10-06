@@ -13,16 +13,27 @@ The manager is descriptor-aware:
 
 Design: built once at construction time, JIT'd swap step cached; ``_run_loop``
 calls ``fires(i)`` / ``apply(state, key)`` at each iteration.
+
+Three swap-kernel flavors (pressure / XRENS / semi-grand) share the exact
+same shape/collective plumbing in both the vmap and shard_map builders below
+— they differ only in which kernel function gets called and whether there's
+an extra per-replica ensemble argument (``composition_targets`` /
+``chemical_potentials`` / none). That's factored into a small ``kernel_call``
+closure per flavor (``_pressure_kernel_call`` / ``_xrens_kernel_call`` /
+``_semi_grand_kernel_call``); ``_build_vmap_swap_fn`` and ``_build_pmap_body``
+each take one such closure and stay flavor-agnostic.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any, TypedDict
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import PartitionSpec
 from jaxtyping import Array, Key
 
 logger = logging.getLogger(__name__)
@@ -76,6 +87,306 @@ _EMPTY_STATS: SwapStats = {
 }
 
 
+def _certify_replicated(tree, axis_name: str, n_devices: int):
+    """psum-then-divide every leaf of *tree* across *axis_name*.
+
+    All devices already hold numerically identical values here (same RNG +
+    same all-gathered data => same swap decision on every device), but
+    ``shard_map``'s VMA type checker doesn't take that on faith — it only
+    trusts a handful of collectives (``psum`` among them) as *proof* of
+    replication, which ``out_specs=PartitionSpec()`` requires. Summing G
+    identical integer copies and dividing by G recovers the exact original
+    value while producing a provably-reduced type. See
+    ``experiments/shard_map_rewrite.md`` ("out_specs=P() ... with a
+    caveat") for the discovery that motivated this.
+    """
+    return jax.tree.map(
+        lambda x: jax.lax.psum(x, axis_name=axis_name) // n_devices, tree
+    )
+
+
+def _wrap_swap_body(fn, axis_name: str, mesh):
+    """``pmap_like``-equivalent for the ``"gpu"``-axis swap body, except the
+    5th return value (the swap-stats dict) is replicated (``out_specs=P()``)
+    rather than concatenated across devices.
+
+    *fn* must be written like :func:`jaxrens.sampling.mesh.pmap_like`'s
+    contract for its first 4 (sharded) return values, and must have already
+    run its swap-stats dict through :func:`_certify_replicated` before
+    returning it — this wrapper does not unsqueeze/re-shape that 5th value
+    at all, it passes it straight through shard_map's replicated path.
+
+    ``check_vma=False``: the swap kernels this wraps (``replica_exchange_step``
+    / ``xrens_replica_exchange_step`` / ``semi_grand_replica_exchange_step``,
+    and ``morph.py`` underneath the XRENS/semi-grand composition swap) have
+    their own internal ``lax.scan``/``lax.cond`` control flow that has not
+    been audited for VMA-correctness — turning this on surfaced a real,
+    unrelated ``lax.cond`` branch-type mismatch inside
+    ``morph.py:pick_from_donor_species`` on real 2-GPU hardware. Auditing
+    and fixing that is a separate, larger undertaking than this wrapper's
+    swap-info replication; ``_certify_replicated`` still makes the
+    ``out_specs=P()`` promise numerically correct (every device provably
+    computed the identical swap), it just isn't statically checked here.
+    """
+
+    def wrapped(*args):
+        args = jax.tree.map(lambda x: jnp.squeeze(x, axis=0), args)
+        shard_pos, shard_typ, shard_ene, shard_bxs, swap_info = fn(*args)
+        sharded_outs = jax.tree.map(
+            lambda x: x[None, ...],
+            (shard_pos, shard_typ, shard_ene, shard_bxs),
+        )
+        return (*sharded_outs, swap_info)
+
+    spec = PartitionSpec(axis_name)
+    out_specs = (spec, spec, spec, spec, PartitionSpec())
+    return jax.shard_map(
+        wrapped, mesh=mesh, in_specs=spec, out_specs=out_specs, check_vma=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-flavor kernel_call closures: map a uniform positional calling
+# convention (rng_key, positions, types, energies, cells, emax, pressures[,
+# extra]) onto each swap kernel's actual (differently-named) kwargs. This is
+# the *only* flavor-specific piece; the shape/collective plumbing around it
+# (_build_vmap_swap_fn, _build_pmap_body below) is shared.
+# ---------------------------------------------------------------------------
+
+
+def _pressure_kernel_call(kernel: SwapKernel, n_swap_cycles: int) -> Callable:
+    def call(rng_key, positions, types, energies, cells, emax, pressures):
+        return replica_exchange_step(
+            rng_key=rng_key,
+            all_positions=positions,
+            all_types=types,
+            all_energies=energies,
+            all_cells=cells,
+            all_emax=emax,
+            pressures=pressures,
+            n_swap_cycles=n_swap_cycles,
+            swap_kernel=kernel,
+        )
+
+    return call
+
+
+def _xrens_kernel_call(
+    kernel: SwapKernel, backend: Any, n_swap_cycles: int
+) -> Callable:
+    def call(
+        rng_key,
+        positions,
+        types,
+        energies,
+        cells,
+        emax,
+        pressures,
+        composition_targets,
+    ):
+        return xrens_replica_exchange_step(
+            rng_key=rng_key,
+            all_positions=positions,
+            all_types=types,
+            all_energies=energies,
+            all_cells=cells,
+            all_emax=emax,
+            composition_targets=composition_targets,
+            backend=backend,
+            xrens_kernel=kernel,
+            pressures=pressures,
+            n_swap_cycles=n_swap_cycles,
+        )
+
+    return call
+
+
+def _semi_grand_kernel_call(
+    kernel: SwapKernel, n_swap_cycles: int
+) -> Callable:
+    def call(
+        rng_key,
+        positions,
+        types,
+        energies,
+        cells,
+        emax,
+        pressures,
+        chemical_potentials,
+    ):
+        return semi_grand_replica_exchange_step(
+            rng_key=rng_key,
+            all_positions=positions,
+            all_types=types,
+            all_energies=energies,
+            all_cells=cells,
+            all_emax=emax,
+            chemical_potentials=chemical_potentials,
+            semi_grand_kernel=kernel,
+            pressures=pressures,
+            n_swap_cycles=n_swap_cycles,
+        )
+
+    return call
+
+
+def _build_vmap_swap_fn(
+    kernel_call: Callable,
+    flavor_name: str,
+    has_extra: bool,
+    n_swap_cycles: int,
+) -> Callable:
+    """JIT-compile *kernel_call* with the ``(n_runs, K, ...)`` calling
+    convention, logging the trace-time flavor/shape once per JIT cache miss
+    (the gap to the next iteration log is the compile + first-execution
+    duration).
+    """
+
+    if has_extra:
+
+        def _swap_fn(
+            rng_key, positions, types, energies, cells, emax, pressures, extra
+        ):
+            logger.info(
+                "inter_re tracing: flavor=%s  pop_shape=%s  n_swap_cycles=%d",
+                flavor_name,
+                positions.shape,
+                int(n_swap_cycles),
+            )
+            return kernel_call(
+                rng_key,
+                positions,
+                types,
+                energies,
+                cells,
+                emax,
+                pressures,
+                extra,
+            )
+
+    else:
+
+        def _swap_fn(
+            rng_key, positions, types, energies, cells, emax, pressures
+        ):
+            logger.info(
+                "inter_re tracing: flavor=%s  pop_shape=%s  n_swap_cycles=%d",
+                flavor_name,
+                positions.shape,
+                int(n_swap_cycles),
+            )
+            return kernel_call(
+                rng_key, positions, types, energies, cells, emax, pressures
+            )
+
+    return jax.jit(_swap_fn)
+
+
+def _all_gather_maybe(x, axis_name: str):
+    """``lax.all_gather`` (default ``tiled=False``: prepends a new size-G
+    axis) unless *x* is ``None``."""
+    if x is None:
+        return None
+    return jax.lax.all_gather(x, axis_name=axis_name, axis=0)
+
+
+def _flatten_gp(x):
+    """``(G, P, *trailing) -> (G*P, *trailing)``; passes ``None`` through.
+
+    Works uniformly for both walker-indexed arrays (positions/types/
+    energies/cells, real trailing dims) and pure per-replica scalars
+    (emax/pressures, empty trailing dims) since ``x.shape[2:]`` is ``()``
+    for the latter.
+    """
+    if x is None:
+        return None
+    return x.reshape((x.shape[0] * x.shape[1],) + x.shape[2:])
+
+
+def _build_pmap_body(kernel_call: Callable, has_extra: bool) -> Callable:
+    """Build the ``"gpu"``-axis swap body shared by all three flavors.
+
+    ``all_gather`` each input across the ``"gpu"`` axis (each device then
+    sees the full ``(G, P, ...)`` population), flatten to ``(G*P, ...)``,
+    run *kernel_call* on the full population (same RNG on every device =>
+    same swap decisions everywhere), reshape back and slice out this
+    device's own ``(P, ...)`` shard, and certify the swap-stats dict as
+    replicated (see :func:`_certify_replicated`) so the caller's
+    ``out_specs=P()`` is valid.
+
+    Written for :func:`jaxrens.sampling.mesh.pmap_like`'s calling
+    convention (mapped axis already stripped from every input) — actually
+    wrapped via :func:`_wrap_swap_body`, not ``pmap_like`` itself, since
+    the swap-stats output needs the replicated (not concatenated) out_spec
+    that ``pmap_like``'s uniform-spec contract can't express.
+    """
+
+    def _run(rng_key_per_device, pos, typ, ene, bxs, em, pres, extra):
+        full_pos = _all_gather_maybe(pos, "gpu")
+        full_typ = _all_gather_maybe(typ, "gpu")
+        full_ene = _all_gather_maybe(ene, "gpu")
+        full_bxs = _all_gather_maybe(bxs, "gpu")
+        full_em = _all_gather_maybe(em, "gpu")
+        full_pres = _all_gather_maybe(pres, "gpu")
+        full_extra = _all_gather_maybe(extra, "gpu")
+        G = full_pos.shape[0]
+
+        call_args = (
+            rng_key_per_device,
+            _flatten_gp(full_pos),
+            _flatten_gp(full_typ),
+            _flatten_gp(full_ene),
+            _flatten_gp(full_bxs),
+            _flatten_gp(full_em),
+            _flatten_gp(full_pres),
+        )
+        if has_extra:
+            call_args = call_args + (_flatten_gp(full_extra),)
+
+        (
+            new_pos_flat,
+            new_typ_flat,
+            new_ene_flat,
+            new_bxs_flat,
+            swap_info,
+        ) = kernel_call(*call_args)
+
+        new_pos_full = new_pos_flat.reshape(full_pos.shape)
+        new_typ_full = new_typ_flat.reshape(full_typ.shape)
+        new_ene_full = new_ene_flat.reshape(full_ene.shape)
+        new_bxs_full = (
+            new_bxs_flat.reshape(full_bxs.shape)
+            if new_bxs_flat is not None
+            else None
+        )
+
+        dev_idx = jax.lax.axis_index("gpu")
+        shard_pos = new_pos_full[dev_idx]
+        shard_typ = new_typ_full[dev_idx]
+        shard_ene = new_ene_full[dev_idx]
+        shard_bxs = new_bxs_full[dev_idx] if new_bxs_full is not None else None
+        # Certify swap_info as provably-replicated so out_specs=P() (in
+        # _wrap_swap_body) is valid.
+        swap_info = _certify_replicated(swap_info, "gpu", G)
+        return shard_pos, shard_typ, shard_ene, shard_bxs, swap_info
+
+    if has_extra:
+
+        def _pmap_body(
+            rng_key_per_device, pos, typ, ene, bxs, em, pres, extra
+        ):
+            return _run(
+                rng_key_per_device, pos, typ, ene, bxs, em, pres, extra
+            )
+
+    else:
+
+        def _pmap_body(rng_key_per_device, pos, typ, ene, bxs, em, pres):
+            return _run(rng_key_per_device, pos, typ, ene, bxs, em, pres, None)
+
+    return _pmap_body
+
+
 class InterREManager:
     """Manages inter-replica-exchange swap passes in the NS outer loop.
 
@@ -113,10 +424,16 @@ class InterREManager:
         # Build and cache the JIT-compiled swap step.
         self._jit_vmap_swap = None
         self._jit_pmap_swap = None
-        self._jit_xrens_vmap_swap = None
-        self._jit_xrens_pmap_swap = None
         if batcher.is_batched:
             self._jit_vmap_swap, self._jit_pmap_swap = self._build_jit_fns()
+
+        # Resolved once here (fixed for this instance's lifetime) rather
+        # than re-checked via isinstance on every apply() call.
+        self._apply_impl = (
+            self._apply_pmap_vmap
+            if isinstance(batcher, PmapVmapRuns)
+            else self._apply_vmap
+        )
 
     # ------------------------------------------------------------------
     # Public interface
@@ -182,15 +499,7 @@ class InterREManager:
             return ns_state, dict(_EMPTY_STATS), new_key
 
         rng_key, swap_key = jax.random.split(rng_key)
-
-        if isinstance(self._batcher, PmapVmapRuns):
-            new_ns_state, swap_stats = self._apply_pmap_vmap(
-                ns_state, swap_key
-            )
-        else:
-            # VmapRuns
-            new_ns_state, swap_stats = self._apply_vmap(ns_state, swap_key)
-
+        new_ns_state, swap_stats = self._apply_impl(ns_state, swap_key)
         return new_ns_state, swap_stats, rng_key
 
     # ------------------------------------------------------------------
@@ -208,7 +517,8 @@ class InterREManager:
                     -> (new_pos, new_types, new_ene, new_cells, swap_info)
 
             ``jit_pmap_swap`` operates on ``(G, P, K, ...)`` shaped inputs via
-            ``pmap(vmap_all_gather_swap, axis_name="gpu")``.
+            a ``"gpu"``-axis ``shard_map`` (pmap-equivalent, see
+            :mod:`jaxrens.sampling.mesh`) wrapping an all_gather swap body.
             ``jit_vmap_swap`` operates on ``(n_runs, K, ...)`` shaped inputs.
 
             For XRENS, the signature is extended with ``composition_targets``::
@@ -228,327 +538,33 @@ class InterREManager:
         backend = self._backend
 
         if self._is_xrens:
-            # XRENS path: requires composition_targets and backend.
-            def _xrens_swap_fn(
-                rng_key,
-                positions,
-                types,
-                energies,
-                cells,
-                emax,
-                pressures,
-                composition_targets,
-            ):
-                # Cache-miss tracing log (fires only on first trace per signature).
-                logger.info(
-                    "inter_re tracing: flavor=xrens  pop_shape=%s  "
-                    "n_swap_cycles=%d",
-                    positions.shape,
-                    int(n_swap_cycles),
-                )
-                return xrens_replica_exchange_step(
-                    rng_key=rng_key,
-                    all_positions=positions,
-                    all_types=types,
-                    all_energies=energies,
-                    all_cells=cells,
-                    all_emax=emax,
-                    composition_targets=composition_targets,
-                    backend=backend,
-                    xrens_kernel=kernel,
-                    pressures=pressures,
-                    n_swap_cycles=n_swap_cycles,
-                )
-
-            jit_vmap = jax.jit(_xrens_swap_fn)
+            kernel_call = _xrens_kernel_call(kernel, backend, n_swap_cycles)
+            flavor_name = "xrens"
+            has_extra = True
         elif self._is_semi_grand:
-            # Semi-grand path: requires chemical_potentials; zero backend calls.
-            def _sg_swap_fn(
-                rng_key,
-                positions,
-                types,
-                energies,
-                cells,
-                emax,
-                pressures,
-                chemical_potentials,
-            ):
-                logger.info(
-                    "inter_re tracing: flavor=semi_grand  pop_shape=%s  "
-                    "n_swap_cycles=%d",
-                    positions.shape,
-                    int(n_swap_cycles),
-                )
-                return semi_grand_replica_exchange_step(
-                    rng_key=rng_key,
-                    all_positions=positions,
-                    all_types=types,
-                    all_energies=energies,
-                    all_cells=cells,
-                    all_emax=emax,
-                    chemical_potentials=chemical_potentials,
-                    semi_grand_kernel=kernel,
-                    pressures=pressures,
-                    n_swap_cycles=n_swap_cycles,
-                )
-
-            jit_vmap = jax.jit(_sg_swap_fn)
+            kernel_call = _semi_grand_kernel_call(kernel, n_swap_cycles)
+            flavor_name = "semi_grand"
+            has_extra = True
         else:
+            kernel_call = _pressure_kernel_call(kernel, n_swap_cycles)
+            flavor_name = "pressure"
+            has_extra = False
 
-            def _swap_fn(
-                rng_key, positions, types, energies, cells, emax, pressures
-            ):
-                logger.info(
-                    "inter_re tracing: flavor=pressure  pop_shape=%s  "
-                    "n_swap_cycles=%d",
-                    positions.shape,
-                    int(n_swap_cycles),
-                )
-                return replica_exchange_step(
-                    rng_key=rng_key,
-                    all_positions=positions,
-                    all_types=types,
-                    all_energies=energies,
-                    all_cells=cells,
-                    all_emax=emax,
-                    pressures=pressures,
-                    n_swap_cycles=n_swap_cycles,
-                    swap_kernel=kernel,
-                )
+        jit_vmap = _build_vmap_swap_fn(
+            kernel_call, flavor_name, has_extra, n_swap_cycles
+        )
 
-            jit_vmap = jax.jit(_swap_fn)
-
-        # Build pmap version: each device receives its own shard (P, K, ...).
-        # We use lax.all_gather to replicate across devices, swap on the full
-        # population, then slice back the device's shard.
-        if self._is_xrens:
-
-            def _pmap_body(
-                rng_key_per_device, pos, typ, ene, bxs, em, pres, comp_targets
-            ):
-                full_pos = jax.lax.all_gather(pos, axis_name="gpu", axis=0)
-                full_typ = jax.lax.all_gather(typ, axis_name="gpu", axis=0)
-                full_ene = jax.lax.all_gather(ene, axis_name="gpu", axis=0)
-                full_em = jax.lax.all_gather(em, axis_name="gpu", axis=0)
-                full_bxs = (
-                    jax.lax.all_gather(bxs, axis_name="gpu", axis=0)
-                    if bxs is not None
-                    else None
-                )
-                full_pres = (
-                    jax.lax.all_gather(pres, axis_name="gpu", axis=0)
-                    if pres is not None
-                    else None
-                )
-                full_comp = jax.lax.all_gather(
-                    comp_targets, axis_name="gpu", axis=0
-                )
-
-                G, P = full_pos.shape[0], full_pos.shape[1]
-                gp = G * P
-                flat_pos = full_pos.reshape((gp,) + full_pos.shape[2:])
-                flat_typ = full_typ.reshape((gp,) + full_typ.shape[2:])
-                flat_ene = full_ene.reshape((gp,) + full_ene.shape[2:])
-                flat_em = full_em.reshape((gp,))
-                flat_bxs = (
-                    full_bxs.reshape((gp,) + full_bxs.shape[2:])
-                    if full_bxs is not None
-                    else None
-                )
-                flat_pres = (
-                    full_pres.reshape((gp,)) if full_pres is not None else None
-                )
-                flat_comp = full_comp.reshape((gp,) + full_comp.shape[2:])
-
-                (
-                    new_pos_flat,
-                    new_typ_flat,
-                    new_ene_flat,
-                    new_bxs_flat,
-                    swap_info,
-                ) = xrens_replica_exchange_step(
-                    rng_key=rng_key_per_device,
-                    all_positions=flat_pos,
-                    all_types=flat_typ,
-                    all_energies=flat_ene,
-                    all_cells=flat_bxs,
-                    all_emax=flat_em,
-                    composition_targets=flat_comp,
-                    backend=backend,
-                    xrens_kernel=kernel,
-                    pressures=flat_pres,
-                    n_swap_cycles=n_swap_cycles,
-                )
-
-                new_pos_full = new_pos_flat.reshape(full_pos.shape)
-                new_typ_full = new_typ_flat.reshape(full_typ.shape)
-                new_ene_full = new_ene_flat.reshape(full_ene.shape)
-                new_bxs_full = (
-                    new_bxs_flat.reshape(full_bxs.shape)
-                    if new_bxs_flat is not None
-                    else None
-                )
-
-                dev_idx = jax.lax.axis_index("gpu")
-                shard_pos = new_pos_full[dev_idx]
-                shard_typ = new_typ_full[dev_idx]
-                shard_ene = new_ene_full[dev_idx]
-                shard_bxs = (
-                    new_bxs_full[dev_idx] if new_bxs_full is not None else None
-                )
-                return shard_pos, shard_typ, shard_ene, shard_bxs, swap_info
-
-        elif self._is_semi_grand:
-
-            def _pmap_body(
-                rng_key_per_device, pos, typ, ene, bxs, em, pres, chem_pots
-            ):
-                full_pos = jax.lax.all_gather(pos, axis_name="gpu", axis=0)
-                full_typ = jax.lax.all_gather(typ, axis_name="gpu", axis=0)
-                full_ene = jax.lax.all_gather(ene, axis_name="gpu", axis=0)
-                full_em = jax.lax.all_gather(em, axis_name="gpu", axis=0)
-                full_bxs = (
-                    jax.lax.all_gather(bxs, axis_name="gpu", axis=0)
-                    if bxs is not None
-                    else None
-                )
-                full_pres = (
-                    jax.lax.all_gather(pres, axis_name="gpu", axis=0)
-                    if pres is not None
-                    else None
-                )
-                full_chem = jax.lax.all_gather(
-                    chem_pots, axis_name="gpu", axis=0
-                )
-
-                G, P = full_pos.shape[0], full_pos.shape[1]
-                gp = G * P
-                flat_pos = full_pos.reshape((gp,) + full_pos.shape[2:])
-                flat_typ = full_typ.reshape((gp,) + full_typ.shape[2:])
-                flat_ene = full_ene.reshape((gp,) + full_ene.shape[2:])
-                flat_em = full_em.reshape((gp,))
-                flat_bxs = (
-                    full_bxs.reshape((gp,) + full_bxs.shape[2:])
-                    if full_bxs is not None
-                    else None
-                )
-                flat_pres = (
-                    full_pres.reshape((gp,)) if full_pres is not None else None
-                )
-                flat_chem = full_chem.reshape((gp,) + full_chem.shape[2:])
-
-                (
-                    new_pos_flat,
-                    new_typ_flat,
-                    new_ene_flat,
-                    new_bxs_flat,
-                    swap_info,
-                ) = semi_grand_replica_exchange_step(
-                    rng_key=rng_key_per_device,
-                    all_positions=flat_pos,
-                    all_types=flat_typ,
-                    all_energies=flat_ene,
-                    all_cells=flat_bxs,
-                    all_emax=flat_em,
-                    chemical_potentials=flat_chem,
-                    semi_grand_kernel=kernel,
-                    pressures=flat_pres,
-                    n_swap_cycles=n_swap_cycles,
-                )
-
-                new_pos_full = new_pos_flat.reshape(full_pos.shape)
-                new_typ_full = new_typ_flat.reshape(full_typ.shape)
-                new_ene_full = new_ene_flat.reshape(full_ene.shape)
-                new_bxs_full = (
-                    new_bxs_flat.reshape(full_bxs.shape)
-                    if new_bxs_flat is not None
-                    else None
-                )
-
-                dev_idx = jax.lax.axis_index("gpu")
-                shard_pos = new_pos_full[dev_idx]
-                shard_typ = new_typ_full[dev_idx]
-                shard_ene = new_ene_full[dev_idx]
-                shard_bxs = (
-                    new_bxs_full[dev_idx] if new_bxs_full is not None else None
-                )
-                return shard_pos, shard_typ, shard_ene, shard_bxs, swap_info
-
-        else:
-
-            def _pmap_body(rng_key_per_device, pos, typ, ene, bxs, em, pres):
-                # Inside pmap each shard has shape (P, K, ...).
-                # all_gather collects all G shards → (G, P, K, ...) on each device.
-                full_pos = jax.lax.all_gather(pos, axis_name="gpu", axis=0)
-                full_typ = jax.lax.all_gather(typ, axis_name="gpu", axis=0)
-                full_ene = jax.lax.all_gather(ene, axis_name="gpu", axis=0)
-                full_em = jax.lax.all_gather(em, axis_name="gpu", axis=0)
-                full_bxs = (
-                    jax.lax.all_gather(bxs, axis_name="gpu", axis=0)
-                    if bxs is not None
-                    else None
-                )
-                full_pres = (
-                    jax.lax.all_gather(pres, axis_name="gpu", axis=0)
-                    if pres is not None
-                    else None
-                )
-
-                # Flatten (G, P, K, ...) → (G*P, K, ...) for the swap function.
-                G, P = full_pos.shape[0], full_pos.shape[1]
-                gp = G * P
-                flat_pos = full_pos.reshape((gp,) + full_pos.shape[2:])
-                flat_typ = full_typ.reshape((gp,) + full_typ.shape[2:])
-                flat_ene = full_ene.reshape((gp,) + full_ene.shape[2:])
-                flat_em = full_em.reshape((gp,))
-                flat_bxs = (
-                    full_bxs.reshape((gp,) + full_bxs.shape[2:])
-                    if full_bxs is not None
-                    else None
-                )
-                flat_pres = (
-                    full_pres.reshape((gp,)) if full_pres is not None else None
-                )
-
-                (
-                    new_pos_flat,
-                    new_typ_flat,
-                    new_ene_flat,
-                    new_bxs_flat,
-                    swap_info,
-                ) = replica_exchange_step(
-                    rng_key=rng_key_per_device,
-                    all_positions=flat_pos,
-                    all_types=flat_typ,
-                    all_energies=flat_ene,
-                    all_cells=flat_bxs,
-                    all_emax=flat_em,
-                    pressures=flat_pres,
-                    n_swap_cycles=n_swap_cycles,
-                    swap_kernel=kernel,
-                )
-
-                # Reshape back and take this device's shard.
-                new_pos_full = new_pos_flat.reshape(full_pos.shape)
-                new_typ_full = new_typ_flat.reshape(full_typ.shape)
-                new_ene_full = new_ene_flat.reshape(full_ene.shape)
-                new_bxs_full = (
-                    new_bxs_flat.reshape(full_bxs.shape)
-                    if new_bxs_flat is not None
-                    else None
-                )
-
-                dev_idx = jax.lax.axis_index("gpu")
-                shard_pos = new_pos_full[dev_idx]
-                shard_typ = new_typ_full[dev_idx]
-                shard_ene = new_ene_full[dev_idx]
-                shard_bxs = (
-                    new_bxs_full[dev_idx] if new_bxs_full is not None else None
-                )
-
-                return shard_pos, shard_typ, shard_ene, shard_bxs, swap_info
-
-        jit_pmap = jax.pmap(_pmap_body, axis_name="gpu")
+        # jit_pmap is only ever invoked for PmapVmapRuns (see `apply`); other
+        # batchers don't carry a mesh to build from and don't need this
+        # callable, so leave it unbuilt.
+        jit_pmap = None
+        if isinstance(self._batcher, PmapVmapRuns):
+            pmap_body = _build_pmap_body(kernel_call, has_extra)
+            # self._batcher.mesh: the same cached Mesh object wrap_step /
+            # wrap_for_batch use for this batcher, not a fresh equivalent one.
+            jit_pmap = jax.jit(
+                _wrap_swap_body(pmap_body, "gpu", self._batcher.mesh)
+            )
 
         return jit_vmap, jit_pmap
 
@@ -821,21 +837,10 @@ class InterREManager:
         )
         new_ns_state = ns_state.set(population=new_pop)
 
-        # All devices ran the same swap (same RNG + same data after all_gather),
-        # so device 0's swap_info is representative.
-        device0_info: dict[str, Any] = {
-            "n_accepted": swap_info_sharded["n_accepted"][0],
-            "n_attempted": swap_info_sharded["n_attempted"][0],
-            "n_accepted_per_pair": swap_info_sharded["n_accepted_per_pair"][0],
-            "n_attempted_per_pair": swap_info_sharded["n_attempted_per_pair"][
-                0
-            ],
-        }
-        if "n_energy_evals" in swap_info_sharded:
-            device0_info["n_energy_evals"] = swap_info_sharded[
-                "n_energy_evals"
-            ][0]
-        stats = self._build_stats(device0_info)
+        # swap_info_sharded arrives already replicated (out_specs=P() in
+        # _wrap_swap_body, certified via _certify_replicated) -- no more
+        # per-device axis to index away, unlike the old pmap path.
+        stats = self._build_stats(swap_info_sharded)
         return new_ns_state, stats
 
     @staticmethod
