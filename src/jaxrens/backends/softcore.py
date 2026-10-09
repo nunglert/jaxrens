@@ -1,4 +1,4 @@
-"""SoftCoreBackend — wraps any EnergyBackend with a fixed repulsive Morse term.
+"""SoftCoreTerm — a fixed repulsive Morse term added to any energy model.
 
 MLIPs (MACE, NeuralIL, Nequix, …) generally have no defined behaviour for
 close-contact configurations far outside their training distribution, where
@@ -6,7 +6,7 @@ the learned potential can become attractive or NaN. During nested sampling
 at high pressure or with aggressive cell moves walkers can drift into such
 configurations and irreversibly collapse atoms onto each other.
 
-This wrapper adds a parameter-free repulsive Morse term::
+This term adds a parameter-free repulsive Morse contribution::
 
     phi(r) = d0 * exp(-2 * a0 * (r - b0))
 
@@ -20,12 +20,11 @@ the shortest cell vector.
 
 Usage::
 
-    base = MACEBackend(...)
-    backend = SoftCoreBackend(base)                          # defaults
-    H = EnsembleBackend(backend, pressure=P)                  # NPT stack
+    model = MACEBackend(...)
+    H = Hamiltonian(model, [SoftCoreTerm(), EnsembleTerm(pressure=P)])
 
-The wrapper satisfies the EnergyBackend protocol and forwards unknown
-attributes to ``base`` via ``__getattr__``.
+The term contributes its own energy and forces (autodiff of the soft-core
+energy alone), so the model keeps its native force path.
 """
 
 from __future__ import annotations
@@ -34,8 +33,8 @@ from typing import Any
 
 import jax.numpy as jnp
 
-from jaxrens.backends.base import BackendResult
 from jaxrens.backends.geometry import pairwise_distances
+from jaxrens.backends.hamiltonian import EnergyTerm, Hamiltonian
 
 #: Default soft-core Morse parameters (``a0``, ``b0``, ``d0``, ``r_core_cut``,
 #: ``r_core_switch``) used when a backend enables soft-core repulsion without
@@ -124,55 +123,38 @@ def _softcore_energy(
     return 0.5 * jnp.sum(contributions)
 
 
-class SoftCoreBackend:
-    """Wraps any EnergyBackend with a fixed repulsive Morse soft core.
+class SoftCoreTerm(EnergyTerm):
+    """Fixed repulsive Morse soft core as an additive Hamiltonian term.
 
-    Satisfies the EnergyBackend protocol. The soft-core term depends only
-    on geometry (positions, cell), not on species or trainable parameters,
-    so any backend (LJ, MACE, Nequix, NeuralIL, jaxmd, toy) can be wrapped.
-
-    For NPT runs, stack with :class:`EnsembleBackend`:
-
-        EnsembleBackend(SoftCoreBackend(base_backend), pressure=p)
-
-    SoftCore sits closest to the bare backend (adds to ``U`` first); the
-    ensemble correction (``+ P*V``) is then added on top.
+    Depends only on geometry (positions, cell), not on species or trainable
+    parameters, so it composes with any model (LJ, MACE, Nequix, NeuralIL,
+    jaxmd, toy).  Forces come from autodiff of this term alone
+    (:meth:`EnergyTerm.energy_and_forces`).
     """
 
     def __init__(
         self,
-        base: Any,
         a0: float = 1.0,
         b0: float = 3.0,
         d0: float = 1.0,
         r_core_cut: float = 1.25,
         r_core_switch: float = 0.75,
     ):
-        self.base = base
-        self.r_cutoff = base.r_cutoff
         self.a0 = float(a0)
         self.b0 = float(b0)
         self.d0 = float(d0)
         self.r_core_cut = float(r_core_cut)
         self.r_core_switch = float(r_core_switch)
 
-    def __call__(
+    def energy(
         self,
         positions: jnp.ndarray,
         species: jnp.ndarray,
         cell: jnp.ndarray,
-        max_neighbors: int,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> BackendResult:
-        """Return the wrapped backend's result with ``E_core`` added to energy."""
-        res = self.base(
-            positions,
-            species,
-            cell,
-            max_neighbors,
-            ensemble_params=ensemble_params,
-        )
-        E_core = _softcore_energy(
+    ) -> jnp.ndarray:
+        """Total soft-core repulsion ``E_core`` for one configuration."""
+        return _softcore_energy(
             positions,
             cell,
             self.a0,
@@ -181,10 +163,12 @@ class SoftCoreBackend:
             self.r_core_switch,
             self.r_core_cut,
         )
-        return res._replace(energy=res.energy + E_core)
 
-    def __getattr__(self, name: str) -> Any:
-        # Called only when normal lookup fails, so this does not shadow
-        # the wrapper's own attributes. Lets resolver code read e.g.
-        # ``wrapped.atomic_numbers`` transparently.
-        return getattr(self.__dict__["base"], name)
+
+def SoftCoreBackend(base: Any, **softcore_kwargs: float) -> Hamiltonian:
+    """Convenience: ``base`` plus a :class:`SoftCoreTerm`.
+
+    Returns a flat :class:`Hamiltonian` (``base`` may itself be one; its
+    terms are kept and the soft-core term appended).
+    """
+    return Hamiltonian(base, [SoftCoreTerm(**softcore_kwargs)])

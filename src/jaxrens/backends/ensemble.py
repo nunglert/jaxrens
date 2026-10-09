@@ -1,12 +1,15 @@
-"""EnsembleBackend — wraps any EnergyBackend with ensemble corrections.
+"""Ensemble corrections (PV, μN) as an additive Hamiltonian term.
 
-Adds thermodynamic potential terms (PV, μN) to the raw backend energy.
-The wrapped backend satisfies the same EnergyBackend protocol.
+Adds thermodynamic potential terms to the raw model energy::
+
+    NVT:  H = U                    (no term)
+    NPT:  H = U + P*V
+    μPT:  H = U + P*V - μ·N
 
 Usage::
 
-    base = HarmonicBackend(k=1.0)
-    backend = EnsembleBackend(base, pressure=0.01)
+    model = HarmonicBackend(k=1.0)
+    backend = Hamiltonian(model, [EnsembleTerm(pressure=0.01)])
     result = backend(positions, species, cell, max_neighbors)
     # result.energy = U + P*V
 
@@ -24,58 +27,36 @@ from typing import Any
 
 import jax.numpy as jnp
 
-from jaxrens.backends.base import BackendResult
+from jaxrens.backends.hamiltonian import EnergyTerm, Hamiltonian
 from jaxrens.utils.cell import get_volume
 
 
-class EnsembleBackend:
-    """Wraps any EnergyBackend with ensemble corrections (PV, μN).
+class EnsembleTerm(EnergyTerm):
+    """``P·V − μ·N`` ensemble correction.
 
-    Satisfies EnergyBackend protocol. Can be used anywhere a plain
-    backend is expected.
+    The closured ``pressure`` / ``chemical_potentials`` are defaults; a
+    per-call ``ensemble_params`` dict overrides them, which lets different
+    runs carry different pressures / chemical potentials under one term.
 
-    Ensemble corrections:
-        NVT:  H = U                    (no correction, don't wrap)
-        NPT:  H = U + P*V
-        μPT:  H = U + P*V - μ·N
-
-    For per-run vmap: pass ensemble_params kwarg to override the
-    closured defaults. This allows different runs to have different
-    pressures/chemical potentials.
+    Both contributions are independent of atomic positions (``V`` depends on
+    the cell, ``N`` on the species), so the forces are exactly zero.
     """
 
     def __init__(
         self,
-        base: Any,
         pressure: float = 0.0,
         chemical_potentials: jnp.ndarray | None = None,
     ):
-        self.base = base
-        self.r_cutoff = base.r_cutoff
         self.pressure = pressure
         self.chemical_potentials = chemical_potentials
 
-    def __call__(
+    def energy(
         self,
         positions: jnp.ndarray,
         species: jnp.ndarray,
         cell: jnp.ndarray,
-        max_neighbors: int,
         ensemble_params: dict[str, Any] | None = None,
-    ) -> BackendResult:
-        """Compute ensemble-corrected energy.
-
-        Calls the base backend for the raw potential U, then adds
-        ensemble terms (PV, μN). Control/diagnostic fields pass through.
-        """
-        res = self.base(
-            positions,
-            species,
-            cell,
-            max_neighbors,
-        )
-        U = res.energy
-
+    ) -> jnp.ndarray:
         # Use per-run params if provided, else closured defaults
         pressure = self.pressure
         mu = self.chemical_potentials
@@ -83,23 +64,40 @@ class EnsembleBackend:
             pressure = ensemble_params.get("pressure", pressure)
             mu = ensemble_params.get("chemical_potentials", mu)
 
-        H = U + pressure * get_volume(cell)
+        E = pressure * get_volume(cell)
 
         if mu is not None:
             n_species = mu.shape[0]
             if n_species > 0:
                 counts = jnp.zeros(n_species, dtype=species.dtype)
                 counts = counts.at[species].add(1)
-                H = H - jnp.dot(mu, counts.astype(jnp.float32))
+                E = E - jnp.dot(mu, counts.astype(jnp.float32))
 
-        return res._replace(energy=H)
+        return E
 
-    def __getattr__(self, name: str) -> Any:
-        # Called only when normal lookup fails, so this does not shadow
-        # ``base`` / ``pressure`` / ``chemical_potentials`` / ``r_cutoff``.
-        # Lets resolver code read e.g. ``wrapped.atomic_numbers`` through
-        # the wrapper without special-casing.
-        return getattr(self.__dict__["base"], name)
+    def energy_and_forces(
+        self,
+        positions: jnp.ndarray,
+        species: jnp.ndarray,
+        cell: jnp.ndarray,
+        ensemble_params: dict[str, Any] | None = None,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Analytic: position-independent, so forces are zero."""
+        E = self.energy(positions, species, cell, ensemble_params)
+        return E, jnp.zeros_like(positions)
+
+
+def EnsembleBackend(
+    base: Any,
+    pressure: float = 0.0,
+    chemical_potentials: jnp.ndarray | None = None,
+) -> Hamiltonian:
+    """Convenience: ``base`` plus an :class:`EnsembleTerm`.
+
+    Returns a flat :class:`Hamiltonian` (``base`` may itself be one; its
+    terms are kept and the ensemble term appended).
+    """
+    return Hamiltonian(base, [EnsembleTerm(pressure, chemical_potentials)])
 
 
 def make_ensemble_params(
@@ -109,7 +107,7 @@ def make_ensemble_params(
     """Create ensemble_params dict for MCState.
 
     Returns a dict suitable for storing on MCState.ensemble_params
-    and passing to EnsembleBackend via the ensemble_params kwarg.
+    and passing to an :class:`EnsembleTerm` via the ensemble_params kwarg.
     """
     params: dict[str, jnp.ndarray] = {"pressure": jnp.asarray(pressure)}
     if chemical_potentials is not None:

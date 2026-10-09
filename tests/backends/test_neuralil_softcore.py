@@ -421,7 +421,7 @@ class TestSoftCoreEnsembleForces:
 
         # The committee backend itself is returned directly.
         assert get_committee_backend(backend) is backend
-        # And it is found through an EnsembleBackend (per-run) wrapper.
+        # And it is found through a Hamiltonian with an EnsembleTerm.
         wrapped = EnsembleBackend(backend, pressure=0.0)
         assert get_committee_backend(wrapped) is backend
 

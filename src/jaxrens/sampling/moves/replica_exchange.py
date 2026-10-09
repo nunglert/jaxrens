@@ -136,7 +136,7 @@ class PressureRENSSwap(SwapKernel):
     ``propose`` is identity — the positions/cell/energy pair is passed
     through unchanged as the swap candidate (no morphing, no backend call).
 
-    The stored energy convention follows ``EnsembleBackend``: each walker's
+    The stored energy convention follows ``EnsembleTerm``: each walker's
     ``state.energy`` is the *enthalpy at the run's own pressure*,
     ``H_self = U + P_self · V``.  ``accept`` undoes the self-PV term before
     re-basing at the partner's pressure::
@@ -202,7 +202,7 @@ class PressureRENSSwap(SwapKernel):
 
         ``proposed['energy_a']`` and ``proposed['energy_b']`` are interpreted as
         the *stored* enthalpies at each run's own pressure
-        (``H_self = U + P_self · V``), matching what ``EnsembleBackend`` writes
+        (``H_self = U + P_self · V``), matching what ``EnsembleTerm`` writes
         into ``state.energy``.  To compare against the receiving run's Emax we
         re-base the enthalpy at the partner's pressure::
 
@@ -249,7 +249,7 @@ class PressureRENSSwap(SwapKernel):
         if use_pressure:
             v_a = get_volume(proposed["cell_a"])
             v_b = get_volume(proposed["cell_b"])
-            # Stored e_a, e_b are enthalpies at self's pressure (EnsembleBackend
+            # Stored e_a, e_b are enthalpies at self's pressure (EnsembleTerm
             # adds P_self·V).  Recover U by subtracting self's PV, then re-add
             # at the partner's pressure to get the enthalpy under the receiving
             # run's constraint.
@@ -316,7 +316,7 @@ def perform_swap(
     Interface convention (legacy ``jaxnest``-style): ``energies_pair`` are
     interpreted as **raw potential energies** *U* (not enthalpies).  Production
     callers that already have ``state.energy = U + P_self · V`` (the
-    ``EnsembleBackend`` convention) should call ``PressureRENSSwap.accept``
+    ``EnsembleTerm`` convention) should call ``PressureRENSSwap.accept``
     directly instead of going through this shim — the kernel expects stored
     enthalpies on that path.
 
@@ -742,7 +742,7 @@ class XRENSSwap(SwapKernel):
     - Each morphed config's energy is re-evaluated under the new types via
       the backend, threading the receiving run's ``ensemble_params`` (so the
       returned energy is the *enthalpy at the receiving run's pressure*,
-      matching the ``EnsembleBackend`` convention for stored state.energy).
+      matching the ``EnsembleTerm`` convention for stored state.energy).
     - Acceptance is a direct ``E_new_a < Emax_a`` / ``E_new_b < Emax_b`` check
       — no further PV terms are added inside ``accept``.
 
@@ -836,7 +836,7 @@ class XRENSSwap(SwapKernel):
 
         # Re-evaluate energies under morphed types, threading each receiving
         # run's ensemble_params so the returned scalar is the enthalpy at the
-        # receiving run's pressure (matches EnsembleBackend stored convention;
+        # receiving run's pressure (matches EnsembleTerm stored convention;
         # see PressureRENSSwap.accept docstring).  Strip non-backend keys
         # ('target_composition') before forwarding.
         backend_params_a = {
@@ -1258,7 +1258,7 @@ class SemiGrandSwap(SwapKernel):
     adopts μ_B and replica B adopts μ_A.  Positions, cells, and types are
     **never** changed — only the μ assignment moves.
 
-    **Sign convention (consistent with ``EnsembleBackend``):**
+    **Sign convention (consistent with ``EnsembleTerm``):**
 
     The stored ``state.energy`` is the grand-canonical energy at the run's own
     chemical potential, ``Ω_self = U - μ_self · N`` (matching the
@@ -1284,7 +1284,7 @@ class SemiGrandSwap(SwapKernel):
     .. note::
         This matches the legacy ``jaxnest`` ``create_perform_semi_grand_swap``
         (subtract self μN to recover U, then re-add partner μN) up to the sign
-        flip introduced by ``EnsembleBackend`` storing ``Ω = U - μN`` instead
+        flip introduced by ``EnsembleTerm`` storing ``Ω = U - μN`` instead
         of the legacy ``E_stored = U + μN``.
 
     Args:
@@ -1319,7 +1319,7 @@ class SemiGrandSwap(SwapKernel):
         Args:
             state_a: Dict with keys ``'positions'``, ``'cell'``, ``'types'``,
                 ``'energy'`` (stored grand-canonical energy
-                ``Ω_self_A = U_A - μ_A · N_A`` from ``EnsembleBackend``).
+                ``Ω_self_A = U_A - μ_A · N_A`` from ``EnsembleTerm``).
             state_b: Same structure for replica B.
             ensemble_params_a: Dict with key ``'chemical_potentials'`` — float
                 array of shape ``(n_species,)``.
@@ -1380,7 +1380,7 @@ class SemiGrandSwap(SwapKernel):
         N_A = jnp.bincount(types_a, length=n_species)  # (n_species,)
         N_B = jnp.bincount(types_b, length=n_species)  # (n_species,)
 
-        # Stored state.energy = Ω_self = U - μ_self·N (EnsembleBackend
+        # Stored state.energy = Ω_self = U - μ_self·N (EnsembleTerm
         # convention).  Recover U by adding μ_self·N back, then subtract the
         # partner's μ·N to get the post-swap grand-canonical energy.
         omega_a = state_a["energy"] + jnp.dot(mu_a, N_A) - jnp.dot(mu_b, N_A)

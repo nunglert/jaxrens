@@ -27,6 +27,8 @@ import numpy as np
 
 import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
 from jaxrens.backends.base import BackendResult, EnergyBackend
+from jaxrens.backends.ensemble import EnsembleTerm
+from jaxrens.backends.hamiltonian import Hamiltonian, unwrap_model
 from jaxrens.cli.schema.adaptation import (
     AdaptationSpec,
     ResolvedAdaptationPolicy,
@@ -531,7 +533,7 @@ def _stack_ensemble_params(
     corrections to thread).
 
     Only energy-relevant keys should be passed in ``keys`` — these are the
-    same per-replica dicts the runtime NS loop hands to its ``EnsembleBackend``
+    same per-replica dicts the runtime NS loop hands to its ``EnsembleTerm``
     via ``ensemble_params_per_run``, so resolved initial energies match the
     runtime by construction.
     """
@@ -594,10 +596,10 @@ def _finalise_initial_energies_and_counts(
     ``ensemble_params_batched`` is an ensemble-agnostic pytree (leaves
     shaped ``batcher.shape_prefix + leaf_shape``) carrying per-replica
     ensemble params — ``pressure`` for NPT, ``chemical_potentials`` for
-    semi-grand μPT, or both.  When supplied with an EnsembleBackend, each
-    replica's initial energy reflects its own P·V and −μ·N terms, matching
-    the runtime NS loop by construction — even though a single
-    EnsembleBackend instance handles all replicas in the consolidated
+    semi-grand μPT, or both.  When supplied with a Hamiltonian carrying an
+    ``EnsembleTerm``, each replica's initial energy reflects its own P·V and
+    −μ·N terms, matching the runtime NS loop by construction — even though
+    a single Hamiltonian handles all replicas in the consolidated
     finalize.  When ``None``, no ensemble correction is threaded (the
     backend's own closured params are used, as on the SingleRun path).
 
@@ -618,7 +620,8 @@ def _finalise_initial_energies_and_counts(
     )
     n_atoms = positions.shape[-2]
 
-    if hasattr(energy_backend, "max_neighbors_for"):
+    model = unwrap_model(energy_backend)
+    if hasattr(model, "max_neighbors_for"):
         logger.info(
             "[resolve] computing per-walker initial neighbor counts and energies "
             "(%s, n_walkers*n_runs=%d, n_atoms=%d, batcher=%s)",
@@ -629,7 +632,7 @@ def _finalise_initial_energies_and_counts(
         )
 
         def per_replica_counts(pos_K, cells_K):
-            return jax.vmap(energy_backend.max_neighbors_for)(pos_K, cells_K)
+            return jax.vmap(model.max_neighbors_for)(pos_K, cells_K)
 
         batched_counts = batcher.wrap_for_batch(per_replica_counts)
         counts = batched_counts(positions, cells)
@@ -912,11 +915,12 @@ def _resolve_init_species(
     # The default path (LJ, toy) uses contiguous 0-based indices over the
     # sorted unique Z-numbers.
     backend_table: list[int] | None = None
-    if energy_backend is not None and hasattr(
-        energy_backend, "atomic_numbers"
-    ):
+    model = (
+        unwrap_model(energy_backend) if energy_backend is not None else None
+    )
+    if model is not None and hasattr(model, "atomic_numbers"):
         try:
-            backend_table = [int(z) for z in energy_backend.atomic_numbers]
+            backend_table = [int(z) for z in model.atomic_numbers]
         except (TypeError, ValueError):
             backend_table = None
 
@@ -1112,12 +1116,12 @@ class ResolvedConfig:
       ``ensemble_params_per_run`` is a length-``n_total`` tuple in
       ``flat_idx = g * P + p`` order (matches ``init_ns_multi_gpu``).
 
-    ``base_backend`` is the unwrapped backend produced by
-    ``BackendSpec.build_backend()`` (e.g. the raw MACE / NeuralIL / LJ
-    instance with no ensemble correction).  The runtime wraps it into an
-    ``EnsembleBackend`` if needed; the resolver applies the same wrapping
+    ``base_backend`` is the :class:`Hamiltonian` built from
+    ``BackendSpec.build_backend()`` (the raw MACE / NeuralIL / LJ model) plus
+    the soft-core term when configured — no ensemble correction.  The
+    runtime adds an ``EnsembleTerm`` if needed; the resolver does the same
     locally just to compute initial energies on the right scale, then
-    discards the wrapper.
+    discards that Hamiltonian.
     """
 
     ns: NSConfig
@@ -1212,18 +1216,18 @@ def _resolve_single_replica(
     backend = root.backend.to_backend_config()
     base_backend = root.backend.build_backend()
 
-    # Soft-core repulsion wrapper: applied closest to the bare backend so
-    # the ensemble PV term sits outside it.  Mutates ``base_backend`` so
-    # both single-replica and downstream multi-replica / rejection-mode
-    # init paths inherit the wrap automatically.
+    # Soft-core repulsion term.  Rebinds ``base_backend`` so both
+    # single-replica and downstream multi-replica / rejection-mode init
+    # paths inherit it automatically.
+    base_backend = Hamiltonian(base_backend)
     if backend.softcore_repulsion is not None:
-        from jaxrens.backends.softcore import SoftCoreBackend
+        from jaxrens.backends.softcore import SoftCoreTerm
 
-        base_backend = SoftCoreBackend(
-            base_backend, **backend.softcore_repulsion
+        base_backend = base_backend.with_terms(
+            SoftCoreTerm(**backend.softcore_repulsion)
         )
 
-    # For initial-energy evaluation, locally wrap with EnsembleBackend so the
+    # For initial-energy evaluation, locally add an EnsembleTerm so the
     # resolver's energies match the NS-loop scale (U + P*V - μ·N) — without
     # this, walkers are initialized with bare LJ energies while the MWG
     # step_fn returns ensemble-corrected energies, causing systematic
@@ -1233,16 +1237,15 @@ def _resolve_single_replica(
     if pressure is not None or chemical_potentials is not None:
         import jax.numpy as jnp
 
-        from jaxrens.backends.ensemble import EnsembleBackend
-
-        init_energy_backend = EnsembleBackend(
-            base_backend,
-            pressure=float(pressure) if pressure is not None else 0.0,
-            chemical_potentials=(
-                jnp.asarray(chemical_potentials, dtype=jnp.float32)
-                if chemical_potentials is not None
-                else None
-            ),
+        init_energy_backend = base_backend.with_terms(
+            EnsembleTerm(
+                pressure=float(pressure) if pressure is not None else 0.0,
+                chemical_potentials=(
+                    jnp.asarray(chemical_potentials, dtype=jnp.float32)
+                    if chemical_potentials is not None
+                    else None
+                ),
+            )
         )
     else:
         init_energy_backend = base_backend
@@ -1512,7 +1515,7 @@ def _resolve_multi_replica(
     """Resolve ``root`` into a multi-replica (PmapVmapRuns) ``ResolvedConfig``.
 
     Builds per-replica initial positions / cells / energies by calling
-    ``_resolve_init`` once per replica with its own seed and EnsembleBackend
+    ``_resolve_init`` once per replica with its own seed and EnsembleTerm
     (so initial energies already include the replica's P·V term).  Stacks the
     per-replica arrays along axis 0 to produce ``(n_total, K, ...)`` pytrees,
     then runs a single consolidated PmapVmapRuns finalize so that resolver,
@@ -1546,24 +1549,22 @@ def _resolve_multi_replica(
     base_backend = root.backend.build_backend()
     backend_cfg = root.backend.to_backend_config()
 
-    # Soft-core repulsion wrapper applied closest to the bare backend so
-    # the per-replica EnsembleBackend (PV term) sits outside it.  Mutates
-    # ``base_backend`` so the per-replica EnsembleBackend wrap below and
-    # the runtime in ``run_multi_gpu_from_config`` both inherit it.
+    # Soft-core repulsion term.  Rebinds ``base_backend`` so the
+    # per-replica EnsembleTerm below and the runtime in
+    # ``run_multi_gpu_from_config`` both inherit it.
+    base_backend = Hamiltonian(base_backend)
     if backend_cfg.softcore_repulsion is not None:
-        from jaxrens.backends.softcore import SoftCoreBackend
+        from jaxrens.backends.softcore import SoftCoreTerm
 
-        base_backend = SoftCoreBackend(
-            base_backend,
-            **backend_cfg.softcore_repulsion,
+        base_backend = base_backend.with_terms(
+            SoftCoreTerm(**backend_cfg.softcore_repulsion)
         )
 
-    # Build a per-replica EnsembleBackend for the *rejection-mode*
+    # A per-replica EnsembleTerm is added below for the *rejection-mode*
     # ceiling check inside ``_sample_per_walker_positions`` (grid mode
     # doesn't use it).  The actual initial-energy compute is deferred
     # to a single consolidated call below — per-replica pressure flows
     # through ``ensemble_params`` rather than separate backend objects.
-    from jaxrens.backends.ensemble import EnsembleBackend
 
     # --- Multi-replica restart: load once, slice per replica --------------
     # When ``init.restart_file`` is set, every replica's positions / cells /
@@ -1643,7 +1644,7 @@ def _resolve_multi_replica(
             )
         else:
             per_run_backend = (
-                EnsembleBackend(base_backend, pressure=float(p))
+                base_backend.with_terms(EnsembleTerm(pressure=float(p)))
                 if p is not None
                 else base_backend
             )
@@ -1715,8 +1716,8 @@ def _resolve_multi_replica(
     # Thread the per-replica ensemble params the runtime NS loop uses
     # (``ensemble_params_per_run``) into the consolidated initial-energy
     # compute, so resolved initial energies include the same P·V and −μ·N
-    # terms the EnsembleBackend applies at runtime — matching by construction.
-    # ``EnsembleBackend`` reads exactly these keys; others (e.g.
+    # terms the EnsembleTerm applies at runtime — matching by construction.
+    # ``EnsembleTerm`` reads exactly these keys; others (e.g.
     # ``target_composition``) are not energy terms and are not threaded.
     _ENERGY_KEYS = ("pressure", "chemical_potentials")
     ensemble_params_batched = _stack_ensemble_params(
@@ -1724,10 +1725,10 @@ def _resolve_multi_replica(
     )
 
     # If any replica carries an energy-relevant ensemble param, all replicas
-    # share one EnsembleBackend wrapper and their per-replica params flow
-    # through ``ensemble_params``; otherwise use the raw base backend.
+    # share one EnsembleTerm and their per-replica params flow through
+    # ``ensemble_params``; otherwise use the base Hamiltonian as is.
     if ensemble_params_batched is not None:
-        finalize_backend = EnsembleBackend(base_backend, pressure=0.0)
+        finalize_backend = base_backend.with_terms(EnsembleTerm(pressure=0.0))
     else:
         finalize_backend = base_backend
 

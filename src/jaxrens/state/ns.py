@@ -13,7 +13,7 @@ dead-point buffer.
 
 NSState is ensemble-agnostic — it doesn't know about pressure, chemical
 potentials, or ensemble type. The full ensemble potential is stored in
-MCState.energy (via EnsembleBackend), and ns_step reads it directly.
+MCState.energy (via EnsembleTerm), and ns_step reads it directly.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ class NSState:
     """Algorithm-only state of a nested sampling run.
 
     Ensemble-agnostic: MCState.energy is the full potential (U, H, Ω, ...),
-    computed by the backend (possibly wrapped in EnsembleBackend).
+    computed by the backend (possibly including an EnsembleTerm).
 
     Shape annotations use a variadic batch prefix ``*B`` to cover all three
     BatchDescriptor topologies: SingleRun (``*B = ()``), VmapRuns

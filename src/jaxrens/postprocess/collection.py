@@ -170,7 +170,7 @@ class MonitorCollection:
 
         Convention: stored energies are treated as the full thermal variable
         (``dead_volumes = live_volumes = None``).  When the run used
-        ``EnsembleBackend``, the stored energy is the NPT enthalpy
+        an ``EnsembleTerm``, the stored energy is the NPT enthalpy
         ``H = U + P*V``, so leaving volumes ``None`` yields
         ``log Z_NPT`` / ``Cp`` / Gibbs ``G`` directly from the standard
         thermodynamics functions (passing the bare cell volume column would

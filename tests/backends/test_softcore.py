@@ -1,7 +1,9 @@
-"""Tests for the backend-agnostic SoftCoreBackend wrapper.
+"""Tests for the backend-agnostic soft-core term (``SoftCoreTerm``).
 
-The wrapper adds a fixed (parameter-free) repulsive Morse term to any
-EnergyBackend.  Tests confirm:
+``SoftCoreBackend(base)`` is the convenience factory for
+``Hamiltonian(base, [SoftCoreTerm()])``.  The term adds a fixed
+(parameter-free) repulsive Morse contribution to any EnergyBackend.
+Tests confirm:
 
 1. The pure-function ``_softcore_energy`` matches the analytic Morse
    formula on hand-built two-atom configurations.
@@ -12,7 +14,7 @@ EnergyBackend.  Tests confirm:
 5. ``jax.jit`` and ``jax.vmap`` are both compatible.
 6. Composition with ``EnsembleBackend`` (NPT stack) returns
    ``U + E_core + P * V``.
-7. ``__getattr__`` forwards unknown attributes to the base backend.
+7. Model attributes are reached via ``.model`` (no ``__getattr__`` forwarding).
 8. Close-contact pairs incur a strong, finite penalty.
 9. The schema mutex on NeuralILBackendSpec rejects the
    ``softcore: true`` + ``softcore_repulsion: {...}`` combo.
@@ -265,14 +267,15 @@ class TestSoftCoreBackendWrapper:
         E_base_far = base(batch[2], species, cell, 0).energy
         assert float(Es[2]) == pytest.approx(float(E_base_far), rel=1e-5)
 
-    def test_attr_forwarding(self):
-        """Unknown attribute lookups fall through to the base."""
+    def test_model_reached_explicitly(self):
+        """The model is reached via ``.model``; attributes are not forwarded."""
         base = HarmonicBackend(k=3.0)
         wrapped = SoftCoreBackend(base)
         # ``r_cutoff`` is mirrored explicitly.
         assert wrapped.r_cutoff == base.r_cutoff
-        # ``k`` is base-only; __getattr__ should find it.
-        assert wrapped.k == 3.0
+        assert wrapped.model.k == 3.0
+        with pytest.raises(AttributeError):
+            wrapped.k  # noqa: B018
 
     def test_compose_with_ensemble_backend(self):
         """EnsembleBackend(SoftCoreBackend(base)) returns U + E_core + P*V."""
