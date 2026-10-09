@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Union
 import jax.numpy as jnp
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from jaxrens.backends.hamiltonian import unwrap_model
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import (
     alchemical,
@@ -136,16 +137,25 @@ class BaseMoveSpec(BaseModel):
         self,
         n_atoms: int | None = None,
         cell_cfg: "CellSpec | None" = None,
+        *,
         symbol_map: dict[int, str] | None = None,
+        reference_positions: Any = None,
+        reference_cell: Any = None,
+        backend: Any = None,
     ) -> dict[str, Any]:
         """Return kernel keyword arguments.
 
-        Simple move specs ignore ``n_atoms``, ``cell_cfg`` and ``symbol_map``.
-        Cell-move specs (volume, shear, stretch) and sweep specs use the first
-        two to populate ``n_atoms`` / cell-geometry bounds from the
-        resolver-provided values rather than duplicating those fields on the
-        spec; species-scoped specs use the third to map element symbols to
-        type codes.
+        Simple move specs ignore every argument.  Cell-move specs (volume,
+        shear, stretch) and sweep specs use ``n_atoms``/``cell_cfg`` to
+        populate cell-geometry bounds from the resolver-provided values
+        rather than duplicating those fields on the spec; species-scoped
+        specs use ``symbol_map`` to map element symbols to type codes.
+        Local-update-capable specs (``species_swap``, ``single_atom``,
+        ``single_atom_sweep``, ``alchemical_morph``) use
+        ``reference_positions``/``reference_cell``/``backend`` to resolve a
+        default ``max_neighbors`` (hence ``max_affected``) when
+        ``local_update: true`` is set and ``max_neighbors`` isn't given
+        explicitly — see ``_build_local_update_kwargs``.
 
         Args:
             n_atoms: Number of atoms, derived from the resolved initial
@@ -154,10 +164,26 @@ class BaseMoveSpec(BaseModel):
                 ``None`` is accepted by specs that don't need it.
             symbol_map: ``{type_code: element_symbol}`` for the resolved
                 system.  ``None`` is accepted by specs that don't need it.
+            reference_positions: The resolved initial positions for one
+                walker (host array), used only by local-update-capable
+                specs to derive a default ``max_neighbors``.
+            reference_cell: The resolved initial cell for one walker,
+                paired with ``reference_positions``.
+            backend: The resolved (possibly term-wrapped) energy backend,
+                used only to probe ``max_neighbors_for``/local energy
+                capability when resolving ``local_update: true`` defaults.
         """
         return {}
 
-    def _extra_state_fields(self) -> dict[str, tuple[type, Callable]]:
+    def _extra_state_fields(
+        self, backend: Any = None
+    ) -> dict[str, tuple[type, Callable]]:
+        """Return this move's ``MCState`` extra fields.
+
+        ``backend`` is only needed by local-update-capable specs, to size
+        ``term_energies`` from ``len(backend.terms)`` (see
+        ``_local_update_extra_state_fields``); every other spec ignores it.
+        """
         return {}
 
     def _reject_reasons(self) -> frozenset[str]:
@@ -181,12 +207,26 @@ class BaseMoveSpec(BaseModel):
         """
         return frozenset({"positions"})
 
+    def _affects(self) -> str:
+        """Structural locality declaration for ``MoveKernel.affects``.
+
+        ``"all"`` by default — override to ``"local"`` only for moves that
+        structurally touch a bounded, small set of atoms (see the
+        ``MoveKernel.affects`` docstring). Independent of whether
+        ``local_update`` is actually enabled; ``to_descriptor`` combines
+        the two.
+        """
+        return "all"
+
     def to_descriptor(
         self,
         *,
         n_atoms: int | None = None,
         cell_cfg: "CellSpec | None" = None,
         symbol_map: dict[int, str] | None = None,
+        reference_positions: Any = None,
+        reference_cell: Any = None,
+        backend: Any = None,
     ) -> MoveKernel:
         """Produce the ``MoveKernel`` for ``build_mwg``.
 
@@ -203,19 +243,126 @@ class BaseMoveSpec(BaseModel):
             symbol_map: ``{type_code: element_symbol}`` for the resolved
                 system, as carried by ``ResolvedInit``.  Only species-scoped
                 specs (``gmc`` with ``species``) need it; all others ignore it.
+            reference_positions, reference_cell, backend: Forwarded to
+                ``_kernel_kwargs`` — see its docstring. Ignored by every
+                move spec that isn't local-update-capable.
         """
         return MoveKernel(
             name=self._effective_name(),
             build_kernel=self._build_kernel(),
             kernel_kwargs=self._kernel_kwargs(
-                n_atoms=n_atoms, cell_cfg=cell_cfg, symbol_map=symbol_map
+                n_atoms=n_atoms,
+                cell_cfg=cell_cfg,
+                symbol_map=symbol_map,
+                reference_positions=reference_positions,
+                reference_cell=reference_cell,
+                backend=backend,
             ),
             weight=self.weight,
             step_size=self.step_size,
-            extra_state_fields=self._extra_state_fields(),
+            extra_state_fields=self._extra_state_fields(backend=backend),
             reject_reasons=self._reject_reasons(),
             mutates=self._mutates(),
+            affects=self._affects(),
         )
+
+
+def _build_local_update_kwargs(
+    *,
+    spec_name: str,
+    backend: Any,
+    reference_positions: Any,
+    reference_cell: Any,
+    max_neighbors: int | None,
+    max_neighbors_margin: int,
+) -> dict[str, Any]:
+    """Shared ``local_update: true`` wiring for all four local moves.
+
+    Resolves ``max_neighbors`` from the backend's own coordination-number
+    probe when not given explicitly (used by each move spec to derive its
+    own default ``max_affected``, since the right formula differs by move
+    — whether the touched atom's position itself changes).
+
+    The periodic-image geometry itself is NOT built here any more: every
+    local move kernel now rebuilds it at every proposal from the CURRENT
+    ``state.image_bucket`` (a static field managed by the image-count
+    bucket ladder — see ``sampling/bucket_manager.py`` and
+    ``sampling/neighbor_list.py::build_symmetric_image_offsets``), so it
+    stays correct even if the cell changes after this resolve-time call
+    (a volume move, or per-walker cell diversity). This function's only
+    remaining geometry-independent job is resolving ``max_neighbors``.
+    """
+    if backend is None:
+        raise ValueError(
+            f"{spec_name}: local_update=True requires the resolver to "
+            "supply backend to to_descriptor() (internal wiring error if "
+            "this is user-visible)."
+        )
+    # ``backend`` may be a bare model or a Hamiltonian wrapping one with
+    # EnergyTerms (SoftCoreTerm, EnsembleTerm, …) — Hamiltonian deliberately
+    # does not forward attribute access to its model (see
+    # backends/hamiltonian.py), so every model-specific capability probe
+    # below must go through the unwrapped model, never ``backend`` itself.
+    model = unwrap_model(backend)
+    if not hasattr(model, "atomic_energies_for"):
+        raise ValueError(
+            f"{spec_name}: local_update=True requires a backend whose model "
+            f"implements atomic_energies_for (e.g. NeuralIL); got "
+            f"{type(model).__name__}."
+        )
+
+    resolved_max_neighbors = max_neighbors
+    if resolved_max_neighbors is None:
+        probe = getattr(model, "max_neighbors_for", None)
+        if (
+            probe is None
+            or reference_positions is None
+            or reference_cell is None
+        ):
+            raise ValueError(
+                f"{spec_name}: local_update=True needs max_neighbors set "
+                "explicitly, since the backend has no max_neighbors_for "
+                "to derive a default from."
+            )
+        resolved_max_neighbors = int(
+            probe(reference_positions, reference_cell)
+        ) + (max_neighbors_margin)
+
+    return {"_resolved_max_neighbors": resolved_max_neighbors}
+
+
+def _local_update_extra_state_fields(
+    backend: Any,
+) -> dict[str, tuple[type, Callable]]:
+    """Shared ``MCState`` extra fields for every ``local_update: true`` move.
+
+    ``atomic_energies``/``raw_energy`` cache the bare model's per-atom
+    decomposition (see ``sampling/local_energy.py::local_energy_update``).
+    ``term_energies`` caches one scalar per ``EnergyTerm`` on ``backend``
+    (``SoftCoreTerm``, ``EnsembleTerm``, …; see
+    ``sampling/local_energy.py::patch_term_energies``) — sized from
+    ``len(backend.terms)`` here, at descriptor-build time, since the
+    generic ``extra_state_fields`` initializer signature
+    ``(positions, types) -> value`` has no backend access itself.  All three
+    start at a zero-valued placeholder; ``sampling/local_energy.py::seed_local_energy_cache``
+    must be called right after ``init_fn`` to fill in real values (same
+    requirement for all three, not just the first two).
+    """
+    n_terms = len(getattr(backend, "terms", ()))
+    return {
+        "atomic_energies": (
+            jnp.ndarray,
+            lambda positions, types: jnp.zeros(positions.shape[0]),
+        ),
+        "raw_energy": (
+            jnp.ndarray,
+            lambda positions, types: jnp.asarray(0.0),
+        ),
+        "term_energies": (
+            jnp.ndarray,
+            lambda positions, types, n=n_terms: jnp.zeros(n),
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +519,7 @@ class GMCMoveSpec(BaseMoveSpec):
         n_atoms: int | None = None,
         cell_cfg: "CellSpec | None" = None,
         symbol_map: dict[int, str] | None = None,
+        **_ignored: Any,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"n_reflect": self.n_reflect}
         # Only emit the scoping kwargs when the move is actually scoped: the
@@ -385,7 +533,9 @@ class GMCMoveSpec(BaseMoveSpec):
             kwargs["direction_field"] = self._direction_field()
         return kwargs
 
-    def _extra_state_fields(self) -> dict[str, tuple[type, Callable]]:
+    def _extra_state_fields(
+        self, backend: Any = None
+    ) -> dict[str, tuple[type, Callable]]:
         return {
             self._direction_field(): (
                 jnp.ndarray,
@@ -430,7 +580,7 @@ class HMCMoveSpec(BaseMoveSpec):
         self,
         n_atoms: int | None = None,
         cell_cfg: "CellSpec | None" = None,
-        symbol_map: dict[int, str] | None = None,
+        **_ignored: Any,
     ) -> dict[str, Any]:
         return {"n_leapfrog": self.n_leapfrog}
 
@@ -454,9 +604,77 @@ class SingleAtomMoveSpec(BaseMoveSpec):
         default="single_atom",
         description="Discriminator selecting this move.",
     )
+    local_update: bool = Field(
+        default=False,
+        description=(
+            "Patch a per-atom energy cache for just the moved atom's "
+            "neighborhood instead of recomputing the whole system. "
+            "Requires a backend with single-cutoff local energy capability "
+            "(NeuralIL today) — falls back to full recompute with a logged "
+            "warning otherwise."
+        ),
+    )
+    max_neighbors: int | None = Field(
+        default=None,
+        description=(
+            "Explicit neighbor-count bound used to size the local-update "
+            "buffer. Derived automatically from the backend when omitted."
+        ),
+    )
+    max_affected: int | None = Field(
+        default=None,
+        description=(
+            "Explicit upper bound on the number of atoms the local-update "
+            "cache patch can touch per proposal. Derived automatically from "
+            "``max_neighbors`` when omitted."
+        ),
+    )
 
     def _build_kernel(self) -> Callable:
         return single_atom.build_kernel
+
+    def _affects(self) -> str:
+        return "local" if self.local_update else "all"
+
+    def _extra_state_fields(
+        self, backend: Any = None
+    ) -> dict[str, tuple[type, Callable]]:
+        if not self.local_update:
+            return {}
+        return _local_update_extra_state_fields(backend)
+
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        *,
+        reference_positions: Any = None,
+        reference_cell: Any = None,
+        backend: Any = None,
+        **_ignored: Any,
+    ) -> dict[str, Any]:
+        if not self.local_update:
+            return {}
+        built = _build_local_update_kwargs(
+            spec_name="single_atom",
+            backend=backend,
+            reference_positions=reference_positions,
+            reference_cell=reference_cell,
+            max_neighbors=self.max_neighbors,
+            max_neighbors_margin=4,
+        )
+        resolved_max_neighbors = built.pop("_resolved_max_neighbors")
+        # The moved atom + neighbors under its old position + neighbors
+        # under its new position (a union, so up to 2x a typical
+        # coordination number in the worst case where the two sets are
+        # disjoint).
+        default_max_affected = 1 + 2 * resolved_max_neighbors
+        max_affected = (
+            self.max_affected
+            if self.max_affected is not None
+            else default_max_affected
+        )
+        return {**built, "max_affected": max_affected}
 
 
 class SingleAtomSweepMoveSpec(BaseMoveSpec):
@@ -480,15 +698,38 @@ class SingleAtomSweepMoveSpec(BaseMoveSpec):
         default="single_atom_sweep",
         description="Discriminator selecting this move.",
     )
+    local_update: bool = Field(
+        default=False,
+        description=(
+            "Same meaning as ``single_atom.local_update``, applied to every "
+            "atom in the sweep."
+        ),
+    )
+    max_neighbors: int | None = Field(default=None)
+    max_affected: int | None = Field(default=None)
 
     def _build_kernel(self) -> Callable:
         return single_atom.build_sweep_kernel
+
+    def _affects(self) -> str:
+        return "local" if self.local_update else "all"
+
+    def _extra_state_fields(
+        self, backend: Any = None
+    ) -> dict[str, tuple[type, Callable]]:
+        if not self.local_update:
+            return {}
+        return _local_update_extra_state_fields(backend)
 
     def _kernel_kwargs(
         self,
         n_atoms: int | None = None,
         cell_cfg: "CellSpec | None" = None,
-        symbol_map: dict[int, str] | None = None,
+        *,
+        reference_positions: Any = None,
+        reference_cell: Any = None,
+        backend: Any = None,
+        **_ignored: Any,
     ) -> dict[str, Any]:
         if n_atoms is None:
             raise ValueError(
@@ -496,7 +737,25 @@ class SingleAtomSweepMoveSpec(BaseMoveSpec):
                 "be provided by the resolver (derived from init positions). "
                 "Call to_descriptor(n_atoms=...) with the atom count."
             )
-        return {"n_atoms": n_atoms}
+        kwargs: dict[str, Any] = {"n_atoms": n_atoms}
+        if not self.local_update:
+            return kwargs
+        built = _build_local_update_kwargs(
+            spec_name="single_atom_sweep",
+            backend=backend,
+            reference_positions=reference_positions,
+            reference_cell=reference_cell,
+            max_neighbors=self.max_neighbors,
+            max_neighbors_margin=4,
+        )
+        resolved_max_neighbors = built.pop("_resolved_max_neighbors")
+        default_max_affected = 1 + 2 * resolved_max_neighbors
+        max_affected = (
+            self.max_affected
+            if self.max_affected is not None
+            else default_max_affected
+        )
+        return {**kwargs, **built, "max_affected": max_affected}
 
 
 class SpeciesSwapMoveSpec(BaseMoveSpec):
@@ -535,6 +794,18 @@ class SpeciesSwapMoveSpec(BaseMoveSpec):
             "auto-named ``species_swap_<symbols>``."
         ),
     )
+    local_update: bool = Field(
+        default=False,
+        description=(
+            "Patch a per-atom energy cache for just the two swapped atoms' "
+            "neighborhoods instead of recomputing the whole system. "
+            "Requires a backend with single-cutoff local energy capability "
+            "(NeuralIL today) — falls back to full recompute with a logged "
+            "warning otherwise."
+        ),
+    )
+    max_neighbors: int | None = Field(default=None)
+    max_affected: int | None = Field(default=None)
 
     @field_validator("species", mode="before")
     @classmethod
@@ -585,11 +856,26 @@ class SpeciesSwapMoveSpec(BaseMoveSpec):
             return "species_swap_" + "_".join(self.species)
         return self.type
 
+    def _affects(self) -> str:
+        return "local" if self.local_update else "all"
+
+    def _extra_state_fields(
+        self, backend: Any = None
+    ) -> dict[str, tuple[type, Callable]]:
+        if not self.local_update:
+            return {}
+        return _local_update_extra_state_fields(backend)
+
     def _kernel_kwargs(
         self,
         n_atoms: int | None = None,
         cell_cfg: "CellSpec | None" = None,
+        *,
         symbol_map: dict[int, str] | None = None,
+        reference_positions: Any = None,
+        reference_cell: Any = None,
+        backend: Any = None,
+        **_ignored: Any,
     ) -> dict[str, Any]:
         if symbol_map is None:
             raise ValueError(
@@ -610,7 +896,25 @@ class SpeciesSwapMoveSpec(BaseMoveSpec):
                     f"whose element is absent would never accept."
                 )
             kwargs["species"] = tuple(code_of[s] for s in self.species)
-        return kwargs
+        if not self.local_update:
+            return kwargs
+        built = _build_local_update_kwargs(
+            spec_name="species_swap",
+            backend=backend,
+            reference_positions=reference_positions,
+            reference_cell=reference_cell,
+            max_neighbors=self.max_neighbors,
+            max_neighbors_margin=4,
+        )
+        resolved_max_neighbors = built.pop("_resolved_max_neighbors")
+        # Two touched atoms, positions unchanged (no old/new doubling).
+        default_max_affected = 2 + 2 * resolved_max_neighbors
+        max_affected = (
+            self.max_affected
+            if self.max_affected is not None
+            else default_max_affected
+        )
+        return {**kwargs, **built, "max_affected": max_affected}
 
 
 class VolumeMoveSpec(BaseMoveSpec):
@@ -649,7 +953,7 @@ class VolumeMoveSpec(BaseMoveSpec):
         self,
         n_atoms: int | None = None,
         cell_cfg: "CellSpec | None" = None,
-        symbol_map: dict[int, str] | None = None,
+        **_ignored: Any,
     ) -> dict[str, Any]:
         if n_atoms is None:
             raise ValueError(
@@ -704,7 +1008,7 @@ class ShearMoveSpec(BaseMoveSpec):
         self,
         n_atoms: int | None = None,
         cell_cfg: "CellSpec | None" = None,
-        symbol_map: dict[int, str] | None = None,
+        **_ignored: Any,
     ) -> dict[str, Any]:
         if n_atoms is None:
             raise ValueError(
@@ -756,7 +1060,7 @@ class StretchMoveSpec(BaseMoveSpec):
         self,
         n_atoms: int | None = None,
         cell_cfg: "CellSpec | None" = None,
-        symbol_map: dict[int, str] | None = None,
+        **_ignored: Any,
     ) -> dict[str, Any]:
         if n_atoms is None:
             raise ValueError(
@@ -799,6 +1103,18 @@ class AlchemicalMorphMoveSpec(BaseMoveSpec):
             "the species count of the initialised system."
         ),
     )
+    local_update: bool = Field(
+        default=False,
+        description=(
+            "Patch a per-atom energy cache for just the morphed atom's "
+            "neighborhood instead of recomputing the whole system. "
+            "Requires a backend with single-cutoff local energy capability "
+            "(NeuralIL today) — falls back to full recompute with a logged "
+            "warning otherwise."
+        ),
+    )
+    max_neighbors: int | None = Field(default=None)
+    max_affected: int | None = Field(default=None)
     # NOTE: n_species could in principle be derived from len(symbol_map) in
     # init_resolved, but that would require threading symbol_map through the
     # resolver to to_descriptor().  Since it is single-valued and small, keeping
@@ -811,12 +1127,45 @@ class AlchemicalMorphMoveSpec(BaseMoveSpec):
         self,
         n_atoms: int | None = None,
         cell_cfg: "CellSpec | None" = None,
-        symbol_map: dict[int, str] | None = None,
+        *,
+        reference_positions: Any = None,
+        reference_cell: Any = None,
+        backend: Any = None,
+        **_ignored: Any,
     ) -> dict[str, Any]:
-        return {"n_species": self.n_species}
+        kwargs: dict[str, Any] = {"n_species": self.n_species}
+        if not self.local_update:
+            return kwargs
+        built = _build_local_update_kwargs(
+            spec_name="alchemical_morph",
+            backend=backend,
+            reference_positions=reference_positions,
+            reference_cell=reference_cell,
+            max_neighbors=self.max_neighbors,
+            max_neighbors_margin=4,
+        )
+        resolved_max_neighbors = built.pop("_resolved_max_neighbors")
+        # One touched atom, position unchanged (no old/new doubling).
+        default_max_affected = 1 + resolved_max_neighbors
+        max_affected = (
+            self.max_affected
+            if self.max_affected is not None
+            else default_max_affected
+        )
+        return {**kwargs, **built, "max_affected": max_affected}
 
     def _mutates(self) -> frozenset[str]:
         return frozenset({"types"})
+
+    def _affects(self) -> str:
+        return "local" if self.local_update else "all"
+
+    def _extra_state_fields(
+        self, backend: Any = None
+    ) -> dict[str, tuple[type, Callable]]:
+        if not self.local_update:
+            return {}
+        return _local_update_extra_state_fields(backend)
 
 
 class Lattice1DMoveSpec(BaseMoveSpec):
@@ -852,7 +1201,7 @@ class Lattice1DMoveSpec(BaseMoveSpec):
         self,
         n_atoms: int | None = None,
         cell_cfg: "CellSpec | None" = None,
-        symbol_map: dict[int, str] | None = None,
+        **_ignored: Any,
     ) -> dict[str, Any]:
         if n_atoms is None or cell_cfg is None:
             raise ValueError(

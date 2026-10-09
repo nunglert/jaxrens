@@ -83,6 +83,13 @@ import jax.numpy as jnp
 from jaxtyping import Array, Int
 
 from jaxrens.sampling.base import MoveInfo
+from jaxrens.sampling.local_energy import local_energy_update, patch_term_energies
+from jaxrens.sampling.neighbor_list import (
+    affected_indices_from_mask,
+    build_symmetric_image_offsets,
+    image_count_needed_for,
+    local_affected_mask,
+)
 from jaxrens.unvalidated import unvalidated
 
 
@@ -120,6 +127,7 @@ def build_kernel(
     backend: Any,
     n_species: int,
     species: Sequence[int] | None = None,
+    max_affected: int | None = None,
 ):
     """Build a species-swap kernel.
 
@@ -129,6 +137,19 @@ def build_kernel(
         species: Type codes this move may exchange.  ``None`` (the default)
             allows every species.  At least two distinct codes are required
             — a one-species scope could never produce a swap.
+        max_affected: Static upper bound on the size of "the two touched
+            atoms plus their neighbors". When given, the kernel patches a
+            per-atom energy cache (``state.atomic_energies``/
+            ``state.raw_energy``) incrementally instead of recomputing the
+            whole system's energy — the affected set is recomputed fresh
+            every proposal from CURRENT ``state.positions``/``state.cell``
+            (see ``sampling/neighbor_list.py::local_affected_mask``), and
+            the periodic-image geometry itself is rebuilt every proposal
+            from the CURRENT ``state.image_bucket`` (see
+            ``sampling/bucket_manager.py``), so this stays correct even if
+            another move in the same set changes positions or cell.
+            Requires a backend that declares ``kind="single_cutoff"``
+            local energy capability (checked by ``build_mwg``, not here).
 
     Returns:
         step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
@@ -137,6 +158,10 @@ def build_kernel(
         ValueError: If ``n_species < 2``, or if ``species`` names fewer than
             two distinct codes or a code outside ``[0, n_species)``.
     """
+    local_update = max_affected is not None
+    if local_update:
+        r_cutoff = backend.r_cutoff
+
     if n_species < 2:
         raise ValueError(
             f"swap.build_kernel requires n_species >= 2, got {n_species}. "
@@ -224,36 +249,118 @@ def build_kernel(
         # code_lo != code_hi, so idx_lo != idx_hi and the two writes commute.
         new_types = types.at[idx_lo].set(code_hi).at[idx_hi].set(code_lo)
 
-        result = backend(
+        if not local_update:
+            result = backend(
+                state.positions,
+                new_types,
+                state.cell,
+                state.max_neighbors,
+                ensemble_params=state.ensemble_params,
+            )
+
+            # ``energy < constraint`` (not ``>= constraint`` negated) so a
+            # NaN energy rejects: NaN fails every comparison, and the
+            # accept-shaped test is the one where that failure lands on
+            # "reject".
+            accepted = (result.energy < likelihood_constraint) & has_pair
+
+            new_state = state.set(
+                types=jnp.where(accepted, new_types, types),
+                energy=jnp.where(accepted, result.energy, state.energy),
+                # Neighbour-list diagnostics describe the configuration that
+                # was actually evaluated, so they survive rejection — except
+                # in the no-pair case, where the evaluated types are
+                # meaningless.
+                max_neighbor_count=jnp.maximum(
+                    state.max_neighbor_count,
+                    jnp.where(has_pair, result.max_neighbor_count, 0),
+                ),
+                overflow=state.overflow | (result.overflow & has_pair),
+            )
+
+            info = MoveInfo(
+                accepted=accepted,
+                log_likelihood=-new_state.energy,
+                n_evaluations=1,
+                reject_reason=jnp.where(accepted, 0, 1).astype(jnp.int32),
+            )
+
+            return new_state, info
+
+        # --- Local/incremental path: no full-system backend call ---
+        image_offsets = build_symmetric_image_offsets(state.image_bucket)
+        image_count_needed = image_count_needed_for(state.cell, r_cutoff)
+        image_overflow = image_count_needed > state.image_bucket
+
+        touched = jnp.array([idx_lo, idx_hi])
+        mask = local_affected_mask(
+            touched, state.positions, state.cell, r_cutoff, image_offsets
+        )
+        affected, overflow = affected_indices_from_mask(mask, max_affected)
+
+        delta_U, new_local_vec = local_energy_update(
+            backend,
+            state.atomic_energies,
+            affected,
             state.positions,
             new_types,
             state.cell,
             state.max_neighbors,
-            ensemble_params=state.ensemble_params,
+        )
+        new_raw_energy = state.raw_energy + delta_U
+
+        new_term_energies = patch_term_energies(
+            backend,
+            state.term_energies,
+            touched,
+            state.positions,
+            types,
+            state.positions,
+            new_types,
+            state.cell,
+            state.ensemble_params,
+        )
+        new_energy = new_raw_energy + jnp.sum(new_term_energies)
+
+        # Overflow (either the affected set didn't fit max_affected, or the
+        # image bucket was too small for the current cell) means the
+        # computed delta can't be trusted — reject rather than risk a
+        # silently-wrong energy, same as the full-recompute path rejects on
+        # ``~has_pair`` rather than trusting a degenerate evaluation.
+        accepted = (
+            (new_energy < likelihood_constraint)
+            & has_pair
+            & ~overflow
+            & ~image_overflow
         )
 
-        # ``energy < constraint`` (not ``>= constraint`` negated) so a NaN
-        # energy rejects: NaN fails every comparison, and the accept-shaped
-        # test is the one where that failure lands on "reject".
-        accepted = (result.energy < likelihood_constraint) & has_pair
+        new_atomic_energies = state.atomic_energies.at[affected].set(
+            new_local_vec, mode="drop"
+        )
 
         new_state = state.set(
             types=jnp.where(accepted, new_types, types),
-            energy=jnp.where(accepted, result.energy, state.energy),
-            # Neighbour-list diagnostics describe the configuration that was
-            # actually evaluated, so they survive rejection — except in the
-            # no-pair case, where the evaluated types are meaningless.
-            max_neighbor_count=jnp.maximum(
-                state.max_neighbor_count,
-                jnp.where(has_pair, result.max_neighbor_count, 0),
+            energy=jnp.where(accepted, new_energy, state.energy),
+            atomic_energies=jnp.where(
+                accepted, new_atomic_energies, state.atomic_energies
             ),
-            overflow=state.overflow | (result.overflow & has_pair),
+            raw_energy=jnp.where(accepted, new_raw_energy, state.raw_energy),
+            term_energies=jnp.where(
+                accepted, new_term_energies, state.term_energies
+            ),
+            # Unconditional (not gated by accepted/has_pair): depends only
+            # on the current cell geometry, not on which pair was drawn, so
+            # it stays valid even in the no-pair case.
+            image_count_needed=jnp.maximum(
+                state.image_count_needed, image_count_needed
+            ),
+            image_overflow=state.image_overflow | image_overflow,
         )
 
         info = MoveInfo(
             accepted=accepted,
             log_likelihood=-new_state.energy,
-            n_evaluations=1,
+            n_evaluations=0,
             reject_reason=jnp.where(accepted, 0, 1).astype(jnp.int32),
         )
 

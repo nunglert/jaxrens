@@ -35,6 +35,8 @@ def _make_state(positions, types, energy, cell=None, step_size=0.1):
         n_proposed=jnp.zeros(1, dtype=jnp.int32),
         max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
         overflow=jnp.asarray(False),
+        image_count_needed=jnp.zeros_like(jnp.asarray(0, dtype=jnp.int32)),
+        image_overflow=jnp.zeros_like(jnp.asarray(False)),
         ensemble_params={},
     )
 
@@ -55,6 +57,8 @@ def _make_batch_state(positions, types, energies, step_size=0.1):
         n_proposed=jnp.zeros((n, 1), dtype=jnp.int32),
         max_neighbor_count=jnp.zeros(n, dtype=jnp.int32),
         overflow=jnp.full(n, False),
+        image_count_needed=jnp.zeros_like(jnp.zeros(n, dtype=jnp.int32)),
+        image_overflow=jnp.zeros_like(jnp.full(n, False)),
         ensemble_params={},
     )
 
@@ -307,3 +311,4 @@ class TestAtomMorph:
                 break
 
         assert changed, "Morph should accept at least once in 50 tries"
+

@@ -85,6 +85,28 @@ class EnergyTerm:
         )
         return e, -g
 
+    def local_energy_delta(
+        self,
+        touched_idx: jnp.ndarray,
+        old_positions: jnp.ndarray,
+        old_types: jnp.ndarray,
+        new_positions: jnp.ndarray,
+        new_types: jnp.ndarray,
+        cell: jnp.ndarray,
+        ensemble_params: dict[str, Any] | None = None,
+    ) -> jnp.ndarray | None:
+        """This term's exact energy change for a proposal touching only
+        ``touched_idx``, computed without re-evaluating the whole system.
+
+        Returns ``None`` when this term has no incremental path — the caller
+        (``jaxrens.sampling.local_energy.patch_term_energies``) then falls
+        back to ``energy(new) - energy(old)`` for this term alone, which
+        stays correct but pays this term's full cost.  A term whose
+        ``energy`` is already cheap (e.g. :class:`~jaxrens.backends.ensemble.EnsembleTerm`,
+        O(1) in the number of atoms) has no reason to override this.
+        """
+        return None
+
 
 class Hamiltonian:
     """Energy model plus additive terms; satisfies the EnergyBackend protocol.

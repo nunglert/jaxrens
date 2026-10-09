@@ -163,22 +163,36 @@ class BaseBackendSpec(BaseModel):
         ),
     )
 
-    @field_validator("max_neighbors_list")
+    # Second, independent bucket-ladder dimension: the periodic-image
+    # half-width used by local-update move kernels (single_atom_swap,
+    # alchemical_morph, single_atom, single_atom_sweep — see
+    # sampling/neighbor_list.py::build_symmetric_image_offsets). Same
+    # overflow-and-retry mechanism as max_neighbors_list/offset/
+    # shrink_dwell above, just applied to a different field triple so the
+    # two ladders never conflict. Inert (never triggers) when no move has
+    # ``local_update: true``.
+    image_neighbors_list: list[int] = Field(
+        default_factory=lambda: [1, 2, 3, 4, 6, 8, 12]
+    )
+    image_neighbors_offset: int = Field(default=1, ge=0)
+    image_neighbors_shrink_dwell: int = Field(default=0, ge=0)
+
+    @field_validator("max_neighbors_list", "image_neighbors_list")
     @classmethod
-    def _ladder_is_sorted_and_positive(cls, v: list[int]) -> list[int]:
+    def _ladder_is_sorted_and_positive(cls, v: list[int], info) -> list[int]:
         if len(v) == 0:
             raise ValueError(
-                "backend.max_neighbors_list is empty. It is the neighbour-"
-                "list capacity ladder the run climbs on overflow, so it needs "
-                "at least one entry, e.g. max_neighbors_list: [64, 96, 128]."
+                f"backend.{info.field_name} is empty. It is a capacity "
+                "ladder the run climbs on overflow, so it needs at least "
+                f"one entry, e.g. {info.field_name}: [64, 96, 128]."
             )
         if any(x <= 0 for x in v):
             raise ValueError(
-                f"max_neighbors_list entries must be positive, got {v}."
+                f"{info.field_name} entries must be positive, got {v}."
             )
         if any(a >= b for a, b in zip(v, v[1:], strict=False)):
             raise ValueError(
-                f"max_neighbors_list must be strictly ascending, got {v}."
+                f"{info.field_name} must be strictly ascending, got {v}."
             )
         return v
 
@@ -207,6 +221,9 @@ class BaseBackendSpec(BaseModel):
             max_neighbors_list=list(self.max_neighbors_list),
             max_neighbors_offset=self.max_neighbors_offset,
             max_neighbors_shrink_dwell=self.max_neighbors_shrink_dwell,
+            image_neighbors_list=list(self.image_neighbors_list),
+            image_neighbors_offset=self.image_neighbors_offset,
+            image_neighbors_shrink_dwell=self.image_neighbors_shrink_dwell,
             softcore_repulsion=softcore_repulsion,
             **self._backend_config_extras(),
         )

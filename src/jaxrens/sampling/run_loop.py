@@ -317,6 +317,7 @@ from jaxrens.sampling.bucket_manager import (  # noqa: E402
     BucketManager,
     _pick_next_bucket,
     _pick_prev_bucket,
+    image_bucket_manager,
 )
 
 
@@ -339,6 +340,9 @@ def _run_loop(
     max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
+    image_neighbors_list: tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12),
+    image_neighbors_offset: int = 1,
+    image_neighbors_shrink_dwell: int = 0,
     ns_step_fn: Callable | None = None,
     n_cull: int = 1,
 ) -> tuple[NSState, Key[Array, "*B"], dict[str, np.ndarray]]:
@@ -394,6 +398,20 @@ def _run_loop(
             byte-identical.  JAX's compilation cache reuses earlier compiles
             when the bucket revisits a known size, so the only cost paid by
             a wrong downsize is the next overflow re-grow.
+        image_neighbors_list, image_neighbors_offset,
+            image_neighbors_shrink_dwell: Same bucket-ladder mechanism as
+            ``max_neighbors_list``/``max_neighbors_offset``/
+            ``max_neighbors_shrink_dwell`` above, applied to a SEPARATE
+            dimension: the periodic-image half-width used by local-update
+            move kernels (``single_atom_swap``, ``alchemical_morph``,
+            ``single_atom``, ``single_atom_sweep`` — see
+            ``sampling/neighbor_list.py::build_symmetric_image_offsets``).
+            Managed by a second, independent :class:`BucketManager`
+            instance (see
+            ``sampling/bucket_manager.py::image_bucket_manager``) so it
+            never conflicts with the neighbor-count ladder above. Inert
+            (never triggers) when no local move is active, since
+            ``population.image_overflow`` then never becomes ``True``.
 
     Returns:
         ``(ns_state, rng_key, cumulative)`` where:
@@ -472,6 +490,15 @@ def _run_loop(
         offset=max_neighbors_offset,
         shrink_dwell=max_neighbors_shrink_dwell,
     )
+    # Second, independent bucket-ladder dimension for local-update move
+    # kernels' periodic-image half-width (see module-level docstring on
+    # ``image_neighbors_list`` above) — same mechanism, different fields,
+    # never conflicts with ``bucket_mgr``.
+    image_bucket_mgr = image_bucket_manager(
+        ladder=image_neighbors_list,
+        offset=image_neighbors_offset,
+        shrink_dwell=image_neighbors_shrink_dwell,
+    )
 
     # ``i`` is the segment-local loop counter (0-based each invocation) and
     # drives termination + adapt phase — keeping it segment-local preserves
@@ -517,8 +544,22 @@ def _run_loop(
 
         # ---- Overflow retry ----
         # For PmapVmapRuns, any overflow across any (G, P) shard triggers a retry.
+        # Two independent bucket dimensions checked in sequence against the
+        # SAME pre-step state (``ns_state`` itself, not yet reassigned) —
+        # each check's rollback target must be the true pre-step state,
+        # never an already-updated one, or a retry would resume from a
+        # step whose overflow made it untrustworthy in the first place.
+        pre_step_ns_state = ns_state
         ns_state, retry = bucket_mgr.grow_if_overflow(
-            ns_state,
+            pre_step_ns_state,
+            new_ns_state,
+            label="iter",
+            iteration=record_iteration,
+        )
+        if retry:
+            continue
+        ns_state, retry = image_bucket_mgr.grow_if_overflow(
+            pre_step_ns_state,
             new_ns_state,
             label="iter",
             iteration=record_iteration,
@@ -531,6 +572,9 @@ def _run_loop(
         # ladder entry once the observed peak has stayed below the next-
         # smaller bucket (with margin) for ``shrink_dwell`` iterations.
         ns_state = bucket_mgr.maybe_shrink(
+            ns_state, iteration=record_iteration
+        )
+        ns_state = image_bucket_mgr.maybe_shrink(
             ns_state, iteration=record_iteration
         )
 
