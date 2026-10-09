@@ -47,6 +47,33 @@ class MoveKernel:
             full aspect set, so a move that forgets to declare its mutations
             is conservatively gated by every constraint (never silently
             skipped) rather than bypassing one.
+        affects: ``"all"`` (default) or ``"local"``. A structural fact
+            about the move itself, independent of any backend —
+            ``build_mwg`` combines this with the backend's declared
+            locality capability (see ``jaxrens.backends.locality``) to
+            decide whether a per-atom energy cache can be patched
+            incrementally instead of the move recomputing the whole
+            system's energy from scratch. Every move not opted into this
+            keeps the default ``"all"`` — no behaviour change unless a
+            move kernel explicitly declares ``"local"``.
+
+            ``"local"`` (``single_atom_swap``, ``alchemical_morph``,
+            ``single_atom``, ``single_atom_sweep``): the move recomputes
+            its affected-atom set fresh, from the CURRENT
+            ``state.positions``/``state.cell``, on every proposal (see
+            ``sampling/neighbor_list.py`` module docstring) — there is no
+            cached structure computed once from a reference geometry that
+            another move could invalidate, so ``"local"`` is safe in ANY
+            combination of moves, cell-mutating ones (``volume``, ``shear``,
+            ``stretch``) included. ``build_mwg`` never rejects a move-set;
+            the only thing that can still prevent a ``"local"`` move from
+            running its incremental path is the backend itself not
+            supporting the subset-energy query it needs, in which case it
+            is silently downgraded to ``"all"`` for that move only, with a
+            message logged via the standard ``logging`` module — that move
+            simply gets no speedup and runs its ordinary full-recompute
+            path, exactly as if it had never declared ``"local"``. See
+            ``mwg.py::_resolve_local_affects``/``_downgrade_to_full``.
     """
 
     name: str
@@ -66,3 +93,4 @@ class MoveKernel:
     mutates: frozenset[str] = field(
         default_factory=lambda: frozenset({"positions", "cell", "types"})
     )
+    affects: str = "all"

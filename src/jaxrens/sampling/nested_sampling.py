@@ -30,6 +30,7 @@ from jaxrens.sampling.batch_descriptor import (
     VmapRuns,
 )
 from jaxrens.sampling.inter_re_manager import InterREManager
+from jaxrens.sampling.local_energy import seed_local_energy_cache
 from jaxrens.sampling.moves.replica_exchange import (
     PressureRENSSwap,
     SemiGrandSwap,
@@ -176,6 +177,8 @@ def init_ns(
     restart_state=None,
     max_neighbors: int = 0,
     max_neighbor_counts: Int[Array, "K"] | None = None,
+    image_bucket: int = 1,
+    image_counts_needed: Int[Array, "K"] | None = None,
 ) -> NSState:
     """Initialize NSState from walker data.
 
@@ -199,6 +202,15 @@ def init_ns(
             log_evidence) from the checkpoint.  Dead-point history is not
             re-seeded — the canonical record on disk (``.energies`` /
             ``.traj``) is append-only and survives across restart.
+        image_bucket: Initial periodic-image half-width for local-update
+            move kernels — mirrors ``max_neighbors`` above, but for the
+            separate image-count bucket ladder (see
+            ``sampling/bucket_manager.py``). Ignored when no local move is
+            active.
+        image_counts_needed: Per-walker true image count needed at init
+            time (see
+            ``sampling/neighbor_list.py::initial_image_bucket_for_cell``),
+            mirrors ``max_neighbor_counts`` above.
 
     Returns:
         Initialized NSState with batched MCState population.
@@ -228,6 +240,12 @@ def init_ns(
             max_neighbor_count_init=(
                 int(max_neighbor_counts[i])
                 if max_neighbor_counts is not None
+                else 0
+            ),
+            image_bucket=image_bucket,
+            image_count_needed_init=(
+                int(image_counts_needed[i])
+                if image_counts_needed is not None
                 else 0
             ),
         )
@@ -991,6 +1009,11 @@ def run_ns(
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
+    image_neighbors_list: tuple[int, ...] | list[int] = (1, 2, 3, 4, 6, 8, 12),
+    image_neighbors_offset: int = 1,
+    image_neighbors_shrink_dwell: int = 0,
+    initial_image_counts_needed: jnp.ndarray | None = None,
+    local_energy_backend: Any = None,
 ) -> dict:
     """Run a full nested sampling calculation.
 
@@ -1004,6 +1027,30 @@ def run_ns(
     another termination criterion fires (typically ``PriorMassTermination``).
     Pass an explicit integer to add an ``IterationTermination`` to the
     default criteria.
+
+    Args:
+        image_neighbors_list, image_neighbors_offset,
+            image_neighbors_shrink_dwell, initial_image_counts_needed:
+            Same bucket-ladder mechanism as ``max_neighbors_list``/
+            ``max_neighbors_offset``/``max_neighbors_shrink_dwell``/
+            ``initial_max_neighbor_counts`` above, applied to the SEPARATE
+            periodic-image half-width dimension used by local-update move
+            kernels (see ``sampling/bucket_manager.py::image_bucket_manager``
+            and ``sampling/neighbor_list.py::initial_image_bucket_for_cell``).
+            Inert when no local move is active.
+        local_energy_backend: The UNWRAPPED energy backend (e.g.
+            ``EnsembleBackend.base``), required only when a move with
+            ``affects="local"`` is active (see
+            ``sampling/move_kernel.py``/``sampling/local_energy.py``). Used
+            once, right after ``init_ns``, to seed the real
+            ``atomic_energies``/``raw_energy`` cache values via
+            ``seed_local_energy_cache`` — the generic per-walker
+            ``init_fn`` initializer has no backend access, so those fields
+            start at a zero placeholder that MUST be corrected before any
+            local-update move runs. A no-op when no local-update move is
+            configured (or when left ``None``), and correctly re-seeds on
+            restart too (this call happens after ``init_ns`` regardless of
+            whether ``restart_state`` was supplied).
 
     Returns a backward-compatible result dict.
     """
@@ -1025,6 +1072,14 @@ def run_ns(
         ladder,
         max_neighbors_offset,
     )
+    image_ladder = tuple(int(x) for x in image_neighbors_list)
+    if not image_ladder:
+        raise ValueError("image_neighbors_list must be non-empty.")
+    starting_image_bucket = _choose_starting_bucket(
+        initial_image_counts_needed,
+        image_ladder,
+        image_neighbors_offset,
+    )
 
     if per_move_fns is not None:
         n_moves = len(per_move_fns)
@@ -1045,7 +1100,15 @@ def run_ns(
         restart_state=restart_state,
         max_neighbors=starting_bucket,
         max_neighbor_counts=initial_max_neighbor_counts,
+        image_bucket=starting_image_bucket,
+        image_counts_needed=initial_image_counts_needed,
     )
+    if local_energy_backend is not None:
+        ns_state = ns_state.set(
+            population=seed_local_energy_cache(
+                ns_state.population, local_energy_backend
+            )
+        )
 
     n_atoms = positions.shape[1] if positions.ndim >= 2 else None
 
@@ -1086,6 +1149,9 @@ def run_ns(
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
         max_neighbors_shrink_dwell=int(max_neighbors_shrink_dwell),
+        image_neighbors_list=image_ladder,
+        image_neighbors_offset=int(image_neighbors_offset),
+        image_neighbors_shrink_dwell=int(image_neighbors_shrink_dwell),
     )
 
     # Final evidence: add contribution from remaining live walkers
@@ -1129,6 +1195,8 @@ def init_ns_parallel(
     restart_states: list | None = None,
     max_neighbors: int = 0,
     max_neighbor_counts: Int[Array, "R K"] | None = None,
+    image_bucket: int = 1,
+    image_counts_needed: Int[Array, "R K"] | None = None,
 ) -> NSState:
     """Create batched NSState for n_runs parallel NS runs.
 
@@ -1180,6 +1248,12 @@ def init_ns_parallel(
                 if max_neighbor_counts is not None
                 else None
             ),
+            image_bucket=image_bucket,
+            image_counts_needed=(
+                image_counts_needed[i]
+                if image_counts_needed is not None
+                else None
+            ),
         )
         runs.append(run_state)
     return jax.tree.map(lambda *xs: jnp.stack(xs), *runs)
@@ -1217,6 +1291,10 @@ def run_ns_parallel(
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
+    image_neighbors_list: tuple[int, ...] | list[int] = (1, 2, 3, 4, 6, 8, 12),
+    image_neighbors_offset: int = 1,
+    image_neighbors_shrink_dwell: int = 0,
+    initial_image_counts_needed: jnp.ndarray | None = None,
 ) -> dict:
     """Run multiple NS calculations in parallel via vmap(ns_step).
 
@@ -1280,6 +1358,14 @@ def run_ns_parallel(
         ladder,
         max_neighbors_offset,
     )
+    image_ladder = tuple(int(x) for x in image_neighbors_list)
+    if not image_ladder:
+        raise ValueError("image_neighbors_list must be non-empty.")
+    starting_image_bucket = _choose_starting_bucket(
+        initial_image_counts_needed,
+        image_ladder,
+        image_neighbors_offset,
+    )
 
     ns_states = init_ns_parallel(
         init_fn,
@@ -1293,6 +1379,8 @@ def run_ns_parallel(
         restart_states=restart_states,
         max_neighbors=starting_bucket,
         max_neighbor_counts=initial_max_neighbor_counts,
+        image_bucket=starting_image_bucket,
+        image_counts_needed=initial_image_counts_needed,
     )
 
     logger.info(
@@ -1369,6 +1457,8 @@ def run_ns_parallel(
                 restart_states=restart_states,
                 max_neighbors=starting_bucket,
                 max_neighbor_counts=initial_max_neighbor_counts,
+                image_bucket=starting_image_bucket,
+                image_counts_needed=initial_image_counts_needed,
             )
         elif cfg.flavor == "semi_grand":
             if cfg.chemical_potentials is None:
@@ -1412,6 +1502,8 @@ def run_ns_parallel(
                 restart_states=restart_states,
                 max_neighbors=starting_bucket,
                 max_neighbor_counts=initial_max_neighbor_counts,
+                image_bucket=starting_image_bucket,
+                image_counts_needed=initial_image_counts_needed,
             )
         else:
             raise NotImplementedError(
@@ -1450,6 +1542,9 @@ def run_ns_parallel(
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
         max_neighbors_shrink_dwell=int(max_neighbors_shrink_dwell),
+        image_neighbors_list=image_ladder,
+        image_neighbors_offset=int(image_neighbors_offset),
+        image_neighbors_shrink_dwell=int(image_neighbors_shrink_dwell),
     )
 
     # Final evidence: per-run contribution from remaining live walkers
@@ -1506,6 +1601,8 @@ def init_ns_multi_gpu(
     restart_states: list[list] | None = None,
     max_neighbors: int = 0,
     max_neighbor_counts: jnp.ndarray | None = None,
+    image_bucket: int = 1,
+    image_counts_needed: jnp.ndarray | None = None,
 ) -> NSState:
     """Initialize a ``(G, P, ...)``-shaped NSState for pmap(vmap) execution.
 
@@ -1559,6 +1656,11 @@ def init_ns_multi_gpu(
         if max_neighbor_counts is not None
         else None
     )
+    icn_flat = (
+        _flatten_leading(image_counts_needed)
+        if image_counts_needed is not None
+        else None
+    )
     rng_keys_flat = (
         rng_keys.reshape(n_total) if rng_keys.ndim == 2 else rng_keys
     )
@@ -1583,6 +1685,8 @@ def init_ns_multi_gpu(
         restart_states=rs_flat,
         max_neighbors=max_neighbors,
         max_neighbor_counts=mnc_flat,
+        image_bucket=image_bucket,
+        image_counts_needed=icn_flat,
     )
 
     # Reshape all dynamic fields from (G*P, ...) to (G, P, ...) and explicitly
@@ -1625,6 +1729,8 @@ def init_ns_sharded(
     restart_state=None,
     max_neighbors: int = 0,
     max_neighbor_counts: jnp.ndarray | None = None,
+    image_bucket: int = 1,
+    image_counts_needed: jnp.ndarray | None = None,
 ) -> NSState:
     """Build an :class:`NSState` for one population sharded across ``n_gpu`` GPUs.
 
@@ -1686,6 +1792,11 @@ def init_ns_sharded(
             if max_neighbor_counts is not None
             else None
         )
+        icn_flat = (
+            image_counts_needed.reshape(K)
+            if image_counts_needed is not None
+            else None
+        )
     else:
         K = positions.shape[0]
         if K % n_gpu != 0:
@@ -1698,6 +1809,7 @@ def init_ns_sharded(
         energies_flat = energies
         cells_flat = cells
         mnc_flat = max_neighbor_counts
+        icn_flat = image_counts_needed
         k_per_gpu = K // n_gpu
 
     # Build the single-replica NSState.
@@ -1713,6 +1825,8 @@ def init_ns_sharded(
         restart_state=restart_state,
         max_neighbors=max_neighbors,
         max_neighbor_counts=mnc_flat,
+        image_bucket=image_bucket,
+        image_counts_needed=icn_flat,
     )
 
     # Reshape population-axis leaves to (G, K/G, ...), broadcast scalar
@@ -1774,6 +1888,10 @@ def run_ns_multi_gpu(
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
+    image_neighbors_list: tuple[int, ...] | list[int] = (1, 2, 3, 4, 6, 8, 12),
+    image_neighbors_offset: int = 1,
+    image_neighbors_shrink_dwell: int = 0,
+    initial_image_counts_needed: jnp.ndarray | None = None,
     batcher: PmapVmapRuns | None = None,
 ) -> dict:
     """Run NS with ``pmap(vmap(ns_step))`` dispatch across G GPUs × P runs each.
@@ -1895,6 +2013,14 @@ def run_ns_multi_gpu(
         "[stage] run_ns_multi_gpu: starting_bucket=%d",
         starting_bucket,
     )
+    image_ladder = tuple(int(x) for x in image_neighbors_list)
+    if not image_ladder:
+        raise ValueError("image_neighbors_list must be non-empty.")
+    starting_image_bucket = _choose_starting_bucket(
+        initial_image_counts_needed,
+        image_ladder,
+        image_neighbors_offset,
+    )
 
     # Initialize (G, P, ...) state via init_ns_multi_gpu.
     logger.debug("[stage] run_ns_multi_gpu: init_ns_multi_gpu — starting")
@@ -1912,6 +2038,8 @@ def run_ns_multi_gpu(
         restart_states=restart_states,
         max_neighbors=starting_bucket,
         max_neighbor_counts=initial_max_neighbor_counts,
+        image_bucket=starting_image_bucket,
+        image_counts_needed=initial_image_counts_needed,
     )
     if logger.isEnabledFor(logging.DEBUG):
         try:
@@ -2005,6 +2133,8 @@ def run_ns_multi_gpu(
                 restart_states=restart_states,
                 max_neighbors=starting_bucket,
                 max_neighbor_counts=initial_max_neighbor_counts,
+                image_bucket=starting_image_bucket,
+                image_counts_needed=initial_image_counts_needed,
             )
         elif cfg.flavor == "semi_grand":
             if cfg.chemical_potentials is None:
@@ -2048,6 +2178,8 @@ def run_ns_multi_gpu(
                 restart_states=restart_states,
                 max_neighbors=starting_bucket,
                 max_neighbor_counts=initial_max_neighbor_counts,
+                image_bucket=starting_image_bucket,
+                image_counts_needed=initial_image_counts_needed,
             )
         else:
             raise NotImplementedError(
@@ -2085,6 +2217,9 @@ def run_ns_multi_gpu(
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
         max_neighbors_shrink_dwell=int(max_neighbors_shrink_dwell),
+        image_neighbors_list=image_ladder,
+        image_neighbors_offset=int(image_neighbors_offset),
+        image_neighbors_shrink_dwell=int(image_neighbors_shrink_dwell),
     )
 
     # Final evidence: per-run contribution from remaining live walkers.
@@ -2167,6 +2302,10 @@ def run_ns_sharded(
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
+    image_neighbors_list: tuple[int, ...] | list[int] = (1, 2, 3, 4, 6, 8, 12),
+    image_neighbors_offset: int = 1,
+    image_neighbors_shrink_dwell: int = 0,
+    initial_image_counts_needed: jnp.ndarray | None = None,
     batcher: ShardedSingleRun | None = None,
 ) -> dict:
     """Run a single NS run with the walker population sharded across ``n_gpu`` GPUs.
@@ -2244,6 +2383,14 @@ def run_ns_sharded(
         ladder,
         max_neighbors_offset,
     )
+    image_ladder = tuple(int(x) for x in image_neighbors_list)
+    if not image_ladder:
+        raise ValueError("image_neighbors_list must be non-empty.")
+    starting_image_bucket = _choose_starting_bucket(
+        initial_image_counts_needed,
+        image_ladder,
+        image_neighbors_offset,
+    )
 
     # Build sharded NSState.
     logger.debug("[stage] run_ns_sharded: init_ns_sharded — starting")
@@ -2260,6 +2407,8 @@ def run_ns_sharded(
         restart_state=restart_state,
         max_neighbors=starting_bucket,
         max_neighbor_counts=initial_max_neighbor_counts,
+        image_bucket=starting_image_bucket,
+        image_counts_needed=initial_image_counts_needed,
     )
     if logger.isEnabledFor(logging.DEBUG):
         try:
@@ -2324,6 +2473,9 @@ def run_ns_sharded(
         max_neighbors_list=ladder,
         max_neighbors_offset=int(max_neighbors_offset),
         max_neighbors_shrink_dwell=int(max_neighbors_shrink_dwell),
+        image_neighbors_list=image_ladder,
+        image_neighbors_offset=int(image_neighbors_offset),
+        image_neighbors_shrink_dwell=int(image_neighbors_shrink_dwell),
         ns_step_fn=ns_step_sharded,
     )
 

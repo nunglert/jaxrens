@@ -34,6 +34,8 @@ def _make_state(positions, types, energy, cell=None, step_size=0.1):
         n_proposed=jnp.zeros(1, dtype=jnp.int32),
         max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
         overflow=jnp.asarray(False),
+        image_count_needed=jnp.zeros_like(jnp.asarray(0, dtype=jnp.int32)),
+        image_overflow=jnp.zeros_like(jnp.asarray(False)),
         ensemble_params={},
     )
 
@@ -53,6 +55,8 @@ def _make_gmc_state(positions, types, energy, cell=None, step_size=0.1):
         n_proposed=jnp.zeros(1, dtype=jnp.int32),
         max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
         overflow=jnp.asarray(False),
+        image_count_needed=jnp.zeros_like(jnp.asarray(0, dtype=jnp.int32)),
+        image_overflow=jnp.zeros_like(jnp.asarray(False)),
         ensemble_params={},
         direction=jnp.zeros_like(positions),
     )
@@ -140,6 +144,8 @@ class TestRandomWalkStep:
             n_proposed=jnp.zeros((4, 1), dtype=jnp.int32),
             max_neighbor_count=jnp.zeros(4, dtype=jnp.int32),
             overflow=jnp.full(4, False),
+            image_count_needed=jnp.zeros_like(jnp.zeros(4, dtype=jnp.int32)),
+            image_overflow=jnp.zeros_like(jnp.full(4, False)),
             ensemble_params={},
         )
 
@@ -250,6 +256,8 @@ class TestGalileanStep:
             n_proposed=jnp.zeros((4, 1), dtype=jnp.int32),
             max_neighbor_count=jnp.zeros(4, dtype=jnp.int32),
             overflow=jnp.full(4, False),
+            image_count_needed=jnp.zeros_like(jnp.zeros(4, dtype=jnp.int32)),
+            image_overflow=jnp.zeros_like(jnp.full(4, False)),
             ensemble_params={},
             direction=batch_dir,
         )

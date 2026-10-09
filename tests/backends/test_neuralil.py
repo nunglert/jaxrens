@@ -158,6 +158,166 @@ class TestNeuralILBackend:
 
 
 @neuralil_required
+class TestNeuralILLocalEnergy:
+    """`atomic_energies` / `atomic_energies_for` — the local/incremental
+    energy-update primitives (see `sampling/local_energy.py`)."""
+
+    @pytest.fixture
+    def backend(self):
+        from jaxrens.backends.neuralil import create_neuralil
+
+        return create_neuralil(
+            pickle_file=str(FIXTURE_DIR / "model.pkl"),
+            supercell_trafo=(1, 1, 1),
+        )
+
+    @pytest.fixture
+    def config(self):
+        ref = np.load(FIXTURE_DIR / "reference.npz", allow_pickle=True)
+        return (
+            jnp.array(ref["positions"]),
+            jnp.array(ref["types"], dtype=jnp.int32),
+            jnp.array(ref["cell"]),
+            int(ref["max_neighbors"]),
+        )
+
+    def test_declares_single_cutoff_capability(self, backend):
+        from jaxrens.backends.locality import probe_local_capability
+
+        cap = probe_local_capability(backend)
+        assert cap.kind == "single_cutoff"
+        assert cap.effective_cutoff == backend.r_cutoff
+        assert cap.supports_subset_query
+
+    def test_atomic_energies_sum_matches_total(self, backend, config):
+        """Sum of the per-atom decomposition (plus the shift term the
+        method deliberately omits) must equal `__call__`'s total energy."""
+        positions, species, cell, mn = config
+        n_real = int((species >= 0).sum())
+
+        atomic = backend.atomic_energies(positions, species, cell, mn)
+        assert atomic.shape == (positions.shape[0],)
+
+        reconstructed = atomic.sum() + backend.energy_shift_per_atom * n_real
+        full = backend(positions, species, cell, mn).energy
+        assert abs(float(reconstructed) - float(full)) < 1e-4 * abs(
+            float(full)
+        )
+
+    def test_atomic_energies_for_full_set_matches_atomic_energies(
+        self, backend, config
+    ):
+        """Requesting *every* atom via the subset path must reproduce the
+        full per-atom decomposition exactly (mirrors `test_max_neighbors_for`'s
+        fast-path-vs-full-path precedent)."""
+        positions, species, cell, mn = config
+        n_atoms = positions.shape[0]
+
+        full = backend.atomic_energies(positions, species, cell, mn)
+        subset = backend.atomic_energies_for(
+            positions, species, cell, jnp.arange(n_atoms), mn
+        )
+        np.testing.assert_allclose(
+            np.asarray(subset), np.asarray(full), atol=1e-5, rtol=1e-5
+        )
+
+    def test_atomic_energies_for_small_subset_matches_full_slice(
+        self, backend, config
+    ):
+        """A hand-picked subset's energies must match the corresponding
+        slice of the full per-atom decomposition — the direct test that
+        `calc_some_atomic_energies` and `calc_atomic_energies` agree."""
+        positions, species, cell, mn = config
+        n_atoms = positions.shape[0]
+        k = min(3, n_atoms)
+        subset_idx = jnp.arange(k)
+
+        full = backend.atomic_energies(positions, species, cell, mn)
+        subset = backend.atomic_energies_for(
+            positions, species, cell, subset_idx, mn
+        )
+        # float32 tolerance matches test_energy_matches_reference's rationale
+        # above: the "some"/partial descriptor path and the full-batch path
+        # don't sum in exactly the same order, so results agree only to
+        # float32 precision, not bit-for-bit.
+        np.testing.assert_allclose(
+            np.asarray(subset), np.asarray(full[:k]), atol=1e-4, rtol=1e-3
+        )
+
+    def test_atomic_energies_for_sentinel_padding_is_zero(
+        self, backend, config
+    ):
+        """Padded slots (sentinel index == n_atoms) must contribute 0.0,
+        not garbage, since callers rely on summing over the raw output."""
+        positions, species, cell, mn = config
+        n_atoms = positions.shape[0]
+        padded_idx = jnp.array([0, n_atoms, n_atoms])
+
+        result = backend.atomic_energies_for(
+            positions, species, cell, padded_idx, mn
+        )
+        assert result.shape == (3,)
+        assert float(result[1]) == 0.0
+        assert float(result[2]) == 0.0
+
+    def test_local_energy_update_matches_full_recompute_after_swap(
+        self, backend, config
+    ):
+        """End-to-end check of `sampling.local_energy.local_energy_update`:
+        swap two atoms' species, and confirm the incrementally patched
+        total energy matches an independent from-scratch recomputation."""
+        from jaxrens.sampling.local_energy import local_energy_update
+        from jaxrens.sampling.neighbor_list import (
+            affected_indices_from_mask,
+            compute_periodic_image_offsets,
+            local_affected_mask,
+        )
+
+        positions, species, cell, mn = config
+        n_atoms = positions.shape[0]
+        n_species = int(species.max()) + 1
+        if n_species < 2:
+            pytest.skip("fixture has only one species; swap needs >= 2")
+
+        image_offsets = jnp.asarray(
+            compute_periodic_image_offsets(np.asarray(cell), backend.r_cutoff)
+        )
+
+        old_atomic = backend.atomic_energies(positions, species, cell, mn)
+        old_total_raw = old_atomic.sum()
+
+        # Swap the species of atoms 0 and 1 (only meaningful if they differ;
+        # otherwise the "swap" is a no-op and the test is vacuous but still
+        # exercises the machinery).
+        idx_a, idx_b = 0, 1
+        new_types = (
+            species.at[idx_a].set(species[idx_b]).at[idx_b].set(species[idx_a])
+        )
+
+        touched = jnp.array([idx_a, idx_b])
+        mask = local_affected_mask(
+            touched, positions, cell, backend.r_cutoff, image_offsets
+        )
+        affected, overflow = affected_indices_from_mask(
+            mask, max_affected=n_atoms
+        )
+        assert not bool(overflow)
+
+        delta_U, new_local_vec = local_energy_update(
+            backend, old_atomic, affected, positions, new_types, cell, mn
+        )
+        incremental_total = old_total_raw + delta_U
+
+        full_recompute = backend.atomic_energies(
+            positions, new_types, cell, mn
+        ).sum()
+
+        assert abs(
+            float(incremental_total) - float(full_recompute)
+        ) < 1e-4 * max(abs(float(full_recompute)), 1.0)
+
+
+@neuralil_required
 class TestNeuralILForces:
     """Native ``energy_and_forces`` agrees with the autodiff fallback.
 

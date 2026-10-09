@@ -32,7 +32,7 @@ from jaxrens.sampling.batch_descriptor import (
     SingleRun,
     VmapRuns,
 )
-from jaxrens.sampling.bucket_manager import BucketManager
+from jaxrens.sampling.bucket_manager import BucketManager, image_bucket_manager
 from jaxrens.state.ns import NSState
 from jaxrens.utils.padding import pad_to_multiple
 
@@ -90,13 +90,17 @@ def _one_walk(
 
     walker_keys = jax.random.split(key, n_walkers)
     # chain_keys: (n_walkers, walklength)
-    chain_keys = jax.vmap(lambda k: jax.random.split(k, walklength))(walker_keys)
+    chain_keys = jax.vmap(lambda k: jax.random.split(k, walklength))(
+        walker_keys
+    )
 
     def walker_fn(walker_state: Any, wkeys: jax.Array) -> tuple[Any, Any]:
         """Scan step_fn over walklength keys for one walker."""
+
         def scan_body(state, k):
             new_state, info = step_fn(k, state, emax)
             return new_state, info.accepted
+
         final, accepted_arr = jax.lax.scan(scan_body, walker_state, wkeys)
         return final, accepted_arr
 
@@ -154,6 +158,9 @@ def initial_walk(
     max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
+    image_neighbors_list: tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12),
+    image_neighbors_offset: int = 1,
+    image_neighbors_shrink_dwell: int = 0,
 ) -> NSState:
     """Run fixed-Emax MCMC to decorrelate walkers from their initialization.
 
@@ -203,6 +210,14 @@ def initial_walk(
             the bucket — see :class:`~jaxrens.sampling.bucket_manager.BucketManager`.
             ``0`` (default) disables shrinking, preserving the existing
             growth-only behaviour.  Mirrors the NS-loop parameter.
+        image_neighbors_list, image_neighbors_offset,
+            image_neighbors_shrink_dwell: Same bucket-ladder mechanism as
+            the ``max_neighbors_*`` parameters above, applied to the
+            SEPARATE periodic-image half-width dimension used by
+            local-update move kernels — see
+            :func:`~jaxrens.sampling.bucket_manager.image_bucket_manager`.
+            Mirrors the NS-loop parameter of the same name. Inert when no
+            local move is active.
 
     Returns:
         New NSState with live walkers advanced. Same pytree shape as input.
@@ -269,14 +284,18 @@ def initial_walk(
         # log shows ``move=random_walk`` etc. instead of ``move=move_0``.
         # Falls back to positional names for back-compat with direct callers
         # (tests / scripts) that don't have descriptors handy.
-        if move_names is not None and len(move_names) != len(adaptation_policies):
+        if move_names is not None and len(move_names) != len(
+            adaptation_policies
+        ):
             raise ValueError(
                 f"initial_walk: len(move_names)={len(move_names)} does not "
                 f"match len(adaptation_policies)={len(adaptation_policies)}."
             )
         descs = [
             MoveKernel(
-                name=(move_names[i] if move_names is not None else f"move_{i}"),
+                name=(
+                    move_names[i] if move_names is not None else f"move_{i}"
+                ),
                 build_kernel=_noop_build_kernel,
                 min_rate=p.min_rate,
                 max_rate=p.max_rate,
@@ -307,7 +326,12 @@ def initial_walk(
     # pmap-of-vmap for PmapVmapRuns).
     def _per_replica(k, run_state, run_emax):
         return _one_walk(
-            k, run_state, step_fn, walklength, run_emax, walker_batch_size,
+            k,
+            run_state,
+            step_fn,
+            walklength,
+            run_emax,
+            walker_batch_size,
         )
 
     jit_one_walk = batcher.wrap_for_batch(_per_replica)
@@ -318,6 +342,14 @@ def initial_walk(
         ladder=max_neighbors_list,
         offset=max_neighbors_offset,
         shrink_dwell=max_neighbors_shrink_dwell,
+    )
+    # Second, independent bucket-ladder dimension for local-update move
+    # kernels' periodic-image half-width — same mechanism, different
+    # fields, never conflicts with ``bucket_mgr``.
+    image_bucket_mgr = image_bucket_manager(
+        ladder=image_neighbors_list,
+        offset=image_neighbors_offset,
+        shrink_dwell=image_neighbors_shrink_dwell,
     )
 
     # --- Outer walk loop (while-loop so overflow retries don't advance walk_i) ---
@@ -331,14 +363,18 @@ def initial_walk(
             # Other batched: SPLIT (independent per replica).
             if isinstance(batcher, ShardedSingleRun):
                 key_adapt = jnp.broadcast_to(
-                    key_adapt, (batcher.n_gpu,) + key_adapt.shape,
+                    key_adapt,
+                    (batcher.n_gpu,) + key_adapt.shape,
                 )
             elif batcher.is_batched:
                 key_adapt = jax.random.split(
-                    key_adapt, batcher.n_runs,
+                    key_adapt,
+                    batcher.n_runs,
                 ).reshape(batcher.shape_prefix)
             ns_state, _diag, _new_key = adapt_step(
-                ns_state, emax, key_adapt,
+                ns_state,
+                emax,
+                key_adapt,
             )
 
         key, sub = jax.random.split(key)
@@ -350,18 +386,33 @@ def initial_walk(
         new_ns_state, _ = jit_one_walk(walk_keys, ns_state, emax)
 
         # Bucket overflow → grow and retry the same walk.  JAX re-traces
-        # ``jit_one_walk`` automatically because ``max_neighbors`` is a
-        # static field on the MCState pytree.  Counter ``walk_i`` is not
-        # advanced.
+        # ``jit_one_walk`` automatically because ``max_neighbors``/
+        # ``image_bucket`` are static fields on the MCState pytree.
+        # Counter ``walk_i`` is not advanced. Both checks roll back to the
+        # SAME pre-walk state (captured before either check reassigns
+        # ``ns_state``) — a retry must redo the whole walk from the true
+        # pre-walk state, never from an already-updated one.
+        pre_walk_ns_state = ns_state
         ns_state, retry = bucket_mgr.grow_if_overflow(
-            ns_state, new_ns_state,
-            label="burn-in walk", iteration=walk_i,
+            pre_walk_ns_state,
+            new_ns_state,
+            label="burn-in walk",
+            iteration=walk_i,
+        )
+        if retry:
+            continue
+        ns_state, retry = image_bucket_mgr.grow_if_overflow(
+            pre_walk_ns_state,
+            new_ns_state,
+            label="burn-in walk",
+            iteration=walk_i,
         )
         if retry:
             continue
 
         # Optional shrink path — no-op when ``shrink_dwell == 0``.
         ns_state = bucket_mgr.maybe_shrink(ns_state, iteration=walk_i)
+        ns_state = image_bucket_mgr.maybe_shrink(ns_state, iteration=walk_i)
         walk_i += 1
 
     return ns_state

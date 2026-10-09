@@ -181,6 +181,35 @@ def _recompute_max_neighbor_counts(
     return flat_counts.reshape(leading_shape)
 
 
+def _recompute_image_counts_needed(
+    r_cutoff: float | None,
+    cells: jnp.ndarray | None,
+) -> jnp.ndarray | None:
+    """Refresh per-walker true image-count-needed after burn-in.
+
+    Mirrors ``_recompute_max_neighbor_counts`` above, but for the
+    periodic-image bucket ladder (see
+    ``sampling/neighbor_list.py::image_count_needed_for`` and
+    ``sampling/bucket_manager.py``) — burn-in can drift cells (e.g. a
+    volume move) so the resolver's pre-burn-in image counts no longer
+    describe the state entering the NS loop. Unlike the neighbor-count
+    recompute, this is pure cell geometry (no descriptor/pairwise
+    tensor), so a plain ``jax.vmap`` is fine — no memory concern to bound
+    via a sequential ``jax.lax.map``. Returns ``None`` when there is no
+    cell or no local move active (``r_cutoff is None``).
+    """
+    if cells is None or r_cutoff is None:
+        return None
+    from jaxrens.sampling.neighbor_list import image_count_needed_for
+
+    leading_shape = cells.shape[:-2]
+    flat_cells = cells.reshape(-1, 3, 3)
+    flat_counts = jax.vmap(lambda c: image_count_needed_for(c, r_cutoff))(
+        flat_cells
+    )
+    return flat_counts.reshape(leading_shape)
+
+
 def _move_config_to_descriptor(mc: MoveConfig) -> MoveKernel:
     """Convert a ``MoveConfig`` dataclass to a ``MoveKernel``.
 
@@ -342,6 +371,7 @@ def run_from_config(
     initial_energies: jnp.ndarray | None = None,
     initial_cells: jnp.ndarray | None = None,
     initial_max_neighbor_counts: jnp.ndarray | None = None,
+    initial_image_counts_needed: jnp.ndarray | None = None,
     symbol_map: dict[int, str] | None = None,
     termination_criteria: list | None = None,
     restart_state=None,
@@ -620,6 +650,15 @@ def run_from_config(
             _ladder,
             _offset,
         )
+        _image_ladder = tuple(
+            int(x) for x in backend_config.image_neighbors_list
+        )
+        _image_offset = int(backend_config.image_neighbors_offset)
+        starting_image_bucket = _choose_starting_bucket(
+            initial_image_counts_needed,
+            _image_ladder,
+            _image_offset,
+        )
 
         key, key_init, key_burn = jax.random.split(key, 3)
         ns_state_burn = init_ns(
@@ -632,6 +671,15 @@ def run_from_config(
             ensemble_params=ensemble_params,
             max_neighbors=starting_bucket,
             max_neighbor_counts=initial_max_neighbor_counts,
+            image_bucket=starting_image_bucket,
+            image_counts_needed=initial_image_counts_needed,
+        )
+        from jaxrens.sampling.local_energy import seed_local_energy_cache
+
+        ns_state_burn = ns_state_burn.set(
+            population=seed_local_energy_cache(
+                ns_state_burn.population, base_backend
+            )
         )
 
         # Build per-move adaptation data if available.
@@ -671,6 +719,9 @@ def run_from_config(
             max_neighbors_list=tuple(backend_config.max_neighbors_list),
             max_neighbors_offset=backend_config.max_neighbors_offset,
             max_neighbors_shrink_dwell=backend_config.max_neighbors_shrink_dwell,
+            image_neighbors_list=tuple(backend_config.image_neighbors_list),
+            image_neighbors_offset=backend_config.image_neighbors_offset,
+            image_neighbors_shrink_dwell=backend_config.image_neighbors_shrink_dwell,
         )
 
         # Extract burned-in walker arrays to re-seed run_ns.
@@ -691,6 +742,11 @@ def run_from_config(
             initial_positions,
             initial_cells,
         )
+        if initial_image_counts_needed is not None:
+            initial_image_counts_needed = _recompute_image_counts_needed(
+                getattr(backend, "r_cutoff", None),
+                initial_cells,
+            )
 
         if burn_in_cfg.write_initial_walkers:
             logger.warning(
@@ -745,6 +801,11 @@ def run_from_config(
         max_neighbors_offset=backend_config.max_neighbors_offset,
         max_neighbors_shrink_dwell=backend_config.max_neighbors_shrink_dwell,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
+        image_neighbors_list=tuple(backend_config.image_neighbors_list),
+        image_neighbors_offset=backend_config.image_neighbors_offset,
+        image_neighbors_shrink_dwell=backend_config.image_neighbors_shrink_dwell,
+        initial_image_counts_needed=initial_image_counts_needed,
+        local_energy_backend=base_backend,
         **full_auto_kwargs,
     )
 
@@ -863,6 +924,14 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
     _offset = int(resolved.backend.max_neighbors_offset)
     _init_counts = resolved.init.initial_max_neighbor_counts
     starting_bucket = _choose_starting_bucket(_init_counts, _ladder, _offset)
+    _image_ladder = tuple(
+        int(x) for x in resolved.backend.image_neighbors_list
+    )
+    _image_offset = int(resolved.backend.image_neighbors_offset)
+    _init_image_counts = resolved.init.initial_image_counts_needed
+    starting_image_bucket = _choose_starting_bucket(
+        _init_image_counts, _image_ladder, _image_offset
+    )
     logger.debug(
         "[stage] resolver -> dispatcher: positions=%s cells=%s energies=%s "
         "starting_bucket=%d ladder=%s offset=%d",
@@ -906,6 +975,8 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
             ensemble_params_per_run=list(resolved.ensemble_params_per_run),
             max_neighbors=starting_bucket,
             max_neighbor_counts=_init_counts,
+            image_bucket=starting_image_bucket,
+            image_counts_needed=_init_image_counts,
         )
         _barrier("init_ns_multi_gpu", ns_state_burn.population.positions)
 
@@ -946,6 +1017,9 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
             max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
             max_neighbors_offset=resolved.backend.max_neighbors_offset,
             max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
+            image_neighbors_list=tuple(resolved.backend.image_neighbors_list),
+            image_neighbors_offset=resolved.backend.image_neighbors_offset,
+            image_neighbors_shrink_dwell=resolved.backend.image_neighbors_shrink_dwell,
         )
         pop = ns_state_burn.population
 
@@ -982,6 +1056,14 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
         else _init_counts
     )
     _barrier("_recompute_max_neighbor_counts", post_burn_in_counts)
+    post_burn_in_image_counts = (
+        _recompute_image_counts_needed(
+            getattr(base_backend, "r_cutoff", None),
+            cells,
+        )
+        if do_burn_in and _init_image_counts is not None
+        else _init_image_counts
+    )
 
     # --- PRNG keys for the multi-GPU dispatch -----------------------------
     key, key_run = jax.random.split(key)
@@ -1240,6 +1322,10 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
         max_neighbors_offset=resolved.backend.max_neighbors_offset,
         max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
         initial_max_neighbor_counts=post_burn_in_counts,
+        image_neighbors_list=tuple(resolved.backend.image_neighbors_list),
+        image_neighbors_offset=resolved.backend.image_neighbors_offset,
+        image_neighbors_shrink_dwell=resolved.backend.image_neighbors_shrink_dwell,
+        initial_image_counts_needed=post_burn_in_image_counts,
         batcher=resolved.batcher,
         restart_states=restart_states_2d,
         **full_auto_kwargs,
@@ -1325,6 +1411,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
         and resolved.init.restart_state is None
     )
     initial_max_neighbor_counts = resolved.init.initial_max_neighbor_counts
+    initial_image_counts_needed = resolved.init.initial_image_counts_needed
     if do_burn_in:
         from jaxrens.init.burn_in import initial_walk
 
@@ -1334,6 +1421,15 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
             initial_max_neighbor_counts,
             _ladder,
             _offset,
+        )
+        _image_ladder = tuple(
+            int(x) for x in resolved.backend.image_neighbors_list
+        )
+        _image_offset = int(resolved.backend.image_neighbors_offset)
+        starting_image_bucket = _choose_starting_bucket(
+            initial_image_counts_needed,
+            _image_ladder,
+            _image_offset,
         )
 
         key, key_init, key_burn = jax.random.split(key, 3)
@@ -1357,6 +1453,8 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
             ),
             max_neighbors=starting_bucket,
             max_neighbor_counts=initial_max_neighbor_counts,
+            image_bucket=starting_image_bucket,
+            image_counts_needed=initial_image_counts_needed,
         )
 
         n_atoms_burn = positions.shape[-2]
@@ -1401,6 +1499,9 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
             max_neighbors_list=tuple(resolved.backend.max_neighbors_list),
             max_neighbors_offset=resolved.backend.max_neighbors_offset,
             max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
+            image_neighbors_list=tuple(resolved.backend.image_neighbors_list),
+            image_neighbors_offset=resolved.backend.image_neighbors_offset,
+            image_neighbors_shrink_dwell=resolved.backend.image_neighbors_shrink_dwell,
         )
 
         # Flatten sharded (G, K/G, ...) population back to (K, ...) so the
@@ -1428,6 +1529,11 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
             initial_max_neighbor_counts = _recompute_max_neighbor_counts(
                 base_backend,
                 positions,
+                cells,
+            )
+        if initial_image_counts_needed is not None:
+            initial_image_counts_needed = _recompute_image_counts_needed(
+                getattr(base_backend, "r_cutoff", None),
                 cells,
             )
 
@@ -1632,6 +1738,10 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
         max_neighbors_offset=resolved.backend.max_neighbors_offset,
         max_neighbors_shrink_dwell=resolved.backend.max_neighbors_shrink_dwell,
         initial_max_neighbor_counts=initial_max_neighbor_counts,
+        image_neighbors_list=tuple(resolved.backend.image_neighbors_list),
+        image_neighbors_offset=resolved.backend.image_neighbors_offset,
+        image_neighbors_shrink_dwell=resolved.backend.image_neighbors_shrink_dwell,
+        initial_image_counts_needed=initial_image_counts_needed,
         batcher=batcher,
         restart_state=resolved.init.restart_state,
         **full_auto_kwargs,

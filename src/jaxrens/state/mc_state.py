@@ -75,6 +75,16 @@ def make_mc_state_class(extra_fields: dict[str, type] | None = None) -> type:
         ("n_proposed", jnp.ndarray),
         ("max_neighbor_count", jnp.ndarray),  # actual max neighbors observed
         ("overflow", jnp.ndarray),  # bool — any overflow detected
+        # Second, independent bucket-ladder dimension (see
+        # sampling/bucket_manager.py) for the periodic-image half-width
+        # used by local-update move kernels (sampling/neighbor_list.py).
+        # Always present, like max_neighbor_count/overflow above, even
+        # when no local move is active — inert in that case (never set
+        # to a nonzero/True value), matching how max_neighbors/
+        # max_neighbor_count/overflow are already unconditionally present
+        # regardless of whether the backend does neighbor-bucket sizing.
+        ("image_count_needed", jnp.ndarray),  # true images-per-axis needed
+        ("image_overflow", jnp.ndarray),  # bool — image bucket too small
         (
             "ensemble_params",
             dict,
@@ -88,6 +98,11 @@ def make_mc_state_class(extra_fields: dict[str, type] | None = None) -> type:
     static = [
         ("max_neighbors", int, static_field(default=0)),
         ("n_atoms", int, static_field(default=0)),
+        # Symmetric per-axis half-width of periodic images to search (see
+        # sampling/neighbor_list.py::build_symmetric_image_offsets) —
+        # default 1 is an inert fallback for MCState instances that never
+        # touch it (no local move active).
+        ("image_bucket", int, static_field(default=1)),
     ]
 
     cls = dataclasses.make_dataclass("MCState", core + extra + static)

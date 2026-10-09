@@ -194,6 +194,7 @@ class ResolvedInit:
     initial_cells: Any  # shape: (n_live, 3, 3) or None
     initial_energies: Any  # shape: (n_live,) or None — None until evaluated
     initial_max_neighbor_counts: Any = None  # shape: (n_live,) int32 or None
+    initial_image_counts_needed: Any = None  # shape: (n_live,) int32 or None
     symbol_map: dict[int, str] | None = None
     # ``RestartBundle`` for single-replica restart; ``list[list[RestartBundle]]``
     # of shape ``(n_gpu, n_per_gpu)`` for multi-replica restart; ``None`` when
@@ -220,7 +221,9 @@ def _check_initial_constraints(
 
     for desc in descriptors:
         predicate = desc.build(**desc.build_kwargs)
-        valid = jax.vmap(lambda p, t, c: predicate(p, t, c))(positions, types, cells)
+        valid = jax.vmap(lambda p, t, c: predicate(p, t, c))(
+            positions, types, cells
+        )
         valid = np.asarray(valid)
         if not valid.all():
             bad = int(np.argmax(~valid))
@@ -949,7 +952,9 @@ def _resolve_init_species(
             energy_backend,
         )
 
-    initial_types_broadcast = jnp.broadcast_to(initial_types[None], (n_live, n_atoms))
+    initial_types_broadcast = jnp.broadcast_to(
+        initial_types[None], (n_live, n_atoms)
+    )
 
     # Energies and neighbor counts are computed once at the correct
     # bucket size by the caller via ``_finalise_initial_energies_and_counts``
@@ -1022,8 +1027,9 @@ def _resolve_init_config_file(
             energy_backend,
         )
 
-
-    initial_types_broadcast = jnp.broadcast_to(types_single[None], (n_live, n_atoms))
+    initial_types_broadcast = jnp.broadcast_to(
+        types_single[None], (n_live, n_atoms)
+    )
 
     return ResolvedInit(
         initial_positions=initial_positions,
@@ -1282,10 +1288,49 @@ def _resolve_single_replica(
 
     import dataclasses as _dc
 
+    reference_positions = resolved_init.initial_positions[0]
+    reference_cell = (
+        resolved_init.initial_cells[0]
+        if resolved_init.initial_cells is not None
+        else None
+    )
+    if any(getattr(m, "local_update", False) for m in root.moves):
+        # Per-walker (not just reference-cell) so a per-walker cell
+        # diversity gap doesn't creep back in: the run-time bucket ladder
+        # (sampling/bucket_manager.py) is chosen to cover every walker's
+        # actual starting cell, exactly mirroring how
+        # initial_max_neighbor_counts covers every walker's actual
+        # coordination number above.
+        from jaxrens.sampling.neighbor_list import (
+            initial_image_bucket_for_cell,
+        )
+
+        all_cells = (
+            np.asarray(resolved_init.initial_cells)
+            if resolved_init.initial_cells is not None
+            else np.zeros((resolved_init.initial_positions.shape[0], 3, 3))
+        )
+        initial_image_counts_needed = np.array(
+            [
+                initial_image_bucket_for_cell(c, base_backend.r_cutoff)
+                for c in all_cells
+            ],
+            dtype=np.int32,
+        )
+        resolved_init = replace(
+            resolved_init,
+            initial_image_counts_needed=initial_image_counts_needed,
+        )
     moves = tuple(m.to_move_config() for m in root.moves)
     move_descriptors = tuple(
         _dc.replace(
-            m.to_descriptor(n_atoms=n_atoms, cell_cfg=root.cell),
+            m.to_descriptor(
+                n_atoms=n_atoms,
+                cell_cfg=root.cell,
+                reference_positions=reference_positions,
+                reference_cell=reference_cell,
+                backend=base_backend,
+            ),
             min_rate=policy.min_rate,
             max_rate=policy.max_rate,
             step_size_max=policy.step_size_max,
@@ -1638,9 +1683,7 @@ def _resolve_multi_replica(
         else None
     )
     # This allows for varying types across replicas.
-    initial_types = jnp.stack(
-        [x.initial_types for x in per_run_init], axis=0
-    )
+    initial_types = jnp.stack([x.initial_types for x in per_run_init], axis=0)
 
     # --- Consolidated finalize on stacked (G, P, K, ...) arrays -----------
     # Reshape (n_total, K, ...) → (G, P, K, ...) and run a single
@@ -1812,10 +1855,39 @@ def _resolve_multi_replica(
 
     import dataclasses as _dc
 
+    # Local-update (see sampling/neighbor_list.py, sampling/local_energy.py)
+    # is currently wired only for the single-replica run path
+    # (cli/run.py::run_from_config -> sampling.nested_sampling.run_ns's
+    # ``local_energy_backend`` seeding hook). The multi-replica/multi-GPU/
+    # sharded dispatchers (run_multi_gpu_from_config, run_sharded_from_config)
+    # don't yet seed the atomic_energies/raw_energy cache after init, so a
+    # local-update move there would silently patch deltas onto a bogus
+    # zero baseline. Fail loudly rather than let that happen quietly.
+    if any(getattr(m, "local_update", False) for m in root.moves):
+        raise NotImplementedError(
+            "local_update=True is not yet supported on the multi-replica "
+            "path (inter_re / multiple pressures-compositions-chemical "
+            "potentials). It is currently wired only for a single-replica "
+            "run. Remove local_update from your moves, or run a "
+            "single-replica config per composition instead."
+        )
+    reference_positions = stacked_init.initial_positions[0, 0]
+    reference_cell = (
+        stacked_init.initial_cells[0, 0]
+        if stacked_init.initial_cells is not None
+        else None
+    )
+
     moves = tuple(m.to_move_config() for m in root.moves)
     move_descriptors = tuple(
         _dc.replace(
-            m.to_descriptor(n_atoms=n_atoms, cell_cfg=root.cell),
+            m.to_descriptor(
+                n_atoms=n_atoms,
+                cell_cfg=root.cell,
+                reference_positions=reference_positions,
+                reference_cell=reference_cell,
+                backend=base_backend,
+            ),
             min_rate=policy.min_rate,
             max_rate=policy.max_rate,
             step_size_max=policy.step_size_max,

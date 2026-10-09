@@ -86,7 +86,8 @@ def _bump_cumulative_counters(
 
 
 def _inject_cumulative_into_info(
-    info: dict[str, Any], cumulative: dict[str, np.ndarray],
+    info: dict[str, Any],
+    cumulative: dict[str, np.ndarray],
 ) -> None:
     """Write cumulative counter snapshots into *info* for downstream callbacks.
 
@@ -99,10 +100,12 @@ def _inject_cumulative_into_info(
         cumulative: Dict with keys ``"n_evaluations"`` and
             ``"n_grad_evaluations"`` (numpy int64 arrays).
     """
-    info["cumulative_n_evaluations_per_move"] = cumulative["n_evaluations"].copy()
-    info["cumulative_n_grad_evaluations_per_move"] = (
-        cumulative["n_grad_evaluations"].copy()
-    )
+    info["cumulative_n_evaluations_per_move"] = cumulative[
+        "n_evaluations"
+    ].copy()
+    info["cumulative_n_grad_evaluations_per_move"] = cumulative[
+        "n_grad_evaluations"
+    ].copy()
 
 
 def _pack_adjustment_info(
@@ -275,6 +278,7 @@ from jaxrens.sampling.bucket_manager import (  # noqa: E402
     BucketManager,
     _pick_next_bucket,
     _pick_prev_bucket,
+    image_bucket_manager,
 )
 
 
@@ -297,6 +301,9 @@ def _run_loop(
     max_neighbors_list: tuple[int, ...] = (30, 35, 40, 45, 50),
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
+    image_neighbors_list: tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12),
+    image_neighbors_offset: int = 1,
+    image_neighbors_shrink_dwell: int = 0,
     ns_step_fn: Callable | None = None,
 ) -> tuple[NSState, Key[Array, "*B"], dict[str, np.ndarray]]:
     """Unified NS outer loop shared by ``run_ns`` and ``run_ns_parallel``.
@@ -349,6 +356,20 @@ def _run_loop(
             byte-identical.  JAX's compilation cache reuses earlier compiles
             when the bucket revisits a known size, so the only cost paid by
             a wrong downsize is the next overflow re-grow.
+        image_neighbors_list, image_neighbors_offset,
+            image_neighbors_shrink_dwell: Same bucket-ladder mechanism as
+            ``max_neighbors_list``/``max_neighbors_offset``/
+            ``max_neighbors_shrink_dwell`` above, applied to a SEPARATE
+            dimension: the periodic-image half-width used by local-update
+            move kernels (``single_atom_swap``, ``alchemical_morph``,
+            ``single_atom``, ``single_atom_sweep`` — see
+            ``sampling/neighbor_list.py::build_symmetric_image_offsets``).
+            Managed by a second, independent :class:`BucketManager`
+            instance (see
+            ``sampling/bucket_manager.py::image_bucket_manager``) so it
+            never conflicts with the neighbor-count ladder above. Inert
+            (never triggers) when no local move is active, since
+            ``population.image_overflow`` then never becomes ``True``.
 
     Returns:
         ``(ns_state, rng_key, cumulative)`` where:
@@ -360,14 +381,18 @@ def _run_loop(
           ``(n_moves,)`` for ``SingleRun``, ``(n_runs, n_moves)`` for
           ``VmapRuns``.
     """
-    from jaxrens.sampling.nested_sampling import ns_step  # avoid circular at module level
+    from jaxrens.sampling.nested_sampling import (  # avoid circular at module level
+        ns_step,
+    )
 
     # JIT-compile ns_step once before the loop.  Callers may override
     # the underlying step function (e.g. ``ns_step_sharded`` for the
     # ShardedSingleRun mode) via ``ns_step_fn``; default preserves the
     # SingleRun / VmapRuns / PmapVmapRuns behaviour.
     step_to_wrap = ns_step_fn if ns_step_fn is not None else ns_step
-    jit_ns_step = batcher.wrap_step(step_to_wrap, step_fn, n_mcmc_steps, n_extra)
+    jit_ns_step = batcher.wrap_step(
+        step_to_wrap, step_fn, n_mcmc_steps, n_extra
+    )
 
     # Per-replica step sizes: pop.step_sizes is (*shape_prefix, K, n_moves).
     # The descriptor drops the walker axis to give (*shape_prefix, n_moves).
@@ -378,10 +403,12 @@ def _run_loop(
     # Empty prefix collapses to (n_moves,) for SingleRun.
     cumulative: dict = {
         "n_evaluations": np.zeros(
-            batcher.shape_prefix + (n_moves,), dtype=np.int64,
+            batcher.shape_prefix + (n_moves,),
+            dtype=np.int64,
         ),
         "n_grad_evaluations": np.zeros(
-            batcher.shape_prefix + (n_moves,), dtype=np.int64,
+            batcher.shape_prefix + (n_moves,),
+            dtype=np.int64,
         ),
     }
 
@@ -419,6 +446,15 @@ def _run_loop(
         offset=max_neighbors_offset,
         shrink_dwell=max_neighbors_shrink_dwell,
     )
+    # Second, independent bucket-ladder dimension for local-update move
+    # kernels' periodic-image half-width (see module-level docstring on
+    # ``image_neighbors_list`` above) — same mechanism, different fields,
+    # never conflicts with ``bucket_mgr``.
+    image_bucket_mgr = image_bucket_manager(
+        ladder=image_neighbors_list,
+        offset=image_neighbors_offset,
+        shrink_dwell=image_neighbors_shrink_dwell,
+    )
 
     # ``i`` is the segment-local loop counter (0-based each invocation) and
     # drives termination + adapt phase — keeping it segment-local preserves
@@ -442,7 +478,9 @@ def _run_loop(
             # same constraint the population was sampled under — minor
             # off-by-one vs. the upcoming step's L_{i+1}, but principled.
             ns_state, per_move_outputs, rng_key = adapt_step(
-                ns_state, ns_state.emax, rng_key,
+                ns_state,
+                ns_state.emax,
+                rng_key,
             )
             # Re-extract for the downstream callbacks / info dict.
             current_step_sizes = batcher.extract_step_sizes(
@@ -456,12 +494,31 @@ def _run_loop(
         if batcher.is_batched:
             new_ns_state, info = jit_ns_step(ns_state)
         else:
-            new_ns_state, info = jit_ns_step(ns_state, step_fn, n_mcmc_steps, n_extra)
+            new_ns_state, info = jit_ns_step(
+                ns_state, step_fn, n_mcmc_steps, n_extra
+            )
 
         # ---- Overflow retry ----
         # For PmapVmapRuns, any overflow across any (G, P) shard triggers a retry.
+        # Two independent bucket dimensions checked in sequence against the
+        # SAME pre-step state (``ns_state`` itself, not yet reassigned) —
+        # each check's rollback target must be the true pre-step state,
+        # never an already-updated one, or a retry would resume from a
+        # step whose overflow made it untrustworthy in the first place.
+        pre_step_ns_state = ns_state
         ns_state, retry = bucket_mgr.grow_if_overflow(
-            ns_state, new_ns_state, label="iter", iteration=record_iteration,
+            pre_step_ns_state,
+            new_ns_state,
+            label="iter",
+            iteration=record_iteration,
+        )
+        if retry:
+            continue
+        ns_state, retry = image_bucket_mgr.grow_if_overflow(
+            pre_step_ns_state,
+            new_ns_state,
+            label="iter",
+            iteration=record_iteration,
         )
         if retry:
             continue
@@ -470,12 +527,21 @@ def _run_loop(
         # No-op when shrink_dwell == 0; otherwise steps the bucket down one
         # ladder entry once the observed peak has stayed below the next-
         # smaller bucket (with margin) for ``shrink_dwell`` iterations.
-        ns_state = bucket_mgr.maybe_shrink(ns_state, iteration=record_iteration)
+        ns_state = bucket_mgr.maybe_shrink(
+            ns_state, iteration=record_iteration
+        )
+        ns_state = image_bucket_mgr.maybe_shrink(
+            ns_state, iteration=record_iteration
+        )
 
         # ---- Inter-RE phase ----
         # Fires after ns_step, before cumulative counter bump and callbacks.
         # Zero overhead when inter_re_mgr is None or is_active=False.
-        if inter_re_mgr is not None and inter_re_mgr.is_active and inter_re_mgr.fires(i):
+        if (
+            inter_re_mgr is not None
+            and inter_re_mgr.is_active
+            and inter_re_mgr.fires(i)
+        ):
             inter_re_key, key_re = jax.random.split(inter_re_key)
             # RE reads the contour off ``ns_state.emax`` (set by the
             # ns_step that just ran).  No emax recomputation here, no
@@ -533,6 +599,7 @@ def _run_loop(
         # to ``(K, ...)`` so SingleRun-shaped callbacks see uniform
         # shapes.
         from jaxrens.sampling.batch_descriptor import ShardedSingleRun
+
         if isinstance(batcher, ShardedSingleRun):
             info = _scalarize_sharded_info(info)
             ns_state_for_cb = _gather_sharded_ns_state(ns_state)
@@ -543,7 +610,8 @@ def _run_loop(
 
         # ---- Termination ----
         log_z_scalar, hmax_scalar = batcher.reduce_for_termination(
-            ns_state.log_evidence, info.get("hmax", jnp.inf),
+            ns_state.log_evidence,
+            info.get("hmax", jnp.inf),
         )
         for criterion in termination_criteria:
             if isinstance(criterion, PriorMassTermination):
@@ -557,5 +625,3 @@ def _run_loop(
         i += 1
 
     return ns_state, rng_key, cumulative
-
-

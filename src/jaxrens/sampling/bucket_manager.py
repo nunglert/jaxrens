@@ -110,6 +110,10 @@ class BucketManager:
         ladder: tuple[int, ...] | list[int],
         offset: int,
         shrink_dwell: int = 0,
+        *,
+        overflow_field: str = "overflow",
+        count_field: str = "max_neighbor_count",
+        bucket_field: str = "max_neighbors",
     ) -> None:
         self.ladder = tuple(int(x) for x in ladder)
         if not self.ladder:
@@ -121,6 +125,15 @@ class BucketManager:
                 f"shrink_dwell must be >= 0, got {self.shrink_dwell}."
             )
         self.low_count = 0
+        # Which population fields this instance reads/writes — defaults
+        # match the original (backend neighbor-count) use so existing
+        # callers are unaffected. A second instance can point these at a
+        # different triple of fields (e.g. "image_overflow"/
+        # "image_count_needed"/"image_bucket") to manage an independent
+        # bucket-ladder dimension without any conflict between instances.
+        self.overflow_field = overflow_field
+        self.count_field = count_field
+        self.bucket_field = bucket_field
 
     def grow_if_overflow(
         self,
@@ -147,22 +160,34 @@ class BucketManager:
             larger bucket).  When False, ``state_to_use_next`` is just
             ``new_ns_state`` unchanged.
         """
-        if not bool(jnp.any(new_ns_state.population.overflow)):
+        if not bool(
+            jnp.any(getattr(new_ns_state.population, self.overflow_field))
+        ):
             return new_ns_state, False
 
-        true_max = int(new_ns_state.population.max_neighbor_count.max())
-        current = int(ns_state.population.max_neighbors)
-        new_max = _pick_next_bucket(true_max, current, self.ladder, self.offset)
+        true_max = int(
+            getattr(new_ns_state.population, self.count_field).max()
+        )
+        current = int(getattr(ns_state.population, self.bucket_field))
+        new_max = _pick_next_bucket(
+            true_max, current, self.ladder, self.offset
+        )
         logger.warning(
-            "Overflow at %s %d: observed max_neighbors=%d, "
+            "Overflow at %s %d: observed %s=%d, "
             "resizing bucket %d -> %d (ladder=%s, offset=%d)",
-            label, iteration, true_max, current, new_max,
-            list(self.ladder), self.offset,
+            label,
+            iteration,
+            self.count_field,
+            true_max,
+            current,
+            new_max,
+            list(self.ladder),
+            self.offset,
         )
         # Growing invalidates any pending shrink streak.
         self.low_count = 0
         retried_state = ns_state.set(
-            population=ns_state.population.set(max_neighbors=new_max),
+            population=ns_state.population.set(**{self.bucket_field: new_max}),
         )
         return retried_state, True
 
@@ -189,10 +214,13 @@ class BucketManager:
         if self.shrink_dwell <= 0:
             return ns_state
 
-        obs_max = int(ns_state.population.max_neighbor_count.max())
-        current = int(ns_state.population.max_neighbors)
+        obs_max = int(getattr(ns_state.population, self.count_field).max())
+        current = int(getattr(ns_state.population, self.bucket_field))
         smaller = _pick_prev_bucket(
-            obs_max, current, self.ladder, self.offset,
+            obs_max,
+            current,
+            self.ladder,
+            self.offset,
         )
         if smaller is None:
             self.low_count = 0
@@ -203,12 +231,43 @@ class BucketManager:
             return ns_state
 
         logger.info(
-            "Shrinking bucket at iter %d: observed max_neighbors=%d, "
+            "Shrinking bucket at iter %d: observed %s=%d, "
             "resizing bucket %d -> %d (ladder=%s, offset=%d, dwell=%d)",
-            iteration, obs_max, current, smaller,
-            list(self.ladder), self.offset, self.shrink_dwell,
+            iteration,
+            self.count_field,
+            obs_max,
+            current,
+            smaller,
+            list(self.ladder),
+            self.offset,
+            self.shrink_dwell,
         )
         self.low_count = 0
         return ns_state.set(
-            population=ns_state.population.set(max_neighbors=smaller),
+            population=ns_state.population.set(**{self.bucket_field: smaller}),
         )
+
+
+def image_bucket_manager(
+    ladder: tuple[int, ...] | list[int],
+    offset: int,
+    shrink_dwell: int = 0,
+) -> BucketManager:
+    """Convenience constructor for the periodic-image-count bucket ladder.
+
+    Same retry/shrink mechanism as the default (backend neighbor-count)
+    :class:`BucketManager`, pointed instead at the
+    ``image_overflow``/``image_count_needed``/``image_bucket`` triple of
+    ``MCState`` fields (see ``sampling/neighbor_list.py``) — used
+    identically (``grow_if_overflow``/``maybe_shrink``) alongside a
+    default-configured instance, never conflicting with it since the two
+    instances never touch the same fields.
+    """
+    return BucketManager(
+        ladder=ladder,
+        offset=offset,
+        shrink_dwell=shrink_dwell,
+        overflow_field="image_overflow",
+        count_field="image_count_needed",
+        bucket_field="image_bucket",
+    )

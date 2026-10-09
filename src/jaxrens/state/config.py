@@ -52,6 +52,20 @@ class BackendConfig:
     # plays the role of post-shrink safety margin.
     max_neighbors_shrink_dwell: int = 0
 
+    # Second, independent bucket-ladder dimension: the periodic-image
+    # half-width used by local-update move kernels (single_atom_swap,
+    # alchemical_morph, single_atom, single_atom_sweep — see
+    # sampling/neighbor_list.py::build_symmetric_image_offsets). Same
+    # overflow-and-retry mechanism as max_neighbors_list/offset/
+    # shrink_dwell above (see sampling/bucket_manager.py::image_bucket_manager),
+    # just applied to a different field triple so the two ladders never
+    # conflict. Inert (never triggers) when no local move is active.
+    image_neighbors_list: list[int] = field(
+        default_factory=lambda: [1, 2, 3, 4, 6, 8, 12]
+    )
+    image_neighbors_offset: int = 1
+    image_neighbors_shrink_dwell: int = 0
+
     # Soft-core repulsion wrapper kwargs.  ``None`` disables.  When set,
     # the runtime wraps ``base_backend`` with ``SoftCoreBackend`` before
     # any ``EnsembleBackend`` wrap.  Expected keys: ``a0``, ``b0``,

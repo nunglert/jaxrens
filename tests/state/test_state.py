@@ -8,9 +8,9 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from jaxrens.state.walker import WalkerState
-from jaxrens.state.ns import NSState
 from jaxrens.state.mc_state import make_mc_state_class
+from jaxrens.state.ns import NSState
+from jaxrens.state.walker import WalkerState
 
 
 class TestWalkerStatePytree:
@@ -92,7 +92,9 @@ class TestWalkerStatePytree:
         leaves, treedef = jax.tree_util.tree_flatten(dummy_walker_nonperiodic)
         reconstructed = treedef.unflatten(leaves)
         assert reconstructed.cell is None
-        assert jnp.array_equal(reconstructed.positions, dummy_walker_nonperiodic.positions)
+        assert jnp.array_equal(
+            reconstructed.positions, dummy_walker_nonperiodic.positions
+        )
 
 
 class TestNSStatePytree:
@@ -113,6 +115,12 @@ class TestNSStatePytree:
             n_proposed=jnp.zeros((n_walkers, n_moves), dtype=jnp.int32),
             max_neighbor_count=jnp.zeros(n_walkers, dtype=jnp.int32),
             overflow=jnp.zeros(n_walkers, dtype=jnp.bool_),
+            image_count_needed=jnp.zeros_like(
+                jnp.zeros(n_walkers, dtype=jnp.int32)
+            ),
+            image_overflow=jnp.zeros_like(
+                jnp.zeros(n_walkers, dtype=jnp.bool_)
+            ),
             ensemble_params={},
         )
         return NSState(
@@ -148,7 +156,9 @@ class TestNSStatePytree:
         state = self._make_ns_state()
         updated = state.set(iteration=jnp.array(42, dtype=jnp.int32))
         assert jnp.array_equal(updated.iteration, jnp.array(42))
-        assert jnp.array_equal(state.iteration, jnp.array(0))  # original unchanged
+        assert jnp.array_equal(
+            state.iteration, jnp.array(0)
+        )  # original unchanged
 
 
 class TestConfigs:
@@ -161,6 +171,7 @@ class TestConfigs:
 
     def test_ns_config_defaults(self):
         from jaxrens.state.config import NSConfig
+
         config = NSConfig()
         assert config.n_live == 500
         assert config.max_iterations is None
@@ -168,12 +179,14 @@ class TestConfigs:
 
     def test_backend_config_max_neighbors(self):
         from jaxrens.state.config import BackendConfig
+
         config = BackendConfig(max_neighbors_list=[10, 20, 30, 40, 50])
         assert config.max_neighbors_list == [10, 20, 30, 40, 50]
         assert config.max_neighbors_offset == 5
 
     def test_output_config_defaults(self):
         from jaxrens.state.config import OutputConfig
+
         config = OutputConfig()
         assert config.format == "extxyz"
         assert config.checkpoint_interval == 100

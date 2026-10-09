@@ -16,9 +16,9 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from jaxrens.backends.toy import create_harmonic, create_double_well
-from jaxrens.sampling.moves import hmc, single_atom, alchemical
+from jaxrens.backends.toy import create_double_well, create_harmonic
 from jaxrens.base import MoveInfo
+from jaxrens.sampling.moves import alchemical, hmc, single_atom
 from jaxrens.state.mc_state import MCState
 
 
@@ -37,6 +37,8 @@ def _make_state(positions, types, energy, cell=None, step_size=0.1):
         n_proposed=jnp.zeros(1, dtype=jnp.int32),
         max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
         overflow=jnp.asarray(False),
+        image_count_needed=jnp.zeros_like(jnp.asarray(0, dtype=jnp.int32)),
+        image_overflow=jnp.zeros_like(jnp.asarray(False)),
         ensemble_params={},
     )
 
@@ -46,7 +48,9 @@ def _make_batch_state(positions, types, energies, step_size=0.1):
     n = positions.shape[0]
     return MCState(
         positions=positions,
-        types=jnp.broadcast_to(types, (n, *types.shape)) if types.ndim == 1 else types,
+        types=jnp.broadcast_to(types, (n, *types.shape))
+        if types.ndim == 1
+        else types,
         energy=energies,
         cell=jnp.zeros((n, 3, 3)),
         step_size=jnp.full(n, step_size),
@@ -55,6 +59,8 @@ def _make_batch_state(positions, types, energies, step_size=0.1):
         n_proposed=jnp.zeros((n, 1), dtype=jnp.int32),
         max_neighbor_count=jnp.zeros(n, dtype=jnp.int32),
         overflow=jnp.full(n, False),
+        image_count_needed=jnp.zeros_like(jnp.zeros(n, dtype=jnp.int32)),
+        image_overflow=jnp.zeros_like(jnp.full(n, False)),
         ensemble_params={},
     )
 
@@ -79,12 +85,14 @@ def positions_1atom():
 
 @pytest.fixture
 def positions_4atom():
-    return jnp.array([
-        [0.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ])
+    return jnp.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
 
 
 @pytest.fixture
@@ -129,8 +137,12 @@ class TestHMC:
         key = jax.random.key(2)
         positions = jax.random.normal(key, (n_walkers, 1, 3))
         cell = jnp.zeros((3, 3))
-        energies = jax.vmap(lambda pos: backend(pos, types_1, cell, 0)[0])(positions)
-        states = _make_batch_state(positions, types_1, energies, step_size=0.01)
+        energies = jax.vmap(lambda pos: backend(pos, types_1, cell, 0)[0])(
+            positions
+        )
+        states = _make_batch_state(
+            positions, types_1, energies, step_size=0.01
+        )
         step_fn = jax.jit(hmc.build_kernel(backend, n_leapfrog=5))
         keys = jax.random.split(jax.random.key(3), n_walkers)
         constraints = 100.0 * jnp.ones(n_walkers)
@@ -200,7 +212,9 @@ class TestSingleAtomMove:
         n_walkers = 4
         positions = jax.random.normal(jax.random.key(12), (n_walkers, 1, 3))
         cell = jnp.zeros((3, 3))
-        energies = jax.vmap(lambda pos: backend(pos, types_1, cell, 0)[0])(positions)
+        energies = jax.vmap(lambda pos: backend(pos, types_1, cell, 0)[0])(
+            positions
+        )
         states = _make_batch_state(positions, types_1, energies, step_size=0.1)
         step_fn = jax.jit(single_atom.build_kernel(backend))
         keys = jax.random.split(jax.random.key(13), n_walkers)
@@ -275,7 +289,9 @@ class TestSingleAtomSwap:
         key = jax.random.key(30)
         new_state, info = step_fn(key, state, 100.0)
         assert new_state.positions.shape == (4, 3)
-        assert jnp.sum(new_state.types == 0) + jnp.sum(new_state.types == 1) == 4
+        assert (
+            jnp.sum(new_state.types == 0) + jnp.sum(new_state.types == 1) == 4
+        )
 
     def test_jit(self, harmonic, positions_4atom, types_4):
         backend = harmonic
@@ -286,7 +302,9 @@ class TestSingleAtomSwap:
         new_state, info = step_fn(jax.random.key(31), state, 100.0)
         assert jnp.isfinite(new_state.energy)
 
-    def test_preserves_species_counts(self, harmonic, positions_4atom, types_4):
+    def test_preserves_species_counts(
+        self, harmonic, positions_4atom, types_4
+    ):
         backend = harmonic
         energy = backend(positions_4atom, types_4, jnp.zeros((3, 3)), 0)[0]
         state = _make_state(positions_4atom, types_4, energy)
@@ -302,7 +320,9 @@ class TestSingleAtomSwap:
     def test_no_swap_single_species(self, harmonic, positions_4atom):
         backend = harmonic
         types_single = jnp.zeros((4,), dtype=jnp.int32)
-        energy = backend(positions_4atom, types_single, jnp.zeros((3, 3)), 0)[0]
+        energy = backend(positions_4atom, types_single, jnp.zeros((3, 3)), 0)[
+            0
+        ]
         state = _make_state(positions_4atom, types_single, energy)
         step_fn = jax.jit(single_atom.build_swap_kernel(backend))
 
@@ -386,7 +406,9 @@ class TestRandomShift:
         if bool(info.accepted):
             displacements = new_state.positions - state.positions
             for i in range(1, 4):
-                assert jnp.allclose(displacements[0], displacements[i], atol=1e-6)
+                assert jnp.allclose(
+                    displacements[0], displacements[i], atol=1e-6
+                )
 
     def test_lax_scan(self, harmonic, positions_4atom, types_4):
         backend = harmonic
@@ -402,3 +424,62 @@ class TestRandomShift:
         final_state, accepted = jax.lax.scan(scan_step, state, keys)
         assert final_state.positions.shape == (4, 3)
         assert accepted.shape == (20,)
+
+    def test_translation_invariant_skip_always_accepts(
+        self, positions_4atom, types_4
+    ):
+        """assume_translation_invariant=True must always accept with an
+        unchanged energy — the whole point of the optimization."""
+        from jaxrens.backends.lj import create_lj
+
+        backend = create_lj(epsilon=1.0, sigma=1.0)
+        cell = 5.0 * jnp.eye(3)
+        energy = backend(positions_4atom, types_4, cell, 0).energy
+        state = _make_state(
+            positions_4atom, types_4, energy, cell=cell, step_size=1.0
+        )
+        step_fn = jax.jit(
+            alchemical.build_shift_kernel(
+                backend, assume_translation_invariant=True
+            )
+        )
+
+        key = jax.random.key(80)
+        new_state, info = step_fn(
+            key, state, -1e9
+        )  # constraint the full path would reject
+        assert bool(info.accepted)
+        assert jnp.asarray(info.n_evaluations) == 0
+        assert jnp.allclose(new_state.energy, state.energy)
+
+    def test_translation_invariant_skip_matches_full_recompute(
+        self, positions_4atom, types_4
+    ):
+        """The skipped energy must equal an independent from-scratch
+        recompute on the shifted (and wrapped) positions — this is the
+        empirical check that the ΔE=0 assumption actually holds for a
+        periodic, relative-distance-only backend (LJ)."""
+        from jaxrens.backends.lj import create_lj
+        from jaxrens.utils.cell import wrap_positions
+
+        backend = create_lj(epsilon=1.0, sigma=1.0)
+        cell = 5.0 * jnp.eye(3)
+        energy = backend(positions_4atom, types_4, cell, 0).energy
+        state = _make_state(
+            positions_4atom, types_4, energy, cell=cell, step_size=2.0
+        )
+        step_fn = jax.jit(
+            alchemical.build_shift_kernel(
+                backend, assume_translation_invariant=True
+            )
+        )
+
+        key = jax.random.key(81)
+        new_state, _ = step_fn(key, state, 1e9)
+
+        full_recompute = backend(new_state.positions, types_4, cell, 0).energy
+        assert jnp.allclose(new_state.energy, full_recompute, atol=1e-5)
+
+        # Positions must be wrapped into the home cell.
+        frac = new_state.positions @ jnp.linalg.inv(cell)
+        assert jnp.all(frac >= -1e-6) and jnp.all(frac < 1 + 1e-6)

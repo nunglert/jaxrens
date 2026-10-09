@@ -30,6 +30,7 @@ import jax
 import jax.numpy as jnp
 
 from jaxrens.backends.base import BackendResult
+from jaxrens.backends.locality import LocalEnergyCapability
 from jaxrens.backends.softcore import DEFAULT_SOFTCORE_KWARGS
 
 logger = logging.getLogger(__name__)
@@ -259,6 +260,15 @@ class NeuralILBackend:
             morse_type=morse_type,
             softcore=softcore,
             softcore_kwargs=self.softcore_kwargs,
+        )
+        # NeuralIL is a strictly local, single-cutoff-radius descriptor
+        # model (Behler-Parrinello style, not multi-layer message passing),
+        # so a small subset of the total energy can be recomputed exactly
+        # via `atomic_energies_for` — see backends/locality.py.
+        self.local_energy_capability = LocalEnergyCapability(
+            kind="single_cutoff",
+            effective_cutoff=r_cutoff,
+            supports_subset_query=True,
         )
 
     @property
@@ -515,6 +525,105 @@ class NeuralILBackend:
             sc_b,
             sc_c,
         )
+
+    def atomic_energies(
+        self,
+        positions: jnp.ndarray,
+        species: jnp.ndarray,
+        cell: jnp.ndarray,
+        max_neighbors: int = 50,
+    ) -> jnp.ndarray:
+        """Full per-atom energy decomposition, shape ``(n_atoms,)``.
+
+        Used only for local-update cache seeding/restart (not the hot
+        loop) — see ``sampling/local_energy.py``. Deliberately does NOT
+        apply the ``energy_shift_per_atom`` correction (see
+        :meth:`atomic_energies_for` for why); callers that need it added
+        back should do ``atomic_energies(...).sum() +
+        self.energy_shift_per_atom * (species >= 0).sum()`` to match
+        ``__call__``'s absolute energy convention.
+        """
+        safe_cell = self._safe_cell(cell)
+        atomic = self._dynamics_model.apply(
+            self.model_params,
+            positions,
+            species,
+            safe_cell,
+            max_neighbors,
+            method=self._dynamics_model.calc_atomic_energies,
+        )
+        if self.is_ensemble:
+            atomic = atomic.mean(axis=0)
+        return atomic
+
+    def atomic_energies_for(
+        self,
+        positions: jnp.ndarray,
+        species: jnp.ndarray,
+        cell: jnp.ndarray,
+        some_indices: jnp.ndarray,
+        max_neighbors: int = 50,
+    ) -> jnp.ndarray:
+        """Per-atom energies for a fixed-size subset of atoms only.
+
+        The expensive part (the ResNet forward over descriptors) runs only
+        over the ``K = len(some_indices)`` requested atoms via
+        ``calc_some_atomic_energies``'s internal ``lax.map`` — cost scales
+        with ``K``, not with the total atom count. The full ``positions``/
+        ``species`` arrays are still required as neighbor-search context
+        (a changed atom's neighbors' own descriptors depend on it).
+
+        Args:
+            positions, species, cell: FULL system arrays, not ``K``-sized.
+            some_indices: ``(K,)`` int array of atom indices to compute
+                energies for. Padded slots must use the sentinel
+                ``positions.shape[0]`` (one-past-the-end) — this method
+                handles that sentinel internally (returns 0.0 for those
+                slots) rather than requiring the caller to pre-mask.
+            max_neighbors: Buffer-shape control, as for ``__call__``.
+
+        Returns:
+            ``(K,)`` per-atom energy contributions, 0.0 at sentinel slots.
+
+        Note on the energy shift: unlike ``__call__``, this method does
+        NOT add ``energy_shift_per_atom``. The shift is a constant times
+        the *global* real-atom count, which every caller of this method
+        (local-update move kernels relabeling/moving existing atoms, never
+        inserting/removing one) leaves invariant — so it cancels exactly
+        in the ``new_local_sum - old_local_sum`` delta computed by
+        ``sampling/local_energy.py::local_energy_update``, and adding it
+        here would double-count it once the caller folds the delta into a
+        shift-inclusive cached total.
+        """
+        n_atoms = positions.shape[0]
+        safe_cell = self._safe_cell(cell)
+
+        valid = some_indices < n_atoms
+        safe_idx = jnp.where(valid, some_indices, 0)
+        some_positions = jnp.take(positions, safe_idx, axis=0)
+        # Padded slots get type -1: `calc_some_atomic_energies` already
+        # masks out (some_types >= 0) internally (NeuralIL's own
+        # "Administratium" convention for absent atoms), so reusing that
+        # existing, tested mask handles our sentinel padding too — no
+        # separate masking convention needed.
+        some_types = jnp.where(valid, jnp.take(species, safe_idx), -1)
+
+        atomic = self._dynamics_model.apply(
+            self.model_params,
+            some_positions,
+            some_types,
+            positions,
+            species,
+            safe_cell,
+            max_neighbors,
+            method=self._dynamics_model.calc_some_atomic_energies,
+        )
+        if self.is_ensemble:
+            # PlainEnsemble.calc_some_atomic_energies returns (n_models, K)
+            # — reduce the ensemble axis the same way __call__ reduces
+            # calc_potential_energy's ensemble axis.
+            atomic = atomic.mean(axis=0)
+        return atomic
 
 
 # ---------------------------------------------------------------------------

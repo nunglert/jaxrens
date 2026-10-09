@@ -22,15 +22,77 @@ Usage:
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
 
+from jaxrens.backends.locality import probe_local_capability
 from jaxrens.base import MoveInfo
 from jaxrens.constraints.base import ConstraintDescriptor, make_move_gate
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.state.mc_state import make_mc_state_class
+
+logger = logging.getLogger(__name__)
+
+_LOCAL_KERNEL_KWARGS = ("max_affected",)
+
+
+def _downgrade_to_full(d: MoveKernel) -> MoveKernel:
+    """Strip whichever kernel_kwargs would select ``d``'s local/incremental
+    path and reclassify it as ``affects="all"``.
+
+    Every local-capable move kernel (``build_swap_kernel``,
+    ``build_morph_kernel``, ``single_atom.build_kernel``,
+    ``build_sweep_kernel``) already has a full-recompute branch it falls
+    back to when its local-path kwarg (``max_affected``) is ``None`` —
+    that's the only thing removing it needs to trigger. ``extra_state_fields``
+    is also cleared: if some other move in the set is still genuinely
+    local, that move's own declaration already contributes the same shared
+    cache fields; if none is, this avoids seeding an
+    ``atomic_energies``/``raw_energy`` cache nothing will read.
+    """
+    stripped_kwargs = {
+        k: v
+        for k, v in d.kernel_kwargs.items()
+        if k not in _LOCAL_KERNEL_KWARGS
+    }
+    return dataclasses.replace(
+        d, affects="all", kernel_kwargs=stripped_kwargs, extra_state_fields={}
+    )
+
+
+def _resolve_local_affects(d: MoveKernel, backend: Any) -> MoveKernel:
+    """Return ``d`` unchanged if its ``affects="local"`` declaration (if
+    any) is safely usable given ``backend``; otherwise log a warning and
+    return a downgraded (``affects="all"``) copy. A no-op for moves that
+    never declared ``"local"``.
+
+    Every local move recomputes its affected-atom set fresh from the
+    CURRENT ``state.positions``/``state.cell`` on every proposal (see
+    ``sampling/neighbor_list.py`` module docstring) — there is no cached
+    structure left that another move in the set could invalidate, so the
+    only remaining reason a ``"local"`` declaration can't be honored is a
+    genuine backend limitation (not a combination of moves).
+    """
+    if d.affects != "local":
+        return d
+
+    cap = probe_local_capability(backend)
+    if cap.kind != "single_cutoff":
+        logger.warning(
+            "move %r declared affects='local', but the backend's local "
+            "energy capability is %r (needs 'single_cutoff') — falling "
+            "back to full energy recomputation for this move (see "
+            "jaxrens.backends.locality).",
+            d.name,
+            cap.kind,
+        )
+        return _downgrade_to_full(d)
+
+    return d
 
 
 def build_mwg(
@@ -62,6 +124,27 @@ def build_mwg(
         - step_fn(rng_key, state, likelihood_constraint) -> (MCState, MoveInfo)
     """
     n_moves = len(move_descriptors)
+
+    # --- Local/incremental energy update: capability check ---
+    # A move declares affects="local" as a structural fact about itself
+    # (see MoveKernel docstring) — it recomputes its affected-atom set
+    # fresh from the current state on every proposal, so it is safe in ANY
+    # combination with other moves, cell-mutating ones included. The only
+    # thing that can still prevent it from running is the backend itself
+    # not supporting the subset-energy query it needs; when that happens,
+    # the declaration is downgraded to "all" (full recompute for that move
+    # only) with a logged warning — every combination of moves is accepted.
+    move_descriptors = [
+        _resolve_local_affects(d, backend) for d in move_descriptors
+    ]
+
+    has_local_move = any(d.affects == "local" for d in move_descriptors)
+
+    # The unwrapped base backend (EnsembleBackend.base if wrapped, else
+    # backend itself) — needed to recompute the atomic-energy cache from
+    # scratch after an affects="all" move, in the *raw* (pre-ensemble-
+    # correction) convention the cache is kept in.
+    _base_backend = getattr(backend, "base", backend)
 
     # --- Collect extra state fields from all descriptors ---
     all_extra_fields: dict[str, tuple[type, Callable]] = {}
@@ -100,11 +183,38 @@ def build_mwg(
     ]
 
     # --- Wrap each step_fn ---
-    def _wrap(raw_fn, move_idx, gate):
+    def _wrap(raw_fn, move_idx, gate, affects):
         def wrapped(state, key: jax.Array, constraint: float | jnp.ndarray):
             # Inject this move's step_size from the per-move array
             state_with_ss = state.set(step_size=state.step_sizes[move_idx])
             new_state, info = raw_fn(key, state_with_ss, constraint)
+
+            if has_local_move and affects == "all":
+                # This move doesn't know about the atomic-energy cache and
+                # may have changed any atom's contribution (or the cell) —
+                # recompute the cache from scratch so later "local" moves
+                # patch it against a correct baseline. Costs one extra full
+                # evaluation per *accepted* affects="all" step; only paid
+                # when local and non-local moves are mixed in the same
+                # move-set (the primary intended workflow — swap/morph
+                # only — never hits this branch).
+                recomputed_atomic = _base_backend.atomic_energies(
+                    new_state.positions,
+                    new_state.types,
+                    new_state.cell,
+                    new_state.max_neighbors,
+                )
+                shift = getattr(_base_backend, "energy_shift_per_atom", 0.0)
+                n_real = jnp.sum(new_state.types >= 0).astype(jnp.float32)
+                recomputed_raw = recomputed_atomic.sum() + shift * n_real
+                new_state = new_state.set(
+                    atomic_energies=jnp.where(
+                        info.accepted, recomputed_atomic, state.atomic_energies
+                    ),
+                    raw_energy=jnp.where(
+                        info.accepted, recomputed_raw, state.raw_energy
+                    ),
+                )
 
             if gate is not None:
                 # Enforce configuration constraints on the proposed config.
@@ -143,7 +253,8 @@ def build_mwg(
         return wrapped
 
     wrapped_fns = [
-        _wrap(fn, i, move_gates[i]) for i, fn in enumerate(raw_step_fns)
+        _wrap(fn, i, move_gates[i], move_descriptors[i].affects)
+        for i, fn in enumerate(raw_step_fns)
     ]
 
     # --- Default step sizes from descriptors ---
@@ -161,6 +272,8 @@ def build_mwg(
         ensemble_params: dict | None = None,
         max_neighbors: int = 0,
         max_neighbor_count_init: int | jnp.ndarray = 0,
+        image_bucket: int = 1,
+        image_count_needed_init: int | jnp.ndarray = 0,
     ) -> Any:  # returns MCStateClass instance
         """Create initial MCState from walker data.
 
@@ -181,6 +294,30 @@ def build_mwg(
                 outer-loop overflow retry sees accurate counts from iter
                 0 instead of zeros that falsely suggest "nothing observed
                 yet".  Default 0 preserves legacy behaviour.
+            image_bucket: Initial periodic-image half-width for local-
+                update move kernels (see
+                ``sampling/neighbor_list.py::build_symmetric_image_offsets``).
+                1 is the legacy/inert default; pass a value chosen from
+                the reference geometry (see
+                ``sampling/neighbor_list.py::initial_image_bucket_for_cell``)
+                to avoid an immediate first-step overflow retry. Ignored
+                when no local move is active.
+            image_count_needed_init: Observed per-walker true image count
+                needed at init time (see
+                ``sampling/neighbor_list.py::initial_image_bucket_for_cell``).
+                Seeds the dynamic ``image_count_needed`` field, mirroring
+                ``max_neighbor_count_init`` above. Default 0 preserves
+                legacy behaviour.
+
+        Note: when an ``affects="local"`` move is active, the
+        ``atomic_energies``/``raw_energy`` extra fields are created here at
+        their zero-valued placeholder default (the generic
+        ``extra_state_fields`` initializer signature has no backend
+        access). Callers must seed them with real values immediately after
+        calling ``init_fn`` via
+        ``sampling/local_energy.py::seed_local_energy_cache`` — see that
+        function's docstring for why this is a required, not optional,
+        follow-up step.
         """
         if cell is None:
             cell = jnp.zeros((3, 3))
@@ -205,11 +342,21 @@ def build_mwg(
                 max_neighbor_count_init, dtype=jnp.int32
             ),
             overflow=jnp.asarray(False),
+            image_count_needed=jnp.asarray(
+                image_count_needed_init, dtype=jnp.int32
+            ),
+            image_overflow=jnp.asarray(False),
             ensemble_params=ensemble_params,
             max_neighbors=int(max_neighbors),
+            image_bucket=int(image_bucket),
         )
 
-        # Initialize move-specific fields
+        # Initialize move-specific fields. Note: when an affects="local"
+        # move is active, this seeds atomic_energies/raw_energy at a
+        # zero-valued placeholder (this initializer has no backend access)
+        # — see this function's docstring: callers MUST follow up with
+        # sampling/local_energy.py::seed_local_energy_cache before running
+        # any step.
         for name, (_, initializer) in all_extra_fields.items():
             kwargs[name] = initializer(positions, types)
 

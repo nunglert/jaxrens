@@ -26,6 +26,35 @@ from jaxrens.backends.base import BackendResult
 from jaxrens.utils.cell import get_volume
 
 
+def ensemble_correction(
+    cell: jnp.ndarray,
+    species: jnp.ndarray,
+    pressure: float | jnp.ndarray,
+    chemical_potentials: jnp.ndarray | None,
+) -> jnp.ndarray:
+    """``P*V - mu.N`` correction, computed cheaply (O(n_species), no NN
+    forward) from the full ``cell``/``species`` arrays alone.
+
+    Extracted from :meth:`EnsembleBackend.__call__` so both the ordinary
+    full-recompute path and any local/incremental-update move kernel share
+    one implementation. A local move's raw energy delta (``delta_U``, from
+    patching a cached per-atom decomposition) is combined with this
+    correction — evaluated fresh from the move's *own* ``cell``/``species``
+    arguments, not cached — to reconstruct the full ensemble-corrected
+    energy without going through the base backend at all.
+    """
+    correction = pressure * get_volume(cell)
+    if chemical_potentials is not None:
+        n_species = chemical_potentials.shape[0]
+        if n_species > 0:
+            counts = jnp.zeros(n_species, dtype=species.dtype)
+            counts = counts.at[species].add(1)
+            correction = correction - jnp.dot(
+                chemical_potentials, counts.astype(jnp.float32)
+            )
+    return correction
+
+
 class EnsembleBackend:
     """Wraps any EnergyBackend with ensemble corrections (PV, μN).
 
@@ -81,14 +110,7 @@ class EnsembleBackend:
             pressure = ensemble_params.get("pressure", pressure)
             mu = ensemble_params.get("chemical_potentials", mu)
 
-        H = U + pressure * get_volume(cell)
-
-        if mu is not None:
-            n_species = mu.shape[0]
-            if n_species > 0:
-                counts = jnp.zeros(n_species, dtype=species.dtype)
-                counts = counts.at[species].add(1)
-                H = H - jnp.dot(mu, counts.astype(jnp.float32))
+        H = U + ensemble_correction(cell, species, pressure, mu)
 
         return res._replace(energy=H)
 

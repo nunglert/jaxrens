@@ -250,7 +250,7 @@ class TestToDescriptor:
     def test_alchemical_shift_descriptor(self):
         spec = AlchemicalShiftMoveSpec()
         desc = spec.to_descriptor()
-        assert desc.kernel_kwargs == {}
+        assert desc.kernel_kwargs == {"assume_translation_invariant": False}
 
     def test_name_defaults_to_type(self):
         spec = RandomWalkMoveSpec()
