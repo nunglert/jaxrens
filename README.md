@@ -97,8 +97,10 @@ XRENS (composition-morphing), and semi-grand swaps are all built in.
 | [nequix](https://github.com/atomicarchitects/nequix) | `[nequix]` | |
 | [jax-md](https://github.com/jax-md/jax-md) | `[jaxmd]` | Tersoff / EAM |
 
-NPT and semi-grand μPT come from an `EnsembleBackend` wrapper that adds the
-`P·V` and `−μ·N` terms, so every backend gets them for free.
+NPT and semi-grand μPT come from an additive `EnsembleTerm` that the sampled
+`Hamiltonian` adds on top of the backend's energy (`P·V` and `−μ·N`), so every
+backend gets them for free. Each layer supplies its own forces, so backends with
+native forces (e.g. NeuralIL) keep them.
 
 ## Install
 

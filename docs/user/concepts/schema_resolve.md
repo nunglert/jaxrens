@@ -48,7 +48,7 @@ flowchart TB
 | Unit conversion (`gpa` → `eva3`) | **Schema** | `NPTEnsembleSpec.to_ensemble_params` |
 | Interval-unit scaling (`per_walker` → absolute iters) | **CLI / Resolver** | `_apply_interval_units` (run from cli before the resolver, second pass inside `resolve` is idempotent) |
 | "Build a MACE backend instance" | **Resolver** | `MACEBackendSpec.build_backend()` |
-| "Compute initial walker energies at the right ensemble scale" | **Resolver** | `_finalise_initial_energies_and_counts` + `EnsembleBackend` wrap |
+| "Compute initial walker energies at the right ensemble scale" | **Resolver** | `_finalise_initial_energies_and_counts` + `EnsembleTerm` on the base Hamiltonian |
 | Device-topology derivation from `jax.local_devices()` | **Resolver** | `_derive_replica_axes` |
 | Species mapping to backend z-table | **Resolver** | `_resolve_init_species` |
 | Pick `n_live`, `n_mcmc_steps` for the scan | **Core** | `run_ns` signature |
@@ -106,8 +106,9 @@ price the initial energies on the right ensemble scale — they just
 differ in *where the parallelism lives*.
 
 Both paths walk the same per-iteration setup: look up the iteration's
-pressure, build the base backend, wrap it in
-`EnsembleBackend(base, pressure=P)` (the rejection-mode ceiling check
+pressure, build the base Hamiltonian (model + soft-core term, if
+configured), add `EnsembleTerm(pressure=P)` to it (the rejection-mode
+ceiling check
 inside `_sample_per_walker_positions` needs ensemble-corrected
 energies), then dispatch the right `_resolve_init` mode helper.  Mode
 helpers return structural init only (positions / cells / types /
@@ -121,9 +122,9 @@ The paths then diverge:
 - **Multi-replica.** The structural-init step runs once per replica in
   a tight Python loop (cheap, no JIT compiles), stacks the resulting
   `(K, …)` arrays into `(n_total, K, …)`, then reshapes to
-  `(G, P, K, …)`.  Before finalize the resolver does a *second*
-  ensemble wrap — one `EnsembleBackend(base, pressure=0.0)` shared by
-  all replicas; the per-replica pressure flows in through the
+  `(G, P, K, …)`.  Before finalize the resolver adds a *second*
+  ensemble term — one `base.with_terms(EnsembleTerm(pressure=0.0))`
+  shared by all replicas; the per-replica pressure flows in through the
   `ensemble_params={"pressure": p}` kwarg on the vmap axis.  Then the
   same `_finalise_initial_energies_and_counts` helper is called once
   with `batcher=PmapVmapRuns(G, P)`.
@@ -137,7 +138,7 @@ Before showing the full `resolve` flow, here is `_resolve_init`
 (resolve.py:604) in isolation. Both branches call it the same way
 — the only difference is *how many times* it runs (once for
 single-replica, n_total times in the multi-replica loop, each with
-its own seed and per-replica `EnsembleBackend` wrapper). The four
+its own seed and per-replica `EnsembleTerm`). The four
 modes are mutually exclusive (the init spec must set exactly one
 of the four discriminator fields) and all converge on
 `_validate_cells`; none of them prices energies — that is the
@@ -180,7 +181,7 @@ flowchart LR
 ```
 
 The `energy_backend` argument is the only place the caller's
-ensemble wrap leaks in — rejection-mode initialization uses it for
+ensemble term leaks in — rejection-mode initialization uses it for
 the ceiling check inside `_sample_per_walker_positions`. Grid-mode
 ignores it. The four mode helpers return *structural init only*
 (`energies=None`, `counts=None`); pricing them is the next
@@ -232,7 +233,7 @@ flowchart LR
 it is a `(G, P)` array — each replica's NPT scalar — fed into the
 `ensemble_params` kwarg on the vmap axis. The single-replica
 branch's per-call pressure is already baked into its
-`init_backend` wrapper (one `EnsembleBackend(base, P)`), so the
+`init_backend` (one `base.with_terms(EnsembleTerm(P))`), so the
 kwarg is `None`.
 
 ### The full `resolve` flow
@@ -261,8 +262,8 @@ flowchart TB
     %% --- single-replica branch (resolve.py:918) ---
     subgraph S["_resolve_single_replica"]
         direction TB
-        S1["base_backend = root.backend.build_backend()"]
-        S2["init_backend =<br>EnsembleBackend(base, P) if P else base<br>(P from ensemble_params)"]
+        S1["base_backend = Hamiltonian(root.backend.build_backend())<br>(+ SoftCoreTerm if configured)"]
+        S2["init_backend =<br>base.with_terms(EnsembleTerm(P)) if P else base<br>(P from ensemble_params)"]
         subgraph S3box["_resolve_init"]
             S3in["root.init, n_live,<br>seed=root.run.seed,<br>init_backend, cell_cfg"]
         end
@@ -277,15 +278,15 @@ flowchart TB
     subgraph M["_resolve_multi_replica"]
         direction TB
         M1["batcher = PmapVmapRuns(n_gpu, n_per_gpu)"]
-        M2["base_backend = root.backend.build_backend()<br>(once, outside the loop)"]
+        M2["base_backend = Hamiltonian(root.backend.build_backend())<br>(+ SoftCoreTerm; once, outside the loop)"]
         M3(["for r in range(n_total)"])
-        M3a["P_r = params_per_run[r].get('pressure')<br>per_run_backend =<br>EnsembleBackend(base, P_r) if P_r else base"]
+        M3a["P_r = params_per_run[r].get('pressure')<br>per_run_backend =<br>base.with_terms(EnsembleTerm(P_r)) if P_r else base"]
         subgraph M3box["_resolve_init"]
             M3bin["root.init, n_live,<br>seed=root.run.seed + r,<br>per_run_backend, cell_cfg"]
         end
         M4["jnp.stack per-replica init along axis 0<br>→ (n_total, K, …)"]
         M5["reshape → (G, P, K, …)"]
-        M6["finalize_backend =<br>EnsembleBackend(base, P=0.0) if any_pressure else base"]
+        M6["finalize_backend =<br>base.with_terms(EnsembleTerm(0.0)) if any_pressure else base"]
         subgraph M7box["_finalise_initial_energies_and_counts"]
             M7in["finalize_backend,<br>(G,P,K,N,3) positions, types, (G,P,K,3,3) cells,<br>batcher=PmapVmapRuns,<br>ladder, offset, pressures=(G,P)"]
         end
@@ -338,11 +339,11 @@ Reading the diagram:
   teal frame for `_resolve_init`, amber frame for
   `_finalise_initial_energies_and_counts`. The wrapper's name
   matches the mini-diagram heading so the reader can drill in.
-- `_resolve_single_replica` is linear: build backend → wrap → init
+- `_resolve_single_replica` is linear: build backend → add ensemble term → init
   (teal wrapper) → finalize (amber wrapper) → return.
 - `_resolve_multi_replica` has the per-replica Python loop on the
-  inside (`build_backend` runs *once* outside it; `EnsembleBackend`
-  wrap and `_resolve_init` (teal wrapper) run *n_total* times);
+  inside (`build_backend` runs *once* outside it; the `EnsembleTerm`
+  and `_resolve_init` (teal wrapper) run *n_total* times);
   then the stack-reshape-finalize (amber wrapper)-reshape chain
   produces the final `(n_total, K, …)` arrays.
 - The amber `_finalise_…` wrapper is the only JIT-compiled work in
@@ -474,12 +475,12 @@ branches:
    passes the same `PmapVmapRuns(G, P)` instance it stores on
    `ResolvedConfig.batcher` — so the resolver, burn-in, and NS step
    all dispatch through one shared batcher instance.
-3. **Per-replica pressure under one wrapper.** The multi-replica path
-   wraps the base backend in a *single* `EnsembleBackend(pressure=0.0)`
-   and threads each replica's pressure through the per-call
+3. **Per-replica pressure under one ensemble term.** The multi-replica
+   path adds a *single* `EnsembleTerm(pressure=0.0)` to the base
+   Hamiltonian and threads each replica's pressure through the per-call
    `ensemble_params={"pressure": p}` kwarg, vmapped over the replica
-   axis. Avoiding N separate `EnsembleBackend(base, pressure=p)`
-   objects keeps the `shard_map` call signature uniform — pressure is just
+   axis. Avoiding N separate `EnsembleTerm(pressure=p)` Hamiltonians
+   keeps the `shard_map` call signature uniform — pressure is just
    another array on the vmap axis.
 
 The end result is that for an 8-replica NeuralIL run on a 4-GPU
@@ -496,17 +497,20 @@ multi-replica runs. The shape depends on the batcher:
 
 | Field | `batcher = SingleRun()` | `batcher = PmapVmapRuns(G, P)` |
 |---|---|---|
-| `base_backend` | unwrapped backend (e.g. raw MACE / LJ instance) | unwrapped backend |
+| `base_backend` | `Hamiltonian(model, [SoftCoreTerm?])` — no ensemble term | same |
 | `ensemble_params_per_run` | length-1 tuple | length-`n_total` tuple, flat order `g * P + p` |
 | `init.initial_positions` shape | `(n_live, A, 3)` | `(n_total, n_live, A, 3)` |
 | `init.initial_energies` shape | `(n_live,)` | `(n_total, n_live)` |
 | `batcher` | `SingleRun()` | `PmapVmapRuns(n_gpu, n_per_gpu)` |
 
-`base_backend` is always the unwrapped backend. The runtime wraps it
-into an `EnsembleBackend` if needed; the resolver applies the same
-wrapping locally only to compute initial energies on the right scale,
-then discards the wrapper. This means a multi-replica run can serve
-8 different pressures from one `EnsembleBackend(pressure=0.0)`
+`base_backend` is always a
+{class}`~jaxrens.backends.hamiltonian.Hamiltonian` holding the bare
+model (`base_backend.model`, e.g. the raw MACE / LJ instance) plus the
+soft-core term when `backend.softcore_repulsion` is set — but never an
+ensemble term. The runtime adds an `EnsembleTerm` if needed; the
+resolver does the same locally only to compute initial energies on the
+right scale, then discards that Hamiltonian. This means a multi-replica
+run can serve 8 different pressures from one `EnsembleTerm(pressure=0.0)`
 instance, with each replica's pressure flowing in through
 `ensemble_params` at call time — no per-replica backend rebuild.
 
@@ -551,14 +555,14 @@ Step by step:
    `_resolve_multi_replica`. Divisibility is checked here.
 5. **Per-replica structural init**: for each of 8 replicas,
    `_resolve_init` builds positions / cells / types only. A
-   per-replica `EnsembleBackend(base, pressure=P_r)` is constructed
+   per-replica `base.with_terms(EnsembleTerm(pressure=P_r))` is constructed
    for the rejection-mode ceiling check inside
    `_sample_per_walker_positions`, but no initial energies are
    computed yet. Per-replica arrays are stacked along axis 0 into
    `(n_total, K, …)`.
 6. **Consolidated finalize**: `_resolve_multi_replica` reshapes to
-   `(G, P, K, …)`, wraps the base backend in *one*
-   `EnsembleBackend(pressure=0.0)`, and calls
+   `(G, P, K, …)`, adds *one* `EnsembleTerm(pressure=0.0)` to the base
+   Hamiltonian, and calls
    `_finalise_initial_energies_and_counts` with
    `batcher=PmapVmapRuns(G, P)`, the per-replica pressures fed
    through `ensemble_params={"pressure": P_r}` on the vmap axis, and

@@ -51,7 +51,7 @@ outside their training set — the learned potential can turn attractive or
 `NaN`. Under high pressure or aggressive cell moves, walkers drift into that
 region and irreversibly collapse.
 
-**Fix:** enable the soft-core repulsion wrapper on the backend
+**Fix:** enable the soft-core repulsion term on the backend
 (`backend.softcore_repulsion`), which adds a parameter-free repulsive Morse
 term that goes to `+∞` at short range:
 

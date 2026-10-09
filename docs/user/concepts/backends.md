@@ -1,20 +1,28 @@
 # Backends and ensembles
 
 An *energy backend* is anything that maps atomic positions + species
-+ cell to an energy. A thin wrapper,
-{class}`~jaxrens.backends.ensemble.EnsembleBackend`, converts that
-bare potential into the *effective energy* appropriate for the
-thermodynamic ensemble. Moves see only the wrapped backend; the
-rest of the library doesn't care which ensemble is active.
++ cell to an energy. The quantity the sampler actually works with is a
+{class}`~jaxrens.backends.hamiltonian.Hamiltonian`: one bare backend
+(the *model*) plus a flat list of additive *energy terms* — the
+ensemble correction $PV - \boldsymbol\mu\cdot\mathbf N$, an optional
+soft-core repulsion, …. Moves see only the Hamiltonian; the rest of
+the library doesn't care which ensemble or which corrections are
+active.
 
 ## The `EnergyBackend` protocol
 
 ```{mermaid}
 flowchart LR
-    M["Move kernel"] --> B["EnsembleBackend(base)"]
-    B --> Base["base.EnergyBackend<br/>(lj / mace / neuralil / …)"]
+    M["Move kernel"] --> B["Hamiltonian(model, terms)"]
+    B --> Base["model: EnergyBackend<br/>(lj / mace / neuralil / …)"]
+    B --> SC["SoftCoreTerm<br/>(optional)"]
+    B --> ET["EnsembleTerm<br/>(NPT / μPT)"]
     Base --> U["U  (bare potential)"]
-    B --> H["H = U + PV − μ·N<br/>(ensemble-corrected)"]
+    SC --> EC["E_core"]
+    ET --> PV["PV − μ·N"]
+    U --> H["H = U + E_core + PV − μ·N"]
+    EC --> H
+    PV --> H
 ```
 
 Every backend — LJ, MACE-JAX, NeuralIL, Nequix, jax-md and the toy
@@ -26,7 +34,7 @@ result = backend(
     species,          # (A,)   z-table indices
     cell,             # (3, 3) lattice vectors as rows
     max_neighbors,    # int    MLIP-side buffer size
-    ensemble_params,  # dict   {"pressure": ..., "mu": ...} or None
+    ensemble_params,  # dict   {"pressure": ..., "chemical_potentials": ...} or None
 )
 result.energy              # scalar per walker — the only universal field
 result.max_neighbor_count  # largest neighbor count seen this call
@@ -51,9 +59,15 @@ JAX reuses the JIT'd kernel compiled for that bucket size.  Backends
 without a neighbor list (LJ, the toy potentials, all-pairs jax-md)
 leave both at their sentinels.
 
-`forces` is populated only on the `energy_and_forces` path, not on the
-energy-only `__call__` above; `energy_members` / `forces_members` are
-reserved for active-learning uncertainty and unpopulated for now.
+`forces` is populated only on the force path, not on the energy-only
+`__call__` above. Callers go through
+{func}`~jaxrens.backends.base.eval_energy_and_forces`, which uses a
+backend's own `energy_and_forces` method when it defines one (e.g.
+NeuralIL's native force evaluation) and otherwise falls back to
+reverse-mode autodiff of the energy. `energy_members` /
+`forces_members` carry per-committee-member predictions for
+ensemble (committee) models; see
+{func}`~jaxrens.backends.base.committee_uncertainty`.
 
 Built-in backends:
 
@@ -162,13 +176,63 @@ and on overflow it bumps `max_neighbors` and re-enters the same
 iteration. The red `escalate max_neighbors` node in the NS-loop
 figure ({doc}`ns_loop`) is exactly this back-edge.
 
-## Ensembles as additive corrections
+## The Hamiltonian: model + additive terms
 
-The `EnsembleBackend` wraps a base backend and adds the appropriate
-thermodynamic term **per call**, reading the ensemble parameters
-from the `ensemble_params` dict. This means one wrapper instance
-serves multiple replicas at different pressures / chemical
-potentials — no rebuild needed.
+Corrections on top of the bare potential are not wrappers around the
+backend; they are {class}`~jaxrens.backends.hamiltonian.EnergyTerm`
+objects composed *next to* the model in a flat
+{class}`~jaxrens.backends.hamiltonian.Hamiltonian`:
+
+```python
+from jaxrens.backends.ensemble import EnsembleTerm
+from jaxrens.backends.hamiltonian import Hamiltonian
+from jaxrens.backends.softcore import SoftCoreTerm
+
+H = Hamiltonian(model, [SoftCoreTerm(), EnsembleTerm(pressure=0.0)])
+H(positions, species, cell, max_neighbors, ensemble_params).energy
+# = U + E_core + P·V − μ·N
+```
+
+A `Hamiltonian` satisfies the same `EnergyBackend` call protocol, so
+move kernels take it unchanged. The resolver builds it from the YAML
+(`backend:` → model, `backend.softcore_repulsion:` → `SoftCoreTerm`,
+`ensemble:` → `EnsembleTerm`); you rarely construct one by hand.
+
+**Energies and forces compose per layer.** Every layer contributes
+its *own* energy and its *own* forces, and the Hamiltonian sums them.
+Nothing is differentiated through a layer it does not own:
+
+| Layer | Energy | Forces |
+|---|---|---|
+| model | `model(...)` | native `energy_and_forces` if the model defines one, else autodiff of the model alone |
+| `SoftCoreTerm` | repulsive Morse $E_\mathrm{core}$ | autodiff of $E_\mathrm{core}$ alone |
+| `EnsembleTerm` | $PV - \boldsymbol\mu\cdot\mathbf N$ | analytically zero (no position dependence) |
+
+A new correction is a subclass of `EnergyTerm` implementing
+`energy(positions, species, cell, ensemble_params)`; its forces
+default to autodiff of that method, and it can override
+`energy_and_forces` to supply custom ones.
+
+**Model metadata is reached explicitly.** The Hamiltonian does *not*
+forward attribute access to its model. Model-level facts —
+`atomic_numbers`, `max_neighbors_for`, `is_ensemble`, … — are read
+from `H.model` or via
+{func}`~jaxrens.backends.hamiltonian.unwrap_model`, which also accepts a
+bare backend.
+
+`Hamiltonian(Hamiltonian(model, [a]), [b])` flattens to
+`Hamiltonian(model, [a, b])`, and `H.with_terms(...)` returns a new
+Hamiltonian with terms appended. `EnsembleBackend(base, ...)` and
+`SoftCoreBackend(base, ...)` remain as convenience functions that
+return such a flat Hamiltonian.
+
+### Ensemble corrections
+
+The `EnsembleTerm` adds the thermodynamic term **per call**, reading
+the ensemble parameters from the `ensemble_params` dict (keys
+`pressure`, `chemical_potentials`) and falling back to its own
+defaults. This means one term instance serves multiple replicas at
+different pressures / chemical potentials — no rebuild needed.
 
 For a configuration $r = (\mathbf q, \mathbf{L}, \sigma)$ with
 volume $V = |\det(\mathbf{L})|$ and species counts $N_i$,
@@ -185,7 +249,8 @@ $$
 
 The NS loop always works with $H$, not $U$. Same sampler, same
 move kernels, same acceptance criterion; the ensemble only changes
-what gets compared to $E_\mathrm{max}$.
+what gets compared to $E_\mathrm{max}$. With soft-core repulsion
+enabled, $U$ above is read as $U + E_\mathrm{core}$.
 
 ## Species indexing
 
@@ -209,7 +274,10 @@ atomic numbers. Symbol tables (`symbol_map`) track the inverse.
 | Concern | File |
 |---|---|
 | Backend protocol | {class}`jaxrens.backends.base.EnergyBackend` |
-| Ensemble wrapper | {class}`jaxrens.backends.ensemble.EnsembleBackend` |
+| Hamiltonian (model + terms) | {class}`jaxrens.backends.hamiltonian.Hamiltonian` |
+| Ensemble term ($PV - \mu N$) | {class}`jaxrens.backends.ensemble.EnsembleTerm` |
+| Soft-core term | {class}`jaxrens.backends.softcore.SoftCoreTerm` |
+| Force dispatch (native vs. autodiff) | {func}`jaxrens.backends.base.eval_energy_and_forces` |
 | Backend loader (by type string) | {func}`jaxrens.backends.loader.load_backend` |
 | MACE backend construction | {func}`jaxrens.backends.mace.create_mace` |
 | Species mapping fix | `cli/resolve.py::_resolve_init_species` |

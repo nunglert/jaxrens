@@ -13,8 +13,8 @@ relevant mathematics, diagrams, and pointers into the code:
   and how batch axes flow through `jit`/`vmap`/`shard_map`.
 - {doc}`concepts/moves_mwg` — individual move kernels and how MWG
   composes them into a single step function.
-- {doc}`concepts/backends` — the `EnergyBackend` protocol and how
-  `EnsembleBackend` adds NPT / semi-grand μPT corrections per call.
+- {doc}`concepts/backends` — the `EnergyBackend` protocol and how a
+  `Hamiltonian` adds NPT / semi-grand μPT (and soft-core) terms per call.
 - {doc}`concepts/replicas` — how `n_total`, `n_gpu`, `n_per_gpu`
   are derived and how inter-replica exchange (RENS) swaps work.
 - {doc}`concepts/restart` — fresh-vs-restart lifecycle, output-dir gate,
@@ -118,7 +118,9 @@ An energy model is anything implementing the
 {class}`~jaxrens.backends.base.BackendResult`, a `NamedTuple` whose
 `energy` field is the only universally-meaningful one —
 `max_neighbor_count` and `overflow` drive the neighbor-bucket manager,
-and `forces` is filled only on the `energy_and_forces` path.
+and `forces` is filled only on the force path
+({func}`~jaxrens.backends.base.eval_energy_and_forces`: native forces
+when the backend has them, autodiff otherwise).
 
 Built-ins:
 
@@ -130,16 +132,20 @@ Built-ins:
 - **`harmonic`**, **`double_well`**, **`gaussian_mixture`** — toy
   potentials for testing.
 
-Ensemble corrections are applied by a thin wrapper,
-{class}`~jaxrens.backends.ensemble.EnsembleBackend`:
+The sampler works with a
+{class}`~jaxrens.backends.hamiltonian.Hamiltonian`: the bare backend
+(the *model*) plus a flat list of additive energy terms. Each layer
+contributes its own energy and forces. The ensemble correction is
+one such term, {class}`~jaxrens.backends.ensemble.EnsembleTerm`:
 
-- **NVT** — no correction (just use the base backend).
+- **NVT** — no correction (no ensemble term).
 - **NPT** — `H = U + P·V`.
 - **μPT / semi-grand** — `H = U + P·V − μ·N`.
 
 `ensemble_params` is passed per call, so different replicas can run
 at different pressures / chemical potentials without rebuilding the
-backend.
+Hamiltonian. The optional soft-core repulsion is another term,
+{class}`~jaxrens.backends.softcore.SoftCoreTerm`.
 
 ## 6. Replica axes: n_total, n_gpu, n_per_gpu
 
