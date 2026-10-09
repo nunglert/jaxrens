@@ -184,7 +184,7 @@ def init_ns(
     and stacking into a single pytree with (n_walkers, ...) batch dims.
 
     The energies passed in are raw backend energies. init_fn applies
-    any ensemble correction (if the backend is an EnsembleBackend).
+    any ensemble correction (if the Hamiltonian carries an EnsembleTerm).
 
     Args:
         init_fn: MCState constructor from build_mwg().
@@ -305,7 +305,7 @@ def ns_step(
     """One NS iteration: replace the worst walker, with optional extra walks.
 
     Fully JIT-compatible. MCState.energy is the full ensemble potential
-    (computed by the backend, possibly wrapped in EnsembleBackend).
+    (computed by the backend, possibly including an EnsembleTerm).
     No enthalpy computation needed here — ns_step is ensemble-agnostic.
 
     When n_extra > 0, additional randomly chosen walkers from the

@@ -174,7 +174,7 @@ def build_mwg(
                 If None, uses defaults from descriptors.
             step_size: Scalar step size — broadcast to all moves.
             ensemble_params: Ensemble parameters dict (e.g. {"pressure": 0.01}).
-                Stored on the MCState for use by EnsembleBackend.
+                Stored on the MCState for use by EnsembleTerm.
             max_neighbors: Initial neighbor-bucket size for GNN-style
                 backends.  0 is the legacy default and causes the first
                 ns_step to overflow immediately (wasteful first retry);

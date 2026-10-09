@@ -9,6 +9,33 @@ The version is derived from git tags by `setuptools-scm` (tag `v0.1.0` →
 version `0.1.0`). To cut a release: add a dated section below, merge to `main`,
 then `git tag -a vX.Y.Z`.
 
+## [Unreleased]
+
+### Changed
+- **Soft-core and ensemble corrections are additive terms, not wrapper
+  backends.** New `jaxrens.backends.hamiltonian`: a flat
+  `Hamiltonian(model, terms)` sums one bare model and a tuple of
+  `EnergyTerm`s (`SoftCoreTerm`, `EnsembleTerm`). Each layer contributes its
+  own energy *and* forces: the model keeps its native `energy_and_forces`
+  (e.g. NeuralIL), and each term supplies its own (autodiff of that term
+  alone by default; analytic zeros for `P·V − μ·N`). There is no
+  `__getattr__` forwarding any more: model metadata is reached via
+  `hamiltonian.model` / `unwrap_model(...)`. `EnsembleBackend(...)` and
+  `SoftCoreBackend(...)` remain as convenience factories that return a flat
+  `Hamiltonian`. `ResolvedConfig.base_backend` is now always a `Hamiltonian`.
+
+### Fixed
+- **Force-based moves (GMC with forces, HMC) dropped the soft-core and
+  ensemble terms on backends with native forces.** The wrappers forwarded
+  `energy_and_forces` to the model, so NeuralIL runs got bare `U` (no
+  `P·V − μ·N`, no soft core) on the force path and bare model forces (no
+  soft-core repulsion).
+- **NaN forces from the soft-core term under autodiff.** `pairwise_distances`
+  now uses a gradient-safe norm, so the zero self-distance diagonal no longer
+  poisons gradients.
+- **Soft core counted twice on the single-run CLI path.** The resolver
+  already added it to `base_backend`; `run_from_config` added it again.
+
 ## [0.5.0] — 2026-09-30
 
 Multi-device parallelization migrated from `jax.pmap` to `jax.shard_map`,

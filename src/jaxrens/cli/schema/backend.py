@@ -22,15 +22,15 @@ from jaxrens.backends.base import EnergyBackend
 from jaxrens.state.config import BackendConfig
 
 # ---------------------------------------------------------------------------
-# Soft-core wrapper spec
+# Soft-core term spec
 # ---------------------------------------------------------------------------
 
 
 class SoftCoreSpec(BaseModel):
-    """Fixed repulsive Morse soft-core wrapper.
+    """Fixed repulsive Morse soft-core term.
 
-    When present on a backend spec, the resolver and runtime wrap the
-    built backend with ``SoftCoreBackend`` (see
+    When present on a backend spec, the resolver and runtime add a
+    ``SoftCoreTerm`` to the built backend's Hamiltonian (see
     ``jaxrens.backends.softcore``).  Adds a parameter-free, isotropic
     repulsive Morse term to the underlying potential to suppress
     close-contact pathologies during nested sampling.
@@ -98,10 +98,10 @@ class BaseBackendSpec(BaseModel):
         ),
     )
 
-    # Optional soft-core repulsion wrapper.  When set, the resolver and
-    # runtime wrap the built backend with ``SoftCoreBackend`` (adds a
-    # parameter-free repulsive Morse term to the bare potential).  See
-    # ``jaxrens.backends.softcore`` for the wrapper and ``SoftCoreSpec``
+    # Optional soft-core repulsion term.  When set, the resolver and
+    # runtime add a ``SoftCoreTerm`` to the built backend's Hamiltonian (a
+    # parameter-free repulsive Morse term on top of the bare potential).  See
+    # ``jaxrens.backends.softcore`` for the term and ``SoftCoreSpec``
     # above for the parameters.  Backend-agnostic: works with MACE,
     # Nequix, LJ, NeuralIL, etc.  For NeuralIL, prefer the (slightly
     # cheaper) per-backend ``softcore: true`` flag on ``NeuralILBackendSpec``

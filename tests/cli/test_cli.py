@@ -118,6 +118,44 @@ class TestRun:
         )
         assert jnp.isfinite(result["log_evidence"])
 
+    def test_run_from_config_does_not_double_softcore(
+        self, tmp_path, monkeypatch
+    ):
+        """A resolver-built ``base_backend`` already carries the soft-core
+        term; ``run_from_config`` must not add it a second time."""
+        import jaxrens.cli.run as run_mod
+        from jaxrens.backends.softcore import SoftCoreBackend, SoftCoreTerm
+        from jaxrens.backends.toy import HarmonicBackend
+
+        captured = {}
+
+        class _Stop(Exception):
+            pass
+
+        def _capture(move_config, backend):
+            captured["backend"] = backend
+            raise _Stop
+
+        monkeypatch.setattr(run_mod, "setup_mwg", _capture)
+
+        softcore = {"a0": 1.0, "b0": 3.0, "d0": 1.0}
+        with pytest.raises(_Stop):
+            run_from_config(
+                NSConfig(n_live=4, max_iterations=1, n_mcmc_steps=1, seed=0),
+                MoveConfig(move_type="random_walk", step_size=0.3),
+                BackendConfig(
+                    backend_type="harmonic", softcore_repulsion=softcore
+                ),
+                OutputConfig(format="none", working_dir=tmp_path),
+                initial_positions=jnp.zeros((4, 2, 3)),
+                initial_types=jnp.zeros((2,), dtype=jnp.int32),
+                initial_energies=jnp.zeros(4),
+                base_backend=SoftCoreBackend(HarmonicBackend(), **softcore),
+            )
+
+        terms = captured["backend"].terms
+        assert sum(isinstance(t, SoftCoreTerm) for t in terms) == 1
+
     def test_run_from_config_with_pressure(self, tmp_path):
         """A non-empty ``ensemble_params`` triggers the ``EnsembleBackend`` wrap
         branch and adds a PV term to the energies."""

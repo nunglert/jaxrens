@@ -1,7 +1,7 @@
 """Geometry helpers shared by energy backends and configuration constraints.
 
 The minimum-image pairwise-distance computation lives here so that the
-soft-core repulsion wrapper (:mod:`jaxrens.backends.softcore`) and the
+soft-core repulsion term (:mod:`jaxrens.backends.softcore`) and the
 configuration constraints (:mod:`jaxrens.constraints`) share a single,
 tested implementation rather than each carrying their own copy.
 
@@ -28,7 +28,8 @@ def pairwise_distances(
     face-to-face distance of the cell).
 
     The diagonal is the self-distance and is therefore exactly 0; callers
-    that sum or threshold over pairs must mask it themselves.
+    that sum or threshold over pairs must mask it themselves.  Gradients
+    are finite everywhere (zero on the diagonal).
 
     Args:
         positions: ``(N, 3)`` atomic positions.
@@ -51,4 +52,10 @@ def pairwise_distances(
     mic_delta = df @ safe_cell
 
     delta = jnp.where(periodic, mic_delta, raw_delta)
-    return jnp.linalg.norm(delta, axis=-1)
+    # Gradient-safe norm: ``d/dx sqrt(x)`` is infinite at the zero diagonal,
+    # and ``0 * inf`` would turn every downstream gradient into NaN even when
+    # the caller masks the diagonal out.  Substitute a dummy positive value
+    # *inside* the sqrt so both branches have finite gradients.
+    d2 = jnp.sum(delta**2, axis=-1)
+    nonzero = d2 > 0.0
+    return jnp.where(nonzero, jnp.sqrt(jnp.where(nonzero, d2, 1.0)), 0.0)

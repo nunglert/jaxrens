@@ -2,7 +2,7 @@
 
 Each concrete spec class maps to a thermodynamic ensemble.  ``to_ensemble_params``
 returns the per-cohort scalar/vector ensemble parameters (pressure, chemical
-potentials, ...) consumed by ``EnsembleBackend`` at run time.
+potentials, ...) consumed by ``EnsembleTerm`` at run time.
 
 Supported ensembles
 --------------------

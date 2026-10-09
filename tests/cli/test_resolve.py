@@ -430,7 +430,7 @@ class TestResolveEnergyBackend:
 
         root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
-        assert isinstance(resolved.base_backend, HarmonicBackend)
+        assert isinstance(resolved.base_backend.model, HarmonicBackend)
 
     def test_resolve_base_backend_is_callable(self):
         import jax.numpy as jnp
@@ -450,7 +450,7 @@ class TestResolveEnergyBackend:
             raw = yaml.safe_load(fh)
         root = RootSpec.model_validate(raw)
         resolved = resolve(root)
-        assert isinstance(resolved.base_backend, LJBackend)
+        assert isinstance(resolved.base_backend.model, LJBackend)
 
 
 # ---------------------------------------------------------------------------
@@ -1446,14 +1446,14 @@ class TestBackendAwareSpeciesMapping:
         with pytest.raises(ValueError, match="atomic numbers"):
             _resolve_init(cfg, n_live=2, seed=0, energy_backend=backend)
 
-    def test_ensemble_wrapper_passes_atomic_numbers_through(self):
+    def test_hamiltonian_passes_model_atomic_numbers_through(self):
         from jaxrens.backends.ensemble import EnsembleBackend
         from jaxrens.cli.resolve import _resolve_init
         from jaxrens.cli.schema.init import InitSpec
 
         backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
         wrapped = EnsembleBackend(backend, pressure=0.1)
-        assert wrapped.atomic_numbers == list(range(1, 90))
+        assert wrapped.model.atomic_numbers == list(range(1, 90))
 
         cfg = InitSpec(
             start_species="8 3, 22 1, 38 1",

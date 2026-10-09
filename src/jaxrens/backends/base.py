@@ -13,6 +13,11 @@ return forces natively; callers should go through :func:`eval_energy_and_forces`
 which dispatches to the native method when present and otherwise falls back to
 reverse-mode autodiff of ``__call__``.
 
+Additive corrections (soft core, ensemble ``P·V − μ·N``) are not wrappers
+around a backend; they are :class:`~jaxrens.backends.hamiltonian.EnergyTerm`
+instances composed with a bare model in a flat
+:class:`~jaxrens.backends.hamiltonian.Hamiltonian`.
+
 Design doc: experiments/jaxrens_design/energy_backend_design.md
 """
 
@@ -140,30 +145,21 @@ def committee_uncertainty(
 
 
 def get_committee_backend(backend: Any) -> Any | None:
-    """Unwrap wrapper backends to the underlying ensemble committee, if any.
+    """The ensemble committee model behind ``backend``, if any.
 
-    Walks the ``.base`` chain (e.g. ``EnsembleBackend`` → ``SoftCoreBackend`` →
-    the committee backend) and returns the **innermost** backend that is a
-    committee — ``is_ensemble`` True and exposing a ``members`` method (for
-    committee uncertainty). The innermost is taken deliberately: wrapper
-    backends (e.g. ``EnsembleBackend``) forward attribute access to their base
-    via ``__getattr__``, so every wrapper *looks* committee-like; the real
-    committee is the deepest such backend (the one whose ``members`` is its own,
-    evaluated without the wrappers' per-run / soft-core machinery). Returns
-    ``None`` when no committee is present (single model / non-NN backend), so
-    callers can warn and skip uncertainty work.
+    Looks through a :class:`~jaxrens.backends.hamiltonian.Hamiltonian` to its
+    bare model (the terms are additive and member-independent, so they do
+    not affect the committee spread) and returns that model when it is a
+    committee — ``is_ensemble`` True and exposing a ``members`` method.
+    Returns ``None`` when no committee is present (single model / non-NN
+    backend), so callers can warn and skip uncertainty work.
     """
-    seen: set[int] = set()
-    current = backend
-    committee = None
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if getattr(current, "is_ensemble", False) and hasattr(
-            current, "members"
-        ):
-            committee = current
-        current = getattr(current, "base", None)
-    return committee
+    from jaxrens.backends.hamiltonian import unwrap_model
+
+    model = unwrap_model(backend)
+    if getattr(model, "is_ensemble", False) and hasattr(model, "members"):
+        return model
+    return None
 
 
 @runtime_checkable
@@ -205,7 +201,8 @@ class EnergyBackend(Protocol):
             cell: Unit cell matrix (3, 3). Zeros for non-periodic.
             max_neighbors: Static parameter controlling compiled shapes.
             ensemble_params: Optional per-run ensemble parameters
-                (used by EnsembleBackend for per-run vmap).
+                (consumed by Hamiltonian terms such as ``EnsembleTerm``;
+                bare models ignore it).
 
         Returns:
             A :class:`BackendResult` with ``energy`` (and the control fields

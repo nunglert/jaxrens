@@ -17,8 +17,10 @@ import jax
 import jax.numpy as jnp
 
 import jaxrens._jax_init  # noqa: F401 -- pins jax_enable_x64=False before any JAX op
-from jaxrens.backends.ensemble import EnsembleBackend
+from jaxrens.backends.ensemble import EnsembleTerm
+from jaxrens.backends.hamiltonian import Hamiltonian, unwrap_model
 from jaxrens.backends.loader import load_backend
+from jaxrens.backends.softcore import SoftCoreTerm
 from jaxrens.cli.monitor import (
     AdaptationCallback,
     BatchedTrajectoryCallback,
@@ -60,7 +62,7 @@ def _to_runtime_ensemble_params(params: dict | None) -> dict | None:
     Generic: list/tuple leaves (e.g. ``chemical_potentials``) become float32
     arrays; scalar leaves (e.g. ``pressure``) pass through unchanged — matching
     the per-run dicts the multi-replica resolver builds.  Returns ``None`` for
-    an empty/``None`` dict (NVT) so callers can skip the EnsembleBackend wrap.
+    an empty/``None`` dict (NVT) so callers can skip the EnsembleTerm.
     """
     if not params:
         return None
@@ -159,7 +161,8 @@ def _recompute_max_neighbor_counts(
     walker's pairwise tensor — vmapping would allocate
     ``(W, N, sc_dim*N, 3)`` and OOM on MACE-sized systems.
     """
-    if cells is None or not hasattr(backend, "max_neighbors_for"):
+    model = unwrap_model(backend)
+    if cells is None or not hasattr(model, "max_neighbors_for"):
         return None
     leading_shape = positions.shape[:-2]
     flat_pos = positions.reshape(-1, *positions.shape[-2:])
@@ -167,7 +170,7 @@ def _recompute_max_neighbor_counts(
 
     def _per_walker(args):
         pos, cell = args
-        return backend.max_neighbors_for(pos, cell)
+        return model.max_neighbors_for(pos, cell)
 
     flat_counts = jax.lax.map(_per_walker, (flat_pos, flat_cells))
     return flat_counts.reshape(leading_shape)
@@ -296,26 +299,27 @@ def run_from_config(
             backend_config.backend_type, **backend_kwargs
         )
 
-    # Soft-core wrapper applied first (closest to the bare backend) so
-    # the EnsembleBackend PV correction sits outside it.
-    if backend_config.softcore_repulsion is not None:
-        from jaxrens.backends.softcore import SoftCoreBackend
+    hamiltonian = Hamiltonian(base_backend)
 
-        base_backend = SoftCoreBackend(
-            base_backend,
-            **backend_config.softcore_repulsion,
+    # Soft-core term.  The resolver already adds it to the ``base_backend``
+    # it hands over; only add it here if it is not present yet (legacy
+    # ``BackendConfig``-only path), so the soft core is never counted twice.
+    if backend_config.softcore_repulsion is not None and not any(
+        isinstance(t, SoftCoreTerm) for t in hamiltonian.terms
+    ):
+        hamiltonian = hamiltonian.with_terms(
+            SoftCoreTerm(**backend_config.softcore_repulsion)
         )
 
     # Ensemble corrections (P·V, -μ·N, ...) are driven entirely by the generic
     # per-call ``ensemble_params`` dict — same contract the multi-replica runner
-    # uses.  Wrap with neutral defaults when any are configured; the dict's
-    # array-valued leaves (e.g. chemical_potentials) are normalised for the
-    # JIT'd step.  An empty/None dict means NVT → no wrap, zero overhead.
+    # uses.  Add the term with neutral defaults when any are configured; the
+    # dict's array-valued leaves (e.g. chemical_potentials) are normalised for
+    # the JIT'd step.  An empty/None dict means NVT → no term, zero overhead.
     ensemble_params = _to_runtime_ensemble_params(ensemble_params)
     if ensemble_params is not None:
-        backend = EnsembleBackend(base_backend, pressure=0.0)
-    else:
-        backend = base_backend
+        hamiltonian = hamiltonian.with_terms(EnsembleTerm(pressure=0.0))
+    backend = hamiltonian
 
     if initial_energies is None:
         logger.debug(
@@ -595,7 +599,7 @@ def run_from_config(
         logger.info("Burn-in complete")
 
         # Refresh counts for the NS loop — burn-in drifted positions/cells.
-        if hasattr(backend, "max_neighbors_for"):
+        if hasattr(unwrap_model(backend), "max_neighbors_for"):
             logger.info(
                 "Recomputing post-burn-in max neighbor counts (n_walkers=%d)",
                 initial_positions.shape[0],
@@ -726,14 +730,14 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
     n_per_gpu = ns.n_per_gpu
     n_total = n_gpu * n_per_gpu
 
-    # --- Backend: one base, wrapped once with EnsembleBackend --------------
-    # Per-call ``ensemble_params`` dicts override the wrapper's closured
-    # defaults (see backends/ensemble.py __call__).  The resolver already
-    # applied the soft-core wrapper (if configured) to ``base_backend``
-    # before stashing it on ``resolved`` (see ``_resolve_multi_replica``),
-    # so no additional wrap is needed here.
+    # --- Backend: one base Hamiltonian plus one EnsembleTerm ---------------
+    # Per-call ``ensemble_params`` dicts override the term's closured
+    # defaults (see backends/ensemble.py ``EnsembleTerm.energy``).  The
+    # resolver already added the soft-core term (if configured) to
+    # ``base_backend`` before stashing it on ``resolved`` (see
+    # ``_resolve_multi_replica``), so no additional term is needed here.
     base_backend = resolved.base_backend
-    backend = EnsembleBackend(base_backend, pressure=0.0)
+    backend = Hamiltonian(base_backend, [EnsembleTerm(pressure=0.0)])
 
     init_fn, step_fn, per_move_fns = build_mwg(
         backend,
@@ -1192,11 +1196,11 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
     n_gpu = batcher.n_gpu
     n_live = ns.n_live
 
-    # The resolver already applied the soft-core wrapper (if configured)
-    # to ``base_backend`` before stashing it on ``resolved``, so no
-    # additional wrap is needed here.
+    # The resolver already added the soft-core term (if configured) to
+    # ``base_backend`` before stashing it on ``resolved``, so no
+    # additional term is needed here.
     base_backend = resolved.base_backend
-    backend = EnsembleBackend(base_backend, pressure=0.0)
+    backend = Hamiltonian(base_backend, [EnsembleTerm(pressure=0.0)])
     init_fn, step_fn, per_move_fns = build_mwg(
         backend,
         list(resolved.move_descriptors),
@@ -1322,7 +1326,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
 
         # Post-burn-in neighbor-count refresh — burn-in drifts
         # positions/cells; the resolver's pre-burn-in counts are stale.
-        if hasattr(base_backend, "max_neighbors_for"):
+        if hasattr(unwrap_model(base_backend), "max_neighbors_for"):
             logger.info(
                 "Recomputing post-burn-in max neighbor counts (n_walkers=%d)",
                 positions.shape[0],
