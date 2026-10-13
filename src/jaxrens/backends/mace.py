@@ -173,7 +173,19 @@ class MACEBackend:
 
     The graphdef (model structure) is captured in a closure for JIT.
     The state (model parameters) is stored as arrays.
+
+    ``force_source`` selects the forces handed to force-using moves (GMC
+    reflections) through :meth:`energy_and_forces`:
+
+    - ``"autograd"`` (default): ``-dE/dx`` by reverse-mode autodiff of the
+      energy — exact, conservative, one extra backward pass.
+    - ``"head"``: the direct forces of a model with a non-conservative force
+      head (mace-nonconservative), returned by the same forward pass as the
+      energy — no backward pass, but not the exact gradient of the energy.
+      The energy, and hence every ``Emax`` acceptance test, is unchanged.
     """
+
+    FORCE_SOURCES = ("autograd", "head")
 
     def __init__(
         self,
@@ -183,6 +195,7 @@ class MACEBackend:
         num_species: int,
         atomic_numbers: list[int],
         supercell_trafo: tuple[int, int, int] = (2, 2, 2),
+        force_source: str = "autograd",
     ):
         self.r_cutoff = r_cutoff
         self.num_species = num_species
@@ -197,6 +210,21 @@ class MACEBackend:
         self._graphdef = graphdef
         self._state = state
 
+        if force_source not in self.FORCE_SOURCES:
+            raise ValueError(
+                f"force_source must be one of {self.FORCE_SOURCES}, "
+                f"got {force_source!r}"
+            )
+        if force_source == "head" and not hasattr(
+            nnx.merge(graphdef, state), "force_readout"
+        ):
+            raise ValueError(
+                "force_source='head' needs a model with a force head "
+                "(mace-nonconservative: 1o in hidden_irreps and MLP_irreps); "
+                "this model has none."
+            )
+        self.force_source = force_source
+
     def __call__(
         self,
         positions: jnp.ndarray,
@@ -205,6 +233,44 @@ class MACEBackend:
         max_neighbors: int = 50,
         ensemble_params: dict[str, Any] | None = None,
     ) -> BackendResult:
+        result, _ = self._forward(positions, species, cell, max_neighbors)
+        return result
+
+    def energy_and_forces(
+        self,
+        positions: jnp.ndarray,
+        species: jnp.ndarray,
+        cell: jnp.ndarray,
+        max_neighbors: int = 50,
+        ensemble_params: dict[str, Any] | None = None,
+    ) -> BackendResult:
+        """Energy and the forces selected by ``force_source``.
+
+        Picked up by :func:`~jaxrens.backends.base.eval_energy_and_forces` as
+        the native force path.
+        """
+        if self.force_source == "head":
+            result, out = self._forward(positions, species, cell, max_neighbors)
+            forces = out["predicted_forces"][: positions.shape[0]]
+            return result._replace(forces=forces)
+
+        def energy_of(pos):
+            result, _ = self._forward(pos, species, cell, max_neighbors)
+            return result.energy, result
+
+        (_, result), grad = jax.value_and_grad(energy_of, has_aux=True)(
+            positions
+        )
+        return result._replace(forces=-grad)
+
+    def _forward(
+        self,
+        positions: jnp.ndarray,
+        species: jnp.ndarray,
+        cell: jnp.ndarray,
+        max_neighbors: int,
+    ) -> tuple[BackendResult, dict[str, jnp.ndarray]]:
+        """One model evaluation: the energy result and the raw model output."""
         n_atoms = positions.shape[0]
         max_edges = n_atoms * max_neighbors
 
@@ -241,16 +307,18 @@ class MACEBackend:
             n_atoms,
         )
 
-        # 3. Run MACE model (energy-only path)
+        # 3. Run MACE model (energy-only path; a model with a force head
+        # also returns its direct forces as out["predicted_forces"])
         model = nnx.merge(self._graphdef, self._state)
         out = model._energy_fn(data)
         energy = out["energy"][0]  # scalar energy for the real graph
 
-        return BackendResult(
+        result = BackendResult(
             energy=energy,
             max_neighbor_count=true_max_per_atom,
             overflow=overflow,
         )
+        return result, out
 
     def max_neighbors_for(
         self,
@@ -282,6 +350,7 @@ class MACEBackend:
 def create_mace(
     model_path: str | None = None,
     supercell_trafo: tuple[int, int, int] = (2, 2, 2),
+    force_source: str = "autograd",
     **kwargs: Any,
 ) -> MACEBackend:
     """Create a MACE-JAX energy backend from any supported model file.
@@ -313,6 +382,8 @@ def create_mace(
             ``.pkl`` graphdef+state pickle.
         supercell_trafo: (sc_a, sc_b, sc_c) supercell expansion for
             neighbor finding. Must satisfy min(cell_diag * sc) >= 2 * r_cutoff.
+        force_source: ``"autograd"`` (``-dE/dx``) or ``"head"`` (direct forces
+            of a force-head model); see :class:`MACEBackend`.
 
     Returns:
         MACEBackend instance.
@@ -331,7 +402,7 @@ def create_mace(
     # to the pickle loader so YAML ``checkpoint_path`` accepts it too.
     if Path(model_path).suffix == ".pkl":
         return create_mace_from_pickle(
-            model_path, supercell_trafo=supercell_trafo
+            model_path, supercell_trafo=supercell_trafo, force_source=force_source
         )
 
     bundle = load_model_bundle(model_path, dtype="float32")
@@ -367,12 +438,14 @@ def create_mace(
         num_species=num_species,
         atomic_numbers=atomic_numbers,
         supercell_trafo=supercell_trafo,
+        force_source=force_source,
     )
 
 
 def create_mace_from_pickle(
     pickle_path: str,
     supercell_trafo: tuple[int, int, int] = (2, 2, 2),
+    force_source: str = "autograd",
 ) -> MACEBackend:
     """Create a MACE backend from a pickle file with graphdef + state.
 
@@ -385,6 +458,7 @@ def create_mace_from_pickle(
     Args:
         pickle_path: Path to model_bundle.pkl.
         supercell_trafo: Supercell expansion for neighbor finding.
+        force_source: ``"autograd"`` or ``"head"``; see :class:`MACEBackend`.
 
     Returns:
         MACEBackend instance.
@@ -403,4 +477,5 @@ def create_mace_from_pickle(
         num_species=int(data["num_species"]),
         atomic_numbers=list(data["atomic_numbers"]),
         supercell_trafo=supercell_trafo,
+        force_source=force_source,
     )

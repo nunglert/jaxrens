@@ -601,6 +601,17 @@ class MACEBackendSpec(BaseBackendSpec):
             "field; the default suits typical small unit cells."
         ),
     )
+    force_source: Literal["autograd", "head"] = Field(
+        default="autograd",
+        description=(
+            "Forces used by force-based moves (GMC reflections).  "
+            "'autograd': -dE/dx of the model energy.  'head': the direct "
+            "forces of a model with a non-conservative force head "
+            "(mace-nonconservative), from the energy forward pass without a "
+            "backward pass.  The energy, and so the Emax acceptance, is the "
+            "same either way."
+        ),
+    )
 
     def _backend_config_extras(self) -> dict:
         return {"checkpoint_path": self.checkpoint_path, "cutoff": None}
@@ -611,6 +622,7 @@ class MACEBackendSpec(BaseBackendSpec):
         return create_mace(
             model_path=self.checkpoint_path,
             supercell_trafo=self.supercell_trafo,
+            force_source=self.force_source,
         )
 
 

@@ -291,6 +291,15 @@ class GMCMoveSpec(BaseMoveSpec):
             "price; more reflections travel further per proposal."
         ),
     )
+    use_forces: bool = Field(
+        default=True,
+        description=(
+            "Reflect off the constraint surface along the forces (the "
+            "default).  ``false`` reflects into a random direction instead: "
+            "no force evaluation, a baseline for comparing reflection "
+            "normals (e.g. the backend's ``force_source``)."
+        ),
+    )
     species: tuple[str, ...] | None = Field(
         default=None,
         description=(
@@ -374,6 +383,10 @@ class GMCMoveSpec(BaseMoveSpec):
         symbol_map: dict[int, str] | None = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"n_reflect": self.n_reflect}
+        # emitted only when off, like the scoping kwargs below: a default spec
+        # keeps producing the historical kernel_kwargs
+        if not self.use_forces:
+            kwargs["use_forces"] = False
         # Only emit the scoping kwargs when the move is actually scoped: the
         # kernel defaults are exactly ``species=None`` /
         # ``direction_field="direction"``, so an unscoped spec keeps producing
