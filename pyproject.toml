@@ -19,8 +19,8 @@ dependencies = [
     # so bounding jax bounds the CUDA plugins too; jaxlib is bounded
     # explicitly because jax and jaxlib must stay version-matched.
     # Drop both upper bounds once flax ships a compatible release.
-    "jax[cuda12]>=0.9.0,<0.11.2",
-    "jaxlib>=0.9.0,<0.11.2",
+    "jax[cuda12]>=0.9.0",
+    "jaxlib>=0.9.0",
     "numpy>=1.26",
     "h5py>=3.10",
     "ase>=3.22",

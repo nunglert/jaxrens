@@ -161,6 +161,85 @@ class TestNeuralILBackend:
         assert int(counts[0]) > 0
 
 
+def _fcc_primitive_supercell(a: float, n: int):
+    """n x n x n diagonal supercell of the zero-diagonal fcc primitive cell."""
+    prim = (
+        0.5 * a * np.array([[0.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 0.0]])
+    )
+    grid = np.stack(
+        np.meshgrid(*(np.arange(n),) * 3, indexing="ij"), axis=-1
+    ).reshape(-1, 3)
+    return grid @ prim, n * prim
+
+
+def _fcc_cubic_supercell(a: float, n: int):
+    """n x n x n supercell of the 4-atom conventional cubic fcc cell."""
+    basis = (
+        0.5
+        * a
+        * np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 1.0, 1.0],
+                [1.0, 0.0, 1.0],
+                [1.0, 1.0, 0.0],
+            ]
+        )
+    )
+    grid = a * np.stack(
+        np.meshgrid(*(np.arange(n),) * 3, indexing="ij"), axis=-1
+    ).reshape(-1, 3)
+    positions = (grid[:, None, :] + basis[None, :, :]).reshape(-1, 3)
+    return positions, n * a * np.eye(3)
+
+
+@neuralil_required
+class TestNeuralILZeroTraceCell:
+    """A zero-diagonal (trace 0) periodic cell is a crystal, not a cluster.
+
+    Regression: ``_safe_cell`` tested ``trace(cell) == 0`` to detect "no
+    cell", so the fcc primitive cell ``[[0,a,a],[a,0,a],[a,a,0]]`` (and any
+    diagonal supercell of it) was swapped for a 1000 A box and scored as a
+    cluster in vacuum.  The same crystal in its cubic setting must give the
+    same per-atom energy and neighbor count.
+    """
+
+    A = 4.0  # nn distance 2.83 A (12 nbrs < r_cut=3.5); 2nd shell at 4.0 A
+
+    @pytest.fixture
+    def backend(self):
+        from jaxrens.backends.neuralil import create_neuralil
+
+        return create_neuralil(
+            pickle_file=str(FIXTURE_DIR / "model.pkl"),
+            supercell_trafo=(1, 1, 1),
+        )
+
+    def _eval(self, backend, positions, cell):
+        positions = jnp.asarray(positions, dtype=jnp.float32)
+        cell = jnp.asarray(cell, dtype=jnp.float32)
+        species = jnp.zeros(positions.shape[0], dtype=jnp.int32)
+        res = backend(positions, species, cell, max_neighbors=24)
+        assert not res.overflow
+        n_geom = int(backend.max_neighbors_for(positions, cell))
+        return float(res.energy) / positions.shape[0], n_geom
+
+    def test_primitive_matches_cubic(self, backend):
+        # (111) plane spacing a/sqrt(3) * 4 = 9.2 A > 2 * r_cut.
+        pos_p, cell_p = _fcc_primitive_supercell(self.A, 4)
+        pos_c, cell_c = _fcc_cubic_supercell(self.A, 3)
+        assert np.trace(cell_p) == 0.0
+
+        e_p, n_p = self._eval(backend, pos_p, cell_p)
+        e_c, n_c = self._eval(backend, pos_c, cell_c)
+
+        assert n_p == n_c == 12
+        assert abs(e_p - e_c) < 1e-3 * max(abs(e_c), 1.0), (
+            f"zero-trace primitive {e_p:.6f} eV/atom vs cubic "
+            f"{e_c:.6f} eV/atom"
+        )
+
+
 @neuralil_required
 class TestNeuralILForces:
     """Native ``energy_and_forces`` agrees with the autodiff fallback.

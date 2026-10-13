@@ -53,7 +53,7 @@ from jaxrens.backends._graph_neighbors import (
 )
 from jaxrens.backends.base import BackendResult
 from jaxrens.unvalidated import unvalidated
-from jaxrens.utils.cell import wrap_positions
+from jaxrens.utils.cell import nonperiodic_safe_cell, wrap_positions
 
 logger = logging.getLogger(__name__)
 
@@ -189,14 +189,10 @@ class NequixBackend:
 
         positions = wrap_positions(positions, cell)
 
-        # Substitute a large dummy cell when the user passed cell == 0
-        # (non-periodic systems).  Same trick as the NeuralIL backend —
+        # Substitute a large dummy cell when the cell is degenerate (cell == 0,
+        # non-periodic systems).  Same trick as the NeuralIL backend —
         # ensures _supercell_edges has a well-defined image geometry.
-        safe_cell = jnp.where(
-            jnp.trace(cell) == 0,
-            1000.0 * jnp.eye(3),
-            cell,
-        )
+        safe_cell = nonperiodic_safe_cell(cell)
 
         (
             senders,

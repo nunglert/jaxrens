@@ -39,8 +39,7 @@ def truncate_energies(path: Path | str, restart_iteration: int) -> None:
         return
     header, rows = lines[0], lines[1:]
     kept = [
-        r for r in rows
-        if r.strip() and int(r.split()[0]) < restart_iteration
+        r for r in rows if r.strip() and int(r.split()[0]) < restart_iteration
     ]
     with open(path, "w") as f:
         f.write(header)
@@ -59,8 +58,7 @@ def truncate_extxyz(path: Path | str, restart_iteration: int) -> None:
     if not isinstance(frames, list):
         frames = [frames]
     kept = [
-        a for a in frames
-        if int(a.info.get("iter", -1)) < restart_iteration
+        a for a in frames if int(a.info.get("iter", -1)) < restart_iteration
     ]
     if kept:
         ase_write(str(path), kept)  # overwrites in place
@@ -108,7 +106,7 @@ def truncate_h5_traj(path: Path | str, restart_iteration: int) -> None:
     """Delete per-iteration groups (keyed by ``str(iteration)``) >= cut.
 
     The HDF5 trajectory writer stores each dead point as a group named after
-    its iteration.  Snapshot groups (``snapshot_*``) are left untouched — they
+    its iteration (``"{iteration}_{cull_rank}"`` when ``n_cull > 1``).  Snapshot groups (``snapshot_*``) are left untouched — they
     are keyed separately and overwritten by cadence, not appended.
     """
     path = Path(path)
@@ -121,7 +119,7 @@ def truncate_h5_traj(path: Path | str, restart_iteration: int) -> None:
             if key.startswith("snapshot_"):
                 continue
             try:
-                it = int(key)
+                it = int(key.split("_", 1)[0])
             except ValueError:
                 continue
             if it >= restart_iteration:

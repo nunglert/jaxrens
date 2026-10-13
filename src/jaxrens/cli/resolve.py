@@ -1286,7 +1286,9 @@ def _resolve_single_replica(
         )
     else:
         termination = (
-            PriorMassTermination(ns.n_live, ns.convergence_threshold),
+            PriorMassTermination(
+                ns.n_live, ns.convergence_threshold, n_cull=ns.n_cull
+            ),
         )
     if ns.max_iterations is not None:
         termination = termination + (IterationTermination(ns.max_iterations),)
@@ -1844,7 +1846,9 @@ def _resolve_multi_replica(
         )
     else:
         termination = (
-            PriorMassTermination(ns.n_live, ns.convergence_threshold),
+            PriorMassTermination(
+                ns.n_live, ns.convergence_threshold, n_cull=ns.n_cull
+            ),
         )
     if ns.max_iterations is not None:
         termination = termination + (IterationTermination(ns.max_iterations),)

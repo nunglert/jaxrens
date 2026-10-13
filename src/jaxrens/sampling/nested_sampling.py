@@ -2,11 +2,11 @@
 
 Two-loop architecture:
 - Outer loop (Python): adaptation, overflow retry, termination, callbacks, logging
-- Inner step (JIT): ns_step — one dead-point replacement via lax.scan over MCMC
+- Inner step (JIT): ns_step — one iteration (n_cull dead points) via lax.scan over MCMC
 
 Functions:
 - init_ns(): Initialize NSState from walker data + MWG init_fn
-- ns_step(): One dead-point replacement (fully JIT-compatible)
+- ns_step(): One NS iteration — cull n_cull walkers, refill, walk (fully JIT-compatible)
 - run_ns(): Full NS run (outer Python loop calling ns_step)
 - init_ns_parallel() / run_ns_parallel(): Multi-run vmap support
 """
@@ -20,8 +20,10 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.scipy.special import logsumexp
 from jaxtyping import Array, Float, Int, Key
 
+from jaxrens.prior_mass import iteration_offsets, log_alpha
 from jaxrens.sampling.adaptation.manager import build_adapt_step
 from jaxrens.sampling.batch_descriptor import (
     PmapVmapRuns,
@@ -111,31 +113,6 @@ def _find_worst_walker(
     return idx, max_val
 
 
-def _find_worst_walkers(
-    energies: jnp.ndarray,
-    n_cull: int,
-    rng_key: jax.Array | None = None,
-    n_atoms: int | None = None,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Find the n_cull walkers with the highest energies.
-
-    Returns:
-        (indices, values) — both shape (n_cull,), sorted by descending energy.
-    """
-    comparison = energies / n_atoms if n_atoms is not None else energies
-
-    if rng_key is not None:
-        noise = 1e-10 * jax.random.uniform(
-            rng_key, shape=comparison.shape, minval=-1.0, maxval=1.0
-        )
-        comparison = comparison + noise
-
-    sorted_indices = jnp.argsort(-comparison)
-    worst_indices = sorted_indices[:n_cull]
-    worst_values = energies[worst_indices]
-    return worst_indices, worst_values
-
-
 def _get_extra_indices(
     worst_idx: jnp.ndarray,
     clone_idx: jnp.ndarray,
@@ -158,6 +135,110 @@ def _get_extra_indices(
     noise = noise.at[worst_idx].set(-jnp.inf)
     noise = noise.at[clone_idx].set(-jnp.inf)
     return jnp.argsort(-noise)[:n_extra]
+
+
+def _select_culls(
+    potentials: jnp.ndarray,
+    n_cull: int,
+    n_extra: int,
+    key_worst: jax.Array,
+    key_clone: jax.Array,
+    key_extra: jax.Array,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Pick the culled walkers, their clone sources and the walk set.
+
+    Shared by :func:`ns_step` and :func:`ns_step_sharded` (which calls it on
+    the globally gathered potentials, so every shard picks the same indices).
+
+    * ``worst`` — the ``n_cull`` highest-potential walkers, in descending
+      potential (ties broken uniformly at random).  This is the dead-point
+      order written to disk and assumed by :mod:`jaxrens.prior_mass`.
+    * ``contour`` — the new NS constraint: the potential of the *last*
+      (lowest) culled walker.  Every survivor is ``<=`` it, so it remains a
+      true upper bound on the live set.
+    * ``clone`` — one distinct survivor per culled slot (no survivor is
+      cloned twice, so each iteration adds no duplicate ancestry).
+    * ``walk`` — ``worst`` (which will hold the clones) followed by
+      ``n_extra`` further survivors, disjoint from both ``worst`` and
+      ``clone`` (see :func:`_get_extra_indices` for why).
+
+    ``n_cull == 1`` keeps the original single-cull code path, so its PRNG
+    consumption — and hence every seeded ``n_cull = 1`` run — is unchanged.
+
+    Returns:
+        ``(worst, clone, walk, contour)`` with shapes ``(n_cull,)``,
+        ``(n_cull,)``, ``(n_cull + n_extra,)`` and ``()``.
+    """
+    n_walkers = potentials.shape[0]
+    if n_cull == 1:
+        worst_idx, contour = _find_worst_walker(potentials, rng_key=key_worst)
+        clone_idx = jax.random.randint(key_clone, (), 0, n_walkers - 1)
+        clone_idx = jnp.where(clone_idx >= worst_idx, clone_idx + 1, clone_idx)
+        if n_extra > 0:
+            extra = _get_extra_indices(
+                worst_idx, clone_idx, n_walkers, n_extra, key_extra
+            )
+            walk = jnp.concatenate([worst_idx[None], extra])
+        else:
+            walk = worst_idx[None]
+        return worst_idx[None], clone_idx[None], walk, contour
+
+    if 2 * n_cull + n_extra > n_walkers:
+        raise ValueError(
+            f"n_cull={n_cull}, n_extra={n_extra} need 2*n_cull + n_extra <= "
+            f"n_walkers={n_walkers}: each culled slot is refilled from a "
+            "distinct survivor and the extras are drawn from the remaining "
+            "survivors."
+        )
+    noise = jax.random.uniform(key_worst, shape=potentials.shape)
+    # Primary key: descending potential; secondary: random tie-break.
+    order = jnp.lexsort((-noise, -potentials))
+    worst = order[:n_cull]
+    contour = potentials[worst[-1]]
+    survivors = jax.random.permutation(key_clone, order[n_cull:])
+    clone = survivors[:n_cull]
+    walk = jnp.concatenate([worst, survivors[n_cull : n_cull + n_extra]])
+    return worst, clone, walk, contour
+
+
+def _dead_log_weights(
+    iteration: jnp.ndarray, n_walkers: int, n_cull: int
+) -> jnp.ndarray:
+    """Log prior-mass weights ``(n_cull,)`` of this iteration's dead points.
+
+    Closed form from :func:`jaxrens.prior_mass.iteration_offsets`, so the
+    JIT evidence accumulator matches post-processing exactly.
+    """
+    _, w_offset = iteration_offsets(n_walkers, n_cull)
+    return iteration.astype(jnp.float32) * jnp.float32(
+        log_alpha(n_walkers, n_cull)
+    ) + jnp.asarray(w_offset, dtype=jnp.float32)
+
+
+def _final_log_evidence(
+    log_evidence: jnp.ndarray,
+    iteration: jnp.ndarray,
+    live_potentials: jnp.ndarray,
+    n_walkers: int,
+    n_cull: int,
+) -> jnp.ndarray:
+    """Add the live walkers' share of the remaining prior mass to ``log Z``.
+
+    Each live walker carries ``X_D / n_walkers`` (:mod:`jaxrens.prior_mass`)
+    with ``D = iteration * n_cull`` dead points so far.  ``iteration`` may be
+    batched ``(*B,)`` with ``live_potentials`` of shape ``(*B, K)``.
+    """
+    # X_D sums D + 1 shrinkage terms: ``iteration`` full cycles plus the
+    # first term of the next cycle, log(N / (N + 1)).
+    log_x = iteration.astype(jnp.float32) * jnp.float32(
+        log_alpha(n_walkers, n_cull)
+    ) + jnp.float32(np.log(n_walkers) - np.log(n_walkers + 1.0))
+    log_live = (
+        log_x
+        - jnp.float32(np.log(n_walkers))
+        + logsumexp(-live_potentials, axis=-1)
+    )
+    return jnp.logaddexp(log_evidence, log_live)
 
 
 # ---------------------------------------------------------------------------
@@ -301,21 +382,25 @@ def ns_step(
     step_fn: Callable,
     n_mcmc_steps: int = 20,
     n_extra: int = 0,
+    n_cull: int = 1,
 ) -> tuple[NSState, dict]:
-    """One NS iteration: replace the worst walker, with optional extra walks.
+    """One NS iteration: replace the ``n_cull`` worst walkers, plus extra walks.
 
     Fully JIT-compatible. MCState.energy is the full ensemble potential
     (computed by the backend, possibly including an EnsembleTerm).
     No enthalpy computation needed here — ns_step is ensemble-agnostic.
 
-    When n_extra > 0, additional randomly chosen walkers from the
-    population are MCMC-walked alongside the clone via vmap.
+    The ``n_cull`` highest-potential walkers become dead points; each is
+    replaced by a clone of a distinct random survivor.  When n_extra > 0,
+    additional randomly chosen survivors are MCMC-walked alongside the
+    clones via vmap.
 
     Args:
         ns_state: Current NSState with batched MCState population.
         step_fn: MCMC step function from build_mwg().
         n_mcmc_steps: Number of MCMC steps per walker (static).
         n_extra: Number of additional walkers to walk (static).
+        n_cull: Number of walkers culled per iteration (static).
 
     Returns:
         (updated_ns_state, info_dict).
@@ -342,11 +427,12 @@ def ns_step(
     _leaf_str = "  ".join(_fmt(v) for v in _leaves_flat)
     logger.info(
         "ns_step tracing: pop_shape=%s  max_neighbors=%d  n_mcmc=%d  "
-        "n_extra=%d  n_leaves=%d  leaves=[%s]",
+        "n_extra=%d  n_cull=%d  n_leaves=%d  leaves=[%s]",
         ns_state.population.positions.shape,
         int(ns_state.population.max_neighbors),
         int(n_mcmc_steps),
         int(n_extra),
+        int(n_cull),
         len(_leaves_flat),
         _leaf_str,
     )
@@ -354,81 +440,68 @@ def ns_step(
     potentials = pop.energy  # (n_walkers,) — full ensemble potential
     key = ns_state.rng_key
 
-    # 1. Find worst walker (highest potential)
+    # 1. Pick the culled walkers (highest potential), their clone sources
+    # and the walk set.  The key splits mirror the historical single-cull
+    # order so ``n_cull = 1`` runs stay bit-identical.
+    n_walkers = ns_state.n_walkers
     key, key_worst = jax.random.split(key)
-    worst_idx, potential_max = _find_worst_walker(
-        potentials,
-        rng_key=key_worst,
+    key, key_clone, key_extra, key_mcmc = jax.random.split(key, 4)
+    worst_indices, clone_indices, walk_indices, potential_max = _select_culls(
+        potentials, n_cull, n_extra, key_worst, key_clone, key_extra
     )
 
-    # 2. Identify dead point.  We no longer write it onto NSState — the
+    # 2. Identify dead points.  We don't write them onto NSState — the
     # values are surfaced via the ``info`` dict instead, and the
     # per-iteration callbacks (``EnergyLogger``, ``TrajectoryCallback``)
-    # persist them straight to disk.  Inside JIT, the dead point only
-    # matters for the log-evidence accumulator below; the rest is pure
+    # persist them straight to disk.  Inside JIT, the dead points only
+    # matter for the log-evidence accumulator below; the rest is pure
     # history / output.
     #
-    # Slice the WHOLE dead walker as a ``WalkerState`` (positions / types /
-    # energy / cell) so consumers read one pytree instead of four parallel
-    # arrays — and so adding e.g. per-walker species lists later doesn't
-    # require touching every consumer.  Crucially this is captured BEFORE
-    # the slot at ``worst_idx`` is overwritten by the clone (and further
-    # mutated by MCMC cell moves); otherwise the traj writer pairs dead
-    # positions with the clone's post-MCMC cell and wrapping produces
-    # apparent close contacts that aren't in the real config.
-    dead_walker = WalkerState(
-        positions=pop.positions[worst_idx],
-        types=pop.types[worst_idx],
-        energy=pop.energy[worst_idx],
-        cell=pop.cell[worst_idx],
+    # Slice the WHOLE dead walkers as a ``WalkerState`` with a leading
+    # ``(n_cull,)`` axis (descending energy) so consumers read one pytree
+    # instead of four parallel arrays.  Crucially this is captured BEFORE
+    # the culled slots are overwritten by the clones (and further mutated by
+    # MCMC cell moves); otherwise the traj writer pairs dead positions with
+    # the clone's post-MCMC cell and wrapping produces apparent close
+    # contacts that aren't in the real config.
+    dead_walkers = WalkerState(
+        positions=pop.positions[worst_indices],
+        types=pop.types[worst_indices],
+        energy=pop.energy[worst_indices],
+        cell=pop.cell[worst_indices],
     )
 
-    # 3. Update evidence estimate
-    n_walkers = ns_state.n_walkers
-    log_weight = -ns_state.iteration / n_walkers + jnp.log(1.0 / n_walkers)
+    # 3. Update evidence estimate (pymatnest prior-mass convention, see
+    # ``jaxrens.prior_mass``).
     log_evidence = jnp.logaddexp(
-        ns_state.log_evidence, log_weight + (-potential_max)
+        ns_state.log_evidence,
+        logsumexp(
+            _dead_log_weights(ns_state.iteration, n_walkers, n_cull)
+            - dead_walkers.energy
+        ),
     )
 
-    # 4. Clone random survivor to replace worst
-    key, key_clone, key_extra, key_mcmc = jax.random.split(key, 4)
-    clone_idx = jax.random.randint(key_clone, (), 0, n_walkers - 1)
-    clone_idx = jnp.where(clone_idx >= worst_idx, clone_idx + 1, clone_idx)
-
-    clone = jax.tree.map(lambda x: x[clone_idx], pop)
-    n_moves = clone.n_accepted.shape[-1]
-    clone = clone.set(
-        n_accepted=jnp.zeros(n_moves, dtype=jnp.int32),
-        n_proposed=jnp.zeros(n_moves, dtype=jnp.int32),
-        max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
-        overflow=jnp.asarray(False),
+    # 4. Clone survivors into the culled slots (before walking).
+    clones = jax.tree.map(lambda x: x[clone_indices], pop)
+    n_moves = clones.n_accepted.shape[-1]
+    clones = clones.set(
+        n_accepted=jnp.zeros((n_cull, n_moves), dtype=jnp.int32),
+        n_proposed=jnp.zeros((n_cull, n_moves), dtype=jnp.int32),
+        max_neighbor_count=jnp.zeros(n_cull, dtype=jnp.int32),
+        overflow=jnp.zeros(n_cull, dtype=bool),
     )
-    # Write clone into population at worst_idx (before walking)
     pop = jax.tree.map(
-        lambda pop_field, clone_field: pop_field.at[worst_idx].set(
+        lambda pop_field, clone_field: pop_field.at[worst_indices].set(
             clone_field
         ),
         pop,
-        clone,
+        clones,
     )
 
-    # 5. Gather walkers to walk: worst_idx (the clone) + n_extra survivors.
-    # Both worst_idx and clone_idx are excluded from the extras pool —
-    # see ``_get_extra_indices`` for why (avoids parent-correlated extras
-    # silently overwriting the clone source).
-    if n_extra > 0:
-        extra_indices = _get_extra_indices(
-            worst_idx,
-            clone_idx,
-            n_walkers,
-            n_extra,
-            key_extra,
-        )
-        walk_indices = jnp.concatenate([worst_idx[None], extra_indices])
-    else:
-        walk_indices = worst_idx[None]
-
-    n_walk = 1 + n_extra
+    # 5. Walk the clones (now at ``worst_indices``) + n_extra survivors.
+    # Clone sources are excluded from the extras — see
+    # ``_get_extra_indices`` for why.
+    n_walk = n_cull + n_extra
     walk_batch = jax.tree.map(lambda x: x[walk_indices], pop)
 
     # 6. Run MCMC chains in parallel via vmap(lax.scan)
@@ -557,17 +630,25 @@ def ns_step(
     info = {
         "emax": potential_max,
         "hmax": potential_max,  # backward compat — same as emax now
-        "worst_idx": worst_idx,
-        "clone_idx": clone_idx,
+        # Single-walker views of the contour cull (the last, lowest-energy
+        # one), kept with their historical shapes; ``n_cull``-wide versions
+        # below.
+        "worst_idx": worst_indices[-1],
+        "clone_idx": clone_indices[-1],
+        "worst_indices": worst_indices,  # (n_cull,)
+        "clone_indices": clone_indices,  # (n_cull,)
         "acceptance_rate": total_accepted / total_steps,
-        # Per-iteration culled-walker (the "dead point").  Read by
+        # Per-iteration culled walkers (the "dead points"), captured before
+        # their slots were overwritten by the clones.  Read by
         # ``EnergyLogger`` / ``TrajectoryCallback`` for streaming-to-disk;
-        # not stored anywhere on NSState.
-        # Per-iteration culled walker as a ``WalkerState`` pytree, captured
-        # before the slot at ``worst_idx`` was overwritten by the clone.
-        # Energy of the dead walker is also exposed as ``info["emax"]`` for
-        # consumers that only need the scalar (adapt, RE, monitor).
-        "dead_walker": dead_walker,
+        # not stored anywhere on NSState.  ``dead_walker`` is the contour
+        # cull alone (== the only one when n_cull == 1); its energy is also
+        # ``info["emax"]`` for consumers that only need the scalar (adapt,
+        # RE, monitor).
+        "dead_walker": jax.tree.map(lambda x: x[-1], dead_walkers),
+        # All of this iteration's dead points, leading ``(n_cull,)`` axis in
+        # descending energy — the order they are written to disk.
+        "dead_walkers": dead_walkers,
         # Chain-level per-move statistics (raw counts; let consumers compute rates).
         # Bucket convention: reject_reason_counts_per_move[:, 0] = accepted,
         #   [:, 1] = energy reject, [:, 2] = cell reject, [:, 3] = prior reject.
@@ -592,6 +673,7 @@ def ns_step_sharded(
     step_fn: Callable,
     n_mcmc_steps: int = 20,
     n_extra: int = 0,
+    n_cull: int = 1,
 ) -> tuple[NSState, dict]:
     """One NS iteration with the population sharded across ``n_gpu`` GPUs.
 
@@ -650,11 +732,12 @@ def ns_step_sharded(
     _leaf_str = "  ".join(_fmt(v) for v in _leaves_flat)
     logger.info(
         "ns_step_sharded tracing: pop_shape=%s  max_neighbors=%d  "
-        "n_mcmc=%d  n_extra=%d  n_leaves=%d  leaves=[%s]",
+        "n_mcmc=%d  n_extra=%d  n_cull=%d  n_leaves=%d  leaves=[%s]",
         ns_state.population.positions.shape,
         int(ns_state.population.max_neighbors),
         int(n_mcmc_steps),
         int(n_extra),
+        int(n_cull),
         len(_leaves_flat),
         _leaf_str,
     )
@@ -678,68 +761,51 @@ def ns_step_sharded(
     pop_global = jax.tree.map(_gather_then_flatten, pop_local)
     potentials_global = pop_global.energy  # (K_total,)
 
-    # 1. Find worst walker on the global population (same on every shard).
+    # 1. Pick culls / clone sources / walk set on the global population.
+    # Same RNG on every shard → same global indices everywhere.  Key splits
+    # mirror ``ns_step`` so sharded and single-device runs agree.
     key, key_worst = jax.random.split(key)
-    worst_idx, potential_max = _find_worst_walker(
-        potentials_global,
-        rng_key=key_worst,
+    key, key_clone, key_extra, key_mcmc = jax.random.split(key, 4)
+    worst_indices, clone_indices, walk_indices, potential_max = _select_culls(
+        potentials_global, n_cull, n_extra, key_worst, key_clone, key_extra
     )
 
     # 2. Dead-point info — extracted from the global gathered pop.
-    # See scalar ``ns_step`` for why we snapshot the whole WalkerState here
-    # (and why it must happen BEFORE the slot at ``worst_idx`` is replaced).
-    dead_walker = WalkerState(
-        positions=pop_global.positions[worst_idx],
-        types=pop_global.types[worst_idx],
-        energy=pop_global.energy[worst_idx],
-        cell=pop_global.cell[worst_idx],
+    # See ``ns_step`` for why we snapshot the whole WalkerState here (and
+    # why it must happen BEFORE the culled slots are replaced).
+    dead_walkers = WalkerState(
+        positions=pop_global.positions[worst_indices],
+        types=pop_global.types[worst_indices],
+        energy=pop_global.energy[worst_indices],
+        cell=pop_global.cell[worst_indices],
     )
 
     # 3. Update evidence (uses global walker count).
-    log_weight = -ns_state.iteration / n_walkers_global + jnp.log(
-        1.0 / n_walkers_global
-    )
     log_evidence = jnp.logaddexp(
         ns_state.log_evidence,
-        log_weight + (-potential_max),
+        logsumexp(
+            _dead_log_weights(ns_state.iteration, n_walkers_global, n_cull)
+            - dead_walkers.energy
+        ),
     )
 
-    # 4. Clone random survivor — same RNG on every shard → same global idx.
-    key, key_clone, key_extra, key_mcmc = jax.random.split(key, 4)
-    clone_idx = jax.random.randint(key_clone, (), 0, n_walkers_global - 1)
-    clone_idx = jnp.where(clone_idx >= worst_idx, clone_idx + 1, clone_idx)
-
-    clone = jax.tree.map(lambda x: x[clone_idx], pop_global)
-    n_moves = clone.n_accepted.shape[-1]
-    clone = clone.set(
-        n_accepted=jnp.zeros(n_moves, dtype=jnp.int32),
-        n_proposed=jnp.zeros(n_moves, dtype=jnp.int32),
-        max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
-        overflow=jnp.asarray(False),
+    # 4. Clone survivors into the culled slots (before walking).
+    clones = jax.tree.map(lambda x: x[clone_indices], pop_global)
+    n_moves = clones.n_accepted.shape[-1]
+    clones = clones.set(
+        n_accepted=jnp.zeros((n_cull, n_moves), dtype=jnp.int32),
+        n_proposed=jnp.zeros((n_cull, n_moves), dtype=jnp.int32),
+        max_neighbor_count=jnp.zeros(n_cull, dtype=jnp.int32),
+        overflow=jnp.zeros(n_cull, dtype=bool),
     )
-    # Write clone into pop_global at worst_idx (before walking).
     pop_global = jax.tree.map(
-        lambda x, c: x.at[worst_idx].set(c),
+        lambda x, c: x.at[worst_indices].set(c),
         pop_global,
-        clone,
+        clones,
     )
 
-    # 5. Gather walkers to walk: worst (clone) + n_extra survivors.
-    # See ``_get_extra_indices`` — both worst_idx and clone_idx are
-    # excluded so the extras pool can't include the clone source.
-    if n_extra > 0:
-        extra_indices = _get_extra_indices(
-            worst_idx,
-            clone_idx,
-            n_walkers_global,
-            n_extra,
-            key_extra,
-        )
-        walk_indices = jnp.concatenate([worst_idx[None], extra_indices])
-    else:
-        walk_indices = worst_idx[None]
-
-    n_walk = 1 + n_extra
+    # 5. Walk the clones (now at ``worst_indices``) + n_extra survivors.
+    n_walk = n_cull + n_extra
     walk_batch = jax.tree.map(lambda x: x[walk_indices], pop_global)
 
     # 6. Run the MCMC chains, DISTRIBUTED across shards.
@@ -905,12 +971,14 @@ def ns_step_sharded(
     info = {
         "emax": potential_max,
         "hmax": potential_max,
-        "worst_idx": worst_idx,
-        "clone_idx": clone_idx,
+        # See ``ns_step`` for the single-walker vs ``n_cull``-wide keys.
+        "worst_idx": worst_indices[-1],
+        "clone_idx": clone_indices[-1],
+        "worst_indices": worst_indices,
+        "clone_indices": clone_indices,
         "acceptance_rate": total_accepted / total_steps,
-        # See scalar ``ns_step`` — single dead-walker pytree replaces the
-        # four parallel ``dead_*`` keys.
-        "dead_walker": dead_walker,
+        "dead_walker": jax.tree.map(lambda x: x[-1], dead_walkers),
+        "dead_walkers": dead_walkers,
         "n_accepted_per_move": agg_n_accepted,
         "n_proposed_per_move": agg_n_proposed,
         "reject_reason_counts_per_move": agg_rr_counts,
@@ -976,6 +1044,7 @@ def run_ns(
     max_iterations: int | None = None,
     n_mcmc_steps: int = 20,
     n_extra: int = 0,
+    n_cull: int = 1,
     convergence_threshold: float = 0.1,
     initial_step_size: float = 0.1,
     target_acceptance: float = 0.5,
@@ -1016,7 +1085,9 @@ def run_ns(
         n_walkers = positions.shape[0]
     if termination_criteria is None:
         termination_criteria = [
-            PriorMassTermination(n_walkers, convergence_threshold),
+            PriorMassTermination(
+                n_walkers, convergence_threshold, n_cull=n_cull
+            ),
         ]
         if max_iterations is not None:
             termination_criteria.append(IterationTermination(max_iterations))
@@ -1064,7 +1135,7 @@ def run_ns(
         max_iterations,
         n_mcmc_steps,
         n_extra,
-        (1 + n_extra) * n_mcmc_steps,
+        (n_cull + n_extra) * n_mcmc_steps,
     )
 
     batcher = SingleRun()
@@ -1087,6 +1158,7 @@ def run_ns(
         step_fn=step_fn,
         n_mcmc_steps=n_mcmc_steps,
         n_extra=n_extra,
+        n_cull=n_cull,
         termination_criteria=termination_criteria,
         callbacks=callbacks,
         n_moves=n_moves,
@@ -1099,19 +1171,19 @@ def run_ns(
     )
 
     # Final evidence: add contribution from remaining live walkers
-    remaining_potentials = ns_state.population.energy
-    log_remaining_mass = -ns_state.iteration / n_walkers
-    log_avg_likelihood = -jnp.mean(remaining_potentials)
     ns_state = ns_state.set(
-        log_evidence=jnp.logaddexp(
+        log_evidence=_final_log_evidence(
             ns_state.log_evidence,
-            log_remaining_mass + log_avg_likelihood,
+            ns_state.iteration,
+            ns_state.population.energy,
+            n_walkers,
+            n_cull,
         ),
     )
 
     logger.info(
         "NS complete: %d dead points, log_Z=%.4f",
-        int(ns_state.iteration),
+        int(ns_state.iteration) * n_cull,
         float(ns_state.log_evidence),
     )
 
@@ -1119,7 +1191,9 @@ def run_ns(
         if hasattr(cb, "on_finish"):
             cb.on_finish(ns_state)
 
-    return _ns_state_to_result_dict(ns_state, n_dead=int(ns_state.iteration))
+    return _ns_state_to_result_dict(
+        ns_state, n_dead=int(ns_state.iteration) * n_cull
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1207,6 +1281,7 @@ def run_ns_parallel(
     max_iterations: int = 10000,
     n_mcmc_steps: int = 20,
     n_extra: int = 0,
+    n_cull: int = 1,
     convergence_threshold: float = 0.1,
     initial_step_size: float = 0.1,
     target_acceptance: float = 0.5,
@@ -1246,6 +1321,7 @@ def run_ns_parallel(
         max_iterations: Max NS iterations per run.
         n_mcmc_steps: MCMC steps per walker (static).
         n_extra: Extra walkers to walk per iteration (static).
+        n_cull: Walkers culled per iteration (static).
         convergence_threshold: For PriorMassTermination.
         initial_step_size: Starting step size.
         target_acceptance: Target acceptance rate (unused directly; kept for
@@ -1273,7 +1349,9 @@ def run_ns_parallel(
         n_walkers = positions.shape[1]
     if termination_criteria is None:
         termination_criteria = [
-            PriorMassTermination(n_walkers, convergence_threshold),
+            PriorMassTermination(
+                n_walkers, convergence_threshold, n_cull=n_cull
+            ),
         ]
         if max_iterations is not None:
             termination_criteria.append(IterationTermination(max_iterations))
@@ -1317,7 +1395,7 @@ def run_ns_parallel(
         max_iterations,
         n_mcmc_steps,
         n_extra,
-        (1 + n_extra) * n_mcmc_steps,
+        (n_cull + n_extra) * n_mcmc_steps,
     )
 
     batcher = VmapRuns(n_runs=n_runs)
@@ -1456,6 +1534,7 @@ def run_ns_parallel(
         step_fn=step_fn,
         n_mcmc_steps=n_mcmc_steps,
         n_extra=n_extra,
+        n_cull=n_cull,
         termination_criteria=termination_criteria,
         callbacks=callbacks or [],
         n_moves=n_moves,
@@ -1469,13 +1548,13 @@ def run_ns_parallel(
     )
 
     # Final evidence: per-run contribution from remaining live walkers
-    remaining_potentials = ns_states.population.energy  # (n_runs, n_walkers)
-    log_remaining_mass = -ns_states.iteration / n_walkers  # (n_runs,)
-    log_avg_likelihood = -jnp.mean(remaining_potentials, axis=-1)  # (n_runs,)
     ns_states = ns_states.set(
-        log_evidence=jnp.logaddexp(
+        log_evidence=_final_log_evidence(
             ns_states.log_evidence,
-            log_remaining_mass + log_avg_likelihood,
+            ns_states.iteration,
+            ns_states.population.energy,
+            n_walkers,
+            n_cull,
         ),
     )
 
@@ -1483,12 +1562,12 @@ def run_ns_parallel(
         logger.info(
             "Run %d complete: %d dead points, log_Z=%.4f",
             r,
-            int(ns_states.iteration[r]),
+            int(ns_states.iteration[r]) * n_cull,
             float(ns_states.log_evidence[r]),
         )
 
     # Dead-point history is persisted to disk by the callbacks; not in
-    # the return.  ``n_dead`` ≡ ``iteration`` (both increment per ns_step).
+    # the return.  ``n_dead`` = ``iteration * n_cull``.
     pop = ns_states.population
     return {
         "positions": pop.positions,
@@ -1497,7 +1576,7 @@ def run_ns_parallel(
         "cells": pop.cell,
         "log_evidence": ns_states.log_evidence,
         "iteration": ns_states.iteration,
-        "n_dead": ns_states.iteration,
+        "n_dead": ns_states.iteration * n_cull,
         "n_walkers": n_walkers,
         "n_runs": n_runs,
     }
@@ -1770,6 +1849,7 @@ def run_ns_multi_gpu(
     max_iterations: int = 10000,
     n_mcmc_steps: int = 20,
     n_extra: int = 0,
+    n_cull: int = 1,
     convergence_threshold: float = 0.1,
     initial_step_size: float = 0.1,
     target_acceptance: float = 0.5,
@@ -1812,6 +1892,7 @@ def run_ns_multi_gpu(
         max_iterations: Max NS iterations per run.
         n_mcmc_steps: MCMC steps per walker (static).
         n_extra: Extra walkers to walk per iteration (static).
+        n_cull: Walkers culled per iteration (static).
         convergence_threshold: For ``PriorMassTermination``.
         initial_step_size: Starting step size.
         target_acceptance: Kept for interface parity; unused directly.
@@ -1881,7 +1962,9 @@ def run_ns_multi_gpu(
 
     if termination_criteria is None:
         termination_criteria = [
-            PriorMassTermination(n_walkers, convergence_threshold),
+            PriorMassTermination(
+                n_walkers, convergence_threshold, n_cull=n_cull
+            ),
         ]
         if max_iterations is not None:
             termination_criteria.append(IterationTermination(max_iterations))
@@ -1958,7 +2041,7 @@ def run_ns_multi_gpu(
         max_iterations,
         n_mcmc_steps,
         n_extra,
-        (1 + n_extra) * n_mcmc_steps,
+        (n_cull + n_extra) * n_mcmc_steps,
     )
 
     if batcher is None:
@@ -2104,6 +2187,7 @@ def run_ns_multi_gpu(
         step_fn=step_fn,
         n_mcmc_steps=n_mcmc_steps,
         n_extra=n_extra,
+        n_cull=n_cull,
         termination_criteria=termination_criteria,
         callbacks=callbacks,
         n_moves=n_moves,
@@ -2118,13 +2202,13 @@ def run_ns_multi_gpu(
 
     # Final evidence: per-run contribution from remaining live walkers.
     # ns_states.population.energy shape: (G, P, K)
-    remaining_potentials = ns_states.population.energy  # (G, P, K)
-    log_remaining_mass = -ns_states.iteration / n_walkers  # (G, P)
-    log_avg_likelihood = -jnp.mean(remaining_potentials, axis=-1)  # (G, P)
     ns_states = ns_states.set(
-        log_evidence=jnp.logaddexp(
+        log_evidence=_final_log_evidence(
             ns_states.log_evidence,
-            log_remaining_mass + log_avg_likelihood,
+            ns_states.iteration,
+            ns_states.population.energy,
+            n_walkers,
+            n_cull,
         ),
     )
 
@@ -2134,7 +2218,7 @@ def run_ns_multi_gpu(
                 "GPU %d run %d complete: %d dead points, log_Z=%.4f",
                 g,
                 p,
-                int(ns_states.iteration[g, p]),
+                int(ns_states.iteration[g, p]) * n_cull,
                 float(ns_states.log_evidence[g, p]),
             )
 
@@ -2143,7 +2227,7 @@ def run_ns_multi_gpu(
             cb.on_finish(ns_states)
 
     # Dead-point history is persisted to disk by the callbacks; not in the
-    # return.  ``n_dead`` ≡ ``iteration`` (both increment per ns_step).
+    # return.  ``n_dead`` = ``iteration * n_cull``.
     pop = ns_states.population
     return {
         "positions": pop.positions,
@@ -2152,7 +2236,7 @@ def run_ns_multi_gpu(
         "cells": pop.cell,
         "log_evidence": ns_states.log_evidence,  # (G, P)
         "iteration": ns_states.iteration,  # (G, P)
-        "n_dead": ns_states.iteration,  # (G, P) — same as iteration
+        "n_dead": ns_states.iteration * n_cull,  # (G, P)
         "n_walkers": n_walkers,
         "n_gpu": n_gpu,
         "n_per_gpu": n_per_gpu,
@@ -2178,6 +2262,7 @@ def run_ns_sharded(
     max_iterations: int = 10000,
     n_mcmc_steps: int = 20,
     n_extra: int = 0,
+    n_cull: int = 1,
     convergence_threshold: float = 0.1,
     initial_step_size: float = 0.1,
     target_acceptance: float = 0.5,
@@ -2257,7 +2342,9 @@ def run_ns_sharded(
 
     if termination_criteria is None:
         termination_criteria = [
-            PriorMassTermination(n_walkers, convergence_threshold),
+            PriorMassTermination(
+                n_walkers, convergence_threshold, n_cull=n_cull
+            ),
         ]
         if max_iterations is not None:
             termination_criteria.append(IterationTermination(max_iterations))
@@ -2315,7 +2402,7 @@ def run_ns_sharded(
         max_iterations,
         n_mcmc_steps,
         n_extra,
-        (1 + n_extra) * n_mcmc_steps,
+        (n_cull + n_extra) * n_mcmc_steps,
     )
 
     if batcher is None:
@@ -2354,6 +2441,7 @@ def run_ns_sharded(
         step_fn=step_fn,
         n_mcmc_steps=n_mcmc_steps,
         n_extra=n_extra,
+        n_cull=n_cull,
         termination_criteria=termination_criteria,
         callbacks=callbacks,
         n_moves=n_moves,
@@ -2369,13 +2457,13 @@ def run_ns_sharded(
 
     # Final evidence: per-shard contribution.  All shards share the
     # same scalar values, so take [0] for the final scalar.
-    remaining_potentials = ns_state.population.energy  # (G, K_per_gpu)
-    log_remaining_mass = -ns_state.iteration / n_walkers  # (G,)
-    log_avg_likelihood = -jnp.mean(remaining_potentials)  # scalar (global)
     ns_state = ns_state.set(
-        log_evidence=jnp.logaddexp(
+        log_evidence=_final_log_evidence(
             ns_state.log_evidence,
-            log_remaining_mass + log_avg_likelihood,
+            ns_state.iteration,
+            ns_state.population.energy.reshape(-1),
+            n_walkers,
+            n_cull,
         ),
     )
 
@@ -2383,7 +2471,7 @@ def run_ns_sharded(
     final_log_z = float(ns_state.log_evidence[0])
     logger.debug(
         "Sharded NS complete: %d dead points, log_Z=%.4f",
-        final_iter,
+        final_iter * n_cull,
         final_log_z,
     )
 
@@ -2405,7 +2493,7 @@ def run_ns_sharded(
         "cells": pop.cell,
         "log_evidence": ns_state.log_evidence,  # (G,) — identical entries
         "iteration": ns_state.iteration,  # (G,)
-        "n_dead": ns_state.iteration,
+        "n_dead": ns_state.iteration * n_cull,
         "n_walkers": n_walkers,
         "n_gpu": n_gpu,
         "n_runs": 1,

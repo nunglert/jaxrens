@@ -92,7 +92,10 @@ and every following line is one dead point::
 
     <iteration> <energy> <volume>
 
-``volume`` is zero for runs without a cell.  Read it with
+With ``n_cull > 1`` each iteration writes ``n_cull`` lines sharing the same
+``<iteration>``, in descending energy (the pymatnest layout), so the row index
+is the dead-point index used by the prior-mass weights.  ``volume`` is zero
+for runs without a cell.  Read it with
 :class:`~jaxrens.io.energy_log.EnergyLogger`:
 
 .. code-block:: python

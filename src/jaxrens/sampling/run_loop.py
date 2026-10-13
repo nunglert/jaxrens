@@ -22,6 +22,7 @@ Design invariants
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
@@ -339,6 +340,7 @@ def _run_loop(
     max_neighbors_offset: int = 5,
     max_neighbors_shrink_dwell: int = 0,
     ns_step_fn: Callable | None = None,
+    n_cull: int = 1,
 ) -> tuple[NSState, Key[Array, "*B"], dict[str, np.ndarray]]:
     """Unified NS outer loop shared by ``run_ns`` and ``run_ns_parallel``.
 
@@ -365,6 +367,8 @@ def _run_loop(
         step_fn: MCMC step function from ``build_mwg()``.
         n_mcmc_steps: Number of MCMC steps per walker (static under JIT).
         n_extra: Number of extra walkers to walk per iteration (static).
+        n_cull: Number of walkers culled per iteration (static; bound into
+            the step function, so ``batcher.wrap_step`` is unchanged).
         termination_criteria: List of ``TerminationCriterion`` objects.  The
             loop runs until any one of these fires; there is no static
             iteration cap.  Pass an ``IterationTermination(N)`` to bound the
@@ -410,6 +414,8 @@ def _run_loop(
     # ShardedSingleRun mode) via ``ns_step_fn``; default preserves the
     # SingleRun / VmapRuns / PmapVmapRuns behaviour.
     step_to_wrap = ns_step_fn if ns_step_fn is not None else ns_step
+    if n_cull != 1:
+        step_to_wrap = functools.partial(step_to_wrap, n_cull=n_cull)
     jit_ns_step = batcher.wrap_step(
         step_to_wrap, step_fn, n_mcmc_steps, n_extra
     )

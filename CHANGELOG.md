@@ -25,6 +25,30 @@ then `git tag -a vX.Y.Z`.
   `Hamiltonian`. `ResolvedConfig.base_backend` is now always a `Hamiltonian`.
 
 ### Fixed
+- **`run.n_cull > 1` never culled more than one walker.** Both NS steps
+  always removed a single walker; `n_cull` only reached the temperature
+  estimate and termination, where it skewed the assumed prior-mass
+  shrinkage.  The steps now cull the `n_cull` highest-energy walkers per
+  iteration (contour = the lowest of them), refill each from a distinct
+  random survivor, walk the clones alongside the `n_extra` extras, and
+  surface all of them as `info["dead_walkers"]` / `worst_indices` /
+  `clone_indices` (leading `(n_cull,)` axis; the single-walker keys remain
+  as the contour cull).  Trajectory callbacks write `n_cull` dead points and
+  `.energies` rows per iteration; HDF5 dead-point groups are keyed
+  `"{iter}_{rank}"` when `n_cull > 1`.  The `.energies` header now records
+  `n_cull` on every run path, and `Monitor.from_directory` /
+  `MonitorCollection` read it back instead of hardcoding 1.  `run.n_cull`
+  joins the restart immutables, and the schema rejects
+  `2 * n_cull + n_extra > n_live`.  `n_cull = 1` sampling is bit-identical.
+- **Prior-mass weights now follow pymatnest's `calc_log_a`.** Post-processing
+  used `(N - n_cull)/(N + 1 - n_cull)` per dead point — `(N-1)/N` for
+  `n_cull = 1`, i.e. one walker too few, a ~`i/N²` drift in `log X` — while
+  the in-JIT evidence, `PriorMassTermination` and `TempTermination` each used
+  their own approximation.  All of them now share `jaxrens.prior_mass`.
+  Re-analysing existing runs shifts thermodynamic observables slightly
+  (≈0.2 % temperature scale at `N = 600`), towards pymatnest's values.  The
+  final live-point evidence term also uses the arithmetic (not geometric)
+  mean of the live likelihoods.
 - **Force-based moves (GMC with forces, HMC) dropped the soft-core and
   ensemble terms on backends with native forces.** The wrappers forwarded
   `energy_and_forces` to the model, so NeuralIL runs got bare `U` (no

@@ -10,6 +10,8 @@ contract or produce a meaningless concatenated trace:
 
   * walker-population shape  (``run.n_live``, ``run.n_gpu``,
     ``run.n_per_gpu``)
+  * prior-mass ladder         (``run.n_cull`` — mixing cull widths within
+    one run breaks the per-dead-point weights)
   * energy function           (``backend`` subtree, including model file)
   * physics conditions        (``ensemble``, ``inter_re`` subtrees)
   * cell topology             (``cell`` subtree)
@@ -42,6 +44,7 @@ logger = logging.getLogger(__name__)
 # most-likely-to-bite-the-user fields first.
 _IMMUTABLE_PATHS: tuple[str, ...] = (
     "run.n_live",
+    "run.n_cull",
     "run.n_gpu",
     "run.n_per_gpu",
     "backend",
@@ -68,6 +71,11 @@ _WARN_PATHS: tuple[str, ...] = (
 
 
 _MISSING = object()
+
+# Immutable fields whose schema default should stand in for a value missing
+# from an older snapshot (so adding the field to ``_IMMUTABLE_PATHS`` doesn't
+# refuse restarts of runs that predate it).
+_MISSING_DEFAULTS: dict[str, Any] = {"run.n_cull": 1}
 
 # Interval-counted ``output.*`` fields scaled by ``_apply_interval_units``
 # (resolve.py).  Kept in sync with that list — both convert per_walker counts
@@ -211,6 +219,9 @@ def _classify_diffs(
     for path in paths:
         a = _dig(snapshot, path)
         b = _dig(current, path)
+        if path in _MISSING_DEFAULTS:
+            a = _MISSING_DEFAULTS[path] if a is _MISSING else a
+            b = _MISSING_DEFAULTS[path] if b is _MISSING else b
         if a is _MISSING and b is _MISSING:
             continue
         if not _immutable_equal(a, b):

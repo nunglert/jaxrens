@@ -14,6 +14,25 @@ def get_volume(cell: jnp.ndarray) -> jnp.ndarray:
     return jnp.abs(jnp.linalg.det(cell))
 
 
+def nonperiodic_safe_cell(
+    cell: jnp.ndarray, box: float = 1000.0
+) -> jnp.ndarray:
+    """Substitute a large cubic dummy box when ``cell`` is degenerate.
+
+    Non-periodic systems pass ``cell == 0``; backends that always build a
+    periodic image geometry need *some* finite cell, so they get a
+    ``box``-sized cube in which the system is an isolated cluster.
+
+    The test is on the determinant, not the trace: a valid periodic cell can
+    have a zero diagonal (e.g. the fcc primitive ``[[0,a,a],[a,0,a],[a,a,0]]``
+    and its diagonal supercells), and a trace test would silently evaluate
+    such crystals as clusters in vacuum.  The threshold matches
+    :func:`wrap_positions`.
+    """
+    periodic = jnp.abs(jnp.linalg.det(cell)) > 1e-12
+    return jnp.where(periodic, cell, box * jnp.eye(3, dtype=cell.dtype))
+
+
 def wrap_positions(positions: jnp.ndarray, cell: jnp.ndarray) -> jnp.ndarray:
     """Wrap atom positions into the home unit cell (fractional coords in [0, 1)).
 

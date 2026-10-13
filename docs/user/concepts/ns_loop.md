@@ -184,9 +184,12 @@ walker distribution concentrates toward the ground state of $H$.
 
 ## Extending the scheme
 
-- **n_cull > 1**: retire the `n_cull` worst walkers per iteration.
-  Changes the contraction rate to
-  $X_i \approx ((N - n_\mathrm{cull})/(N+1-n_\mathrm{cull}))^i$.
+- **n_cull > 1**: retire the `n_cull` worst walkers per iteration, each
+  refilled from a distinct random survivor; every culled walker is a dead
+  point.  One iteration contracts the prior mass by
+  $(N + 1 - n_\mathrm{cull})/(N + 1)$, and within an iteration dead point
+  $j$ (descending energy) carries the shrinkage $(N - j)/(N + 1 - j)$ —
+  pymatnest's convention, implemented once in {mod}`jaxrens.prior_mass`.
   See {attr}`jaxrens.state.config.NSConfig.n_cull`.
 - **n_extra**: reseed MCMC chains starting from additional random
   live walkers per iteration. Reduces chain correlation at the cost

@@ -18,14 +18,13 @@ import jax.numpy as jnp
 import pytest
 
 from jaxrens.sampling.termination import (
+    KB_EV,
     EnergyTermination,
     IterationTermination,
     PriorMassTermination,
     TempTermination,
     check_any,
-    KB_EV,
 )
-
 
 # ── IterationTermination ─────────────────────────────────────────────────
 
@@ -64,6 +63,41 @@ class TestPriorMassTermination:
         assert not t.check(500, 0.0)
 
 
+class TestNCullAwareTermination:
+    """Criteria use the shared pymatnest ladder (``jaxrens.prior_mass``)."""
+
+    def test_prior_mass_uses_n_cull(self):
+        from jaxrens.prior_mass import log_alpha
+
+        n, c = 50, 5
+        t = PriorMassTermination(n_live=n, threshold=1.0, n_cull=c)
+        # log X after iteration i is (i + 1) * log_alpha; with log_Z = 0 and
+        # emax = 0 it triggers as soon as that drops below log(threshold)=0,
+        # i.e. right after the "every walker replaced once" guard.
+        t.update_evidence(0.0)
+        assert not t.check(n // c, 0.0)  # guard: i * c <= n
+        assert t.check(n // c + 1, 0.0)
+        assert t._log_alpha == pytest.approx(log_alpha(n, c))
+
+    def test_prior_mass_n_cull_contracts_faster(self):
+        slow = PriorMassTermination(n_live=100, threshold=1e-3, n_cull=1)
+        fast = PriorMassTermination(n_live=100, threshold=1e-3, n_cull=10)
+        first = {}
+        for name, t in (("slow", slow), ("fast", fast)):
+            t.update_evidence(-1.0)
+            first[name] = next(i for i in range(10_000) if t.check(i, 0.0))
+        assert first["fast"] * 8 < first["slow"]
+
+    def test_temp_termination_weight_is_contour_dead_point(self):
+        from jaxrens.prior_mass import log_dead_weights
+
+        n, c, i = 40, 4, 17
+        t = TempTermination(n_walkers=n, target_temp=1000.0, n_cull=c)
+        t.check(i, 0.0)  # emax = 0 → log_Z_term is the bare weight
+        expected = log_dead_weights((i + 1) * c, n, c)[-1]
+        assert t.log_Z_term_last == pytest.approx(expected)
+
+
 # ── EnergyTermination ────────────────────────────────────────────────────
 
 
@@ -93,12 +127,16 @@ class TestTempTermination:
         """Feed decreasing energies; once contributions fall off, should trigger."""
         n_walkers = 100
         target_temp = 300.0
-        t = TempTermination(n_walkers=n_walkers, target_temp=target_temp, threshold=10.0)
+        t = TempTermination(
+            n_walkers=n_walkers, target_temp=target_temp, threshold=10.0
+        )
 
         # Simulate a nested sampling run with exponentially decaying energies
         # (realistic: energies decrease fast then plateau near ground state)
         n_iters = 5000
-        energies = [10.0 * math.exp(-i / (n_walkers * 0.5)) for i in range(n_iters)]
+        energies = [
+            10.0 * math.exp(-i / (n_walkers * 0.5)) for i in range(n_iters)
+        ]
 
         triggered_at = None
         for i, e in enumerate(energies):
@@ -106,7 +144,9 @@ class TestTempTermination:
                 triggered_at = i
                 break
 
-        assert triggered_at is not None, "TempTermination should have triggered"
+        assert (
+            triggered_at is not None
+        ), "TempTermination should have triggered"
         assert triggered_at > 0, "Should not trigger on first iteration"
 
     def test_never_triggers_if_energies_flat(self):
@@ -148,7 +188,9 @@ class TestTempTermination:
         # In NS, dead point energies decrease monotonically
         n_iters = 5000
         # Exponentially decreasing energies (typical NS behavior)
-        energies = [5.0 * math.exp(-i / (n_walkers * 0.5)) for i in range(n_iters)]
+        energies = [
+            5.0 * math.exp(-i / (n_walkers * 0.5)) for i in range(n_iters)
+        ]
 
         triggered_at = None
         for i, e in enumerate(energies):
@@ -162,7 +204,9 @@ class TestTempTermination:
 
     def test_n_cull_greater_than_one(self):
         """Multi-cull should still work."""
-        t = TempTermination(n_walkers=100, target_temp=500.0, n_cull=3, threshold=10.0)
+        t = TempTermination(
+            n_walkers=100, target_temp=500.0, n_cull=3, threshold=10.0
+        )
 
         triggered_at = None
         for i in range(5000):
@@ -191,7 +235,9 @@ class TestTempTermination:
                 break
 
         assert trigger_5 is not None and trigger_15 is not None
-        assert trigger_5 < trigger_15, "Smaller threshold should trigger earlier"
+        assert (
+            trigger_5 < trigger_15
+        ), "Smaller threshold should trigger earlier"
 
     def test_log_Z_term_properties(self):
         """Properties track internal state correctly."""
@@ -261,7 +307,10 @@ class CustomCriterion:
     def check(self, iteration: int, emax: float) -> bool:
         if self._prev_energy is not None:
             direction = emax > self._prev_energy
-            if self._prev_direction is not None and direction != self._prev_direction:
+            if (
+                self._prev_direction is not None
+                and direction != self._prev_direction
+            ):
                 self._oscillations += 1
             self._prev_direction = direction
         self._prev_energy = emax
@@ -311,7 +360,9 @@ class TestBatchTermination:
         all_triggered = [None] * n_runs
         for i in range(5000):
             for r in range(n_runs):
-                if all_triggered[r] is None and criteria[r].check(i, schedules[r][i]):
+                if all_triggered[r] is None and criteria[r].check(
+                    i, schedules[r][i]
+                ):
                     all_triggered[r] = i
 
             if all(t is not None for t in all_triggered):
@@ -320,7 +371,9 @@ class TestBatchTermination:
         # All runs should have converged
         assert all(t is not None for t in all_triggered)
         # They converge at different iterations
-        assert len(set(all_triggered)) > 1, "Runs should converge at different times"
+        assert (
+            len(set(all_triggered)) > 1
+        ), "Runs should converge at different times"
 
     def test_slowest_run_determines_batch_termination(self):
         """Batch terminates when the slowest run converges."""
@@ -332,8 +385,8 @@ class TestBatchTermination:
 
         # One slow run (slow decay), two fast
         schedules = [
-            [10.0 * math.exp(-i / 40.0) for i in range(5000)],   # fast
-            [10.0 * math.exp(-i / 40.0) for i in range(5000)],   # fast
+            [10.0 * math.exp(-i / 40.0) for i in range(5000)],  # fast
+            [10.0 * math.exp(-i / 40.0) for i in range(5000)],  # fast
             [10.0 * math.exp(-i / 100.0) for i in range(5000)],  # slow
         ]
 
@@ -342,16 +395,23 @@ class TestBatchTermination:
 
         for i in range(5000):
             for r in range(n_runs):
-                if per_run_trigger[r] is None and criteria[r].check(i, schedules[r][i]):
+                if per_run_trigger[r] is None and criteria[r].check(
+                    i, schedules[r][i]
+                ):
                     per_run_trigger[r] = i
 
-            if all(t is not None for t in per_run_trigger) and batch_done_at is None:
+            if (
+                all(t is not None for t in per_run_trigger)
+                and batch_done_at is None
+            ):
                 batch_done_at = i
                 break
 
         assert batch_done_at is not None
         # Batch termination should be at the slowest run's trigger
-        assert batch_done_at == max(t for t in per_run_trigger if t is not None)
+        assert batch_done_at == max(
+            t for t in per_run_trigger if t is not None
+        )
 
 
 # ── Existing fallback termination still works ────────────────────────────
@@ -360,7 +420,9 @@ class TestBatchTermination:
 class TestFallbackTermination:
     def test_iteration_fallback(self):
         """IterationTermination as fallback when temp termination not reached."""
-        t_temp = TempTermination(n_walkers=100, target_temp=0.001, threshold=50.0)
+        t_temp = TempTermination(
+            n_walkers=100, target_temp=0.001, threshold=50.0
+        )
         t_iter = IterationTermination(max_iterations=100)
 
         for i in range(200):
@@ -388,9 +450,12 @@ class TestTempTerminationIntegration:
         from jaxrens.sampling.nested_sampling import run_ns
 
         backend = create_harmonic(k=1.0)
-        init_fn, step_fn, _ = build_mwg(backend, [
-            MoveKernel("random_walk", random_walk.build_kernel),
-        ])
+        init_fn, step_fn, _ = build_mwg(
+            backend,
+            [
+                MoveKernel("random_walk", random_walk.build_kernel),
+            ],
+        )
 
         n_walkers = 50
         key = jax.random.key(99)
@@ -401,9 +466,9 @@ class TestTempTerminationIntegration:
         )
         types = jnp.zeros((1,), dtype=jnp.int32)
         cell = jnp.zeros((3, 3))
-        energies = jax.vmap(
-            lambda pos: backend(pos, types, cell, 0)[0]
-        )(positions)
+        energies = jax.vmap(lambda pos: backend(pos, types, cell, 0)[0])(
+            positions
+        )
 
         max_iters = 5000
         temp_crit = TempTermination(
@@ -412,7 +477,9 @@ class TestTempTerminationIntegration:
         iter_crit = IterationTermination(max_iterations=max_iters)
 
         result = run_ns(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -424,9 +491,9 @@ class TestTempTerminationIntegration:
         )
 
         # TempTermination should have stopped the run early
-        assert result["iteration"] < max_iters, (
-            f"Expected early termination, but ran all {max_iters} iterations"
-        )
+        assert (
+            result["iteration"] < max_iters
+        ), f"Expected early termination, but ran all {max_iters} iterations"
         assert jnp.isfinite(result["log_evidence"])
 
     def test_energy_termination_with_run_ns(self):
@@ -438,9 +505,12 @@ class TestTempTerminationIntegration:
         from jaxrens.sampling.nested_sampling import run_ns
 
         backend = create_harmonic(k=1.0)
-        init_fn, step_fn, _ = build_mwg(backend, [
-            MoveKernel("random_walk", random_walk.build_kernel),
-        ])
+        init_fn, step_fn, _ = build_mwg(
+            backend,
+            [
+                MoveKernel("random_walk", random_walk.build_kernel),
+            ],
+        )
 
         n_walkers = 50
         key = jax.random.key(77)
@@ -451,16 +521,20 @@ class TestTempTerminationIntegration:
         )
         types = jnp.zeros((1,), dtype=jnp.int32)
         cell = jnp.zeros((3, 3))
-        energies = jax.vmap(
-            lambda pos: backend(pos, types, cell, 0)[0]
-        )(positions)
+        energies = jax.vmap(lambda pos: backend(pos, types, cell, 0)[0])(
+            positions
+        )
 
         # Set energy target that should be reached well before 5000 iters
-        energy_target = 1.0  # harmonic energies start ~5-10, decrease during NS
+        energy_target = (
+            1.0  # harmonic energies start ~5-10, decrease during NS
+        )
         max_iters = 5000
 
         result = run_ns(
-            positions, types, energies,
+            positions,
+            types,
+            energies,
             cells=None,
             init_fn=init_fn,
             step_fn=step_fn,
@@ -486,6 +560,7 @@ class TestTempTerminationIntegration:
 # TerminationSpec end-to-end JIT test (moved from test_schema.py)
 # ---------------------------------------------------------------------------
 
+
 class TestTerminationEndToEndJit:
     def test_iteration_termination_stops_early_under_jit(self):
         """IterationTermination(5) causes run_ns to stop at iteration 5.
@@ -508,19 +583,27 @@ class TestTerminationEndToEndJit:
             },
             "moves": [{"move_type": "random_walk", "step_size": 0.3}],
             "backend": {"backend_type": "harmonic"},
-            "output": {"format": "none", "working_dir": ".", "info_interval": 999},
+            "output": {
+                "format": "none",
+                "working_dir": ".",
+                "info_interval": 999,
+            },
             "termination": [{"type": "iteration", "max_iterations": 5}],
         }
         root = RootSpec.model_validate(d)
         resolved = resolve(root)
 
         backend = create_harmonic()
-        init_fn, step_fn, _ = build_mwg(backend, list(resolved.move_descriptors))
+        init_fn, step_fn, _ = build_mwg(
+            backend, list(resolved.move_descriptors)
+        )
 
         key = jax.random.key(123)
         key, key_pos = jax.random.split(key)
         n_live = 10
-        positions = jax.random.uniform(key_pos, (n_live, 1, 3), minval=-2.0, maxval=2.0)
+        positions = jax.random.uniform(
+            key_pos, (n_live, 1, 3), minval=-2.0, maxval=2.0
+        )
         types = jnp.zeros((1,), dtype=jnp.int32)
         energies = jax.vmap(
             lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]

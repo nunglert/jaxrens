@@ -19,6 +19,8 @@ from typing import Protocol, runtime_checkable
 
 import jax.numpy as jnp
 
+from jaxrens.prior_mass import iteration_offsets, log_alpha
+
 logger = logging.getLogger(__name__)
 
 # Boltzmann constant in eV/K
@@ -67,16 +69,20 @@ class PriorMassTermination:
     """Terminate when remaining prior mass contributes negligibly to evidence.
 
     Skilling-style check: the upper bound on the remaining contribution
-    to Z is ``X_i * L_max_remaining`` where ``X_i = exp(-i/n_live)`` is the
-    current prior-mass fraction and ``L_max_remaining`` is bounded above
-    by the likelihood of the currently-removed walker (``exp(-emax)``).
+    to Z is ``X_i * L_max_remaining`` where ``X_i`` is the prior mass left
+    after iteration ``i`` (``(i + 1) * log_alpha`` in log space, see
+    :mod:`jaxrens.prior_mass`) and ``L_max_remaining`` is bounded above
+    by the likelihood at the current contour (``exp(-emax)``).
+
     Convergence: remaining contribution < ``threshold * Z``.
     """
 
-    def __init__(self, n_live: int, threshold: float = 1e-3):
+    def __init__(self, n_live: int, threshold: float = 1e-3, n_cull: int = 1):
         self.n_live = n_live
+        self.n_cull = n_cull
         self.threshold = threshold
         self._log_threshold = math.log(threshold)
+        self._log_alpha = log_alpha(n_live, n_cull)
         self._log_evidence = -jnp.inf
 
     def update_evidence(self, log_evidence: float) -> None:
@@ -84,9 +90,10 @@ class PriorMassTermination:
         self._log_evidence = log_evidence
 
     def check(self, iteration: int, emax: float) -> bool:
-        if iteration <= self.n_live:
+        # Don't stop before every walker has (on average) been replaced once.
+        if iteration * self.n_cull <= self.n_live:
             return False
-        log_X = -iteration / self.n_live
+        log_X = (iteration + 1) * self._log_alpha
         log_L_upper = -float(emax)
         log_remaining_contrib = log_X + log_L_upper
         log_Z = float(self._log_evidence)
@@ -94,7 +101,10 @@ class PriorMassTermination:
         if converged:
             logger.debug(
                 "PriorMassTermination: log(X*L_max)=%.4f < log_Z=%.4f + log(%.1e)=%.4f",
-                log_remaining_contrib, log_Z, self.threshold, self._log_threshold,
+                log_remaining_contrib,
+                log_Z,
+                self.threshold,
+                self._log_threshold,
             )
         return converged
 
@@ -137,13 +147,10 @@ class TempTermination:
         self.target_temp = target_temp
         self.threshold = threshold
 
-        # Precompute shrinkage factor
-        n = n_walkers
-        k = n_cull
-        # log_t = log((N - k) / (N + 1 - k))
-        self._log_t = math.log(n - k) - math.log(n + 1 - k)
-        # log_shell = log(1 - t) = log(1/(N+1-k)) = -log(N+1-k)
-        self._log_shell = -math.log(n + 1 - k)
+        # Weight of the contour dead point (the last, lowest-energy cull of
+        # the iteration) is ``iteration * log_alpha + w_offset[-1]``.
+        self._log_alpha = log_alpha(n_walkers, n_cull)
+        self._log_w_offset = float(iteration_offsets(n_walkers, n_cull)[1][-1])
 
         # Running state
         self._log_Z_term_max = -math.inf
@@ -151,9 +158,8 @@ class TempTermination:
         self._fulfilled = False
 
     def check(self, iteration: int, emax: float) -> bool:
-        # log weight at this iteration: log_X_i + log_shell
-        # where log_X_i = i * log_t
-        log_w = iteration * self._log_t + self._log_shell
+        # Prior-mass weight of this iteration's contour dead point.
+        log_w = iteration * self._log_alpha + self._log_w_offset
 
         # Partition function contribution: w_i * exp(-beta * E_i)
         # In log space: log_w - beta * E
@@ -165,13 +171,18 @@ class TempTermination:
 
         # Converged when last term is threshold orders of magnitude below max
         if self._log_Z_term_max > -math.inf:
-            self._fulfilled = log_Z_term < (self._log_Z_term_max - self.threshold)
+            self._fulfilled = log_Z_term < (
+                self._log_Z_term_max - self.threshold
+            )
 
         if self._fulfilled:
             logger.debug(
                 "TempTermination: T=%.1fK, log_Z_term=%.4f, max=%.4f, gap=%.1f > %.1f",
-                self.target_temp, log_Z_term, self._log_Z_term_max,
-                self._log_Z_term_max - log_Z_term, self.threshold,
+                self.target_temp,
+                log_Z_term,
+                self._log_Z_term_max,
+                self._log_Z_term_max - log_Z_term,
+                self.threshold,
             )
 
         return self._fulfilled

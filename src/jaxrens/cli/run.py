@@ -417,6 +417,7 @@ def run_from_config(
     energy_logger = EnergyLogger(
         working_dir / f"{output_config.out_file_prefix}.energies",
         n_walkers=ns_config.n_live,
+        n_cull=ns_config.n_cull,
         n_atoms=initial_positions.shape[-2],
         mode=writer_mode,
         restart_iteration=restart_iteration,
@@ -649,6 +650,7 @@ def run_from_config(
         max_iterations=ns_config.max_iterations,
         n_mcmc_steps=ns_config.n_mcmc_steps,
         n_extra=ns_config.n_extra,
+        n_cull=ns_config.n_cull,
         convergence_threshold=ns_config.convergence_threshold,
         initial_step_size=first_mc.step_size,
         target_acceptance=first_mc.target_acceptance,
@@ -970,6 +972,7 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
             EnergyLogger(
                 energy_path,
                 n_walkers=n_live,
+                n_cull=ns.n_cull,
                 n_atoms=n_atoms,
                 mode=writer_mode,
                 restart_iteration=restart_iteration,
@@ -1142,6 +1145,7 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
         max_iterations=ns.max_iterations,
         n_mcmc_steps=ns.n_mcmc_steps,
         n_extra=ns.n_extra,
+        n_cull=ns.n_cull,
         convergence_threshold=ns.convergence_threshold,
         initial_step_size=first_mc.step_size,
         target_acceptance=first_mc.target_acceptance,
@@ -1401,6 +1405,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
     energy_logger = EnergyLogger(
         energy_path,
         n_walkers=n_live,
+        n_cull=ns.n_cull,
         n_atoms=n_atoms,
         mode=writer_mode,
         restart_iteration=restart_iteration,
@@ -1527,6 +1532,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
         max_iterations=ns.max_iterations,
         n_mcmc_steps=ns.n_mcmc_steps,
         n_extra=ns.n_extra,
+        n_cull=ns.n_cull,
         convergence_threshold=ns.convergence_threshold,
         initial_step_size=first_mc.step_size,
         target_acceptance=first_mc.target_acceptance,
