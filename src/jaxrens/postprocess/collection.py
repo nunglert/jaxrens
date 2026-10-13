@@ -357,7 +357,7 @@ class MonitorCollection:
                 log_evidence=float(log_Z_flat[i]),
                 iteration=int(iter_flat[i]),
                 n_live=n_live,
-                n_cull=1,
+                n_cull=elog.n_cull,
                 symbol_map=symbol_map,
                 energy_trace=np.asarray(elog.energies, dtype=np.float64),
                 iteration_trace=np.asarray(elog.iterations, dtype=np.int64),

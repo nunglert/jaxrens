@@ -7,22 +7,23 @@ results for a 3D harmonic potential.
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from jaxrens.postprocess.thermodynamics import (
     calc_log_weights,
     calc_log_weights_live,
+    expectation,
     free_energy,
     heat_capacity,
     log_evidence,
     partition_function,
-    expectation,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers: synthetic nested-sampling data for a harmonic potential
 # ---------------------------------------------------------------------------
+
 
 def _generate_harmonic_ns_data(
     n_dead: int = 2000,
@@ -44,7 +45,9 @@ def _generate_harmonic_ns_data(
     L = 10.0  # box half-side, large enough to capture most of the Boltzmann weight
 
     # Draw positions uniformly in the box
-    positions = jax.random.uniform(key, shape=(n_total, n_dim), minval=-L, maxval=L)
+    positions = jax.random.uniform(
+        key, shape=(n_total, n_dim), minval=-L, maxval=L
+    )
     energies = 0.5 * omega**2 * jnp.sum(positions**2, axis=1)
 
     # Sort by energy (nested sampling orders by increasing energy)
@@ -59,6 +62,7 @@ def _generate_harmonic_ns_data(
 # ---------------------------------------------------------------------------
 # Test calc_log_weights
 # ---------------------------------------------------------------------------
+
 
 class TestCalcLogWeights:
     """Tests for calc_log_weights shrinkage factors."""
@@ -75,19 +79,18 @@ class TestCalcLogWeights:
         assert jnp.all(diffs < 0), "Log weights should be strictly decreasing."
 
     def test_known_values_n_cull_1(self):
-        """Check shrinkage against manual calculation for n_live=10, n_cull=1."""
+        """pymatnest convention for n_live=10, n_cull=1: per-dead-point
+        shrinkage ``N/(N+1)`` and ``log a_n = (n+1) log(N/(N+1)) - log(N+1)``
+        (``ns_analyse.calc_log_a``).  The old ``(N-1)/N`` formula fails this.
+        """
         n_live = 10
-        n_cull = 1
         n_dead = 5
 
-        log_t = jnp.log(jnp.array(n_live - n_cull, dtype=jnp.float32)) - jnp.log(
-            jnp.array(n_live + 1.0 - n_cull, dtype=jnp.float32)
-        )
-        log_shell = jnp.log1p(-jnp.exp(log_t))
-        expected = jnp.arange(n_dead, dtype=jnp.float32) * log_t + log_shell
+        log_t = np.log(n_live / (n_live + 1.0))
+        expected = (np.arange(n_dead) + 1.0) * log_t - np.log(n_live + 1.0)
 
-        log_w = calc_log_weights(n_dead=n_dead, n_live=n_live, n_cull=n_cull)
-        assert jnp.allclose(log_w, expected, atol=1e-6)
+        log_w = calc_log_weights(n_dead=n_dead, n_live=n_live, n_cull=1)
+        np.testing.assert_allclose(log_w, expected, atol=1e-12)
 
     def test_n_cull_gt_1(self):
         """Weights with n_cull=2 should differ from n_cull=1."""
@@ -105,6 +108,7 @@ class TestCalcLogWeights:
 # ---------------------------------------------------------------------------
 # Test log_evidence
 # ---------------------------------------------------------------------------
+
 
 class TestLogEvidence:
     """Tests for log_evidence."""
@@ -129,6 +133,7 @@ class TestLogEvidence:
 # Test partition_function
 # ---------------------------------------------------------------------------
 
+
 class TestPartitionFunction:
     """Z(T) for a 3D harmonic potential.
 
@@ -143,9 +148,13 @@ class TestPartitionFunction:
     def harmonic_data(self):
         n_dim = 3
         omega = 1.0
-        return _generate_harmonic_ns_data(
-            n_dead=3000, n_live=200, n_dim=n_dim, omega=omega, seed=1
-        ), n_dim, omega
+        return (
+            _generate_harmonic_ns_data(
+                n_dead=3000, n_live=200, n_dim=n_dim, omega=omega, seed=1
+            ),
+            n_dim,
+            omega,
+        )
 
     def test_scalar_output(self, harmonic_data):
         (dead_E, live_E), n_dim, omega = harmonic_data
@@ -164,10 +173,12 @@ class TestPartitionFunction:
 
         # Use moderate beta values where the integral converges well
         betas = jnp.array([0.5, 1.0, 2.0, 4.0])
-        log_Zs = jnp.array([
-            partition_function(b, dead_E, live_E, n_live=n_live)
-            for b in betas
-        ])
+        log_Zs = jnp.array(
+            [
+                partition_function(b, dead_E, live_E, n_live=n_live)
+                for b in betas
+            ]
+        )
 
         log_betas = jnp.log(betas)
         # Linear fit: log Z = slope * log(beta) + intercept
@@ -177,9 +188,9 @@ class TestPartitionFunction:
         slope = result[0][0]
 
         expected_slope = -n_dim / 2.0
-        assert abs(float(slope) - expected_slope) < 0.5, (
-            f"Expected slope ~ {expected_slope}, got {float(slope)}"
-        )
+        assert (
+            abs(float(slope) - expected_slope) < 0.5
+        ), f"Expected slope ~ {expected_slope}, got {float(slope)}"
 
     def test_z_increases_with_temperature(self, harmonic_data):
         """Z should increase as temperature increases (beta decreases)."""
@@ -194,15 +205,19 @@ class TestPartitionFunction:
 # Test heat_capacity
 # ---------------------------------------------------------------------------
 
+
 class TestHeatCapacity:
     """C_v for 3D harmonic: classical limit is n_dim/2 per degree of freedom = n_dim/2."""
 
     @pytest.fixture
     def harmonic_data(self):
         n_dim = 3
-        return _generate_harmonic_ns_data(
-            n_dead=3000, n_live=200, n_dim=n_dim, omega=1.0, seed=2
-        ), n_dim
+        return (
+            _generate_harmonic_ns_data(
+                n_dead=3000, n_live=200, n_dim=n_dim, omega=1.0, seed=2
+            ),
+            n_dim,
+        )
 
     def test_scalar_output(self, harmonic_data):
         (dead_E, live_E), n_dim = harmonic_data
@@ -215,7 +230,9 @@ class TestHeatCapacity:
         (dead_E, live_E), n_dim = harmonic_data
         for beta in [0.2, 1.0, 5.0]:
             cv = heat_capacity(beta, dead_E, live_E, n_live=200)
-            assert float(cv) >= -1e-6, f"C_v should be non-negative, got {float(cv)}"
+            assert (
+                float(cv) >= -1e-6
+            ), f"C_v should be non-negative, got {float(cv)}"
 
     def test_classical_limit_high_T(self, harmonic_data):
         """At high T (low beta), C_v should be positive and finite.
@@ -230,9 +247,9 @@ class TestHeatCapacity:
         cv = heat_capacity(1.0, dead_E, live_E, n_live=200)
         expected = n_dim / 2.0
         assert float(cv) > 0, f"C_v should be positive, got {float(cv)}"
-        assert abs(float(cv) - expected) < 2.0, (
-            f"Expected C_v ~ {expected} at moderate T, got {float(cv)}"
-        )
+        assert (
+            abs(float(cv) - expected) < 2.0
+        ), f"Expected C_v ~ {expected} at moderate T, got {float(cv)}"
 
     def test_cv_at_different_temperatures(self, harmonic_data):
         """C_v should be finite and positive across a range of temperatures."""
@@ -240,12 +257,15 @@ class TestHeatCapacity:
         for beta in [0.5, 1.0, 2.0, 5.0]:
             cv = heat_capacity(beta, dead_E, live_E, n_live=200)
             assert jnp.isfinite(cv), f"C_v not finite at beta={beta}"
-            assert float(cv) >= -1e-6, f"C_v negative at beta={beta}: {float(cv)}"
+            assert (
+                float(cv) >= -1e-6
+            ), f"C_v negative at beta={beta}: {float(cv)}"
 
 
 # ---------------------------------------------------------------------------
 # Test expectation
 # ---------------------------------------------------------------------------
+
 
 class TestExpectation:
     """<E> for harmonic potential: at temperature T, <E> = n_dim/(2*beta)."""
@@ -253,9 +273,12 @@ class TestExpectation:
     @pytest.fixture
     def harmonic_data(self):
         n_dim = 3
-        return _generate_harmonic_ns_data(
-            n_dead=3000, n_live=200, n_dim=n_dim, omega=1.0, seed=3
-        ), n_dim
+        return (
+            _generate_harmonic_ns_data(
+                n_dead=3000, n_live=200, n_dim=n_dim, omega=1.0, seed=3
+            ),
+            n_dim,
+        )
 
     def test_scalar_output(self, harmonic_data):
         (dead_E, live_E), n_dim = harmonic_data
@@ -273,9 +296,9 @@ class TestExpectation:
         expected = n_dim / (2.0 * beta)
 
         # Generous tolerance since nested sampling is stochastic
-        assert abs(float(mean_E) - expected) < 1.5, (
-            f"Expected <E> ~ {expected}, got {float(mean_E)}"
-        )
+        assert (
+            abs(float(mean_E) - expected) < 1.5
+        ), f"Expected <E> ~ {expected}, got {float(mean_E)}"
 
     def test_mean_energy_increases_with_T(self, harmonic_data):
         """<E> should increase with temperature."""
@@ -298,6 +321,7 @@ class TestExpectation:
 # ---------------------------------------------------------------------------
 # Test free_energy
 # ---------------------------------------------------------------------------
+
 
 class TestFreeEnergy:
     """F = -log Z / beta, consistency with partition_function."""
@@ -354,15 +378,23 @@ class TestFreeEnergy:
         beta = 1.0
         dbeta = 0.01
 
-        log_Z_plus = partition_function(beta + dbeta, dead_E, live_E, n_live=n_live)
-        log_Z_minus = partition_function(beta - dbeta, dead_E, live_E, n_live=n_live)
+        log_Z_plus = partition_function(
+            beta + dbeta, dead_E, live_E, n_live=n_live
+        )
+        log_Z_minus = partition_function(
+            beta - dbeta, dead_E, live_E, n_live=n_live
+        )
 
-        bF_plus = -(beta + dbeta) * free_energy(beta + dbeta, log_Z_plus)  # = log_Z_plus
+        bF_plus = -(beta + dbeta) * free_energy(
+            beta + dbeta, log_Z_plus
+        )  # = log_Z_plus
         bF_minus = -(beta - dbeta) * free_energy(beta - dbeta, log_Z_minus)
 
         # Numerical d(beta*F)/d(beta) — but beta*F = -log Z, so
         # d(-log Z)/d(beta) = <E> (Gibbs-Helmholtz)
-        d_neg_logZ_dbeta = (-float(log_Z_plus) - (-float(log_Z_minus))) / (2 * dbeta)
+        d_neg_logZ_dbeta = (-float(log_Z_plus) - (-float(log_Z_minus))) / (
+            2 * dbeta
+        )
 
         mean_E = expectation(all_E, beta, dead_E, live_E, n_live=n_live)
 
@@ -379,7 +411,10 @@ class TestFreeEnergy:
 # Helper: build (G, P, max_dead) dead_energies and (G, P, n_live) live_energies
 # by stacking independent 1-D runs.
 
-def _make_gp_data(G: int = 1, P: int = 2, n_dead: int = 500, n_live: int = 50) -> tuple:
+
+def _make_gp_data(
+    G: int = 1, P: int = 2, n_dead: int = 500, n_live: int = 50
+) -> tuple:
     """Return (dead_energies, live_energies) with shape (G, P, n_dead/n_live).
 
     Each (g, p) slice is independently generated so per-slice vs batch
@@ -391,13 +426,15 @@ def _make_gp_data(G: int = 1, P: int = 2, n_dead: int = 500, n_live: int = 50) -
         row_d, row_l = [], []
         for p in range(P):
             seed = g * P + p
-            d, l = _generate_harmonic_ns_data(n_dead=n_dead, n_live=n_live, seed=seed + 10)
+            d, l = _generate_harmonic_ns_data(
+                n_dead=n_dead, n_live=n_live, seed=seed + 10
+            )
             row_d.append(d)
             row_l.append(l)
         slices_dead.append(jnp.stack(row_d))
         slices_live.append(jnp.stack(row_l))
-    dead = jnp.stack(slices_dead)   # (G, P, n_dead)
-    live = jnp.stack(slices_live)   # (G, P, n_live)
+    dead = jnp.stack(slices_dead)  # (G, P, n_dead)
+    live = jnp.stack(slices_live)  # (G, P, n_live)
     return dead, live
 
 
@@ -426,14 +463,15 @@ class TestBatchShapeLogEvidence:
         for g in range(G):
             for p in range(P):
                 ref = log_evidence(dead[g, p], live[g, p], n_live=50)
-                assert jnp.allclose(batched[g, p], ref, atol=1e-5), (
-                    f"Mismatch at ({g},{p}): batch={batched[g,p]:.6f}, ref={ref:.6f}"
-                )
+                assert jnp.allclose(
+                    batched[g, p], ref, atol=1e-5
+                ), f"Mismatch at ({g},{p}): batch={batched[g,p]:.6f}, ref={ref:.6f}"
 
     def test_1d_still_returns_scalar(self):
         dead_1d, live_1d = _generate_harmonic_ns_data(n_dead=200, n_live=20)
         out = log_evidence(dead_1d, live_1d, n_live=20)
         assert out.ndim == 0, f"Expected scalar, got ndim={out.ndim}"
+
 
 class TestBatchShapePartitionFunction:
     """partition_function with (G, P, max_dead) input."""
@@ -450,15 +488,18 @@ class TestBatchShapePartitionFunction:
         batched = partition_function(1.0, dead, live, n_live=50)
         for g in range(G):
             for p in range(P):
-                ref = partition_function(1.0, dead[g, p], live[g, p], n_live=50)
-                assert jnp.allclose(batched[g, p], ref, atol=1e-5), (
-                    f"Mismatch at ({g},{p}): batch={batched[g,p]:.6f}, ref={ref:.6f}"
+                ref = partition_function(
+                    1.0, dead[g, p], live[g, p], n_live=50
                 )
+                assert jnp.allclose(
+                    batched[g, p], ref, atol=1e-5
+                ), f"Mismatch at ({g},{p}): batch={batched[g,p]:.6f}, ref={ref:.6f}"
 
     def test_1d_still_returns_scalar(self):
         dead_1d, live_1d = _generate_harmonic_ns_data(n_dead=200, n_live=20)
         out = partition_function(1.0, dead_1d, live_1d, n_live=20)
         assert out.ndim == 0
+
 
 class TestBatchShapeHeatCapacity:
     """heat_capacity with (G, P, max_dead) input."""
@@ -476,14 +517,15 @@ class TestBatchShapeHeatCapacity:
         for g in range(G):
             for p in range(P):
                 ref = heat_capacity(1.0, dead[g, p], live[g, p], n_live=50)
-                assert jnp.allclose(batched[g, p], ref, atol=1e-5), (
-                    f"Mismatch at ({g},{p}): batch={batched[g,p]:.6f}, ref={ref:.6f}"
-                )
+                assert jnp.allclose(
+                    batched[g, p], ref, atol=1e-5
+                ), f"Mismatch at ({g},{p}): batch={batched[g,p]:.6f}, ref={ref:.6f}"
 
     def test_1d_still_returns_scalar(self):
         dead_1d, live_1d = _generate_harmonic_ns_data(n_dead=200, n_live=20)
         out = heat_capacity(1.0, dead_1d, live_1d, n_live=20)
         assert out.ndim == 0
+
 
 class TestBatchShapeExpectation:
     """expectation with (G, P, max_dead) input."""
@@ -503,16 +545,19 @@ class TestBatchShapeExpectation:
         batched = expectation(obs, 1.0, dead, live, n_live=n_live)
         for g in range(G):
             for p in range(P):
-                ref = expectation(obs[g, p], 1.0, dead[g, p], live[g, p], n_live=n_live)
-                assert jnp.allclose(batched[g, p], ref, atol=1e-5), (
-                    f"Mismatch at ({g},{p}): batch={batched[g,p]:.6f}, ref={ref:.6f}"
+                ref = expectation(
+                    obs[g, p], 1.0, dead[g, p], live[g, p], n_live=n_live
                 )
+                assert jnp.allclose(
+                    batched[g, p], ref, atol=1e-5
+                ), f"Mismatch at ({g},{p}): batch={batched[g,p]:.6f}, ref={ref:.6f}"
 
     def test_1d_still_returns_scalar(self):
         dead_1d, live_1d = _generate_harmonic_ns_data(n_dead=200, n_live=20)
         obs = jnp.concatenate([dead_1d, live_1d])
         out = expectation(obs, 1.0, dead_1d, live_1d, n_live=20)
         assert out.ndim == 0
+
 
 class TestBatchShapeFreeEnergy:
     """free_energy handles batched log_Z_beta."""
@@ -531,15 +576,16 @@ class TestBatchShapeFreeEnergy:
         F_batch = free_energy(1.0, log_Z)
         for g in range(G):
             for p in range(P):
-                log_Z_ref = partition_function(1.0, dead[g, p], live[g, p], n_live=50)
-                F_ref = free_energy(1.0, log_Z_ref)
-                assert jnp.allclose(F_batch[g, p], F_ref, atol=1e-5), (
-                    f"Mismatch at ({g},{p}): batch={F_batch[g,p]:.6f}, ref={F_ref:.6f}"
+                log_Z_ref = partition_function(
+                    1.0, dead[g, p], live[g, p], n_live=50
                 )
+                F_ref = free_energy(1.0, log_Z_ref)
+                assert jnp.allclose(
+                    F_batch[g, p], F_ref, atol=1e-5
+                ), f"Mismatch at ({g},{p}): batch={F_batch[g,p]:.6f}, ref={F_ref:.6f}"
 
     def test_1d_still_returns_scalar(self):
         dead_1d, live_1d = _generate_harmonic_ns_data(n_dead=200, n_live=20)
         log_Z = partition_function(1.0, dead_1d, live_1d, n_live=20)
         F = free_energy(1.0, log_Z)
         assert F.ndim == 0
-

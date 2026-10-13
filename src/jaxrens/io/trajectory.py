@@ -25,8 +25,18 @@ class TrajectoryWriter(Protocol):
     """
 
     def write_dead_point(
-        self, iteration: int, walker: Any, energy: float
+        self,
+        iteration: int,
+        walker: Any,
+        energy: float,
+        cull_rank: int | None = None,
     ) -> None:
+        """Write one dead point.
+
+        ``cull_rank`` is the walker's position (0 = highest energy) among the
+        ``n_cull`` walkers culled in this iteration; ``None`` when
+        ``n_cull == 1``, so single-cull output is unchanged.
+        """
         ...
 
     def write_walker_snapshot(self, iteration: int, walkers: Any) -> None:
@@ -107,7 +117,11 @@ class ExtxyzTrajectoryWriter:
             truncate_extxyz(self.path, restart_iteration)
 
     def write_dead_point(
-        self, iteration: int, walker: Any, energy: float
+        self,
+        iteration: int,
+        walker: Any,
+        energy: float,
+        cull_rank: int | None = None,
     ) -> None:
         from ase.io import write as ase_write
 
@@ -116,6 +130,8 @@ class ExtxyzTrajectoryWriter:
         atoms = walker_to_ase_atoms(walker, self.symbol_map)
         atoms.info["iter"] = iteration
         atoms.info["ns_energy"] = energy
+        if cull_rank is not None:
+            atoms.info["cull_rank"] = cull_rank
         if self.wrap and any(atoms.get_pbc()):
             atoms.wrap()
         append = (self._mode == "a") or not self._first_write
@@ -201,14 +217,25 @@ class H5TrajectoryWriter:
         _stamp_unvalidated(self._file)
 
     def write_dead_point(
-        self, iteration: int, walker: Any, energy: float
+        self,
+        iteration: int,
+        walker: Any,
+        energy: float,
+        cull_rank: int | None = None,
     ) -> None:
         from jaxrens.io.formats import walker_to_h5_group
 
-        grp = self._file.create_group(str(iteration))
+        # n_cull > 1: several dead points share an iteration, so key them
+        # ``"{iteration}_{cull_rank}"``; single-cull files keep ``"{iteration}"``.
+        name = (
+            str(iteration) if cull_rank is None else f"{iteration}_{cull_rank}"
+        )
+        grp = self._file.create_group(name)
         walker_to_h5_group(grp, _wrapped_walker(walker, self.wrap))
         grp.attrs["iteration"] = iteration
         grp.attrs["energy"] = energy
+        if cull_rank is not None:
+            grp.attrs["cull_rank"] = cull_rank
 
     def write_walker_snapshot(self, iteration: int, walkers: Any) -> None:
         from jaxrens.io.formats import iter_walker_states, walker_to_h5_group
