@@ -18,7 +18,7 @@ from jaxrens.backends._graph_neighbors import (
     _make_image_offsets,
     _neighbor_mask,
 )
-from jaxrens.utils.cell import wrap_positions
+from jaxrens.utils.cell import nonperiodic_safe_cell, wrap_positions
 
 
 def _ortho_cell(a=4.0, b=5.0, c=6.0):
@@ -180,3 +180,36 @@ class TestNeighborInvariance:
         assert int(base) == int(wrapped_count)
         # And the bond is actually present (each atom sees the other).
         assert int(base) == 2
+
+
+class TestNonperiodicSafeCell:
+    """Only a *degenerate* cell is replaced by the dummy box.
+
+    Regression: the backends used to test ``trace(cell) == 0``, which also
+    matches the zero-diagonal fcc primitive cell and its diagonal
+    supercells, so such crystals were silently evaluated as vacuum clusters.
+    """
+
+    def test_zero_cell_gets_dummy_box(self):
+        out = nonperiodic_safe_cell(jnp.zeros((3, 3)))
+        np.testing.assert_allclose(np.asarray(out), 1000.0 * np.eye(3))
+
+    @pytest.mark.parametrize("n", [1, 3])
+    def test_zero_diagonal_fcc_primitive_kept(self, n):
+        a = 4.0
+        cell = (
+            n
+            * 0.5
+            * a
+            * jnp.array([[0.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 0.0]])
+        )
+        assert float(jnp.trace(cell)) == 0.0
+        np.testing.assert_array_equal(
+            np.asarray(nonperiodic_safe_cell(cell)), np.asarray(cell)
+        )
+
+    def test_regular_cells_kept(self):
+        for cell in (_ortho_cell(), _triclinic_cell()):
+            np.testing.assert_array_equal(
+                np.asarray(nonperiodic_safe_cell(cell)), np.asarray(cell)
+            )
