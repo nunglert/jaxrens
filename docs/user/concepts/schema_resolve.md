@@ -368,9 +368,11 @@ write a frame, flush the log, check termination, attempt a replica
 swap, re-tune the step size — is counted in NS iterations by default.
 But a single NS iteration replaces just `n_cull` of the `n_live`
 walkers, so the *natural* cadence for most of these is one **walker
-sweep** (`n_live` iterations — roughly "every walker touched once"),
-not one iteration. The catch is that a sweep is `n_live` iterations,
-so an interval tuned for `n_live=500` is off by 4× at `n_live=2000`.
+sweep** (`n_live` culled walkers, i.e. `n_live / n_cull` iterations —
+roughly "every walker touched once"), not one iteration. The catch is
+that the number of iterations per sweep depends on `n_live` and
+`n_cull`, so an interval tuned for `n_live=500` is off by 4× at
+`n_live=2000`, and by 10× once `n_cull` goes from 1 to 10.
 
 `interval_units` removes that coupling. It is a single top-level key
 with two modes:
@@ -378,8 +380,9 @@ with two modes:
 - **`absolute`** (default) — interval fields are raw NS iteration
   counts. What you write is what the runtime sees.
 - **`per_walker`** — interval fields are walker-sweeps. The resolver
-  multiplies each by `run.n_live`, so the *same* YAML keeps the same
-  physical cadence no matter what `n_live` you run at.
+  multiplies each by `run.n_live / run.n_cull`, so the *same* YAML keeps
+  the same physical cadence (the same prior-mass compression per
+  interval) no matter what `n_live` and `n_cull` you run at.
 
 ```yaml
 run:
@@ -390,6 +393,10 @@ output:
   traj_interval: 10          # → dump a frame every 10 sweeps = 10 000 iters
   snapshot_interval: 0.001   # → 0.001 × 1000 = every 1 iteration
 ```
+
+With `n_cull: 10` added to `run:`, the same YAML resolves to a tenth of
+these iteration counts (`info_interval: 1` → every 100 iterations, each
+culling 10 walkers), so every interval still spans 1000 dead points.
 
 The resolver applies this in `_apply_interval_units(root)`, which
 scales these fields (and leaves an unset `None`, e.g. an omitted

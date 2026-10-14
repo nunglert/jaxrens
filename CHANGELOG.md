@@ -9,7 +9,7 @@ The version is derived from git tags by `setuptools-scm` (tag `v0.1.0` →
 version `0.1.0`). To cut a release: add a dated section below, merge to `main`,
 then `git tag -a vX.Y.Z`.
 
-## [Unreleased]
+## [0.6.0] — 2026-10-14
 
 ### Changed
 - **Soft-core and ensemble corrections are additive terms, not wrapper
@@ -23,8 +23,38 @@ then `git tag -a vX.Y.Z`.
   `hamiltonian.model` / `unwrap_model(...)`. `EnsembleBackend(...)` and
   `SoftCoreBackend(...)` remain as convenience factories that return a flat
   `Hamiltonian`. `ResolvedConfig.base_backend` is now always a `Hamiltonian`.
+- **`interval_units: per_walker` accounts for `run.n_cull`.** A walker-sweep
+  is now `n_live` culled walkers, i.e. `n_live / n_cull` iterations, so
+  per-walker intervals are scaled by `n_live / n_cull` instead of `n_live`.
+  A per-walker config keeps the same prior-mass compression per interval
+  when `n_cull` changes; before, every interval (adaptation, temperature
+  lag, output, `max_iterations`, …) silently grew `n_cull`-fold.
+  `n_cull = 1` configs resolve exactly as before; `n_cull > 1` per-walker
+  configs now resolve to `1 / n_cull` of their previous iteration counts.
+- **JAX stays capped at `<0.11.2`, now for a different reason.** The flax
+  incompatibility that originally motivated the cap is fixed upstream, but
+  jax/jaxlib 0.11.2 segfault while compiling a full-slice scatter
+  (`x.at[:].add(y)`) inside a multi-device `shard_map` (Shardy partitioner).
+  mace-jax's `scatter_sum` uses that pattern, so every multi-GPU MACE run
+  crashed at its first compile. 0.11.1 is unaffected.
 
 ### Fixed
+- **MWG evaluated every move kernel on every MCMC step.** The move index
+  was drawn per chain, so under `vmap` (always on: chains, runs) the
+  `lax.switch` dispatch lowered to a `select` that ran all kernels — each
+  with its own energy/force calls — and kept one result. Every step cost
+  the *sum* of all moves rather than their weighted average (~4× slower
+  on a MACE rw/volume/gmc mix; no effect for single-move configs). The
+  index is now drawn from a key shared by all chains walked in a step —
+  across `n_extra` chains, burn-in walkers, and all runs/GPUs of a
+  `VmapRuns`/`PmapVmapRuns` job — so only the chosen kernel runs, and GPUs
+  stay load-balanced. **Breaking:** `build_mwg`'s `step_fn` now
+  requires a `move_key` argument (`step_fn(rng_key, state, emax,
+  move_key)`), which must be unbatched under `vmap`; `ns_step` /
+  `ns_step_sharded` take an optional `move_key`; `wrap_for_batch` accepts
+  `replicated=` on all batchers. Move types are now correlated across
+  chains within a step (each chain remains a valid MWG chain). Seeded runs
+  are not reproducible against earlier versions.
 - **`run.n_cull > 1` never culled more than one walker.** Both NS steps
   always removed a single walker; `n_cull` only reached the temperature
   estimate and termination, where it skewed the assumed prior-mass
@@ -39,7 +69,9 @@ then `git tag -a vX.Y.Z`.
   `n_cull` on every run path, and `Monitor.from_directory` /
   `MonitorCollection` read it back instead of hardcoding 1.  `run.n_cull`
   joins the restart immutables, and the schema rejects
-  `2 * n_cull + n_extra > n_live`.  `n_cull = 1` sampling is bit-identical.
+  `2 * n_cull + n_extra > n_live`.  For `n_cull = 1` the cull/clone
+  logic is unchanged (seeded runs still differ from 0.5.0 because of the
+  MWG move-key fix above).
 - **Prior-mass weights now follow pymatnest's `calc_log_a`.** Post-processing
   used `(N - n_cull)/(N + 1 - n_cull)` per dead point — `(N-1)/N` for
   `n_cull = 1`, i.e. one walker too few, a ~`i/N²` drift in `log X` — while
@@ -59,6 +91,12 @@ then `git tag -a vX.Y.Z`.
   poisons gradients.
 - **Soft core counted twice on the single-run CLI path.** The resolver
   already added it to `base_backend`; `run_from_config` added it again.
+- **Periodic cells with a zero diagonal were evaluated as clusters.** The
+  NeuralIL and Nequix backends picked the non-periodic dummy box by testing
+  the cell's trace, so valid cells such as the fcc primitive
+  `[[0,a,a],[a,0,a],[a,a,0]]` were silently treated as an isolated cluster
+  in vacuum. The new `jaxrens.utils.cell.nonperiodic_safe_cell` tests the
+  determinant instead.
 
 ## [0.5.0] — 2026-09-30
 

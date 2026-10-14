@@ -281,4 +281,6 @@ def test_ladder_tracks_analytic_prior_mass(n_cull):
     )
     resid = log_x_est[inside] - log_x_true
     assert np.abs(resid).max() < 1.0, resid
-    assert abs(resid[-100:].mean()) < 0.5, resid[-100:].mean()
+    # Tail mean has seed-to-seed std ~0.25 (n_cull=5, 32 seeds); 0.75 is ~3σ.
+    # A mis-handled cull is off by ~4 here, so this still fails loudly.
+    assert abs(resid[-100:].mean()) < 0.75, resid[-100:].mean()

@@ -41,6 +41,18 @@ from jaxtyping import Array, Float, Shaped
 from jaxrens.sampling.mesh import build_mesh, pmap_like
 
 
+def _shared_move_key(rng_key: jax.Array) -> jax.Array:
+    """One move-schedule key for every replica on this device.
+
+    Computed OUTSIDE the run-level ``vmap`` from replica 0's key so that it
+    is unbatched there: a per-replica (batched) key would turn the MWG
+    ``lax.switch`` into a ``select`` that evaluates every move branch.  See
+    :func:`jaxrens.sampling.nested_sampling._move_schedule`.
+    """
+    run0_key = jnp.asarray(rng_key).reshape(-1)[0]
+    return jax.random.fold_in(run0_key, 1)
+
+
 class _UniformBatcher:
     """Shared behavior for the three "uniform shape-prefix" topologies.
 
@@ -162,7 +174,33 @@ class _UniformBatcher:
             self.shape_prefix,
         )
 
-    def wrap_for_batch(self, per_element_fn, *, check_vma: bool = False):
+    def _wrap_batched_step(self, ns_step_fn, step_fn, n_mcmc_steps, n_extra):
+        """``wrap_step`` for the batched topologies (VmapRuns, PmapVmapRuns).
+
+        One ``move_key`` for ALL replicas is derived outside every map and
+        passed in replicated, so the MWG move index is unbatched under the
+        run vmap (``lax.switch`` stays a real conditional) and every device
+        walks the same move-type sequence (no per-device load imbalance).
+        """
+        batched = self.wrap_for_batch(
+            lambda s, mk: ns_step_fn(
+                s, step_fn, n_mcmc_steps, n_extra, move_key=mk
+            ),
+            replicated=(False, True),
+        )
+        return jax.jit(
+            lambda ns_states: batched(
+                ns_states, _shared_move_key(ns_states.rng_key)
+            )
+        )
+
+    def wrap_for_batch(
+        self,
+        per_element_fn,
+        *,
+        check_vma: bool = False,
+        replicated: tuple[bool, ...] = (),
+    ):
         """Wrap a per-replica callable with jit/vmap/shard_map as appropriate.
 
         Generic version of ``wrap_step`` for callables that don't take
@@ -181,22 +219,55 @@ class _UniformBatcher:
         VmapRuns never enter a mapped context) — see that function's
         docstring.
 
+        ``replicated``: one bool per positional argument, as in
+        :meth:`ShardedSingleRun.wrap_for_batch`.  ``True`` marks a plain
+        value with no ``shape_prefix`` axes that every replica receives
+        unbatched (``vmap`` ``in_axes=None``, ``shard_map`` ``P()``).  Empty
+        keeps the uniform map-everything contract.
+
         Default implementation routes by ``shape_prefix`` length so concrete
         classes inherit unchanged.
         """
         n_prefix = len(self.shape_prefix)
         if n_prefix == 0:
             return jax.jit(per_element_fn)
+        in_axes = (
+            tuple(None if r else 0 for r in replicated) if replicated else 0
+        )
+        per_device = jax.vmap(per_element_fn, in_axes=in_axes)
         if n_prefix == 1:
-            return jax.jit(jax.vmap(per_element_fn))
+            return jax.jit(per_device)
         # n_prefix == 2 (PmapVmapRuns): outer shard_map over G, inner vmap
         # over P. Unlike jax.pmap, shard_map composes with jax.jit.
         # self.mesh: only PmapVmapRuns reaches this branch, and it defines
         # the cached `mesh` property this base class doesn't declare.
         mesh = self.mesh  # type: ignore[attr-defined]
+        if not replicated:
+            return jax.jit(
+                pmap_like(per_device, "gpu", mesh, check_vma=check_vma)
+            )
+
+        def wrapped(*args):
+            squeezed = tuple(
+                a
+                if is_rep
+                else jax.tree.map(lambda x: jnp.squeeze(x, axis=0), a)
+                for a, is_rep in zip(args, replicated)
+            )
+            out = per_device(*squeezed)
+            return jax.tree.map(lambda x: x[None, ...], out)
+
+        in_specs = tuple(
+            PartitionSpec() if is_rep else PartitionSpec("gpu")
+            for is_rep in replicated
+        )
         return jax.jit(
-            pmap_like(
-                jax.vmap(per_element_fn), "gpu", mesh, check_vma=check_vma
+            jax.shard_map(
+                wrapped,
+                mesh=mesh,
+                in_specs=in_specs,
+                out_specs=PartitionSpec("gpu"),
+                check_vma=check_vma,
             )
         )
 
@@ -304,6 +375,9 @@ class VmapRuns(_UniformBatcher):
 
         The closure captures ``step_fn``, ``n_mcmc_steps``, and ``n_extra``
         as Python-level static values so vmap sees no dynamic static args.
+        A single ``move_key`` (from replica 0's key, outside the vmap) is
+        passed to every run so the MWG move index stays unbatched — see
+        :meth:`_wrap_batched_step`.
 
         The returned function has signature::
 
@@ -312,12 +386,9 @@ class VmapRuns(_UniformBatcher):
         which matches the current ``run_ns_parallel`` inner step pattern.
         """
 
-        def step_all_runs(ns_states):
-            return jax.vmap(
-                lambda s: ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)
-            )(ns_states)
-
-        return jax.jit(step_all_runs)
+        return self._wrap_batched_step(
+            ns_step_fn, step_fn, n_mcmc_steps, n_extra
+        )
 
     def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
         """Vmap ``jax.random.split`` over the ``(n_runs,)`` key array.
@@ -368,15 +439,19 @@ class PmapVmapRuns(_UniformBatcher):
     For ``n_gpu=1`` this degenerates to ``(1, P, K, ...)`` and runs on the
     single available device, which is useful for testing.
 
-    **wrap_step** composes a ``"gpu"``-axis ``jax.shard_map`` (G axis, via
-    :func:`jaxrens.sampling.mesh.pmap_like`, pmap-equivalent) over
-    ``jax.vmap`` (P axis):
+    **wrap_step** composes a ``"gpu"``-axis ``jax.shard_map`` (G axis) over
+    ``jax.vmap`` (P axis), with one move-schedule key shared by every run on
+    every device (simplified; squeezing of the G axis omitted):
 
     .. code-block:: python
 
-        per_run    = lambda s: ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)
-        per_device = jax.vmap(per_run)
-        jit_step   = jax.jit(pmap_like(per_device, "gpu", mesh))
+        per_run  = lambda s, mk: ns_step_fn(
+            s, step_fn, n_mcmc_steps, n_extra, move_key=mk)
+        sharded  = jax.shard_map(            # ns_states: P("gpu"), mk: P()
+            jax.vmap(per_run, in_axes=(0, None)), mesh=mesh,
+            in_specs=(P("gpu"), P()), out_specs=P("gpu"))
+        jit_step = jax.jit(
+            lambda s: sharded(s, _shared_move_key(s.rng_key)))
 
     Unlike ``jax.pmap``, ``shard_map`` composes cleanly with ``jax.jit``, so
     the result is explicitly jit-wrapped.
@@ -440,8 +515,8 @@ class PmapVmapRuns(_UniformBatcher):
 
         where ``ns_states`` has leading shape ``(G, P, ...)``.
 
-        Built on ``jax.shard_map`` via :func:`jaxrens.sampling.mesh.pmap_like`
-        rather than ``jax.pmap`` — this is the ``"gpu"``-axis leg of the
+        Built on ``jax.shard_map`` (via :meth:`wrap_for_batch`) rather than
+        ``jax.pmap`` — this is the ``"gpu"``-axis leg of the
         pmap -> shard_map migration. Unlike ``jax.pmap``, ``shard_map``
         composes with ``jax.jit``, so the returned callable is explicitly
         jit-wrapped.
@@ -460,16 +535,14 @@ class PmapVmapRuns(_UniformBatcher):
         Returns
         -------
         callable
-            ``jax.jit(pmap_like(jax.vmap(per_run), "gpu", mesh))`` where
-            ``per_run(s) = ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)``.
+            ``jax.jit(shard_map(vmap(per_run)))`` with ``ns_states``
+            sharded over G and one globally shared ``move_key`` replicated
+            to every device (see :meth:`_wrap_batched_step`).
         """
 
-        # Close over Python-level statics, same as under the old pmap path.
-        def per_run(s):
-            return ns_step_fn(s, step_fn, n_mcmc_steps, n_extra)
-
-        per_device = jax.vmap(per_run)
-        return jax.jit(pmap_like(per_device, "gpu", self.mesh))
+        return self._wrap_batched_step(
+            ns_step_fn, step_fn, n_mcmc_steps, n_extra
+        )
 
     def split_keys(self, rng_key: jax.Array, n_sub_keys: int) -> jax.Array:
         """Split a per-replica PRNG key array into ``(G, P, n_sub_keys)``.

@@ -79,7 +79,7 @@ _MISSING_DEFAULTS: dict[str, Any] = {"run.n_cull": 1}
 
 # Interval-counted ``output.*`` fields scaled by ``_apply_interval_units``
 # (resolve.py).  Kept in sync with that list — both convert per_walker counts
-# to absolute iterations by multiplying by ``run.n_live``.
+# to absolute iterations by multiplying by ``run.n_live / run.n_cull``.
 _OUTPUT_INTERVAL_FIELDS: tuple[str, ...] = (
     "info_interval",
     "traj_interval",
@@ -100,7 +100,9 @@ def _normalise_intervals(tree: dict) -> dict:
     Mirrors ``resolve._apply_interval_units`` but works on the dumped dict
     (so it is independent of RootSpec construction): when
     ``interval_units == "per_walker"`` every interval field is multiplied by
-    ``run.n_live`` and rounded (clamped to >= 1); ``"absolute"`` only rounds.
+    ``run.n_live / run.n_cull`` and rounded (clamped to >= 1); ``"absolute"``
+    only rounds.  A snapshot without ``run.n_cull`` predates multi-walker
+    culling and ran with ``n_cull = 1``.
     ``interval_units`` itself is set to ``"absolute"`` afterwards so the two
     sides no longer differ on that soft field once their values agree.
     Returns a deep copy; the input is left untouched.
@@ -111,8 +113,10 @@ def _normalise_intervals(tree: dict) -> dict:
         return tree
     out = copy.deepcopy(tree)
     units = out.get("interval_units", "absolute")
-    n_live = (out.get("run") or {}).get("n_live", 1)
-    factor = n_live if units == "per_walker" else 1
+    run_tree = out.get("run") or {}
+    n_live = run_tree.get("n_live", 1)
+    n_cull = run_tree.get("n_cull", _MISSING_DEFAULTS["run.n_cull"])
+    factor = n_live / n_cull if units == "per_walker" else 1
 
     def scale(v: Any) -> Any:
         if v is None or not isinstance(v, (int, float)) or isinstance(v, bool):

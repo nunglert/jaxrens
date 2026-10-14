@@ -82,7 +82,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _scale_interval(v: int | float | None, *, factor: int) -> int | None:
+def _scale_interval(v: int | float | None, *, factor: float) -> int | None:
     """Scale one iteration-counted field for the resolver.
 
     * ``None`` (e.g. unset ``run.max_iterations``) passes through unchanged.
@@ -102,7 +102,8 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
     When ``root.interval_units == "absolute"`` this is a no-op apart from
     rounding any float values down to int (so the downstream runtime
     dataclasses always see ints).  When ``"per_walker"`` every affected field
-    is multiplied by ``root.run.n_live`` first.
+    is multiplied by ``root.run.n_live / root.run.n_cull`` first: a sweep is
+    ``n_live`` culled walkers, and every iteration culls ``n_cull`` of them.
 
     The scaled fields:
         output.{info,traj,snapshot,checkpoint}_interval
@@ -115,7 +116,11 @@ def _apply_interval_units(root: RootSpec) -> RootSpec:
         inter_re.re_interval
         adaptation.adjust_interval
     """
-    factor = root.run.n_live if root.interval_units == "per_walker" else 1
+    factor = (
+        root.run.n_live / root.run.n_cull
+        if root.interval_units == "per_walker"
+        else 1
+    )
 
     output_upd = {
         name: _scale_interval(getattr(root.output, name), factor=factor)
