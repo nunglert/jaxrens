@@ -31,9 +31,12 @@ then `git tag -a vX.Y.Z`.
   lag, output, `max_iterations`, …) silently grew `n_cull`-fold.
   `n_cull = 1` configs resolve exactly as before; `n_cull > 1` per-walker
   configs now resolve to `1 / n_cull` of their previous iteration counts.
-- **JAX version cap removed.** `jax[cuda12]` / `jaxlib` are now `>=0.9.0`
-  with no upper bound; the upstream flax bugs that required the `<0.11.2`
-  cap are fixed.
+- **JAX stays capped at `<0.11.2`, now for a different reason.** The flax
+  incompatibility that originally motivated the cap is fixed upstream, but
+  jax/jaxlib 0.11.2 segfault while compiling a full-slice scatter
+  (`x.at[:].add(y)`) inside a multi-device `shard_map` (Shardy partitioner).
+  mace-jax's `scatter_sum` uses that pattern, so every multi-GPU MACE run
+  crashed at its first compile. 0.11.1 is unaffected.
 
 ### Fixed
 - **MWG evaluated every move kernel on every MCMC step.** The move index
