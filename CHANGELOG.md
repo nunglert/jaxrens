@@ -33,6 +33,22 @@ then `git tag -a vX.Y.Z`.
   configs now resolve to `1 / n_cull` of their previous iteration counts.
 
 ### Fixed
+- **MWG evaluated every move kernel on every MCMC step.** The move index
+  was drawn per chain, so under `vmap` (always on: chains, runs) the
+  `lax.switch` dispatch lowered to a `select` that ran all kernels — each
+  with its own energy/force calls — and kept one result. Every step cost
+  the *sum* of all moves rather than their weighted average (~4× slower
+  on a MACE rw/volume/gmc mix; no effect for single-move configs). The
+  index is now drawn from a key shared by all chains walked in a step —
+  across `n_extra` chains, burn-in walkers, and all runs/GPUs of a
+  `VmapRuns`/`PmapVmapRuns` job — so only the chosen kernel runs, and GPUs
+  stay load-balanced. **Breaking:** `build_mwg`'s `step_fn` now
+  requires a `move_key` argument (`step_fn(rng_key, state, emax,
+  move_key)`), which must be unbatched under `vmap`; `ns_step` /
+  `ns_step_sharded` take an optional `move_key`; `wrap_for_batch` accepts
+  `replicated=` on all batchers. Move types are now correlated across
+  chains within a step (each chain remains a valid MWG chain). Seeded runs
+  are not reproducible against earlier versions.
 - **`run.n_cull > 1` never culled more than one walker.** Both NS steps
   always removed a single walker; `n_cull` only reached the temperature
   estimate and termination, where it skewed the assumed prior-mass

@@ -59,7 +59,7 @@ def _one_walk(
     Args:
         key: PRNG key. Consumed to produce (n_walkers, walklength) sub-keys.
         ns_state: Single-run NSState. Population shape (n_walkers, ...).
-        step_fn: MWG step fn. Signature: (rng_key, mcstate, emax) -> (mcstate, info).
+        step_fn: MWG step fn. Signature: (rng_key, mcstate, emax, move_key) -> (mcstate, info).
         walklength: Number of MCMC steps per walker.
         emax: Scalar energy ceiling.
         walker_batch_size: If None, vmap over all walkers. If int, chunk via
@@ -191,7 +191,7 @@ def initial_walk(
             descriptor (``()`` for SingleRun, ``(R,)`` for VmapRuns,
             ``(G, P)`` for PmapVmapRuns).
         step_fn: MWG step function from build_mwg().
-            Signature: (rng_key, mcstate, emax) -> (mcstate, MoveInfo).
+            Signature: (rng_key, mcstate, emax, move_key) -> (mcstate, MoveInfo).
         n_walks: Number of outer walk iterations. n_walks=0 is a no-op.
         walklength: MCMC steps per walk per walker.
         adjust_interval: Run step-size adaptation every this many walks (>0).

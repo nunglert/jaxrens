@@ -19,10 +19,10 @@ import jaxrens.sampling.moves.random_walk as _rw_mod
 from jaxrens.backends.toy import create_harmonic
 from jaxrens.sampling.adaptation.manager import build_adapt_step
 from jaxrens.sampling.batch_descriptor import SingleRun
+from jaxrens.sampling.bucket_manager import BucketManager, _pick_prev_bucket
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns
-from jaxrens.sampling.bucket_manager import BucketManager, _pick_prev_bucket
 from jaxrens.sampling.run_loop import _run_loop
 from jaxrens.sampling.termination import IterationTermination
 
@@ -47,7 +47,10 @@ def _build_ns_state(n_walkers: int = 6, n_atoms: int = 2, seed: int = 0):
     key = jax.random.key(seed)
     key, key_pos = jax.random.split(key)
     positions = jax.random.uniform(
-        key_pos, (n_walkers, n_atoms, 3), minval=-2.0, maxval=2.0,
+        key_pos,
+        (n_walkers, n_atoms, 3),
+        minval=-2.0,
+        maxval=2.0,
     )
     types = jnp.zeros((n_atoms,), dtype=jnp.int32)
     cells = jnp.zeros((n_walkers, 3, 3))
@@ -73,45 +76,66 @@ class TestPickPrevBucket:
 
     def test_returns_next_smaller_when_headroom_available(self):
         # current=50, observed peak well below 45 → step down to 45.
-        assert _pick_prev_bucket(true_max=20, current=50,
-                                 ladder=self.LADDER,
-                                 offset=5) == 45
+        assert (
+            _pick_prev_bucket(
+                true_max=20, current=50, ladder=self.LADDER, offset=5
+            )
+            == 45
+        )
 
     def test_returns_none_when_target_requires_current_or_larger(self):
         # observed + offset = 35 + 5 = 40.  Largest entry strictly below
         # current=40 is 35 < 40 → no qualifying entry → None.
-        assert _pick_prev_bucket(true_max=35, current=40,
-                                 ladder=self.LADDER,
-                                 offset=5) is None
+        assert (
+            _pick_prev_bucket(
+                true_max=35, current=40, ladder=self.LADDER, offset=5
+            )
+            is None
+        )
 
     def test_returns_none_when_current_is_smallest_entry(self):
         # current=30 is the bottom of the ladder — nothing smaller exists.
-        assert _pick_prev_bucket(true_max=5, current=30,
-                                 ladder=self.LADDER,
-                                 offset=5) is None
+        assert (
+            _pick_prev_bucket(
+                true_max=5, current=30, ladder=self.LADDER, offset=5
+            )
+            is None
+        )
 
     def test_steps_down_one_ladder_entry_even_if_much_smaller_qualifies(self):
         # observed peak well below 30 — picker still only returns the
         # immediate-next-smaller entry (45), never a multi-step jump.
-        assert _pick_prev_bucket(true_max=5, current=50,
-                                 ladder=self.LADDER,
-                                 offset=0) == 45
+        assert (
+            _pick_prev_bucket(
+                true_max=5, current=50, ladder=self.LADDER, offset=0
+            )
+            == 45
+        )
 
     def test_offset_acts_as_shrink_safety_margin(self):
         # With offset=5, true_max=25 → target=30 → 35 qualifies (next-smaller).
-        assert _pick_prev_bucket(true_max=25, current=40,
-                                 ladder=self.LADDER,
-                                 offset=5) == 35
+        assert (
+            _pick_prev_bucket(
+                true_max=25, current=40, ladder=self.LADDER, offset=5
+            )
+            == 35
+        )
         # With offset=11, true_max=25 → target=36 → 35 < 36 → None.
-        assert _pick_prev_bucket(true_max=25, current=40,
-                                 ladder=self.LADDER,
-                                 offset=11) is None
+        assert (
+            _pick_prev_bucket(
+                true_max=25, current=40, ladder=self.LADDER, offset=11
+            )
+            is None
+        )
 
     def test_zero_offset_picks_immediate_neighbour(self):
         # current=45, target=true_max=40 → 40 qualifies → return 40.
-        assert _pick_prev_bucket(true_max=40, current=45,
-                                 ladder=self.LADDER,
-                                 offset=0) == 40
+        assert (
+            _pick_prev_bucket(
+                true_max=40, current=45, ladder=self.LADDER, offset=0
+            )
+            == 40
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -127,22 +151,30 @@ def _wrap_step_fn_force_observed(real_step_fn, observed_max: int):
     the real harmonic backend would otherwise report.  ``overflow`` is forced
     to ``False`` so the upgrade path never fires.
     """
-    def wrapped(key, state, emax):
-        new_state, info = real_step_fn(key, state, emax)
+
+    def wrapped(key, state, emax, move_key):
+        new_state, info = real_step_fn(key, state, emax, move_key)
         new_state = new_state.set(
             max_neighbor_count=jnp.asarray(
-                observed_max, dtype=new_state.max_neighbor_count.dtype,
+                observed_max,
+                dtype=new_state.max_neighbor_count.dtype,
             ),
             overflow=jnp.asarray(False),
         )
         return new_state, info
+
     return wrapped
 
 
-def _run_loop_minimal(ns_state, step_fn, *, n_iters: int,
-                      shrink_dwell: int = 0,
-                      ladder=(30, 35, 40, 45, 50),
-                      offset: int = 0):
+def _run_loop_minimal(
+    ns_state,
+    step_fn,
+    *,
+    n_iters: int,
+    shrink_dwell: int = 0,
+    ladder=(30, 35, 40, 45, 50),
+    offset: int = 0,
+):
     """Drive ``_run_loop`` with a SingleRun batcher and an iteration cap.
 
     Mirrors the minimal slice of ``run_ns`` needed to exercise the
@@ -193,8 +225,12 @@ class TestBucketShrinkInLoop:
         wrapped = _wrap_step_fn_force_observed(step_fn, observed_max=5)
 
         result = _run_loop_minimal(
-            ns_state, wrapped, n_iters=10,
-            shrink_dwell=0, ladder=self.LADDER, offset=0,
+            ns_state,
+            wrapped,
+            n_iters=10,
+            shrink_dwell=0,
+            ladder=self.LADDER,
+            offset=0,
         )
         assert int(result.population.max_neighbors) == 50
 
@@ -209,8 +245,12 @@ class TestBucketShrinkInLoop:
         # dwell=3, offset=0 → after 3 low iterations the picker returns
         # the next-smaller entry (45) and the bucket is shrunk once.
         result = _run_loop_minimal(
-            ns_state, wrapped, n_iters=4,
-            shrink_dwell=3, ladder=self.LADDER, offset=0,
+            ns_state,
+            wrapped,
+            n_iters=4,
+            shrink_dwell=3,
+            ladder=self.LADDER,
+            offset=0,
         )
         assert int(result.population.max_neighbors) == 45
 
@@ -225,8 +265,12 @@ class TestBucketShrinkInLoop:
         # dwell=2 → 50→45 at iter 1, 45→40 at iter 3, 40→35 at iter 5,
         # 35→30 at iter 7.  After 9 iterations the bucket is at 30.
         result = _run_loop_minimal(
-            ns_state, wrapped, n_iters=9,
-            shrink_dwell=2, ladder=self.LADDER, offset=0,
+            ns_state,
+            wrapped,
+            n_iters=9,
+            shrink_dwell=2,
+            ladder=self.LADDER,
+            offset=0,
         )
         assert int(result.population.max_neighbors) == 30
 
@@ -241,8 +285,12 @@ class TestBucketShrinkInLoop:
         # With offset=1 → target=46 > 45 → no qualifying entry → no shrink.
         wrapped = _wrap_step_fn_force_observed(step_fn, observed_max=45)
         result = _run_loop_minimal(
-            ns_state, wrapped, n_iters=10,
-            shrink_dwell=2, ladder=self.LADDER, offset=1,
+            ns_state,
+            wrapped,
+            n_iters=10,
+            shrink_dwell=2,
+            ladder=self.LADDER,
+            offset=1,
         )
         assert int(result.population.max_neighbors) == 50
 
@@ -265,8 +313,11 @@ class TestBucketManagerDirect:
                 self.overflow = jnp.asarray(of)
 
             def set(self, **kw):
-                new = _Pop(self.max_neighbors, int(self.max_neighbor_count[0]),
-                           bool(self.overflow))
+                new = _Pop(
+                    self.max_neighbors,
+                    int(self.max_neighbor_count[0]),
+                    bool(self.overflow),
+                )
                 for k, v in kw.items():
                     setattr(new, k, v)
                 return new
@@ -296,7 +347,10 @@ class TestBucketManagerDirect:
         # AND >current=40 → picker returns 45.
         new = self._stub_state(bucket=40, observed=42, overflow=True)
         retried, retry = mgr.grow_if_overflow(
-            st, new, label="iter", iteration=2,
+            st,
+            new,
+            label="iter",
+            iteration=2,
         )
         assert retry is True
         assert int(retried.population.max_neighbors) == 45
@@ -322,10 +376,14 @@ class TestBucketManagerDirect:
         st = self._stub_state(bucket=50, observed=5)
         st = mgr.maybe_shrink(st, iteration=0)
         assert mgr.low_count == 1
-        st = self._stub_state(bucket=int(st.population.max_neighbors), observed=46)
+        st = self._stub_state(
+            bucket=int(st.population.max_neighbors), observed=46
+        )
         st = mgr.maybe_shrink(st, iteration=1)
         assert mgr.low_count == 0
-        st = self._stub_state(bucket=int(st.population.max_neighbors), observed=5)
+        st = self._stub_state(
+            bucket=int(st.population.max_neighbors), observed=5
+        )
         st = mgr.maybe_shrink(st, iteration=2)
         assert mgr.low_count == 1
         assert int(st.population.max_neighbors) == 50
@@ -356,6 +414,8 @@ class TestNegativeParamsRejected:
         ns_state, step_fn, _backend = _build_ns_state(n_walkers=4, n_atoms=2)
         with pytest.raises(ValueError, match="shrink_dwell"):
             _run_loop_minimal(
-                ns_state, step_fn, n_iters=1,
+                ns_state,
+                step_fn,
+                n_iters=1,
                 shrink_dwell=-1,
             )

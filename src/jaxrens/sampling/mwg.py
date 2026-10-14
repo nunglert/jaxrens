@@ -17,7 +17,8 @@ Usage::
                        lambda pos, types: jnp.zeros_like(pos))}),
     ])
     state = init_fn(positions, types, energy, cell)
-    state, info = step_fn(rng_key, state, likelihood_constraint)
+    state, info = step_fn(rng_key, state, likelihood_constraint, move_key)
+    # move_key must be unbatched under vmap (see step_fn)
     # per_move_fns[i](state, key, constraint) runs move i directly
 """
 
@@ -62,7 +63,8 @@ def build_mwg(
     Returns:
         (init_fn, step_fn) where:
         - init_fn(positions, types, energy, cell, step_sizes) -> MCState
-        - step_fn(rng_key, state, likelihood_constraint) -> (MCState, MoveInfo)
+        - step_fn(rng_key, state, likelihood_constraint, move_key)
+          -> (MCState, MoveInfo)
     """
     n_moves = len(move_descriptors)
 
@@ -226,26 +228,25 @@ def build_mwg(
         rng_key: Key[Array, ""],
         state: Any,
         likelihood_constraint: float | Float[Array, ""],
-        move_key: Key[Array, ""] | None = None,
+        move_key: Key[Array, ""],
     ) -> tuple[Any, MoveInfo]:
-        """One MWG step: randomly select a move and execute it.
+        """One MWG step: select a move with ``move_key``, run it with ``rng_key``.
 
-        ``move_key``, when given, replaces the per-step selection key.  Under
-        ``vmap`` a batched switch index lowers to ``select`` and evaluates
-        EVERY move branch; callers that vmap over chains/runs pass a key that
-        is unbatched (shared across the mapped axis) so the index stays
-        unbatched and ``lax.switch`` remains a real conditional.
+        ``move_key`` is required and kept separate from ``rng_key`` because
+        the two must be batched differently.  Under ``vmap`` a batched switch
+        index lowers to ``select``, which evaluates EVERY move branch (with
+        all its energy/force calls) and keeps one result.  Callers that vmap
+        over chains/runs therefore pass a ``move_key`` that is unbatched
+        (shared across the mapped axis) so ``lax.switch`` stays a real
+        conditional; ``rng_key`` stays per-chain.
         """
-        key_select, key_move = jax.random.split(rng_key)
-        if move_key is not None:
-            key_select = move_key
-        move_idx = jax.random.choice(key_select, n_moves, p=move_probs)
+        move_idx = jax.random.choice(move_key, n_moves, p=move_probs)
 
         new_state, info = jax.lax.switch(
             move_idx,
             wrapped_fns,
             state,
-            key_move,
+            rng_key,
             likelihood_constraint,
         )
 
