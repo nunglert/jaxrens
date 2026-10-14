@@ -1329,41 +1329,53 @@ class TrajectoryCallback:
         self.snapshot_interval = snapshot_interval
 
     def on_iteration(self, iteration: int, ns_state: Any, info: dict) -> None:
-        # The dead walker is surfaced by ``ns_step`` as a single
-        # ``WalkerState`` pytree under ``info["dead_walker"]`` (positions,
-        # types, energy, cell).  Energy is also exposed as ``info["emax"]``
-        # for consumers that only need the scalar.
-        dead_ws = info["dead_walker"]
-        dead_cell = dead_ws.cell
-
-        if iteration % self.traj_interval == 0:
-            # Emax is the culled walker's energy under the NS contour; carry it
-            # on the WalkerState so the writer records the contour value.  Drop
-            # a degenerate (all-zero) cell to None so it serializes as
-            # non-periodic, matching the previous dict-with-optional-box path.
-            cell = (
-                dead_cell
-                if dead_cell is not None and jnp.any(dead_cell != 0)
-                else None
-            )
-            dead_walker = dead_ws.set(
-                energy=jnp.asarray(info.get("emax", 0.0)), cell=cell
-            )
-            self.writer.write_dead_point(
-                iteration, dead_walker, float(info["emax"])
+        # ``ns_step`` surfaces this iteration's dead points as one
+        # ``WalkerState`` pytree with a leading ``(n_cull,)`` axis in
+        # descending energy under ``info["dead_walkers"]``.  Older callers
+        # (and hand-built test infos) only carry the single ``dead_walker``.
+        dead_ws = info.get("dead_walkers")
+        if dead_ws is None:
+            dead_ws = jax.tree.map(lambda x: x[None], info["dead_walker"])
+        dead_cells = np.asarray(dead_ws.cell)
+        dead_energies = np.asarray(dead_ws.energy, dtype=np.float64).reshape(
+            -1
+        )
+        n_cull = dead_energies.shape[0]
+        if n_cull == 1:
+            # Single cull: record the NS contour exactly as before (identical
+            # to the walker's own energy).
+            dead_energies = np.asarray(
+                [float(info.get("emax", dead_energies[0]))]
             )
 
-        if self.energy_logger is not None:
-            # Write the culled-walker energy and volume so postprocess can
-            # reconstruct the dead-point trace from this single file.
-            # Volume is derived from the dead walker's cell (det) — no
-            # separate ``dead_volume`` field needed in ``info``.
-            dead_v = float(jnp.abs(jnp.linalg.det(dead_cell)))
-            self.energy_logger.write_entry(
-                iteration,
-                float(info.get("emax", 0)),
-                volume=dead_v,
-            )
+        for k in range(n_cull):
+            dead_cell = dead_cells[k]
+            if iteration % self.traj_interval == 0:
+                # Carry each dead point's energy on its WalkerState so the
+                # writer records it.  Drop a degenerate (all-zero) cell to
+                # None so it serializes as non-periodic.
+                cell = (
+                    jnp.asarray(dead_cell) if np.any(dead_cell != 0) else None
+                )
+                dead_walker = jax.tree.map(lambda x: x[k], dead_ws).set(
+                    energy=jnp.asarray(dead_energies[k]), cell=cell
+                )
+                self.writer.write_dead_point(
+                    iteration,
+                    dead_walker,
+                    float(dead_energies[k]),
+                    cull_rank=k if n_cull > 1 else None,
+                )
+
+            if self.energy_logger is not None:
+                # One ``.energies`` row per dead point (n_cull per iteration,
+                # descending energy — the pymatnest layout), with the volume
+                # derived from the dead walker's own cell.
+                self.energy_logger.write_entry(
+                    iteration,
+                    float(dead_energies[k]),
+                    volume=float(abs(np.linalg.det(dead_cell))),
+                )
 
         if (
             self.snapshot_interval
@@ -1451,43 +1463,64 @@ class BatchedTrajectoryCallback:
                 emax_arr.reshape(-1) if emax_arr.ndim >= 1 else emax_arr[None]
             )
 
-        # Dead walker is a single ``WalkerState`` pytree from ns_step.
-        # Flatten each leaf over the replica axis once; per-replica slicing
-        # then uses simple integer indexing on each leaf.
-        dead_ws = info["dead_walker"]
+        # Dead walkers are one ``WalkerState`` pytree from ns_step with leaves
+        # ``(*shape_prefix, n_cull, ...)`` (descending energy).  Fall back to
+        # the single ``dead_walker`` (no cull axis) for legacy infos.  Flatten
+        # each leaf over the replica axis once; per-replica slicing then uses
+        # simple integer indexing.
+        dead_ws = info.get("dead_walkers")
+        has_cull_axis = dead_ws is not None
+        if not has_cull_axis:
+            dead_ws = info["dead_walker"]
         dead_pos_flat = np.asarray(flatten(dead_ws.positions))
         dead_types_flat = np.asarray(flatten(dead_ws.types))
         dead_cell_flat = np.asarray(flatten(dead_ws.cell))
-        n_atoms = int(dead_pos_flat.shape[1])
+        dead_e_flat = np.asarray(flatten(dead_ws.energy), dtype=np.float64)
+        if not has_cull_axis:
+            dead_pos_flat = dead_pos_flat[:, None]
+            dead_types_flat = dead_types_flat[:, None]
+            dead_cell_flat = dead_cell_flat[:, None]
+            dead_e_flat = dead_e_flat[:, None]
+        n_cull = int(dead_pos_flat.shape[1])
+        n_atoms = int(dead_pos_flat.shape[2])
+        if n_cull == 1:
+            # Single cull: record the NS contour exactly as before.
+            dead_e_flat = np.asarray(emax_flat, dtype=np.float64).reshape(
+                -1, 1
+            )
 
-        if iteration % self.traj_interval == 0:
-            for r in range(n_runs):
-                cell_r = dead_cell_flat[r]
-                # Build the per-replica dead walker as a typed WalkerState
-                # (jnp arrays satisfy the jaxtyped fields).  A degenerate
-                # all-zero cell serializes as non-periodic (cell=None).
-                dead_walker = WalkerState(
-                    positions=jnp.asarray(dead_pos_flat[r]),
-                    types=jnp.asarray(dead_types_flat[r]),
-                    energy=jnp.asarray(emax_flat[r]),
-                    cell=jnp.asarray(cell_r) if np.any(cell_r != 0) else None,
-                    n_atoms=n_atoms,
-                )
-                self.writers[r].write_dead_point(
-                    iteration,
-                    dead_walker,
-                    float(emax_flat[r]),
-                )
+        for r in range(n_runs):
+            for k in range(n_cull):
+                cell_rk = dead_cell_flat[r, k]
+                if iteration % self.traj_interval == 0:
+                    # Build the per-replica dead walker as a typed WalkerState
+                    # (jnp arrays satisfy the jaxtyped fields).  A degenerate
+                    # all-zero cell serializes as non-periodic (cell=None).
+                    dead_walker = WalkerState(
+                        positions=jnp.asarray(dead_pos_flat[r, k]),
+                        types=jnp.asarray(dead_types_flat[r, k]),
+                        energy=jnp.asarray(dead_e_flat[r, k]),
+                        cell=(
+                            jnp.asarray(cell_rk)
+                            if np.any(cell_rk != 0)
+                            else None
+                        ),
+                        n_atoms=n_atoms,
+                    )
+                    self.writers[r].write_dead_point(
+                        iteration,
+                        dead_walker,
+                        float(dead_e_flat[r, k]),
+                        cull_rank=k if n_cull > 1 else None,
+                    )
 
-        if self.energy_loggers is not None:
-            # Per-replica volume derived from the dead walker's own cell.
-            for r in range(n_runs):
-                vol = float(np.abs(np.linalg.det(dead_cell_flat[r])))
-                self.energy_loggers[r].write_entry(
-                    iteration,
-                    float(emax_flat[r]),
-                    volume=vol,
-                )
+                if self.energy_loggers is not None:
+                    # Per-replica volume derived from the dead walker's cell.
+                    self.energy_loggers[r].write_entry(
+                        iteration,
+                        float(dead_e_flat[r, k]),
+                        volume=float(abs(np.linalg.det(cell_rk))),
+                    )
 
         if (
             self.snapshot_interval

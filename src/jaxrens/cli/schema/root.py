@@ -70,11 +70,12 @@ class RootSpec(BaseModel):
         description=(
             "How the resolver interprets every iteration-counted field. "
             "``absolute`` (default): values are raw NS iteration counts. "
-            "``per_walker``: values are walker-sweeps, where one sweep equals "
-            "``run.n_live`` iterations; the resolver multiplies each affected "
-            "field by ``n_live`` before building the runtime dataclasses, so "
+            "``per_walker``: values are walker-sweeps, where one sweep is "
+            "``run.n_live`` culled walkers, i.e. ``n_live / run.n_cull`` "
+            "iterations; the resolver multiplies each affected field by "
+            "``n_live / n_cull`` before building the runtime dataclasses, so "
             "an interval expressed in sweeps stays comparable across configs "
-            "with different ``n_live``. Affected fields: "
+            "with different ``n_live`` and ``n_cull``. Affected fields: "
             "``output.{info,traj,snapshot,checkpoint,flush}_interval``, "
             "``output.{temperature_lag,temperature,acc_rates,max_neighbors,"
             "collision_check}_interval``, ``run.max_iterations``, "
@@ -251,19 +252,15 @@ class RootSpec(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _warn_n_cull_postprocessing_unvalidated(self) -> "RootSpec":
-        """Flag ``run.n_cull > 1`` as unvalidated on the postprocessing path.
+    def _warn_n_cull_unvalidated(self) -> "RootSpec":
+        """Flag ``run.n_cull > 1`` as unvalidated.
 
-        The sampler itself culls ``n_cull`` walkers per iteration correctly
-        for any value.  But ``Monitor.from_directory`` — the loader every
-        ``jaxrens analyze``/``jaxrens plot`` observable goes through — and
-        ``postprocess.collection`` both reconstruct a run's ``Monitor`` with
-        ``n_cull`` hardcoded to ``1``, not read back from the config or the
-        checkpoint.  For ``n_cull == 1`` (the default) that hardcoding is
-        correct by construction; for ``n_cull > 1`` it silently mismatches
-        the run that actually produced the data, biasing every downstream
-        prior-mass weight, log Z, and thermodynamic observable — no
-        production run has exercised that combination, hence
+        Multi-walker culling is implemented end to end — the sampler culls
+        ``n_cull`` walkers per iteration, the evidence / termination /
+        post-processing weights follow pymatnest's per-dead-point
+        convention (:mod:`jaxrens.prior_mass`), and ``Monitor`` reads
+        ``n_cull`` back from the ``.energies`` header — but no production
+        run has exercised it yet, hence
         :func:`~jaxrens.unvalidated.warn_unvalidated` rather than a plain
         warning: it is tracked in the same registry as everything else this
         codebase doesn't yet trust, controllable via ``JAXRENS_UNVALIDATED``,
@@ -276,24 +273,15 @@ class RootSpec(BaseModel):
             warn_unvalidated(
                 "run.n_cull > 1",
                 concern=(
-                    f"n_cull={self.run.n_cull}: the sampler culls "
-                    f"{self.run.n_cull} walkers per iteration correctly, "
-                    "but Monitor.from_directory (used by `jaxrens analyze` "
-                    "and `jaxrens plot`) hardcodes n_cull=1 when "
-                    "reconstructing prior-mass weights from disk, so "
-                    "downstream log Z / heat-capacity / free-energy "
-                    "estimates from the CLI will be wrong for this run "
-                    "unless you call the lower-level "
-                    "postprocess.thermodynamics functions yourself with "
-                    "the correct n_cull."
+                    f"n_cull={self.run.n_cull}: multi-walker culling is new "
+                    "and has not yet been checked against an n_cull=1 "
+                    "reference on a production system."
                 ),
                 since="0.3.1",
                 clears_when=(
-                    "Monitor.from_directory reads n_cull from the "
-                    "checkpoint/config instead of hardcoding 1, and a "
-                    "production run with n_cull > 1 has had its "
-                    "postprocessed observables checked against the raw "
-                    "dead-point ladder."
+                    "A production run with n_cull > 1 has reproduced the "
+                    "log Z / heat-capacity curve of an n_cull = 1 reference "
+                    "within statistical error."
                 ),
                 stacklevel=2,
             )

@@ -88,7 +88,8 @@ class IterationTerminationSpec(BaseTerminationSpec):
 class PriorMassTerminationSpec(BaseTerminationSpec):
     """Stop once the remaining prior mass falls below ``threshold``.
 
-    The usual choice: prior mass contracts as ``exp(-i / n_live)``, so the
+    The usual choice: prior mass contracts by ``(n_live + 1 - n_cull) /
+    (n_live + 1)`` per iteration (≈ ``exp(-n_cull / n_live)``), so the
     same threshold means the same depth of exploration regardless of
     ``n_live``.  Smaller values sample further into the low-energy tail.
 
@@ -106,7 +107,8 @@ class PriorMassTerminationSpec(BaseTerminationSpec):
     threshold: float = Field(
         default=0.1,
         description=(
-            "Stop once the remaining prior mass ``X_i = exp(-i / n_live)`` "
+            "Stop once the remaining prior mass "
+            "``X_i ≈ exp(-i * n_cull / n_live)`` "
             "falls below this fraction.  The usual way to terminate: it "
             "adapts the iteration count to ``n_live`` instead of pinning "
             "it.  Smaller values sample further into the low-energy tail."
@@ -124,7 +126,9 @@ class PriorMassTerminationSpec(BaseTerminationSpec):
                 "PriorMassTerminationSpec.to_criterion() requires n_live. "
                 "Call to_criterion(n_live=...) from the resolver with run.n_live."
             )
-        return PriorMassTermination(n_live=n_live, threshold=self.threshold)
+        return PriorMassTermination(
+            n_live=n_live, threshold=self.threshold, n_cull=n_cull or 1
+        )
 
 
 class TemperatureTerminationSpec(BaseTerminationSpec):

@@ -721,17 +721,13 @@ class TestIntervalUnitsField:
             RootSpec.model_validate(d)
 
 
-class TestNCullPostprocessingWarning:
-    """``run.n_cull > 1`` is sampled correctly but silently mis-analysed:
-
-    ``Monitor.from_directory`` hardcodes ``n_cull=1`` when reconstructing
-    prior-mass weights from disk, so downstream ``jaxrens analyze``/``plot``
-    would be wrong for such a run.  Routed through :mod:`jaxrens.unvalidated`
-    (not a plain warning) since this is exactly that module's concern: a path
-    nobody has checked against a real run's output.  The marker mechanism
-    itself (registry, one-shot, env policy) is covered by
-    ``tests/test_unvalidated.py``; these two just confirm this call site
-    trips it under the right condition and stays quiet otherwise.
+class TestNCullWarningAndValidation:
+    """``run.n_cull > 1`` is implemented but not yet production-validated,
+    so it is routed through :mod:`jaxrens.unvalidated` (not a plain
+    warning).  The marker mechanism itself (registry, one-shot, env policy)
+    is covered by ``tests/test_unvalidated.py``; these confirm this call site
+    trips it under the right condition and stays quiet otherwise, and that
+    impossible cull widths are rejected.
     """
 
     @pytest.fixture(autouse=True)
@@ -753,6 +749,20 @@ class TestNCullPostprocessingWarning:
         d = _minimal_dict()
         d["run"]["n_cull"] = 2
         with pytest.warns(UnvalidatedFeatureWarning, match=r"run\.n_cull > 1"):
+            RootSpec.model_validate(d)
+
+    @pytest.mark.parametrize("n_cull", [0, -1])
+    def test_n_cull_below_one_rejected(self, n_cull):
+        d = _minimal_dict()
+        d["run"]["n_cull"] = n_cull
+        with pytest.raises(ValidationError):
+            RootSpec.model_validate(d)
+
+    def test_n_cull_too_wide_for_population_rejected(self):
+        d = _minimal_dict()
+        n_live = RootSpec.model_validate(_minimal_dict()).run.n_live
+        d["run"]["n_cull"] = n_live // 2 + 1
+        with pytest.raises(ValidationError, match="2 \\* n_cull"):
             RootSpec.model_validate(d)
 
 

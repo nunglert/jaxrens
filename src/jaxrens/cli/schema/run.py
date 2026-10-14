@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class RunSpec(BaseModel):
@@ -73,11 +73,17 @@ class RunSpec(BaseModel):
     )
     n_cull: int = Field(
         default=1,
+        ge=1,
         description=(
             "Number of highest-energy walkers removed per NS iteration.  "
-            "Values > 1 contract the prior mass faster per iteration and "
-            "amortise fixed per-iteration overhead, at the cost of a "
-            "coarser energy grid."
+            "Each is replaced by a clone of a distinct random survivor, and "
+            "the ``n_cull`` clones are MCMC-walked together (alongside the "
+            "``n_extra`` extras), so values > 1 contract the prior mass "
+            "``n_cull`` times faster per iteration (by "
+            "``(n_live + 1 - n_cull) / (n_live + 1)``) and widen the "
+            "parallel walk batch.  Every culled walker is a dead point "
+            "(``n_cull`` rows per iteration in ``.energies``).  Requires "
+            "``2 * n_cull + n_extra <= n_live``."
         ),
     )
     seed: int = Field(
@@ -101,3 +107,17 @@ class RunSpec(BaseModel):
             "behaviour identical to today's single-GPU single run."
         ),
     )
+
+    @model_validator(mode="after")
+    def _check_cull_width(self) -> "RunSpec":
+        """Every culled slot needs a distinct clone source, and the extras
+        are drawn from the survivors that are neither culled nor cloned."""
+        if 2 * self.n_cull + self.n_extra > self.n_live:
+            raise ValueError(
+                f"run.n_cull={self.n_cull} and run.n_extra={self.n_extra} "
+                f"need 2 * n_cull + n_extra <= n_live (= {self.n_live}): "
+                "each culled walker is replaced by a clone of a distinct "
+                "survivor, and the extras are walked from the remaining "
+                "survivors."
+            )
+        return self

@@ -600,8 +600,8 @@ class TestPerMoveCounters:
         # Wrap with explicit trace counter
         trace_count = [0]
 
-        def counting_step_fn(rng_key, st, lc):
-            return s["step_fn"](rng_key, st, lc)
+        def counting_step_fn(rng_key, st, lc, move_key):
+            return s["step_fn"](rng_key, st, lc, move_key)
 
         # JIT ns_step with a Python function — retraces if JAX recompiles
         # Use cache_size heuristic: run twice, both times measure if fresh JIT

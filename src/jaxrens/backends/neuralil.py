@@ -32,6 +32,7 @@ import jax.numpy as jnp
 
 from jaxrens.backends.base import BackendResult
 from jaxrens.backends.softcore import DEFAULT_SOFTCORE_KWARGS
+from jaxrens.utils.cell import nonperiodic_safe_cell
 
 logger = logging.getLogger(__name__)
 
@@ -281,8 +282,8 @@ class NeuralILBackend:
 
     @staticmethod
     def _safe_cell(cell: jnp.ndarray) -> jnp.ndarray:
-        """Substitute a large dummy cell for non-periodic (zero-trace) inputs."""
-        return jnp.where(jnp.trace(cell) == 0, 1000.0 * jnp.eye(3), cell)
+        """Substitute a large dummy cell for non-periodic (degenerate) inputs."""
+        return nonperiodic_safe_cell(cell)
 
     def _apply_energy_shift(
         self, energy: jnp.ndarray, species: jnp.ndarray
@@ -508,11 +509,7 @@ class NeuralILBackend:
         ignores for length-N inputs).
         """
         sc_a, sc_b, sc_c = self.supercell_trafo
-        safe_cell = jnp.where(
-            jnp.trace(cell) == 0,
-            1000.0 * jnp.eye(3),
-            cell,
-        )
+        safe_cell = self._safe_cell(cell)
         species = jnp.zeros(positions.shape[0], dtype=jnp.int32)
         return _get_max_number_of_neighbors(
             positions,

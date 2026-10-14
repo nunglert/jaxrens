@@ -14,11 +14,14 @@ authors = [
     { name = "Nico Unglert" },
 ]
 dependencies = [
-    # TEMPORARY upper bound: jax >=0.11.2 conflicts with flax (unresolved
-    # upstream).  jax[cuda12] pins jax-cuda12-plugin/pjrt to the jax version,
-    # so bounding jax bounds the CUDA plugins too; jaxlib is bounded
-    # explicitly because jax and jaxlib must stay version-matched.
-    # Drop both upper bounds once flax ships a compatible release.
+    # TEMPORARY upper bound: jax/jaxlib 0.11.2 segfault compiling a
+    # full-slice scatter (`x.at[:].add(y)`) inside a multi-device shard_map
+    # (Shardy partitioner).  mace-jax's scatter_sum uses exactly that, so
+    # every multi-GPU MACE run crashes at the first compile.  0.11.1 is fine.
+    # jax[cuda12] pins jax-cuda12-plugin/pjrt to the jax version, so bounding
+    # jax bounds the CUDA plugins too; jaxlib is bounded explicitly because
+    # jax and jaxlib must stay version-matched.  Drop both upper bounds once
+    # a jax release fixes it (check with the multi_gpu MACE pipeline test).
     "jax[cuda12]>=0.9.0,<0.11.2",
     "jaxlib>=0.9.0,<0.11.2",
     "numpy>=1.26",

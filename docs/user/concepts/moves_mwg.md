@@ -65,6 +65,26 @@ flowchart LR
     ST --> O
 ```
 
+### One move schedule for every chain
+
+The move index is drawn **once per MCMC step and shared** by every chain
+walked in that step: the `1 + n_extra` chains of an NS iteration, all
+walkers during burn-in, and every run of a multi-run job (`VmapRuns`,
+and `PmapVmapRuns` across all GPUs). Which *move type* runs at step $t$
+is therefore common to all of them; each chain still draws its own
+proposal, so the chains evolve independently otherwise.
+Sampling stays correct: the move choice depends only on the RNG, never on
+the walker state, so each chain is still a valid Metropolis-within-Gibbs
+chain with selection probabilities $p_k$. The only cost is that move
+types are correlated *across* chains and runs within one step.
+
+The MWG `step_fn` therefore takes the selection key as a separate,
+**required** argument: `step_fn(rng_key, state, emax, move_key)`.
+`rng_key` drives the proposal and is per chain; `move_key` picks the move
+and must be unbatched under any `vmap`, i.e. closed over or passed with
+`in_axes=None`, never mapped
+(see {func}`~jaxrens.sampling.nested_sampling.ns_step`'s `move_key`).
+
 ## Acceptance at the NS constraint
 
 NS enforces a hard likelihood threshold instead of a

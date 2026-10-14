@@ -42,8 +42,8 @@ def _run(step_fn, state, n_steps=25, seed=0):
     key = jax.random.key(seed)
     reasons, accepts = [], []
     for _ in range(n_steps):
-        key, sub = jax.random.split(key)
-        state, info = step_fn(sub, state, EMAX)
+        key, sub, move_key = jax.random.split(key, 3)
+        state, info = step_fn(sub, state, EMAX, move_key)
         reasons.append(int(info.reject_reason))
         accepts.append(bool(info.accepted))
     return state, reasons, accepts

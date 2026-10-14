@@ -195,7 +195,10 @@ class Monitor:
             log_evidence=float(state["log_evidence"]),
             iteration=int(state["iteration"]),
             n_live=n_live,
-            n_cull=1,  # jaxrens runs with n_cull=1 by default
+            # The ``.energies`` header records the run's cull width (and every
+            # file written before multi-cull existed says 1, which is what
+            # those runs actually did).
+            n_cull=energies_log.n_cull if energies_log is not None else 1,
             symbol_map=symbol_map,
             energy_trace=energy_trace,
             iteration_trace=iteration_trace,

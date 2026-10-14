@@ -56,7 +56,9 @@ easy to conflate since both sound like "more sampling":
   that's 16 walkers walked per iteration.
 - `n_mcmc_steps` is the **chain length** — how many sequential move
   proposals each of those 16 walkers takes, one weighted draw from
-  `{gmc, volume, shear, stretch}` per step.
+  `{gmc, volume, shear, stretch}` per step — shared by all 16, so they
+  make the same move type at the same step (see
+  {doc}`/user/concepts/moves_mwg` for why).
 
 So this config proposes `(1 + n_extra) × n_mcmc_steps = 16 × 20 = 320`
 moves per outer NS iteration — a number fixed by the config, independent of

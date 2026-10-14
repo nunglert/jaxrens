@@ -251,7 +251,9 @@ class TestScopedMovesInMWG:
 
         jitted = jax.jit(step_fn)
         for i in range(40):
-            state, _ = jitted(jax.random.key(i), state, 10.0)
+            state, _ = jitted(
+                jax.random.key(i), state, 10.0, jax.random.key(1000 + i)
+            )
 
         assert not jnp.allclose(state.positions[:2], initial[:2])
         assert not jnp.allclose(state.positions[2:], initial[2:])

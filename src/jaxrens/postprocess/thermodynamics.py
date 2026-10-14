@@ -29,6 +29,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.special import logsumexp
 
+from jaxrens.prior_mass import log_dead_weights, log_live_weight
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -40,21 +41,6 @@ def _as_f64(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float64)
 
 
-def _log_t(n_live, n_cull: int = 1) -> np.ndarray:
-    """Per-iteration log shrinkage factor, ``log((N+1-c-1)/(N+1-c))``.
-
-    Computed as ``log(N - c) - log(N + 1 - c)`` for numerical stability.
-    """
-    nl = _as_f64(n_live)
-    nc = _as_f64(n_cull)
-    return np.log(nl - nc) - np.log(nl + 1.0 - nc)
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
 def calc_log_weights(
     n_dead,
     n_live,
@@ -62,11 +48,10 @@ def calc_log_weights(
 ) -> np.ndarray:
     """Compute log prior-mass weights for dead points.
 
-    For dead point ``i`` (0-indexed)::
-
-        log_t   = log((N - n_cull) / (N + 1 - n_cull))
-        log_X_i = i * log_t
-        log_w_i = log_X_i + log(1 - exp(log_t))
+    pymatnest convention (``ns_analyse.calc_log_a``); see
+    :mod:`jaxrens.prior_mass` for the formulae.  Dead points are indexed
+    over the per-cull sequence, ``n_cull`` per iteration in descending
+    energy — exactly the row order of a ``.energies`` file.
 
     Args:
         n_dead: Number of dead points collected (scalar).
@@ -76,11 +61,7 @@ def calc_log_weights(
     Returns:
         ``np.ndarray[float64]`` of shape ``(n_dead,)``.
     """
-    n_dead = int(np.asarray(n_dead))
-    log_t = _log_t(n_live, n_cull)
-    log_shell = np.log1p(-np.exp(log_t))
-    indices = np.arange(n_dead, dtype=np.float64)
-    return indices * log_t + log_shell
+    return log_dead_weights(int(np.asarray(n_dead)), int(n_live), int(n_cull))
 
 
 def calc_log_weights_live(
@@ -90,9 +71,9 @@ def calc_log_weights_live(
 ) -> np.ndarray:
     """Compute log weight for each remaining live walker.
 
-    After ``n_dead`` iterations the remaining prior mass is
-    ``X_final = exp(n_dead * log_t)``; each live walker carries
-    ``log_w_live = log(X_final / n_live)``.
+    Each of the ``n_live`` live walkers carries ``X_D / n_live`` of the
+    remaining prior mass after ``n_dead`` dead points (see
+    :func:`jaxrens.prior_mass.log_live_weight`).
 
     Args:
         n_dead: Number of dead points collected (scalar).
@@ -102,10 +83,7 @@ def calc_log_weights_live(
     Returns:
         0-d ``np.ndarray[float64]`` (the scalar log weight per live walker).
     """
-    n_dead_f = _as_f64(n_dead)
-    n_live_f = _as_f64(n_live)
-    log_t = _log_t(n_live, n_cull)
-    return n_dead_f * log_t - np.log(n_live_f)
+    return log_live_weight(int(np.asarray(n_dead)), int(n_live), int(n_cull))
 
 
 def log_evidence(
@@ -134,7 +112,7 @@ def log_evidence(
     live_E = _as_f64(live_energies)
     n_dead = dead_E.shape[-1]
 
-    log_w_dead = calc_log_weights(n_dead, n_live, n_cull)      # (n_dead,)
+    log_w_dead = calc_log_weights(n_dead, n_live, n_cull)  # (n_dead,)
     log_w_live = calc_log_weights_live(n_dead, n_live, n_cull)  # scalar
 
     # Broadcasting handles arbitrary batch prefix; axis=-1 reduces the trailing
@@ -184,12 +162,13 @@ def partition_function(
     log_w_dead = calc_log_weights(n_dead, n_live, n_cull)
     log_w_live = calc_log_weights_live(n_dead, n_live, n_cull)
 
-    log_terms_dead = log_w_dead - beta * dead_E   # (*batch, n_dead)
-    log_terms_live = log_w_live - beta * live_E   # (*batch, n_live)
+    log_terms_dead = log_w_dead - beta * dead_E  # (*batch, n_dead)
+    log_terms_live = log_w_live - beta * live_E  # (*batch, n_live)
 
     # Concatenate along the trailing axis (works for any batch prefix).
     log_terms_live_b = np.broadcast_to(
-        log_terms_live, log_terms_dead.shape[:-1] + (log_terms_live.shape[-1],),
+        log_terms_live,
+        log_terms_dead.shape[:-1] + (log_terms_live.shape[-1],),
     )
     all_log_terms = np.concatenate([log_terms_dead, log_terms_live_b], axis=-1)
     return logsumexp(all_log_terms, axis=-1)
@@ -234,14 +213,15 @@ def heat_capacity(
     # Broadcast to a common batch prefix so concatenation along the trailing
     # axis works for arbitrary input ndims.
     live_E_b = np.broadcast_to(
-        live_E, dead_E.shape[:-1] + (live_E.shape[-1],),
+        live_E,
+        dead_E.shape[:-1] + (live_E.shape[-1],),
     )
     all_E = np.concatenate([dead_E, live_E_b], axis=-1)
     all_log_w = np.concatenate([log_w_dead, log_w_live])  # (n_dead + n_live,)
 
-    log_unnorm = all_log_w - beta * all_E                # (*batch, n_total)
+    log_unnorm = all_log_w - beta * all_E  # (*batch, n_total)
     log_Z = logsumexp(log_unnorm, axis=-1, keepdims=True)
-    w = np.exp(log_unnorm - log_Z)                       # normalised weights
+    w = np.exp(log_unnorm - log_Z)  # normalised weights
 
     mean_E = np.sum(w * all_E, axis=-1, keepdims=True)
     var_E = np.sum(w * (all_E - mean_E) ** 2, axis=-1)
@@ -283,7 +263,8 @@ def expectation(
     log_w_live = np.full(live_E.shape[-1], log_w_live_scalar, dtype=np.float64)
 
     live_E_b = np.broadcast_to(
-        live_E, dead_E.shape[:-1] + (live_E.shape[-1],),
+        live_E,
+        dead_E.shape[:-1] + (live_E.shape[-1],),
     )
     all_E = np.concatenate([dead_E, live_E_b], axis=-1)
     all_log_w = np.concatenate([log_w_dead, log_w_live])
