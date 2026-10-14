@@ -11,14 +11,9 @@ from __future__ import annotations
 
 import pytest
 
-from jaxrens.cli.resolve import (
-    _apply_interval_units,
-    _scale_interval,
-    resolve,
-)
+from jaxrens.cli.resolve import _apply_interval_units, _scale_interval, resolve
 from jaxrens.cli.schema import RootSpec
 from jaxrens.cli.schema.termination import IterationTerminationSpec
-
 
 # ---------------------------------------------------------------------------
 # Fixture: a minimal RootSpec dict that exercises all 8 interval fields.
@@ -113,11 +108,62 @@ class TestApplyIntervalUnits:
         assert out.inter_re.re_interval == 50
         assert out.termination[0].max_iterations == 40
 
+    def test_per_walker_divides_by_n_cull(self):
+        """A sweep is n_live culls = n_live / n_cull iterations.
+
+        n_live=100 with n_cull=10 is 10 iterations per sweep, the same as
+        n_live=10 with n_cull=1, so the fields scale exactly as above.
+        """
+        d = _full_interval_dict(n_live=100)
+        d["run"]["n_cull"] = 10
+        d["interval_units"] = "per_walker"
+        root = RootSpec.model_validate(d)
+        out = _apply_interval_units(root)
+
+        assert out.output.info_interval == 70
+        assert out.output.traj_interval == 30
+        assert out.output.snapshot_interval == 110
+        assert out.output.checkpoint_interval == 130
+        assert out.run.max_iterations == 500
+        assert out.adaptation.adjust_interval == 20
+        assert out.inter_re.re_interval == 50
+        assert out.termination[0].max_iterations == 40
+
+    def test_per_walker_n_cull_keeps_dead_points_per_interval(self):
+        """Changing n_cull keeps the dead points (culls) per interval fixed."""
+        culls = {}
+        for n_cull in (1, 4, 20):
+            d = _full_interval_dict(n_live=400)
+            d["run"]["n_cull"] = n_cull
+            d["interval_units"] = "per_walker"
+            d["output"]["info_interval"] = 0.5
+            out = _apply_interval_units(RootSpec.model_validate(d))
+            culls[n_cull] = out.output.info_interval * n_cull
+        assert culls == {1: 200, 4: 200, 20: 200}
+
+    def test_per_walker_n_cull_rounds_and_clamps(self):
+        d = _full_interval_dict(n_live=30)
+        d["run"]["n_cull"] = 7  # 30 / 7 = 4.29 iterations per sweep
+        d["interval_units"] = "per_walker"
+        d["output"]["info_interval"] = 0.01
+        out = _apply_interval_units(RootSpec.model_validate(d))
+        assert out.output.traj_interval == 13  # round(3 * 4.29)
+        assert out.output.info_interval == 1  # clamped, never 0
+
+    def test_absolute_mode_ignores_n_cull(self):
+        d = _full_interval_dict(n_live=100)
+        d["run"]["n_cull"] = 10
+        out = _apply_interval_units(RootSpec.model_validate(d))
+        assert out.output.info_interval == 7
+        assert out.run.max_iterations == 50
+
     def test_per_walker_scales_temperature_lag_interval_and_interval(self):
         """``temperature_lag_interval`` / ``temperature_interval`` scale with n_live."""
         d = _full_interval_dict(n_live=500)
         d["interval_units"] = "per_walker"
-        d["output"]["temperature_lag_interval"] = 0.5      # 0.5 walker-sweeps → 250 iters
+        d["output"][
+            "temperature_lag_interval"
+        ] = 0.5  # 0.5 walker-sweeps → 250 iters
         d["output"]["temperature_interval"] = 0.2  # → 100 iters
         root = RootSpec.model_validate(d)
         out = _apply_interval_units(root)
@@ -210,8 +256,11 @@ class TestResolveIntervals:
         # iteration spec).  Confirm there is one whose limit matches the
         # scaled value.
         from jaxrens.sampling.termination import IterationTermination
+
         iter_terms = [
-            t for t in resolved.termination if isinstance(t, IterationTermination)
+            t
+            for t in resolved.termination
+            if isinstance(t, IterationTermination)
         ]
         assert iter_terms, "expected at least one IterationTermination"
         # The explicit termination[0] from the fixture scales 4 → 40; the
@@ -221,6 +270,16 @@ class TestResolveIntervals:
         assert max_iters == [40, 500]
 
         # The full-auto adjust interval flows through ``adaptation_cfg``.
+        assert resolved.adaptation_cfg.adjust_interval == 20
+
+    def test_per_walker_n_cull_flows_through_resolve(self):
+        d = _full_interval_dict(n_live=100)
+        d["run"]["n_cull"] = 10
+        d["interval_units"] = "per_walker"
+        d.pop("inter_re", None)
+        resolved = resolve(RootSpec.model_validate(d))
+        assert resolved.output.info_interval == 70
+        assert resolved.ns.max_iterations == 500
         assert resolved.adaptation_cfg.adjust_interval == 20
 
     def test_absolute_default_unchanged(self):

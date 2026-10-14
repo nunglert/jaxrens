@@ -23,6 +23,14 @@ then `git tag -a vX.Y.Z`.
   `hamiltonian.model` / `unwrap_model(...)`. `EnsembleBackend(...)` and
   `SoftCoreBackend(...)` remain as convenience factories that return a flat
   `Hamiltonian`. `ResolvedConfig.base_backend` is now always a `Hamiltonian`.
+- **`interval_units: per_walker` accounts for `run.n_cull`.** A walker-sweep
+  is now `n_live` culled walkers, i.e. `n_live / n_cull` iterations, so
+  per-walker intervals are scaled by `n_live / n_cull` instead of `n_live`.
+  A per-walker config keeps the same prior-mass compression per interval
+  when `n_cull` changes; before, every interval (adaptation, temperature
+  lag, output, `max_iterations`, …) silently grew `n_cull`-fold.
+  `n_cull = 1` configs resolve exactly as before; `n_cull > 1` per-walker
+  configs now resolve to `1 / n_cull` of their previous iteration counts.
 
 ### Fixed
 - **`run.n_cull > 1` never culled more than one walker.** Both NS steps
