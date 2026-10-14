@@ -52,6 +52,7 @@ def _one_walk(
     walklength: int,
     emax: jnp.ndarray,
     walker_batch_size: int | None,
+    move_key: jax.Array | None = None,
 ) -> tuple[NSState, Any]:
     """Advance all walkers in a single-run NSState by walklength steps.
 
@@ -65,6 +66,9 @@ def _one_walk(
             lax.map(batch_size=walker_batch_size). Any positive int is
             accepted; non-divisors are handled by padding the population with
             copies of the last walker and slicing the padding off the output.
+        move_key: Key for the move-type schedule shared by all walkers.
+            ``None`` splits it off ``key``; batched callers pass one key
+            unbatched across replicas.
 
     Returns:
         (new_ns_state, last_accepted) where last_accepted is (n_walkers, walklength).
@@ -89,20 +93,29 @@ def _one_walk(
     # global so the two agree.
     n_walkers = population.energy.shape[0]
 
+    if move_key is None:
+        key, move_key = jax.random.split(key)
     walker_keys = jax.random.split(key, n_walkers)
     # chain_keys: (n_walkers, walklength)
     chain_keys = jax.vmap(lambda k: jax.random.split(k, walklength))(
         walker_keys
     )
+    # Move-type schedule shared by all walkers (closed over, not vmapped) so
+    # the MWG ``lax.switch`` index stays unbatched and only the chosen move
+    # executes.
+    move_keys = jax.random.split(move_key, walklength)
 
     def walker_fn(walker_state: Any, wkeys: jax.Array) -> tuple[Any, Any]:
         """Scan step_fn over walklength keys for one walker."""
 
-        def scan_body(state, k):
-            new_state, info = step_fn(k, state, emax)
+        def scan_body(state, keys):
+            k, mk = keys
+            new_state, info = step_fn(k, state, emax, move_key=mk)
             return new_state, info.accepted
 
-        final, accepted_arr = jax.lax.scan(scan_body, walker_state, wkeys)
+        final, accepted_arr = jax.lax.scan(
+            scan_body, walker_state, (wkeys, move_keys)
+        )
         return final, accepted_arr
 
     if walker_batch_size is None:
@@ -315,7 +328,10 @@ def initial_walk(
     # ``wrap_for_batch`` adds the right jit / vmap / shard_map composition for
     # the chosen descriptor (identity for SingleRun, vmap for VmapRuns,
     # pmap-of-vmap for PmapVmapRuns).
-    def _per_replica(k, run_state, run_emax):
+    # ``move_key`` is replicated (unbatched across replicas) so the MWG move
+    # index stays unbatched under the run-level vmap — see
+    # ``nested_sampling._move_schedule``.
+    def _per_replica(k, run_state, run_emax, move_key):
         return _one_walk(
             k,
             run_state,
@@ -323,9 +339,12 @@ def initial_walk(
             walklength,
             run_emax,
             walker_batch_size,
+            move_key=move_key,
         )
 
-    jit_one_walk = batcher.wrap_for_batch(_per_replica)
+    jit_one_walk = batcher.wrap_for_batch(
+        _per_replica, replicated=(False, False, False, True)
+    )
 
     # Bucket-ladder manager shared with ``_run_loop``.  Growth always
     # active; shrink path opt-in via ``shrink_dwell > 0``.
@@ -360,13 +379,13 @@ def initial_walk(
                 key_adapt,
             )
 
-        key, sub = jax.random.split(key)
+        key, sub, move_key = jax.random.split(key, 3)
 
         # ``distinct_keys`` returns shape_prefix-shaped INDEPENDENT keys
         # (scalar for SingleRun) on the right mesh per batcher.  Each
         # replica/shard walks its own walkers.
         walk_keys = batcher.distinct_keys(sub)
-        new_ns_state, _ = jit_one_walk(walk_keys, ns_state, emax)
+        new_ns_state, _ = jit_one_walk(walk_keys, ns_state, emax, move_key)
 
         # Bucket overflow → grow and retry the same walk.  JAX re-traces
         # ``jit_one_walk`` automatically because ``max_neighbors`` is a

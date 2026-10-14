@@ -137,6 +137,21 @@ def _get_extra_indices(
     return jnp.argsort(-noise)[:n_extra]
 
 
+def _move_schedule(move_key: jax.Array, n_mcmc_steps: int) -> jax.Array:
+    """Per-step move-selection keys ``(n_mcmc_steps,)`` shared by all chains.
+
+    ``build_mwg``'s ``step_fn`` dispatches moves via ``lax.switch``.  If the
+    switch index is batched (one draw per vmapped chain), ``vmap`` lowers the
+    switch to ``select`` and every move branch -- each with its own energy /
+    force evaluations -- runs on every step.  Drawing the index from these
+    keys, which are closed over rather than vmapped, keeps it unbatched so
+    only the chosen move executes.  All chains thus make the same move-type
+    choice at a given step; the choice is independent of walker state, so
+    every chain is still a valid MWG chain.
+    """
+    return jax.random.split(move_key, n_mcmc_steps)
+
+
 def _select_culls(
     potentials: jnp.ndarray,
     n_cull: int,
@@ -383,6 +398,7 @@ def ns_step(
     n_mcmc_steps: int = 20,
     n_extra: int = 0,
     n_cull: int = 1,
+    move_key: jax.Array | None = None,
 ) -> tuple[NSState, dict]:
     """One NS iteration: replace the ``n_cull`` worst walkers, plus extra walks.
 
@@ -401,6 +417,11 @@ def ns_step(
         n_mcmc_steps: Number of MCMC steps per walker (static).
         n_extra: Number of additional walkers to walk (static).
         n_cull: Number of walkers culled per iteration (static).
+        move_key: Key for the per-step move-type schedule shared by all
+            walked chains (see :func:`_move_schedule`).  ``None`` splits
+            it off this run's key; batchers that vmap over runs pass one
+            key from OUTSIDE that vmap so the schedule is unbatched there
+            too.
 
     Returns:
         (updated_ns_state, info_dict).
@@ -441,11 +462,13 @@ def ns_step(
     key = ns_state.rng_key
 
     # 1. Pick the culled walkers (highest potential), their clone sources
-    # and the walk set.  The key splits mirror the historical single-cull
-    # order so ``n_cull = 1`` runs stay bit-identical.
+    # and the walk set.  ``key_moves`` seeds the move-type schedule shared
+    # by all walked chains (see ``_move_schedule``).
     n_walkers = ns_state.n_walkers
     key, key_worst = jax.random.split(key)
-    key, key_clone, key_extra, key_mcmc = jax.random.split(key, 4)
+    key, key_clone, key_extra, key_mcmc, key_moves = jax.random.split(key, 5)
+    if move_key is None:
+        move_key = key_moves
     worst_indices, clone_indices, walk_indices, potential_max = _select_culls(
         potentials, n_cull, n_extra, key_worst, key_clone, key_extra
     )
@@ -506,6 +529,7 @@ def ns_step(
 
     # 6. Run MCMC chains in parallel via vmap(lax.scan)
     chain_keys = jax.random.split(key_mcmc, n_walk)
+    move_keys = _move_schedule(move_key, n_mcmc_steps)
     all_mcmc_keys = jax.vmap(lambda k: jax.random.split(k, n_mcmc_steps))(
         chain_keys
     )
@@ -518,8 +542,11 @@ def ns_step(
         #   axis 1 index 3 = prior reject count
         # Each row sums to n_proposed_per_move for that move.
         # This makes the 4 buckets exclusive and exhaustive.
-        def scan_body(state, step_key):
-            new_state, info = step_fn(step_key, state, potential_max)
+        def scan_body(state, keys):
+            step_key, step_move_key = keys
+            new_state, info = step_fn(
+                step_key, state, potential_max, move_key=step_move_key
+            )
             # Per-move accepted count: scatter accepted flag onto move_idx
             n_acc = (
                 jnp.zeros(n_moves, dtype=jnp.int32)
@@ -573,7 +600,7 @@ def ns_step(
             rr_arr,
             n_evals_arr,
             n_grad_evals_arr,
-        ) = jax.lax.scan(scan_body, walker, chain_keys)
+        ) = jax.lax.scan(scan_body, walker, (chain_keys, move_keys))
         # Sum over the scan axis (n_mcmc_steps)
         return (
             final,
@@ -674,6 +701,7 @@ def ns_step_sharded(
     n_mcmc_steps: int = 20,
     n_extra: int = 0,
     n_cull: int = 1,
+    move_key: jax.Array | None = None,
 ) -> tuple[NSState, dict]:
     """One NS iteration with the population sharded across ``n_gpu`` GPUs.
 
@@ -765,7 +793,9 @@ def ns_step_sharded(
     # Same RNG on every shard → same global indices everywhere.  Key splits
     # mirror ``ns_step`` so sharded and single-device runs agree.
     key, key_worst = jax.random.split(key)
-    key, key_clone, key_extra, key_mcmc = jax.random.split(key, 4)
+    key, key_clone, key_extra, key_mcmc, key_moves = jax.random.split(key, 5)
+    if move_key is None:
+        move_key = key_moves
     worst_indices, clone_indices, walk_indices, potential_max = _select_culls(
         potentials_global, n_cull, n_extra, key_worst, key_clone, key_extra
     )
@@ -818,6 +848,7 @@ def ns_step_sharded(
     # -> same sequence); only the model-eval work is divided G ways.
     n_gpu = n_walkers_global // K_per_gpu
     chain_keys = jax.random.split(key_mcmc, n_walk)
+    move_keys = _move_schedule(move_key, n_mcmc_steps)
     all_mcmc_keys = jax.vmap(lambda k: jax.random.split(k, n_mcmc_steps))(
         chain_keys
     )
@@ -845,8 +876,11 @@ def ns_step_sharded(
     def run_one_chain(walker, chain_keys):
         # Same body as ns_step.run_one_chain — see ns_step for the
         # bucket convention on reject_reason_counts_per_move.
-        def scan_body(state, step_key):
-            new_state, info = step_fn(step_key, state, potential_max)
+        def scan_body(state, keys):
+            step_key, step_move_key = keys
+            new_state, info = step_fn(
+                step_key, state, potential_max, move_key=step_move_key
+            )
             n_acc = (
                 jnp.zeros(n_moves, dtype=jnp.int32)
                 .at[info.move_idx]
@@ -897,7 +931,7 @@ def ns_step_sharded(
             rr_arr,
             n_evals_arr,
             n_grad_evals_arr,
-        ) = jax.lax.scan(scan_body, walker, chain_keys)
+        ) = jax.lax.scan(scan_body, walker, (chain_keys, move_keys))
         return (
             final,
             jnp.sum(accepted_arr),

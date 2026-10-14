@@ -25,7 +25,6 @@ from jaxrens.sampling.batch_descriptor import (
     from_shape_prefix,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers — minimal fake ns_step and ns_state
 # ---------------------------------------------------------------------------
@@ -36,25 +35,40 @@ def _fake_ns_step(ns_state, step_fn, n_mcmc_steps, n_extra):
     return ns_state, {}
 
 
-def _fake_ns_step_vmap(ns_state, step_fn, n_mcmc_steps, n_extra):
-    """Same contract; used to verify vmap wrapping passes state through."""
+def _fake_ns_step_vmap(ns_state, step_fn, n_mcmc_steps, n_extra, move_key):
+    """Same contract; used to verify vmap wrapping passes state through.
+
+    Batched wrappers also pass the run-shared ``move_key``.
+    """
     return ns_state, {}
 
 
 class _FakeState:
     """Minimal JAX-pytree-compatible stand-in for NSState.
 
-    Registers as a pytree so vmap can map over a batch of them.
+    Registers as a pytree so vmap can map over a batch of them.  Carries an
+    ``rng_key`` of the same batch shape as ``value`` (batched ``wrap_step``
+    derives the run-shared move key from it).
     """
-    def __init__(self, value: jax.Array):
+
+    def __init__(self, value: jax.Array, rng_key: jax.Array | None = None):
         self.value = value
+        if rng_key is None:
+            n = int(np.prod(jnp.shape(value)))
+            rng_key = jax.random.split(jax.random.key(0), n).reshape(
+                jnp.shape(value)
+            )
+        self.rng_key = rng_key
 
     def tree_flatten(self):
-        return (self.value,), ()
+        return (self.value, self.rng_key), ()
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        return cls(children[0])
+        # Bypass __init__: JAX may unflatten with placeholder leaves.
+        obj = cls.__new__(cls)
+        obj.value, obj.rng_key = children
+        return obj
 
 
 jax.tree_util.register_pytree_node_class(_FakeState)
@@ -207,8 +221,8 @@ class TestVmapRuns:
         ev_out, hmax_out = d.reduce_for_termination(log_ev, hmax)
         assert isinstance(ev_out, float)
         assert isinstance(hmax_out, float)
-        assert abs(ev_out - (-10.0)) < 1e-6   # min(log_evidence)
-        assert abs(hmax_out - 5.0) < 1e-6     # max(hmax)
+        assert abs(ev_out - (-10.0)) < 1e-6  # min(log_evidence)
+        assert abs(hmax_out - 5.0) < 1e-6  # max(hmax)
 
     def test_reduce_scalar_outputs(self):
         d = VmapRuns(n_runs=5)
@@ -288,9 +302,9 @@ class TestPmapVmapRuns:
         n_gpu, n_per_gpu = 1, 3
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
         base_key = jax.random.key(0)
-        per_replica_keys = jax.random.split(base_key, n_gpu * n_per_gpu).reshape(
-            n_gpu, n_per_gpu
-        )
+        per_replica_keys = jax.random.split(
+            base_key, n_gpu * n_per_gpu
+        ).reshape(n_gpu, n_per_gpu)
         result = d.split_keys(per_replica_keys, 5)
         assert result.shape == (n_gpu, n_per_gpu, 5)
 
@@ -298,9 +312,9 @@ class TestPmapVmapRuns:
         """Two calls with the same (G, P) keys produce identical results."""
         n_gpu, n_per_gpu = 1, 2
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
-        per_replica_keys = jax.random.split(jax.random.key(7), n_gpu * n_per_gpu).reshape(
-            n_gpu, n_per_gpu
-        )
+        per_replica_keys = jax.random.split(
+            jax.random.key(7), n_gpu * n_per_gpu
+        ).reshape(n_gpu, n_per_gpu)
         r1 = d.split_keys(per_replica_keys, 4)
         r2 = d.split_keys(per_replica_keys, 4)
         np.testing.assert_array_equal(
@@ -311,9 +325,9 @@ class TestPmapVmapRuns:
     def test_split_keys_under_jit(self):
         n_gpu, n_per_gpu = 1, 3
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
-        per_replica_keys = jax.random.split(jax.random.key(3), n_gpu * n_per_gpu).reshape(
-            n_gpu, n_per_gpu
-        )
+        per_replica_keys = jax.random.split(
+            jax.random.key(3), n_gpu * n_per_gpu
+        ).reshape(n_gpu, n_per_gpu)
 
         @jax.jit
         def _split(keys):
@@ -328,12 +342,12 @@ class TestPmapVmapRuns:
         """reduce_for_termination on (G, P) input returns worst-of scalars."""
         d = PmapVmapRuns(n_gpu=1, n_per_gpu=3)
         log_ev = jnp.array([[-10.0, -5.0, -7.0]])  # (1, 3)
-        hmax = jnp.array([[2.0, 5.0, 3.0]])         # (1, 3)
+        hmax = jnp.array([[2.0, 5.0, 3.0]])  # (1, 3)
         ev_out, hmax_out = d.reduce_for_termination(log_ev, hmax)
         assert isinstance(ev_out, float)
         assert isinstance(hmax_out, float)
-        assert abs(ev_out - (-10.0)) < 1e-6   # min across all
-        assert abs(hmax_out - 5.0) < 1e-6     # max across all
+        assert abs(ev_out - (-10.0)) < 1e-6  # min across all
+        assert abs(hmax_out - 5.0) < 1e-6  # max across all
 
     def test_reduce_scalar_outputs(self):
         d = PmapVmapRuns(n_gpu=1, n_per_gpu=4)
@@ -376,8 +390,8 @@ class _FakePop:
 
 
 _DESCRIPTOR_CASES = [
-    pytest.param(SingleRun(),                        id="single"),
-    pytest.param(VmapRuns(n_runs=3),                 id="vmap_R3"),
+    pytest.param(SingleRun(), id="single"),
+    pytest.param(VmapRuns(n_runs=3), id="vmap_R3"),
     pytest.param(PmapVmapRuns(n_gpu=2, n_per_gpu=3), id="pmap_G2P3"),
 ]
 
@@ -500,14 +514,20 @@ class TestScalarKey:
         assert jnp.asarray(d.scalar_key(key)).ndim == 0
         # Same bits going in and out for a scalar input.
         out = d.scalar_key(key)
-        assert jax.random.key_data(out).tolist() == jax.random.key_data(key).tolist()
+        assert (
+            jax.random.key_data(out).tolist()
+            == jax.random.key_data(key).tolist()
+        )
 
     def test_batched_takes_replica_zero(self):
         d = VmapRuns(n_runs=4)
         flat = jax.random.split(jax.random.key(11), 4)
         out = d.scalar_key(flat)
         # The first replica's key should match.
-        assert jax.random.key_data(out).tolist() == jax.random.key_data(flat[0]).tolist()
+        assert (
+            jax.random.key_data(out).tolist()
+            == jax.random.key_data(flat[0]).tolist()
+        )
 
     @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
     def test_jit(self, descriptor):
@@ -541,8 +561,15 @@ class TestFromShapePrefix:
             from_shape_prefix((1, 2, 3))
 
     def test_roundtrip_via_shape_prefix(self):
-        for d in (SingleRun(), VmapRuns(n_runs=4), PmapVmapRuns(n_gpu=2, n_per_gpu=3)):
-            assert from_shape_prefix(d.shape_prefix).shape_prefix == d.shape_prefix
+        for d in (
+            SingleRun(),
+            VmapRuns(n_runs=4),
+            PmapVmapRuns(n_gpu=2, n_per_gpu=3),
+        ):
+            assert (
+                from_shape_prefix(d.shape_prefix).shape_prefix
+                == d.shape_prefix
+            )
 
 
 class TestWrapForBatch:
@@ -561,7 +588,9 @@ class TestWrapForBatch:
         d = VmapRuns(n_runs=4)
         wrapped = d.wrap_for_batch(self._square)
         out = wrapped(jnp.arange(4, dtype=jnp.float32))
-        np.testing.assert_array_equal(np.asarray(out), np.array([0.0, 1.0, 4.0, 9.0]))
+        np.testing.assert_array_equal(
+            np.asarray(out), np.array([0.0, 1.0, 4.0, 9.0])
+        )
 
     def test_pmap_vmap_runs_on_GP_batch(self):
         n_devices = jax.local_device_count()

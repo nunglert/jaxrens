@@ -226,9 +226,19 @@ def build_mwg(
         rng_key: Key[Array, ""],
         state: Any,
         likelihood_constraint: float | Float[Array, ""],
+        move_key: Key[Array, ""] | None = None,
     ) -> tuple[Any, MoveInfo]:
-        """One MWG step: randomly select a move and execute it."""
+        """One MWG step: randomly select a move and execute it.
+
+        ``move_key``, when given, replaces the per-step selection key.  Under
+        ``vmap`` a batched switch index lowers to ``select`` and evaluates
+        EVERY move branch; callers that vmap over chains/runs pass a key that
+        is unbatched (shared across the mapped axis) so the index stays
+        unbatched and ``lax.switch`` remains a real conditional.
+        """
         key_select, key_move = jax.random.split(rng_key)
+        if move_key is not None:
+            key_select = move_key
         move_idx = jax.random.choice(key_select, n_moves, p=move_probs)
 
         new_state, info = jax.lax.switch(
