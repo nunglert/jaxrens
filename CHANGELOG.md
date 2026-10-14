@@ -9,7 +9,7 @@ The version is derived from git tags by `setuptools-scm` (tag `v0.1.0` →
 version `0.1.0`). To cut a release: add a dated section below, merge to `main`,
 then `git tag -a vX.Y.Z`.
 
-## [Unreleased]
+## [0.6.0] — 2026-10-14
 
 ### Changed
 - **Soft-core and ensemble corrections are additive terms, not wrapper
@@ -31,6 +31,9 @@ then `git tag -a vX.Y.Z`.
   lag, output, `max_iterations`, …) silently grew `n_cull`-fold.
   `n_cull = 1` configs resolve exactly as before; `n_cull > 1` per-walker
   configs now resolve to `1 / n_cull` of their previous iteration counts.
+- **JAX version cap removed.** `jax[cuda12]` / `jaxlib` are now `>=0.9.0`
+  with no upper bound; the upstream flax bugs that required the `<0.11.2`
+  cap are fixed.
 
 ### Fixed
 - **MWG evaluated every move kernel on every MCMC step.** The move index
@@ -63,7 +66,9 @@ then `git tag -a vX.Y.Z`.
   `n_cull` on every run path, and `Monitor.from_directory` /
   `MonitorCollection` read it back instead of hardcoding 1.  `run.n_cull`
   joins the restart immutables, and the schema rejects
-  `2 * n_cull + n_extra > n_live`.  `n_cull = 1` sampling is bit-identical.
+  `2 * n_cull + n_extra > n_live`.  For `n_cull = 1` the cull/clone
+  logic is unchanged (seeded runs still differ from 0.5.0 because of the
+  MWG move-key fix above).
 - **Prior-mass weights now follow pymatnest's `calc_log_a`.** Post-processing
   used `(N - n_cull)/(N + 1 - n_cull)` per dead point — `(N-1)/N` for
   `n_cull = 1`, i.e. one walker too few, a ~`i/N²` drift in `log X` — while
@@ -83,6 +88,12 @@ then `git tag -a vX.Y.Z`.
   poisons gradients.
 - **Soft core counted twice on the single-run CLI path.** The resolver
   already added it to `base_backend`; `run_from_config` added it again.
+- **Periodic cells with a zero diagonal were evaluated as clusters.** The
+  NeuralIL and Nequix backends picked the non-periodic dummy box by testing
+  the cell's trace, so valid cells such as the fcc primitive
+  `[[0,a,a],[a,0,a],[a,a,0]]` were silently treated as an isolated cluster
+  in vacuum. The new `jaxrens.utils.cell.nonperiodic_safe_cell` tests the
+  determinant instead.
 
 ## [0.5.0] — 2026-09-30
 
