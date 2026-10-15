@@ -747,10 +747,89 @@ def _sample_per_walker_positions(
     return jnp.stack(positions_list, axis=0)
 
 
+def _backend_z_table(energy_backend: EnergyBackend | None) -> list[int] | None:
+    """Return the model's species table (index -> Z), or ``None`` if it has none.
+
+    Model-based backends (MACE, NeuralIL, nequix, jax-md) expose an
+    ``atomic_numbers`` attribute that defines the order the model expects
+    species indices in (one-hot over the z-table).  Backends without one (LJ,
+    toy) accept arbitrary contiguous type indices.
+    """
+    model = (
+        unwrap_model(energy_backend) if energy_backend is not None else None
+    )
+    if model is None or not hasattr(model, "atomic_numbers"):
+        return None
+    try:
+        return [int(z) for z in model.atomic_numbers]
+    except (TypeError, ValueError):
+        return None
+
+
+def _z_to_backend_index(
+    zs: list[int], backend_table: list[int], source: object
+) -> dict[int, int]:
+    """Map each atomic number in ``zs`` to its index in the model's z-table."""
+    missing = sorted(z for z in set(zs) if z not in backend_table)
+    if missing:
+        raise ValueError(
+            f"{source} references atomic numbers {missing} not in the "
+            f"backend z-table (atomic_numbers length {len(backend_table)})."
+        )
+    return {z: backend_table.index(z) for z in zs}
+
+
+def _remap_types_to_backend(
+    types: jnp.ndarray,
+    symbol_map: dict[int, str],
+    energy_backend: EnergyBackend | None,
+    source: object,
+) -> tuple[jnp.ndarray, dict[int, str]]:
+    """Re-index file-loaded species into the backend's z-table.
+
+    Structure / walker-set loaders are backend-agnostic: they number species
+    0, 1, ... in order of first appearance.  A model with a z-table expects
+    the index of each element in that table instead (e.g. Si -> 14 for an
+    89-element foundation model, not 0 = H).  This mirrors the
+    ``start_species`` mapping.  Backends without a z-table get the loader's
+    indices unchanged.
+
+    Returns:
+        ``(types, symbol_map)`` in backend index space.
+    """
+    backend_table = _backend_z_table(energy_backend)
+    if backend_table is None:
+        return types, symbol_map
+
+    from ase.data import atomic_numbers as symbol_to_z
+
+    unknown = sorted(s for s in symbol_map.values() if s not in symbol_to_z)
+    if unknown:
+        raise ValueError(
+            f"{source}: species labels {unknown} are not element symbols, so "
+            f"they cannot be mapped onto the model's z-table. Store element "
+            f"symbols in the file (for HDF5, a 'symbol_map' attribute)."
+        )
+    old_to_z = {idx: symbol_to_z[sym] for idx, sym in symbol_map.items()}
+    z_to_idx = _z_to_backend_index(
+        list(old_to_z.values()), backend_table, source
+    )
+
+    lut = np.zeros(max(old_to_z) + 1, dtype=np.int32)
+    for old, z in old_to_z.items():
+        lut[old] = z_to_idx[z]
+    new_types = jnp.asarray(lut[np.asarray(types)], dtype=jnp.int32)
+    new_symbol_map = {
+        z_to_idx[z]: symbol_map[old] for old, z in old_to_z.items()
+    }
+    return new_types, new_symbol_map
+
+
 def _resolve_init_walker_set(
     init: InitSpec,
     cell_cfg: CellSpec,
     n_live: int,
+    energy_backend: EnergyBackend | None = None,
 ) -> ResolvedInit:
     """Mode C: load a pre-computed set of N walker configurations from disk.
 
@@ -771,16 +850,22 @@ def _resolve_init_walker_set(
 
     walker_set = load_walker_set(Path(init.start_walker_set), n_live)
     n_atoms = walker_set.types.shape[1]
+    types, symbol_map = _remap_types_to_backend(
+        walker_set.types,
+        walker_set.symbol_map,
+        energy_backend,
+        init.start_walker_set,
+    )
 
     _validate_cells(walker_set.cells, n_atoms, cell_cfg)
 
     return ResolvedInit(
         initial_positions=walker_set.positions,
-        initial_types=walker_set.types,
+        initial_types=types,
         initial_cells=walker_set.cells,
         initial_energies=None,
         initial_max_neighbor_counts=None,
-        symbol_map=walker_set.symbol_map,
+        symbol_map=symbol_map,
     )
 
 
@@ -862,7 +947,7 @@ def _resolve_init(
         return _resolve_init_restart(init, cell_cfg, n_live)
 
     if init.start_walker_set is not None:
-        return _resolve_init_walker_set(init, cell_cfg, n_live)
+        return _resolve_init_walker_set(init, cell_cfg, n_live, energy_backend)
 
     if init.start_config_file is not None:
         return _resolve_init_config_file(
@@ -914,30 +999,14 @@ def _resolve_init_species(
     unique_z = sorted(set(types_list))
     from ase.data import chemical_symbols
 
-    # Backend-aware species mapping. Model-based backends (MACE, and in the
-    # future NeuralIL) expose an ``atomic_numbers`` attribute that defines the
-    # order the model expects species indices in (one-hot over the z-table).
-    # The default path (LJ, toy) uses contiguous 0-based indices over the
-    # sorted unique Z-numbers.
-    backend_table: list[int] | None = None
-    model = (
-        unwrap_model(energy_backend) if energy_backend is not None else None
-    )
-    if model is not None and hasattr(model, "atomic_numbers"):
-        try:
-            backend_table = [int(z) for z in model.atomic_numbers]
-        except (TypeError, ValueError):
-            backend_table = None
-
+    backend_table = _backend_z_table(energy_backend)
     if backend_table is not None:
-        missing = [z for z in unique_z if z not in backend_table]
-        if missing:
-            raise ValueError(
-                f"start_species references atomic numbers {missing} not in the "
-                f"backend z-table (atomic_numbers length {len(backend_table)})."
-            )
-        z_to_idx = {z: backend_table.index(z) for z in unique_z}
+        z_to_idx = _z_to_backend_index(
+            unique_z, backend_table, "start_species"
+        )
     else:
+        # Default path (LJ, toy): contiguous 0-based indices over the sorted
+        # unique Z-numbers.
         z_to_idx = {z: i for i, z in enumerate(unique_z)}
 
     type_indices = [z_to_idx[z] for z in types_list]
@@ -1043,6 +1112,9 @@ def _resolve_init_config_file(
     )
     positions_single, types_single, cell_single, symbol_map = load_structure(
         init.start_config_file
+    )
+    types_single, symbol_map = _remap_types_to_backend(
+        types_single, symbol_map, energy_backend, init.start_config_file
     )
     n_atoms = positions_single.shape[0]
 
