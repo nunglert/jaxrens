@@ -1471,6 +1471,125 @@ class TestBackendAwareSpeciesMapping:
         assert bool((result.initial_types == result.initial_types[0]).all())
 
 
+def _write_si_o_frames(path: Path, n_frames: int) -> None:
+    """Write ``n_frames`` copies of a Si2O cell, Si listed first."""
+    import ase.io
+    from ase import Atoms
+
+    atoms = Atoms(
+        "Si2O",
+        positions=[[0.0, 0.0, 0.0], [2.0, 2.0, 2.0], [1.0, 3.0, 1.0]],
+        cell=[6.0, 6.0, 6.0],
+        pbc=True,
+    )
+    ase.io.write(str(path), [atoms.copy() for _ in range(n_frames)])
+
+
+class TestBackendAwareSpeciesMappingFromFile:
+    """File-based init modes map species onto the backend z-table too.
+
+    The loaders number species 0, 1, ... in order of first appearance; with
+    an 89-element z-table that turned Si into index 0 (= H).
+    """
+
+    def test_config_file_uses_backend_z_table(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitSpec
+
+        p = tmp_path / "founder.extxyz"
+        _write_si_o_frames(p, 1)
+        backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
+        cfg = InitSpec(
+            start_config_file=p,
+            random_initialise_pos=False,
+            random_initialise_cell=False,
+        )
+        result = _resolve_init(cfg, n_live=2, seed=0, energy_backend=backend)
+        # Si (Z=14) -> idx 13, O (Z=8) -> idx 7.
+        assert list(map(int, result.initial_types[0])) == [13, 13, 7]
+        assert result.symbol_map == {13: "Si", 7: "O"}
+
+    def test_config_file_without_z_table_keeps_loader_indices(self, tmp_path):
+        from jaxrens.backends.toy import create_harmonic
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitSpec
+
+        p = tmp_path / "founder.extxyz"
+        _write_si_o_frames(p, 1)
+        cfg = InitSpec(
+            start_config_file=p,
+            random_initialise_pos=False,
+            random_initialise_cell=False,
+        )
+        result = _resolve_init(
+            cfg, n_live=2, seed=0, energy_backend=create_harmonic()
+        )
+        assert list(map(int, result.initial_types[0])) == [0, 0, 1]
+        assert result.symbol_map == {0: "Si", 1: "O"}
+
+    def test_config_file_missing_z_raises(self, tmp_path):
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitSpec
+
+        p = tmp_path / "founder.extxyz"
+        _write_si_o_frames(p, 1)
+        backend = _FakeZTableBackend(atomic_numbers=[1, 8])
+        cfg = InitSpec(
+            start_config_file=p,
+            random_initialise_pos=False,
+            random_initialise_cell=False,
+        )
+        with pytest.raises(ValueError, match=r"atomic numbers \[14\]"):
+            _resolve_init(cfg, n_live=2, seed=0, energy_backend=backend)
+
+    def test_walker_set_extxyz_uses_backend_z_table(self, tmp_path):
+        import jax.numpy as jnp
+
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitSpec
+
+        p = tmp_path / "walkers.extxyz"
+        _write_si_o_frames(p, 3)
+        backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
+        cfg = InitSpec(
+            start_walker_set=p,
+            random_initialise_pos=False,
+            random_initialise_cell=False,
+        )
+        result = _resolve_init(cfg, n_live=3, seed=0, energy_backend=backend)
+        assert result.initial_types.shape == (3, 3)
+        assert bool((result.initial_types == jnp.array([13, 13, 7])).all())
+        assert result.symbol_map == {13: "Si", 7: "O"}
+
+    def test_walker_set_hdf5_uses_symbol_map(self, tmp_path):
+        import json
+
+        import h5py
+        import jax.numpy as jnp
+        import numpy as np
+
+        from jaxrens.cli.resolve import _resolve_init
+        from jaxrens.cli.schema.init import InitSpec
+
+        p = tmp_path / "walkers.h5"
+        with h5py.File(p, "w") as f:
+            f["positions"] = np.zeros((2, 3, 3), dtype=np.float32)
+            f["types"] = np.array([[0, 0, 1]] * 2, dtype=np.int32)
+            f["cells"] = np.broadcast_to(
+                np.eye(3, dtype=np.float32) * 6.0, (2, 3, 3)
+            )
+            f.attrs["symbol_map"] = json.dumps({"0": "Si", "1": "O"})
+        backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
+        cfg = InitSpec(
+            start_walker_set=p,
+            random_initialise_pos=False,
+            random_initialise_cell=False,
+        )
+        result = _resolve_init(cfg, n_live=2, seed=0, energy_backend=backend)
+        assert bool((result.initial_types == jnp.array([13, 13, 7])).all())
+        assert result.symbol_map == {13: "Si", 7: "O"}
+
+
 class _BucketRecordingBackend:
     """Stub backend exposing ``max_neighbors_for`` and recording the
     ``max_neighbors`` value passed into ``__call__``.

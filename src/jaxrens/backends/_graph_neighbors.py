@@ -12,6 +12,7 @@ graph-NN backends, not a public API.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -49,7 +50,10 @@ def _neighbor_mask(
     compute true neighbor counts without allocating the edge buffer or
     running the GNN forward.
     """
-    cart_shifts = image_offsets @ cell
+    # HIGHEST precision: GPU default matmul is TF32-like (see lj.py).
+    cart_shifts = jnp.matmul(
+        image_offsets, cell, precision=jax.lax.Precision.HIGHEST
+    )
     super_positions = (
         positions[None, :, :] + cart_shifts[:, None, :]
     ).reshape(-1, 3)
@@ -81,7 +85,14 @@ def _supercell_edges(
     r_cutoff: float,
     max_edges: int,
     image_offsets: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
     """Find edges within cutoff using supercell expansion. JIT-compatible.
 
     Args:
@@ -106,7 +117,9 @@ def _supercell_edges(
 
     # Cartesian shift for each image: (sc_dim, 3).  Rebuilt below alongside
     # the mask; kept out of _neighbor_mask so it's available for edge shifts.
-    cart_shifts = image_offsets @ cell
+    cart_shifts = jnp.matmul(
+        image_offsets, cell, precision=jax.lax.Precision.HIGHEST
+    )
 
     # Edge mask: (N, sc_dim * N), within cutoff and not self-interaction.
     mask = _neighbor_mask(positions, cell, r_cutoff, image_offsets)
@@ -121,7 +134,9 @@ def _supercell_edges(
     flat_mask = mask.ravel()
     n_total = n_atoms * sc_dim * n_atoms
     fill_val = n_total  # out-of-bounds sentinel
-    flat_indices = jnp.nonzero(flat_mask, size=max_edges, fill_value=fill_val)[0]
+    flat_indices = jnp.nonzero(flat_mask, size=max_edges, fill_value=fill_val)[
+        0
+    ]
 
     n_actual = jnp.sum(flat_mask)
     overflow = n_actual > max_edges

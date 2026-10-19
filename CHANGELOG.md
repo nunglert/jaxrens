@@ -9,6 +9,44 @@ The version is derived from git tags by `setuptools-scm` (tag `v0.1.0` →
 version `0.1.0`). To cut a release: add a dated section below, merge to `main`,
 then `git tag -a vX.Y.Z`.
 
+## [0.7.0] — 2026-10-19
+
+### Added
+- **`refresh_direction` option for GMC moves.** `{type: gmc,
+  refresh_direction: true}` draws a fresh random direction on every GMC call
+  instead of perturbing the stored one, so the direction only persists within
+  one `n_reflect` trajectory. Both settings are valid samplers; the flag trades
+  GMC's cross-call momentum for faster decorrelation and is mainly a
+  diagnostic switch. Default `false` (unchanged behaviour).
+
+### Fixed
+- **GMC was not invariant whenever its direction persisted between calls.**
+  On rejection the kernel stored minus the *unperturbed* direction instead of
+  minus the perturbed direction the trajectory actually used, so the
+  perturbation was discarded although the accept/reject decision had been
+  made for it. This breaks invariance of the uniform distribution inside the
+  contour and drifts walkers to lower energy: NS runs came out too cold. On
+  LJ₈ (periodic box, `n_live` 500, GMC 20 steps, `n_extra` 15) the
+  configurational temperature was 18 % low and ⟨U⟩ up to 0.4 ε too low
+  against canonical MC; with the fix both agree within statistics. The bias
+  grows with the number of GMC calls per walker (`n_mcmc_steps`, `n_extra`).
+  Seeded GMC runs are not reproducible against earlier versions.
+- **Reduced-precision matmuls in periodic backends on GPU.** JAX's default
+  float32 matmul precision on GPU is TF32-like, which rounded the cell to
+  ~10 mantissa bits in the minimum-image conversion and image shifts of
+  `LJBackend`, the shared MIC helper (`backends/geometry.py`), the GNN edge
+  builder (`backends/_graph_neighbors.py`, used by MACE/Nequix/NeuralIL) and
+  the jax-md fractional-coordinate conversion. Since NS walkers are never
+  wrapped, coordinates drift far outside the cell and stored LJ energies were
+  off by up to ~0.3 ε. These matmuls now use `precision=HIGHEST`.
+- **Species from structure/walker files were not mapped onto the model's
+  z-table.** File loaders number species `0, 1, …` in order of first
+  appearance, but backends with a z-table (MACE, NeuralIL, Nequix, jax-md)
+  expect each element's index in their `atomic_numbers` table. File-loaded
+  types are now re-indexed into the backend's table, mirroring
+  `start_species`; elements missing from the table, or labels that are not
+  element symbols, raise a clear error.
+
 ## [0.6.0] — 2026-10-14
 
 ### Changed

@@ -300,6 +300,13 @@ class TestGMCSpeciesSchema:
         assert spec._kernel_kwargs(symbol_map=_SYMBOL_MAP) == {"n_reflect": 5}
         assert "direction" in spec._extra_state_fields()
 
+    def test_refresh_direction_reaches_kernel_kwargs(self):
+        spec = GMCMoveSpec(refresh_direction=True)
+        assert spec._kernel_kwargs(symbol_map=_SYMBOL_MAP) == {
+            "n_reflect": 5,
+            "refresh_direction": True,
+        }
+
     def test_unknown_species_raises(self):
         spec = GMCMoveSpec(species=["Xe"])
         with pytest.raises(ValueError, match="not present in the system"):

@@ -102,6 +102,7 @@ def build_kernel(
     use_forces: bool = True,
     species: tuple[int, ...] | None = None,
     direction_field: str = "direction",
+    refresh_direction: bool = False,
 ):
     """Build a Galilean Monte Carlo move kernel.
 
@@ -114,6 +115,11 @@ def build_kernel(
         species: Type codes this move may displace; every other atom is
             held fixed for the whole trajectory.  ``None`` (the default)
             moves all atoms.  See the module docstring.
+        refresh_direction: If True, draw a fresh random direction on every
+            call instead of perturbing the stored one, so persistence is
+            limited to the ``n_reflect`` steps of one trajectory.  Both
+            settings leave the uniform distribution invariant; the flag only
+            trades GMC's cross-call momentum for faster decorrelation.
         direction_field: Name of the MCState field holding this move's
             persistent direction.  Species-scoped moves **must** each use a
             distinct field: ``build_mwg`` unions ``extra_state_fields`` by
@@ -149,11 +155,12 @@ def build_kernel(
                 state.positions.dtype
             )
 
-        # Initialize direction if zero (first call), otherwise perturb
+        # Draw a fresh direction if zero (first call) or on every call with
+        # ``refresh_direction``; otherwise perturb the stored one.
         dir_norm = jnp.sqrt(jnp.sum(prev_direction**2))
-        is_zero = dir_norm < 1e-8
+        draw_fresh = (dir_norm < 1e-8) | refresh_direction
         direction = jnp.where(
-            is_zero,
+            draw_fresh,
             _random_direction(key_init, state.positions.shape, mask),
             _perturb_direction(
                 key_perturb, prev_direction, perturb_angle, mask
@@ -265,17 +272,18 @@ def build_kernel(
         # Accept if final energy < Emax
         accepted = final_energy < likelihood_constraint
 
-        # If rejected: revert to initial positions, flip direction
+        # If rejected: revert to initial positions and flip the direction the
+        # trajectory actually used -- the *perturbed* one.  Flipping
+        # ``prev_direction`` instead discards the perturbation while the
+        # accept/reject decision was made for it, which breaks invariance of
+        # uniform(positions) x uniform(direction) whenever the direction
+        # persists into the next call (LJ8 NS: up to ~18 % too cold).
         new_state = state.set(
             positions=jnp.where(accepted, final_pos, state.positions),
             energy=jnp.where(accepted, final_energy, state.energy),
             max_neighbor_count=acc_count,
             overflow=acc_overflow,
-            **{
-                direction_field: jnp.where(
-                    accepted, final_dir, -prev_direction
-                )
-            },
+            **{direction_field: jnp.where(accepted, final_dir, -direction)},
         )
 
         # n_reflect calls to value_and_grad (when use_forces=True),

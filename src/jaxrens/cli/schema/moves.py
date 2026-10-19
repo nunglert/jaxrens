@@ -302,6 +302,15 @@ class GMCMoveSpec(BaseMoveSpec):
             "the other.  Scoped moves are auto-named ``gmc_<symbols>``."
         ),
     )
+    refresh_direction: bool = Field(
+        default=False,
+        description=(
+            "Draw a fresh random direction on every GMC call instead of "
+            "perturbing the previous one, so the direction only persists "
+            "within one trajectory of ``n_reflect`` steps.  Valid either "
+            "way; mainly a decorrelation / diagnostic switch."
+        ),
+    )
 
     @field_validator("species", mode="before")
     @classmethod
@@ -374,6 +383,9 @@ class GMCMoveSpec(BaseMoveSpec):
         symbol_map: dict[int, str] | None = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"n_reflect": self.n_reflect}
+        # Only emitted when set, for the same comparability reason as below.
+        if self.refresh_direction:
+            kwargs["refresh_direction"] = True
         # Only emit the scoping kwargs when the move is actually scoped: the
         # kernel defaults are exactly ``species=None`` /
         # ``direction_field="direction"``, so an unscoped spec keeps producing
