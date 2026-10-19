@@ -29,6 +29,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 
 from jaxrens.backends._graph_neighbors import _make_image_offsets
@@ -143,13 +144,20 @@ class LJBackend:
         # Triclinic minimum-image: project to fractional coords, round, project
         # back. Replaces the previous diag-only MIC, which was wrong for any
         # sheared cell produced by shear / stretch moves.
+        # HIGHEST precision: the GPU default (TF32-like) matmul rounds the
+        # cell to ~10 mantissa bits, so image shifts of unwrapped walkers
+        # (|x| >> L) came out wrong by ~1e-2 and corrupted the energies.
         inv_cell = jnp.linalg.inv(safe_cell)
-        dr_frac = dr @ inv_cell
-        dr_mic = dr - jnp.round(dr_frac) @ safe_cell  # (N, N, 3)
+        dr_frac = jnp.matmul(dr, inv_cell, precision=jax.lax.Precision.HIGHEST)
+        dr_mic = dr - jnp.matmul(
+            jnp.round(dr_frac), safe_cell, precision=jax.lax.Precision.HIGHEST
+        )  # (N, N, 3)
 
         # Add explicit supercell image translations on top of the MIC pair.
         # image_translations: (K, 3), broadcast to (K, N, N, 3).
-        image_translations = self._image_offsets @ safe_cell
+        image_translations = jnp.matmul(
+            self._image_offsets, safe_cell, precision=jax.lax.Precision.HIGHEST
+        )
         dr_kij = dr_mic[None, :, :, :] + image_translations[:, None, None, :]
         r2 = jnp.sum(dr_kij**2, axis=-1)  # (K, N, N)
 

@@ -11,6 +11,7 @@ values.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 
@@ -46,10 +47,16 @@ def pairwise_distances(
     # non-periodic branch so the discarded MIC values never poison gradients.
     periodic = jnp.abs(jnp.linalg.det(cell)) > 1e-10
     safe_cell = jnp.where(periodic, cell, jnp.eye(3, dtype=cell.dtype))
-    frac = positions @ jnp.linalg.inv(safe_cell)
+    # HIGHEST precision: the GPU default matmul is TF32-like and would round
+    # the cell (and hence every MIC displacement) to ~10 mantissa bits.
+    frac = jnp.matmul(
+        positions,
+        jnp.linalg.inv(safe_cell),
+        precision=jax.lax.Precision.HIGHEST,
+    )
     df = frac[:, None, :] - frac[None, :, :]
     df = df - jnp.round(df)
-    mic_delta = df @ safe_cell
+    mic_delta = jnp.matmul(df, safe_cell, precision=jax.lax.Precision.HIGHEST)
 
     delta = jnp.where(periodic, mic_delta, raw_delta)
     # Gradient-safe norm: ``d/dx sqrt(x)`` is infinite at the zero diagonal,

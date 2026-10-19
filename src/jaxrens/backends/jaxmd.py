@@ -57,6 +57,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 
 from jaxrens.backends.base import BackendResult
@@ -203,7 +204,11 @@ class JaxMDBackend:
             # because jax-md's Tersoff is numerically broken in absolute
             # coords (see that helper's docstring).  Convert here so the
             # rest of jaxrens can keep storing Cartesian positions.
-            frac_positions = positions @ jnp.linalg.inv(cell)
+            frac_positions = jnp.matmul(
+                positions,
+                jnp.linalg.inv(cell),
+                precision=jax.lax.Precision.HIGHEST,
+            )
             e = self._energy_fn(frac_positions, new_box=cell)
         else:
             e = self._energy_fn(positions)

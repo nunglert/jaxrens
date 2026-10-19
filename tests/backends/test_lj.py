@@ -286,6 +286,24 @@ class TestTriclinicMIC:
         )
         assert jnp.allclose(e, ref, atol=1e-5, rtol=1e-5)
 
+    def test_invariant_under_large_lattice_translations(self):
+        # NS walkers are not wrapped, so |x| >> L is routine.  The MIC
+        # matmuls must not lose precision there: under the GPU default
+        # (TF32-like) matmul precision this was off by ~1e-2.
+        key_pos, key_shift = jax.random.split(jax.random.PRNGKey(1))
+        cell = jnp.eye(3) * 6.0034575  # not exactly representable in TF32
+        positions = jax.random.uniform(key_pos, (8, 3), minval=0.0, maxval=6.0)
+        shifts = jax.random.randint(key_shift, (8, 3), -8, 9)
+        shifted = positions + shifts.astype(jnp.float32) @ cell
+
+        be = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5)
+        types = jnp.zeros(8, dtype=jnp.int32)
+        e = jax.jit(lambda p: be(p, types, cell).energy)
+        assert jnp.allclose(e(shifted), e(positions), atol=1e-3), (
+            e(shifted),
+            e(positions),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Supercell-image enumeration — additional images for tight cells
