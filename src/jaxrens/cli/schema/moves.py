@@ -705,8 +705,21 @@ class SingleAtomSweepMoveSpec(BaseMoveSpec):
             "atom in the sweep."
         ),
     )
-    max_neighbors: int | None = Field(default=None)
-    max_affected: int | None = Field(default=None)
+    max_neighbors: int | None = Field(
+        default=None,
+        description=(
+            "Explicit neighbor-count bound used to size the local-update "
+            "buffer. Derived automatically from the backend when omitted."
+        ),
+    )
+    max_affected: int | None = Field(
+        default=None,
+        description=(
+            "Explicit upper bound on the number of atoms the local-update "
+            "cache patch can touch per proposal. Derived automatically from "
+            "``max_neighbors`` when omitted."
+        ),
+    )
 
     def _build_kernel(self) -> Callable:
         return single_atom.build_sweep_kernel
@@ -804,8 +817,21 @@ class SpeciesSwapMoveSpec(BaseMoveSpec):
             "warning otherwise."
         ),
     )
-    max_neighbors: int | None = Field(default=None)
-    max_affected: int | None = Field(default=None)
+    max_neighbors: int | None = Field(
+        default=None,
+        description=(
+            "Explicit neighbor-count bound used to size the local-update "
+            "buffer. Derived automatically from the backend when omitted."
+        ),
+    )
+    max_affected: int | None = Field(
+        default=None,
+        description=(
+            "Explicit upper bound on the number of atoms the local-update "
+            "cache patch can touch per proposal. Derived automatically from "
+            "``max_neighbors`` when omitted."
+        ),
+    )
 
     @field_validator("species", mode="before")
     @classmethod
@@ -1113,8 +1139,21 @@ class AlchemicalMorphMoveSpec(BaseMoveSpec):
             "warning otherwise."
         ),
     )
-    max_neighbors: int | None = Field(default=None)
-    max_affected: int | None = Field(default=None)
+    max_neighbors: int | None = Field(
+        default=None,
+        description=(
+            "Explicit neighbor-count bound used to size the local-update "
+            "buffer. Derived automatically from the backend when omitted."
+        ),
+    )
+    max_affected: int | None = Field(
+        default=None,
+        description=(
+            "Explicit upper bound on the number of atoms the local-update "
+            "cache patch can touch per proposal. Derived automatically from "
+            "``max_neighbors`` when omitted."
+        ),
+    )
     # NOTE: n_species could in principle be derived from len(symbol_map) in
     # init_resolved, but that would require threading symbol_map through the
     # resolver to to_descriptor().  Since it is single-valued and small, keeping

@@ -164,7 +164,7 @@ class BaseBackendSpec(BaseModel):
     )
 
     # Second, independent bucket-ladder dimension: the periodic-image
-    # half-width used by local-update move kernels (single_atom_swap,
+    # half-width used by local-update move kernels (species_swap,
     # alchemical_morph, single_atom, single_atom_sweep — see
     # sampling/neighbor_list.py::build_symmetric_image_offsets). Same
     # overflow-and-retry mechanism as max_neighbors_list/offset/
@@ -172,10 +172,33 @@ class BaseBackendSpec(BaseModel):
     # two ladders never conflict. Inert (never triggers) when no move has
     # ``local_update: true``.
     image_neighbors_list: list[int] = Field(
-        default_factory=lambda: [1, 2, 3, 4, 6, 8, 12]
+        default_factory=lambda: [1, 2, 3, 4, 6, 8, 12],
+        description=(
+            "Ascending ladder of periodic-image half-widths for "
+            "local-update move kernels (see ``image_neighbors_offset``). "
+            "Same overflow-and-retry mechanism as ``max_neighbors_list``, "
+            "on an independent field triple. Inert unless a move sets "
+            "``local_update: true``."
+        ),
     )
-    image_neighbors_offset: int = Field(default=1, ge=0)
-    image_neighbors_shrink_dwell: int = Field(default=0, ge=0)
+    image_neighbors_offset: int = Field(
+        default=1,
+        ge=0,
+        description=(
+            "Headroom added to the observed required image half-width "
+            "before choosing a ladder entry from ``image_neighbors_list``."
+        ),
+    )
+    image_neighbors_shrink_dwell: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Consecutive iterations that must fit a smaller image-bucket "
+            "entry before it is stepped down. ``0`` (default) keeps the "
+            "escalate-only behaviour, mirroring "
+            "``max_neighbors_shrink_dwell``."
+        ),
+    )
 
     @field_validator("max_neighbors_list", "image_neighbors_list")
     @classmethod

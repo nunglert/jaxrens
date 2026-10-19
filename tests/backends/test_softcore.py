@@ -428,3 +428,152 @@ class TestSchemaMutex:
         spec = LJBackendSpec(epsilon=1.0, sigma=1.0)
         cfg = spec.to_backend_config()
         assert cfg.softcore_repulsion is None
+
+
+# ---------------------------------------------------------------------------
+# local_energy_delta: the O(K*N) incremental path used by local_update moves
+# ---------------------------------------------------------------------------
+
+
+class TestSoftCoreLocalEnergyDelta:
+    """``SoftCoreTerm.local_energy_delta`` must match a full
+    ``energy(new) - energy(old)`` recompute, for any touched-atom set — this
+    is what lets ``local_update: true`` stay exact even with
+    ``softcore_repulsion`` configured (see ``sampling/local_energy.py::
+    patch_term_energies``). float32 reality: the two paths take different
+    computational routes (O(K*N) vs. the full O(N^2) sum), so they are
+    compared with a relative tolerance, not bit-for-bit — the same
+    convention used throughout this codebase for local-vs-full energy
+    comparisons (e.g. ``tests/sampling/test_local_energy_integration.py``).
+    """
+
+    def _term(self):
+        from jaxrens.backends.softcore import SoftCoreTerm
+
+        return SoftCoreTerm(
+            a0=A0, b0=B0, d0=D0, r_core_cut=R_CUT, r_core_switch=R_SWITCH
+        )
+
+    def _random_config(self, n, cell_length, seed):
+        rng = np.random.default_rng(seed)
+        positions = jnp.asarray(
+            rng.uniform(0.0, cell_length, size=(n, 3)), dtype=jnp.float32
+        )
+        types = jnp.zeros(n, dtype=jnp.int32)
+        cell = _cell(cell_length)
+        return positions, types, cell
+
+    def _assert_delta_matches_full_recompute(
+        self, term, touched_idx, old_positions, new_positions, types, cell
+    ):
+        e_old = term.energy(old_positions, types, cell)
+        e_new = term.energy(new_positions, types, cell)
+        delta_full = e_new - e_old
+        delta_local = term.local_energy_delta(
+            jnp.asarray(touched_idx),
+            old_positions,
+            types,
+            new_positions,
+            types,
+            cell,
+        )
+        # Relative tolerance, not bit-for-bit: the O(K*N) and O(N^2) paths
+        # take different floating-point routes to the same analytic
+        # quantity, and float32 rounding gets amplified near the soft-core
+        # cutoff's steepest slope. 1e-2 is still ~25x tighter than the
+        # formula bug this test is meant to catch (a missing/incorrect
+        # double-count correction changes the result by tens of percent,
+        # not a fraction of one).
+        scale = max(float(jnp.abs(delta_full)), 1.0)
+        assert (
+            abs(float(delta_full) - float(delta_local)) < 1e-2 * scale
+        ), f"delta_full={float(delta_full)} delta_local={float(delta_local)}"
+
+    def test_single_touched_atom(self):
+        term = self._term()
+        positions, types, cell = self._random_config(
+            n=16, cell_length=10.0, seed=0
+        )
+        touched = [3]
+        new_positions = positions.at[touched[0]].add(
+            jnp.array([0.2, -0.1, 0.05])
+        )
+        self._assert_delta_matches_full_recompute(
+            term, touched, positions, new_positions, types, cell
+        )
+
+    def test_two_touched_atoms_far_apart(self):
+        term = self._term()
+        positions, types, cell = self._random_config(
+            n=16, cell_length=10.0, seed=1
+        )
+        touched = [2, 9]
+        new_positions = positions.at[jnp.array(touched)].add(
+            jnp.array([[0.2, 0.1, 0.0], [-0.1, 0.2, 0.1]])
+        )
+        self._assert_delta_matches_full_recompute(
+            term, touched, positions, new_positions, types, cell
+        )
+
+    def test_two_touched_atoms_close_together(self):
+        """Exercises the S_TT double-count correction: the moved atoms are
+        close enough to each other to interact directly, not just with the
+        untouched background."""
+        term = self._term()
+        rng = np.random.default_rng(2)
+        positions = jnp.asarray(
+            rng.uniform(0.0, 10.0, size=(10, 3)), dtype=jnp.float32
+        )
+        # Force two atoms within the soft-core cutoff of each other.
+        positions = positions.at[1].set(
+            positions[0] + jnp.array([R_SWITCH * 0.5, 0.0, 0.0])
+        )
+        types = jnp.zeros(10, dtype=jnp.int32)
+        cell = _cell(10.0)
+
+        touched = [0, 1]
+        new_positions = positions.at[jnp.array(touched)].add(
+            jnp.array([[0.1, 0.0, 0.0], [-0.05, 0.05, 0.0]])
+        )
+        self._assert_delta_matches_full_recompute(
+            term, touched, positions, new_positions, types, cell
+        )
+
+    def test_types_only_change_is_exactly_zero(self):
+        """SoftCoreTerm depends only on geometry — a species-only change
+        (as in species_swap/alchemical_morph) must give an exact zero
+        delta, not just a small one."""
+        term = self._term()
+        positions, types, cell = self._random_config(
+            n=8, cell_length=10.0, seed=3
+        )
+        new_types = types.at[0].set(1).at[1].set(0)
+
+        delta = term.local_energy_delta(
+            jnp.array([0, 1]),
+            positions,
+            types,
+            positions,
+            new_types,
+            cell,
+        )
+        assert float(delta) == 0.0
+
+    def test_jit_compatible(self):
+        term = self._term()
+        positions, types, cell = self._random_config(
+            n=12, cell_length=10.0, seed=4
+        )
+        touched = jnp.array([4, 7])
+        new_positions = positions.at[touched].add(0.1)
+
+        jit_delta = jax.jit(term.local_energy_delta)(
+            touched, positions, types, new_positions, types, cell
+        )
+        eager_delta = term.local_energy_delta(
+            touched, positions, types, new_positions, types, cell
+        )
+        # Both are expected to be near-zero here (touched atoms far from
+        # everything) — compare with an absolute floor so float32 noise
+        # around zero doesn't trip the default atol.
+        assert jnp.allclose(jit_delta, eager_delta, atol=1e-5)

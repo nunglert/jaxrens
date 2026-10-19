@@ -1,7 +1,7 @@
 """Integration tests for local/incremental energy updates through build_mwg.
 
 Exercises the full wiring: MoveKernel.affects -> build_mwg's capability
-check and cache plumbing -> single_atom_swap/alchemical_morph's local path
+check and cache plumbing -> species_swap/alchemical_morph's local path
 -> NeuralILBackend.atomic_energies_for -> agreement with a from-scratch
 full recomputation. Requires the real NeuralIL backend (skipped otherwise).
 """
@@ -32,24 +32,32 @@ def toy_backend():
     return create_harmonic(k=1.0)
 
 
-def _local_extra_state_fields():
+def _local_extra_state_fields(n_terms=0):
     return {
         "atomic_energies": (
             jnp.ndarray,
             lambda positions, types: jnp.zeros(positions.shape[0]),
         ),
         "raw_energy": (jnp.ndarray, lambda positions, types: jnp.asarray(0.0)),
+        "term_energies": (
+            jnp.ndarray,
+            lambda positions, types, n=n_terms: jnp.zeros(n),
+        ),
     }
 
 
-def _swap_kernel_descriptor(max_affected):
+def _swap_kernel_descriptor(max_affected, n_species, species=None):
     from jaxrens.sampling.move_kernel import MoveKernel
-    from jaxrens.sampling.moves import single_atom
+    from jaxrens.sampling.moves import swap
 
     return MoveKernel(
-        name="single_atom_swap",
-        build_kernel=single_atom.build_swap_kernel,
-        kernel_kwargs={"max_affected": max_affected},
+        name="species_swap",
+        build_kernel=swap.build_kernel,
+        kernel_kwargs={
+            "n_species": n_species,
+            "species": species,
+            "max_affected": max_affected,
+        },
         mutates=frozenset({"types"}),
         affects="local",
         extra_state_fields=_local_extra_state_fields(),
@@ -125,6 +133,132 @@ def _volume_kernel_descriptor(n_atoms, step_size=2.0):
     )
 
 
+class TestPatchTermEnergies:
+    """``patch_term_energies`` (the generalized per-``EnergyTerm`` cache
+    patcher) in isolation — no NeuralIL required, since it only ever reads
+    ``backend.terms``, never the model. Covers the two branches every local
+    move kernel relies on: a term with its own ``local_energy_delta``
+    (``SoftCoreTerm``) and a term without one, which must fall back to a
+    full two-evaluation recompute for itself only (``EnsembleTerm``) — see
+    ``backends/hamiltonian.py::EnergyTerm.local_energy_delta`` and
+    ``sampling/local_energy.py::patch_term_energies``.
+    """
+
+    def test_no_terms_is_a_noop(self):
+        from jaxrens.sampling.local_energy import patch_term_energies
+
+        backend = object()  # no .terms attribute at all
+        term_energies = jnp.zeros(0)
+        touched = jnp.array([0])
+        positions = jnp.zeros((2, 3))
+        types = jnp.zeros(2, dtype=jnp.int32)
+        cell = jnp.eye(3) * 10.0
+
+        result = patch_term_energies(
+            backend,
+            term_energies,
+            touched,
+            positions,
+            types,
+            positions,
+            types,
+            cell,
+            None,
+        )
+        assert result.shape == (0,)
+
+    def test_ensemble_term_fallback_matches_full_recompute(self):
+        """EnsembleTerm has no local_energy_delta override, so the
+        fallback (energy(new) - energy(old), added to the cache) must
+        reproduce exactly what re-evaluating EnsembleTerm.energy from
+        scratch would give."""
+        from jaxrens.backends.ensemble import EnsembleTerm
+        from jaxrens.backends.hamiltonian import Hamiltonian
+        from jaxrens.sampling.local_energy import patch_term_energies
+
+        class _ZeroModel:
+            r_cutoff = 1.0
+
+        term = EnsembleTerm(
+            pressure=0.5, chemical_potentials=jnp.array([0.1, -0.2])
+        )
+        backend = Hamiltonian(_ZeroModel(), [term])
+
+        old_types = jnp.array([0, 0, 1])
+        new_types = jnp.array([0, 1, 1])  # species counts change
+        positions = jnp.zeros((3, 3))
+        cell = jnp.eye(3) * 5.0
+
+        term_energies_old = jnp.array(
+            [term.energy(positions, old_types, cell)]
+        )
+        patched = patch_term_energies(
+            backend,
+            term_energies_old,
+            jnp.array([1]),
+            positions,
+            old_types,
+            positions,
+            new_types,
+            cell,
+            None,
+        )
+        expected = term.energy(positions, new_types, cell)
+        assert jnp.allclose(patched[0], expected)
+
+    def test_softcore_and_ensemble_terms_combine_correctly(self):
+        """The case the original design would have silently dropped:
+        SoftCoreTerm *and* EnsembleTerm active together. Each term's
+        contribution must be patched independently and sum to the exact
+        total a from-scratch Hamiltonian evaluation would give."""
+        from jaxrens.backends.ensemble import EnsembleTerm
+        from jaxrens.backends.hamiltonian import Hamiltonian
+        from jaxrens.backends.softcore import SoftCoreTerm
+        from jaxrens.sampling.local_energy import patch_term_energies
+
+        class _ZeroModel:
+            r_cutoff = 1.0
+
+            def __call__(self, positions, species, cell, max_neighbors, **kw):
+                from jaxrens.backends.base import BackendResult
+
+                return BackendResult(energy=jnp.asarray(0.0))
+
+        softcore = SoftCoreTerm()
+        ensemble = EnsembleTerm(pressure=0.3)
+        backend = Hamiltonian(_ZeroModel(), [softcore, ensemble])
+
+        rng = np.random.default_rng(0)
+        positions = jnp.asarray(
+            rng.uniform(0.0, 10.0, size=(10, 3)), dtype=jnp.float32
+        )
+        types = jnp.zeros(10, dtype=jnp.int32)
+        cell = jnp.eye(3, dtype=jnp.float32) * 10.0
+
+        touched = jnp.array([2])
+        new_positions = positions.at[2].add(jnp.array([0.3, -0.1, 0.0]))
+
+        term_energies_old = jnp.array(
+            [t.energy(positions, types, cell) for t in backend.terms]
+        )
+        patched = patch_term_energies(
+            backend,
+            term_energies_old,
+            touched,
+            positions,
+            types,
+            new_positions,
+            types,
+            cell,
+            None,
+        )
+        expected_total = sum(
+            float(t.energy(new_positions, types, cell)) for t in backend.terms
+        )
+        scale = max(abs(expected_total), 1.0)
+        assert abs(float(jnp.sum(patched)) - expected_total) < 1e-2 * scale
+
+
 class TestBuildMwgGracefulDowngrade:
     """build_mwg never rejects a move-set: a move that declares
     affects='local' but whose backend doesn't support the subset-energy
@@ -151,7 +285,7 @@ class TestBuildMwgGracefulDowngrade:
             ]
         )
         cell = 10.0 * np.eye(3)
-        desc = _swap_kernel_descriptor(max_affected=6)
+        desc = _swap_kernel_descriptor(max_affected=6, n_species=2)
 
         with caplog.at_level("WARNING"):
             init_fn, step_fn, _ = build_mwg(toy_backend, [desc])
@@ -216,7 +350,9 @@ class TestLocalUpdateThroughBuildMwg:
         image_bucket = initial_image_bucket_for_cell(
             np.asarray(cell), backend.r_cutoff
         )
-        desc = _swap_kernel_descriptor(max_affected=n_atoms)
+        desc = _swap_kernel_descriptor(
+            max_affected=n_atoms, n_species=n_species
+        )
 
         init_fn, step_fn, _ = build_mwg(backend, [desc])
 
@@ -446,7 +582,7 @@ class TestLocalUpdateThroughBuildMwg:
     def test_swap_and_single_atom_together_stay_consistent(
         self, backend, config
     ):
-        """Two DIFFERENT local moves in the same set: single_atom_swap
+        """Two DIFFERENT local moves in the same set: species_swap
         relabels species without moving anything, single_atom moves one
         atom's position — before Stage 3's unification, combining these
         would have silently invalidated swap's precomputed static neighbor
@@ -468,7 +604,9 @@ class TestLocalUpdateThroughBuildMwg:
         image_bucket = initial_image_bucket_for_cell(
             np.asarray(cell), backend.r_cutoff
         )
-        swap_desc = _swap_kernel_descriptor(max_affected=n_atoms)
+        swap_desc = _swap_kernel_descriptor(
+            max_affected=n_atoms, n_species=n_species
+        )
         single_atom_desc = _single_atom_kernel_descriptor(max_affected=n_atoms)
 
         init_fn, step_fn, _ = build_mwg(backend, [swap_desc, single_atom_desc])

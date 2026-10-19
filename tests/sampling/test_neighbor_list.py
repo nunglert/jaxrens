@@ -49,7 +49,7 @@ def _brute_force_neighbors(positions, cell, r_cutoff, image_range=3):
 
 
 class TestLocalAffectedMask:
-    """Species-only affected-set search (single_atom_swap, alchemical_morph)
+    """Species-only affected-set search (species_swap, alchemical_morph)
     — positions never move, so unlike TestDynamicAffectedMask there is no
     before/after distinction; a single neighbor search against the current
     positions is enough. Recomputed fresh on every call from whatever
@@ -106,7 +106,7 @@ class TestLocalAffectedMask:
         assert bool(mask[0]) and not bool(mask[1])
 
     def test_two_touched_atoms_union(self):
-        """single_atom_swap touches two atoms — the affected set is the
+        """species_swap touches two atoms — the affected set is the
         UNION of both neighborhoods, not just one."""
         positions = np.array(
             [

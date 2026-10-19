@@ -403,7 +403,7 @@ def _run_loop(
             ``max_neighbors_list``/``max_neighbors_offset``/
             ``max_neighbors_shrink_dwell`` above, applied to a SEPARATE
             dimension: the periodic-image half-width used by local-update
-            move kernels (``single_atom_swap``, ``alchemical_morph``,
+            move kernels (``species_swap``, ``alchemical_morph``,
             ``single_atom``, ``single_atom_sweep`` — see
             ``sampling/neighbor_list.py::build_symmetric_image_offsets``).
             Managed by a second, independent :class:`BucketManager`

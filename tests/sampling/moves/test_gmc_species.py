@@ -47,6 +47,8 @@ def _make_state(
         n_proposed=jnp.zeros(n_moves, dtype=jnp.int32),
         max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
         overflow=jnp.asarray(False),
+        image_count_needed=jnp.asarray(0, dtype=jnp.int32),
+        image_overflow=jnp.asarray(False),
         ensemble_params={},
     )
     for name in direction_fields:

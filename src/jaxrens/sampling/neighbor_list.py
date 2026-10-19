@@ -1,6 +1,6 @@
 """Affected-atom-set queries for local ("few atoms changed") move kernels.
 
-Every local move (``single_atom_swap``, ``alchemical_morph``,
+Every local move (``species_swap``, ``alchemical_morph``,
 ``single_atom``, ``single_atom_sweep``) recomputes its affected-atom set
 fresh, in JAX, on every proposal, from the CURRENT ``state.positions``/
 ``state.cell`` — never from a cached/precomputed structure. This is
@@ -20,7 +20,7 @@ Two flavors, depending on whether the move itself moves the touched
 atom(s):
 
 - **Species-only** (:func:`local_affected_mask`): for moves that relabel
-  species without moving positions (``single_atom_swap``,
+  species without moving positions (``species_swap``,
   ``alchemical_morph``) — a single neighbor search against the current
   positions is enough, since the touched atom(s) don't move.
 - **Position-changing** (:func:`dynamic_affected_mask`): for moves that
@@ -203,7 +203,7 @@ def local_affected_mask(
     image_offsets: jnp.ndarray,
 ) -> jnp.ndarray:
     """JIT-compatible boolean ``(n_atoms,)`` affected-set mask for moves
-    that relabel species WITHOUT moving positions (``single_atom_swap``,
+    that relabel species WITHOUT moving positions (``species_swap``,
     ``alchemical_morph``).
 
     Recomputed fresh on every proposal from CURRENT ``positions``/``cell``

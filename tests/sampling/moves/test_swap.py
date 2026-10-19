@@ -35,6 +35,8 @@ def _make_state(positions, types, energy, step_size=0.1):
         n_proposed=jnp.zeros(1, dtype=jnp.int32),
         max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
         overflow=jnp.asarray(False),
+        image_count_needed=jnp.asarray(0, dtype=jnp.int32),
+        image_overflow=jnp.asarray(False),
         ensemble_params={},
     )
 
@@ -266,6 +268,8 @@ class TestTransforms:
             n_proposed=jnp.zeros((n_walkers, 1), dtype=jnp.int32),
             max_neighbor_count=jnp.zeros(n_walkers, dtype=jnp.int32),
             overflow=jnp.full(n_walkers, False),
+            image_count_needed=jnp.zeros(n_walkers, dtype=jnp.int32),
+            image_overflow=jnp.full(n_walkers, False),
             ensemble_params={},
         )
         step_fn = swap.build_kernel(backend, n_species=2)
