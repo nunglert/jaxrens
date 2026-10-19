@@ -219,6 +219,32 @@ class TestGalileanStep:
         dir_norm = jnp.sqrt(jnp.sum(new_state.direction**2))
         assert dir_norm > 0.1
 
+    @pytest.mark.parametrize("refresh", [False, True])
+    def test_refresh_direction_flag(self, harmonic, positions, types, refresh):
+        """Stored direction is perturbed by default, redrawn with the flag."""
+        d0 = jnp.ones_like(positions) / jnp.sqrt(positions.size)
+        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
+        state = state.set(direction=d0)
+        step = gmc_build_kernel(
+            harmonic, n_reflect=3, refresh_direction=refresh
+        )
+
+        # Loose constraint: no reflections, every trajectory accepted, so the
+        # final direction is the (perturbed or fresh) initial one.
+        keys = jax.random.split(jax.random.key(0), 200)
+        new_states, info = jax.jit(
+            jax.vmap(lambda k: step(k, state, likelihood_constraint=1e6))
+        )(keys)
+        assert bool(jnp.all(info.accepted))
+
+        cos = jnp.abs(jnp.sum(new_states.direction * d0, axis=(1, 2)))
+        if refresh:
+            # Random unit vectors in 6 dims: E|cos| ~ 0.33.
+            assert float(cos.mean()) < 0.6
+        else:
+            # 0.1 rad-scale nudge of d0.
+            assert float(cos.min()) > 0.9
+
     def test_jit(self, harmonic, positions, types):
         backend = harmonic
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
@@ -357,6 +383,64 @@ class TestGalileanBaldockSemantics:
         # is zero on first call, so this just checks final_dir is not
         # used in the reject branch — position-invariance is the real
         # signal here).
+
+    def test_reject_flips_the_perturbed_direction(
+        self, harmonic, positions, types
+    ):
+        """On reject the stored direction is minus the *perturbed* direction
+        the trajectory used, not minus the stored one.  Flipping the stored
+        one discards the perturbation the accept/reject was decided for."""
+        from jaxrens.sampling.moves.galilean import _perturb_direction
+
+        d0 = jnp.ones_like(positions) / jnp.sqrt(positions.size)
+        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.5)
+        state = state.set(direction=d0)
+        key = jax.random.key(0)
+        step = jax.jit(gmc_build_kernel(harmonic, n_reflect=4))
+        new_state, info = step(key, state, likelihood_constraint=0.1)
+        assert not bool(info.accepted)
+
+        # Same key split as the kernel: (init, perturb, reflect).
+        _, key_perturb, _ = jax.random.split(key, 3)
+        used = _perturb_direction(key_perturb, d0, 0.1)
+        assert jnp.allclose(new_state.direction, -used, atol=1e-6)
+        assert not jnp.allclose(new_state.direction, -d0, atol=1e-3)
+
+    def test_persistent_direction_keeps_uniform_ball_invariant(self, harmonic):
+        """Start exactly uniform in {0.5|q|^2 < 0.5} (a 6-D unit ball) with
+        uniform directions and apply 100 persistent GMC calls at a fixed
+        constraint: <r^2> must stay d/(d+2) = 0.75.  With the old reject
+        branch (flip the unperturbed direction) it drifts inward to ~0.732,
+        the same too-cold bias seen in NS on LJ8."""
+        n, n_atoms, d = 8000, 2, 6
+        k_dir, k_rad, k_v, k_run = jax.random.split(jax.random.key(0), 4)
+        x = jax.random.normal(k_dir, (n, d))
+        x = x / jnp.linalg.norm(x, axis=1, keepdims=True)
+        x = x * jax.random.uniform(k_rad, (n, 1)) ** (1 / d)
+        x = x.reshape(n, n_atoms, 3)
+        v = jax.random.normal(k_v, x.shape)
+        v = v / jnp.linalg.norm(v.reshape(n, -1), axis=1)[:, None, None]
+
+        state = jax.vmap(
+            lambda p, e: _make_gmc_state(
+                p, jnp.zeros(n_atoms, jnp.int32), e, step_size=0.15
+            )
+        )(x, 0.5 * jnp.sum(x**2, axis=(1, 2)))
+        state = state.set(direction=v)
+        step = jax.vmap(
+            gmc_build_kernel(harmonic, n_reflect=4), in_axes=(0, 0, None)
+        )
+
+        def body(st, key):
+            st, _ = step(jax.random.split(key, n), st, 0.5)
+            return st, None
+
+        final, _ = jax.jit(
+            lambda st: jax.lax.scan(body, st, jax.random.split(k_run, 100))
+        )(state)
+        r2 = jnp.sum(final.positions**2, axis=(1, 2))
+        # statistical error ~0.0022; the old kernel was ~0.018 low
+        assert abs(float(r2.mean()) - d / (d + 2)) < 0.006, float(r2.mean())
 
     def test_accept_advances_through_intermediate_violations(
         self,
