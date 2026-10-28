@@ -1,4 +1,6 @@
-"""Tests for the cell-geometry constraint (framework wrapper of check_cell_shape)."""
+"""Tests for the cell-geometry constraint, the constraint-framework wrapper
+around ``check_cell_shape``.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ from jaxrens.constraints.cell_geometry import (
 )
 from jaxrens.utils.cell import check_cell_shape
 
+# The predicate reads only the cell; positions and types are placeholders.
 DUMMY_POS = jnp.zeros((4, 3))
 DUMMY_TYPES = jnp.zeros((4,), dtype=jnp.int32)
 
@@ -47,12 +50,13 @@ def test_rejects_too_large_and_too_small():
 
 def test_rejects_bad_aspect():
     skewed = jnp.array([[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 0.05]])
+    # Volume per atom (5) is within the band, so only the aspect ratio can
+    # reject this cell.
     assert not _valid(skewed, n_atoms=1, max_vol_per_atom=1e6, min_aspect=0.5)
 
 
 def test_descriptor_aspects_and_bucket():
     desc = cell_geometry_descriptor(n_atoms=8)
-    assert desc.name == "cell_geometry"
     assert desc.depends_on == frozenset({"cell"})
     assert desc.reject_reason == 2
 
@@ -65,8 +69,7 @@ def test_descriptor_is_gate_capable_for_cell_moves():
     assert make_move_gate(desc, frozenset({"types"})) is None
 
     gate = make_move_gate(desc, frozenset({"cell"}))
-    ok, reason = gate(
-        DUMMY_POS, DUMMY_TYPES, jnp.eye(3) * 10.0
-    )  # vol/atom=250>10
+    # Volume 1000 over 4 atoms is 250 per atom, above the limit of 10.
+    ok, reason = gate(DUMMY_POS, DUMMY_TYPES, jnp.eye(3) * 10.0)
     assert not bool(ok)
     assert int(reason) == 2

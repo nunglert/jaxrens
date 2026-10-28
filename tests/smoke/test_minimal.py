@@ -1,12 +1,29 @@
-"""Sub-second smoke checks: package imports and a minimal NS run per dispatcher."""
+"""Sub-second smoke checks: package imports and a minimal NS run through
+each dispatcher (``run_ns``, ``run_ns_parallel``, ``run_ns_multi_gpu``).
+
+Only the harmonic backend is used, so nothing here compiles a real model.
+"""
 
 from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
 
+from jaxrens.backends.toy import create_harmonic
+from jaxrens.sampling.move_kernel import MoveKernel
+from jaxrens.sampling.moves import random_walk
+from jaxrens.sampling.mwg import build_mwg
+from jaxrens.sampling.nested_sampling import (
+    run_ns,
+    run_ns_multi_gpu,
+    run_ns_parallel,
+)
+
 _N_WALKERS: int = 4
 _N_ATOMS: int = 1
+# run_ns adds a PriorMassTermination next to IterationTermination, and with
+# 4 walkers it usually fires before _MAX_ITERATIONS. The tests only check
+# that the loop ran, so n_dead may land anywhere in [1, _MAX_ITERATIONS].
 _MAX_ITERATIONS: int = 50
 _N_MCMC_STEPS: int = 10
 _N_RUNS_PARALLEL: int = 2
@@ -26,13 +43,8 @@ def test_package_imports() -> None:
 
 
 def test_minimal_ns_completes() -> None:
-    """Single-run NS with the harmonic backend finishes."""
-    from jaxrens.backends.toy import create_harmonic
-    from jaxrens.sampling.move_kernel import MoveKernel
-    from jaxrens.sampling.moves import random_walk
-    from jaxrens.sampling.mwg import build_mwg
-    from jaxrens.sampling.nested_sampling import run_ns
-
+    """Smallest legal single run: no cells, callbacks, burn-in, RENS or
+    adaptation."""
     backend = create_harmonic(k=1.0)
     descriptors = [
         MoveKernel(
@@ -65,19 +77,11 @@ def test_minimal_ns_completes() -> None:
     )
     assert jnp.isfinite(result["log_evidence"])
     n_dead = int(result["n_dead"])
-    assert (
-        1 <= n_dead <= _MAX_ITERATIONS
-    ), f"n_dead={n_dead} outside [1, {_MAX_ITERATIONS}]"
+    assert 1 <= n_dead <= _MAX_ITERATIONS
 
 
 def test_minimal_ns_parallel_completes() -> None:
-    """Same via run_ns_parallel (batched runs)."""
-    from jaxrens.backends.toy import create_harmonic
-    from jaxrens.sampling.move_kernel import MoveKernel
-    from jaxrens.sampling.moves import random_walk
-    from jaxrens.sampling.mwg import build_mwg
-    from jaxrens.sampling.nested_sampling import run_ns_parallel
-
+    """Same run through ``run_ns_parallel``, with a leading ``n_runs`` axis."""
     backend = create_harmonic(k=1.0)
     descriptors = [
         MoveKernel(
@@ -110,25 +114,18 @@ def test_minimal_ns_parallel_completes() -> None:
         n_mcmc_steps=_N_MCMC_STEPS,
     )
     log_z = jnp.asarray(result["log_evidence"])
-    assert log_z.shape == (
-        _N_RUNS_PARALLEL,
-    ), f"expected ({_N_RUNS_PARALLEL},), got {log_z.shape}"
-    assert jnp.all(jnp.isfinite(log_z)), f"non-finite log_evidence: {log_z}"
+    assert log_z.shape == (_N_RUNS_PARALLEL,)
+    assert jnp.all(jnp.isfinite(log_z))
     n_dead = jnp.asarray(result["n_dead"])
     assert n_dead.shape == (_N_RUNS_PARALLEL,)
-    assert jnp.all(
-        (n_dead >= 1) & (n_dead <= _MAX_ITERATIONS)
-    ), f"n_dead={n_dead} outside [1, {_MAX_ITERATIONS}] per replica"
+    assert jnp.all((n_dead >= 1) & (n_dead <= _MAX_ITERATIONS))
 
 
 def test_minimal_ns_multi_gpu_completes() -> None:
-    """Same via run_ns_multi_gpu; pmap over one device runs on CPU too."""
-    from jaxrens.backends.toy import create_harmonic
-    from jaxrens.sampling.move_kernel import MoveKernel
-    from jaxrens.sampling.moves import random_walk
-    from jaxrens.sampling.mwg import build_mwg
-    from jaxrens.sampling.nested_sampling import run_ns_multi_gpu
+    """Same run through ``run_ns_multi_gpu`` with ``n_gpu=1, n_per_gpu=2``.
 
+    ``pmap`` over a single device does nothing, so this also runs on CPU.
+    """
     backend = create_harmonic(k=1.0)
     descriptors = [
         MoveKernel(
@@ -164,16 +161,16 @@ def test_minimal_ns_multi_gpu_completes() -> None:
         n_mcmc_steps=_N_MCMC_STEPS,
     )
     log_z = jnp.asarray(result["log_evidence"])
-    assert log_z.shape == (
-        _N_GPU,
-        _N_PER_GPU,
-    ), f"expected (n_gpu, n_per_gpu)=({_N_GPU}, {_N_PER_GPU}), got {log_z.shape}"
-    assert jnp.all(jnp.isfinite(log_z)), f"non-finite log_evidence: {log_z}"
+    assert log_z.shape == (_N_GPU, _N_PER_GPU)
+    assert jnp.all(jnp.isfinite(log_z))
     n_dead = jnp.asarray(result["n_dead"])
     assert n_dead.shape == (_N_GPU, _N_PER_GPU)
-    assert jnp.all(
-        (n_dead >= 1) & (n_dead <= _MAX_ITERATIONS)
-    ), f"n_dead={n_dead} outside [1, {_MAX_ITERATIONS}] per replica"
-    # Live walkers retained their (G, P, n_walkers, n_atoms, 3) layout.
+    assert jnp.all((n_dead >= 1) & (n_dead <= _MAX_ITERATIONS))
     positions_out = jnp.asarray(result["positions"])
-    assert positions_out.shape == (_N_GPU, _N_PER_GPU, _N_WALKERS, _N_ATOMS, 3)
+    assert positions_out.shape == (
+        _N_GPU,
+        _N_PER_GPU,
+        _N_WALKERS,
+        _N_ATOMS,
+        3,
+    )
