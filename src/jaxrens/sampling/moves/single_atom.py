@@ -20,23 +20,47 @@ from jaxrens.sampling.base import MoveInfo
 from jaxrens.unvalidated import unvalidated
 
 
-def build_kernel(backend: Any):
+def build_kernel(backend: Any, species: tuple[int, ...] | None = None):
     """Build a single-atom random displacement kernel.
 
     Args:
         backend: EnergyBackend instance.
+        species: Type codes this move may displace.  The atom is drawn
+            uniformly among atoms of these types and the rest are never
+            touched, so the move keeps its own adapted step size (a mobile
+            sublattice is not capped by a stiff one).  ``None`` (the
+            default) draws among all atoms.
 
     Returns:
         step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
+
+    Note:
+        The draw is uniform over the in-scope atoms, so the proposal is
+        symmetric and the acceptance test is unchanged.  If no atom of the
+        scope is present in a walker the displacement is zero (the identity
+        move, which always "accepts"); the resolver rejects species absent
+        from the system.
     """
 
     def step(rng_key, state, likelihood_constraint):
         key_atom, key_disp = jax.random.split(rng_key)
 
         n_atoms = state.positions.shape[0]
-        atom_idx = jax.random.randint(key_atom, (), 0, n_atoms)
+        if species is None:
+            atom_idx = jax.random.randint(key_atom, (), 0, n_atoms)
+            in_scope = True
+        else:
+            # Mask from ``state.types`` at trace time (types can be mutated
+            # by swap/alchemical moves), as in the scoped GMC.
+            codes = jnp.asarray(species, dtype=state.types.dtype)
+            mask = jnp.isin(state.types, codes)
+            n_scope = jnp.sum(mask)
+            in_scope = n_scope > 0
+            probs = mask / jnp.maximum(n_scope, 1)
+            atom_idx = jax.random.choice(key_atom, n_atoms, p=probs)
 
         displacement = state.step_size * jax.random.normal(key_disp, (3,))
+        displacement = jnp.where(in_scope, displacement, 0.0)
         new_positions = state.positions.at[atom_idx].add(displacement)
 
         result = backend(

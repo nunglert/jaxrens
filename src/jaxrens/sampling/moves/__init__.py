@@ -11,6 +11,7 @@ from jaxrens.sampling.moves import (
     stretch,
     swap,
     volume,
+    volume_axis,
 )
 from jaxrens.sampling.moves.replica_exchange import (
     PressureRENSSwap,

@@ -37,6 +37,7 @@ from jaxrens.cli.schema.moves import (
     SingleAtomMoveSpec,
     SingleAtomSweepMoveSpec,
     StretchMoveSpec,
+    VolumeAxisMoveSpec,
     VolumeMoveSpec,
 )
 from jaxrens.cli.schema.output import OutputSpec
@@ -91,5 +92,6 @@ __all__ = [
     "StretchMoveSpec",
     "TemperatureTerminationSpec",
     "TerminationSpec",
+    "VolumeAxisMoveSpec",
     "VolumeMoveSpec",
 ]

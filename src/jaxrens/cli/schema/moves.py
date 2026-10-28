@@ -27,6 +27,7 @@ from jaxrens.sampling.moves import (
     swap,
     toy_1d,
     volume,
+    volume_axis,
 )
 from jaxrens.state.config import MoveConfig
 
@@ -46,6 +47,7 @@ MoveType = Literal[
     "single_atom_sweep",
     "species_swap",
     "volume",
+    "volume_axis",
     "shear",
     "stretch",
     "alchemical_morph",
@@ -456,19 +458,78 @@ class SingleAtomMoveSpec(BaseMoveSpec):
     evaluation per atom moved, which is why it is usually a supporting move
     rather than the main one.
 
+    ``species`` restricts the draw to atoms of the named element(s).  One
+    scoped move per element gives each sublattice its own adapted step size,
+    e.g. a mobile intercalant next to a stiff host lattice.  Without it the
+    atom is drawn among all atoms, so a majority species dominates the draws
+    and a single step size is shared.
+
     ::
 
         moves:
           - {type: single_atom, step_size: 0.2, weight: 1}
+          - {type: single_atom, species: Li, step_size: 0.2, weight: 4}
     """
 
     type: Literal["single_atom"] = Field(
         default="single_atom",
         description="Discriminator selecting this move.",
     )
+    species: tuple[str, ...] | None = Field(
+        default=None,
+        description=(
+            "Restrict the move to the named element(s): the atom is drawn "
+            "uniformly among them and every other atom is left alone.  A "
+            "bare symbol (``species: Li``) is accepted as shorthand for a "
+            "one-element list.  Scoped moves are auto-named "
+            "``single_atom_<symbols>``; give two moves of the same scope "
+            "distinct ``name`` values."
+        ),
+    )
+
+    @field_validator("species", mode="before")
+    @classmethod
+    def _wrap_bare_symbol(cls, v: Any) -> Any:
+        """Accept ``species: Li`` as shorthand for ``species: [Li]``."""
+        return (v,) if isinstance(v, str) else v
+
+    def _effective_name(self) -> str:
+        if self.name is not None:
+            return self.name
+        if self.species:
+            return "single_atom_" + "_".join(self.species)
+        return self.type
 
     def _build_kernel(self) -> Callable:
         return single_atom.build_kernel
+
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        symbol_map: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        # An unscoped spec keeps producing the historical empty kwargs.
+        if not self.species:
+            return {}
+        if symbol_map is None:
+            raise ValueError(
+                "SingleAtomMoveSpec with species=... requires symbol_map to "
+                "be provided by the resolver (it maps element symbols to the "
+                "type codes stored in WalkerState.types). Build descriptors "
+                "via ResolvedConfig.move_descriptors rather than "
+                "setup_mwg()/MoveConfig, which carry no species information."
+            )
+        code_of = {sym: code for code, sym in symbol_map.items()}
+        unknown = [s for s in self.species if s not in code_of]
+        if unknown:
+            raise ValueError(
+                f"single_atom species {unknown} not present in the system "
+                f"(symbols: {sorted(code_of)}). A scoped move whose element "
+                f"is absent would silently become a no-op that always "
+                f"accepts."
+            )
+        return {"species": tuple(code_of[s] for s in self.species)}
 
 
 class SingleAtomSweepMoveSpec(BaseMoveSpec):
@@ -679,6 +740,77 @@ class VolumeMoveSpec(BaseMoveSpec):
             "min_vol_per_atom": cell_cfg.min_volume_per_atom,
             "min_aspect": cell_cfg.min_aspect_ratio,
             "flat_v_prior": cell_cfg.flat_V_prior,
+        }
+
+
+class VolumeAxisMoveSpec(BaseMoveSpec):
+    """Volume change by lengthening one lattice vector, the rest untouched.
+
+    Scales the component of the chosen lattice vector (``axis``) normal to
+    the plane of the other two.  Those two vectors and the in-plane part of
+    the chosen one do not change, and the atoms keep their fractional
+    coordinates.  For a layered cell whose stacking vector is ``axis`` this
+    changes the interlayer spacing without straining the in-plane lattice or
+    sliding the layers.  The isotropic ``volume`` move and ``stretch`` also
+    strain the stiff plane, so their adapted step sizes stay small; this move
+    gets its own.  ``step_size`` has the units of ``volume`` (volume per
+    atom).
+
+    Acceptance matches ``volume`` (same volume prior, ``cell.flat_V_prior``
+    respected).  Use it alongside ``volume``; in an NPT run it does not
+    replace it.
+
+    ::
+
+        moves:
+          - {type: volume, step_size: 0.3, weight: 1}
+          - {type: volume_axis, axis: c, step_size: 0.3, weight: 1}
+    """
+
+    type: Literal["volume_axis"] = Field(
+        default="volume_axis", description="Discriminator selecting this move."
+    )
+    axis: Literal["a", "b", "c"] = Field(
+        default="c",
+        description=(
+            "Lattice vector whose normal component is scaled (``a``, ``b`` "
+            "or ``c`` = first, second or third cell vector).  Default is "
+            "``c``, the stacking vector of a layered cell."
+        ),
+    )
+
+    def _reject_reasons(self) -> frozenset[str]:
+        return frozenset({"energy", "cell", "prior"})
+
+    def _mutates(self) -> frozenset[str]:
+        return frozenset({"positions", "cell"})
+
+    def _build_kernel(self) -> Callable:
+        return volume_axis.build_kernel
+
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        symbol_map: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        if n_atoms is None:
+            raise ValueError(
+                "VolumeAxisMoveSpec.to_descriptor() requires n_atoms to be "
+                "provided by the resolver (derived from init positions)."
+            )
+        if cell_cfg is None:
+            raise ValueError(
+                "VolumeAxisMoveSpec.to_descriptor() requires cell_cfg to be "
+                "provided by the resolver (from the [cell] config section)."
+            )
+        return {
+            "n_atoms": n_atoms,
+            "max_vol_per_atom": cell_cfg.max_volume_per_atom,
+            "min_vol_per_atom": cell_cfg.min_volume_per_atom,
+            "min_aspect": cell_cfg.min_aspect_ratio,
+            "flat_v_prior": cell_cfg.flat_V_prior,
+            "axis": "abc".index(self.axis),
         }
 
 
@@ -914,6 +1046,7 @@ MoveSpec = Annotated[
         Lattice1DMoveSpec,
         Distance1DMoveSpec,
         VolumeMoveSpec,
+        VolumeAxisMoveSpec,
         ShearMoveSpec,
         StretchMoveSpec,
         AlchemicalMorphMoveSpec,

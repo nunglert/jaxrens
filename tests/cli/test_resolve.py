@@ -217,6 +217,22 @@ class TestToDescriptor:
         desc = spec.to_descriptor()
         assert desc.kernel_kwargs == {}
 
+    def test_single_atom_species_descriptor(self):
+        spec = SingleAtomMoveSpec(species="Li")
+        desc = spec.to_descriptor(symbol_map={0: "C", 1: "Li"})
+        assert desc.name == "single_atom_Li"
+        assert desc.kernel_kwargs == {"species": (1,)}
+
+    def test_single_atom_species_needs_symbol_map(self):
+        with pytest.raises(ValueError, match="symbol_map"):
+            SingleAtomMoveSpec(species="Li").to_descriptor()
+
+    def test_single_atom_species_absent_raises(self):
+        with pytest.raises(ValueError, match="not present"):
+            SingleAtomMoveSpec(species="Na").to_descriptor(
+                symbol_map={0: "C", 1: "Li"}
+            )
+
     def test_volume_descriptor(self):
         from jaxrens.cli.schema.cell import CellSpec
 

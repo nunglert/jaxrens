@@ -245,6 +245,77 @@ class TestSingleAtomMove:
         assert n_changed <= 1
 
 
+class TestSingleAtomMoveSpecies:
+    """``species`` scoping: only atoms of the named types are drawn."""
+
+    def _state_and_step(self, harmonic, positions, types, species):
+        energy = harmonic(positions, types, jnp.zeros((3, 3)), 0)[0]
+        state = _make_state(positions, types, energy, step_size=0.1)
+        step_fn = jax.jit(single_atom.build_kernel(harmonic, species=species))
+        return state, step_fn
+
+    def test_only_scoped_atoms_move(self, harmonic, positions_4atom, types_4):
+        # types_4 = [0, 0, 1, 1]; scope to type 1 -> atoms 2 and 3 only.
+        state, step_fn = self._state_and_step(
+            harmonic, positions_4atom, types_4, species=(1,)
+        )
+        moved = jnp.zeros(4, dtype=bool)
+        for i in range(40):
+            new_state, _ = step_fn(jax.random.key(i), state, 100.0)
+            moved |= jnp.any(new_state.positions != state.positions, axis=1)
+        assert not bool(moved[0]) and not bool(moved[1])
+        assert bool(moved[2]) and bool(moved[3])
+
+    def test_draw_is_uniform_over_scope(self, harmonic, types_4):
+        # One scoped atom among many: it must be drawn every time, where an
+        # unscoped draw would hit it only 1/n of the time.
+        types = jnp.array([0, 0, 0, 1], dtype=jnp.int32)
+        positions = jnp.array(
+            [[0.0, 0, 0], [1.0, 0, 0], [0, 1.0, 0], [0, 0, 1.0]]
+        )
+        state, step_fn = self._state_and_step(
+            harmonic, positions, types, species=(1,)
+        )
+        for i in range(10):
+            new_state, _ = step_fn(jax.random.key(100 + i), state, 100.0)
+            changed = jnp.any(new_state.positions != state.positions, axis=1)
+            assert bool(changed[3]) and not bool(jnp.any(changed[:3]))
+
+    def test_unscoped_stream_unchanged(
+        self, harmonic, positions_4atom, types_4
+    ):
+        """species=None must reproduce the historical kernel exactly."""
+        energy = harmonic(positions_4atom, types_4, jnp.zeros((3, 3)), 0)[0]
+        state = _make_state(positions_4atom, types_4, energy, step_size=0.1)
+        a = jax.jit(single_atom.build_kernel(harmonic))
+        b = jax.jit(single_atom.build_kernel(harmonic, species=None))
+        sa, _ = a(jax.random.key(3), state, 100.0)
+        sb, _ = b(jax.random.key(3), state, 100.0)
+        assert jnp.array_equal(sa.positions, sb.positions)
+
+    def test_absent_species_is_identity(
+        self, harmonic, positions_4atom, types_4
+    ):
+        state, step_fn = self._state_and_step(
+            harmonic, positions_4atom, types_4, species=(7,)
+        )
+        new_state, _ = step_fn(jax.random.key(0), state, 100.0)
+        assert jnp.array_equal(new_state.positions, state.positions)
+
+    def test_vmap_and_scan(self, harmonic, positions_4atom, types_4):
+        state, step_fn = self._state_and_step(
+            harmonic, positions_4atom, types_4, species=(1,)
+        )
+
+        def scan_step(st, key):
+            ns, info = step_fn(key, st, 100.0)
+            return ns, info.accepted
+
+        keys = jax.random.split(jax.random.key(5), 20)
+        final, _ = jax.lax.scan(scan_step, state, keys)
+        assert jnp.array_equal(final.positions[:2], state.positions[:2])
+
+
 # ── SingleAtomSweep Tests ───────────────────────────────────────────────────
 
 
