@@ -9,6 +9,7 @@ from jaxrens.constraints.min_distance import (
     min_distance_descriptor,
 )
 
+# A zero cell means a non-periodic system.
 OPEN = jnp.zeros((3, 3))
 
 
@@ -50,10 +51,10 @@ def test_swap_changes_validity_under_per_pair():
     positions = jnp.array([[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]])
     d_min = jnp.array([[1.0, 1.8], [1.8, 1.0]])  # like: 1.0, cross: 1.8
     pred = build_min_distance(d_min)
-    assert bool(pred(positions, jnp.array([0, 0]), OPEN))  # like-pair ok
-    assert not bool(
-        pred(positions, jnp.array([0, 1]), OPEN)
-    )  # cross-pair fails
+    # The atoms are 1.5 apart: that passes the like-pair floor (1.0) and
+    # fails the cross-pair floor (1.8).
+    assert bool(pred(positions, jnp.array([0, 0]), OPEN))
+    assert not bool(pred(positions, jnp.array([0, 1]), OPEN))
 
 
 def test_minimum_image_periodic_violation():

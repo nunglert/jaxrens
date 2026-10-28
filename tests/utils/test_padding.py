@@ -1,17 +1,7 @@
-"""Tests for jaxrens.utils.padding.pad_to_multiple.
+"""Tests for ``pad_to_multiple`` in ``jaxrens.utils.padding``.
 
-``jax.lax.map(batch_size=N)`` requires the leading axis to be exactly
-divisible by ``N``.  ``pad_to_multiple`` lifts that constraint for the two
-call sites that need it (``init/burn_in.py`` and
-``adaptation/stepsize_handler.py``), so the properties that matter are:
-
-(a) the padded axis really is a multiple of the chunk and ``n_pad`` says how
-    much to slice back off,
-(b) the padding repeats the *last real entry* rather than zeros — the padded
-    slots are fed to an energy backend, and a zero-state walker means
-    coincident atoms and a NaN/inf energy,
-(c) an already-divisible input is returned untouched (no allocation), and
-(d) every leaf of a pytree is padded consistently, so the tree still maps.
+It pads the leading axis of a pytree up to a multiple of the ``lax.map``
+batch size; ``init/burn_in.py`` and ``adaptation/stepsize_handler.py`` call it.
 """
 
 from __future__ import annotations
@@ -23,18 +13,17 @@ import pytest
 
 from jaxrens.utils.padding import pad_to_multiple
 
-# ---------------------------------------------------------------------------
-# Shape / n_pad arithmetic
-# ---------------------------------------------------------------------------
-
 
 class TestPadArithmetic:
+    """Check that ``n_pad`` and the padded length are right, including an
+    empty axis and a chunk larger than the axis."""
+
     @pytest.mark.parametrize(
         "axis_len,chunk,expected_pad",
         [
             (10, 4, 2),  # 10 -> 12
-            (7, 3, 2),  # 7 -> 9
-            (5, 8, 3),  # chunk larger than the axis: 5 -> 8
+            (7, 3, 2),
+            (5, 8, 3),  # chunk larger than the axis
             (1, 4, 3),
             (8, 4, 0),  # already divisible
             (8, 1, 0),  # chunk of 1 never pads
@@ -56,15 +45,12 @@ class TestPadArithmetic:
         assert padded.shape == (8, 3, 7)
 
 
-# ---------------------------------------------------------------------------
-# What the padding contains
-# ---------------------------------------------------------------------------
-
-
 class TestPadContents:
+    """Check that padded slots copy the last real entry, not zeros."""
+
     def test_padding_repeats_the_last_entry_not_zeros(self):
-        # The property that keeps padded slots safe to run through an energy
-        # backend: a zeroed walker would put every atom at the origin.
+        # Padded slots go through the energy backend; a zeroed walker puts
+        # every atom at the origin and gives a NaN/inf energy.
         x = jnp.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
         padded, n_pad = pad_to_multiple(x, 3, 4)
 
@@ -82,18 +68,15 @@ class TestPadContents:
         )
 
     def test_slicing_off_n_pad_recovers_the_input(self):
-        # This is how every call site consumes the result.
         x = jnp.arange(7, dtype=jnp.float32)
         padded, n_pad = pad_to_multiple(x, 7, 4)
         np.testing.assert_allclose(np.asarray(padded[:-n_pad]), np.asarray(x))
 
 
-# ---------------------------------------------------------------------------
-# Pytrees
-# ---------------------------------------------------------------------------
-
-
 class TestPytrees:
+    """Check that every leaf is padded alike and that dtypes and tree
+    structure survive."""
+
     def test_every_leaf_padded_consistently(self):
         tree = {
             "positions": jnp.ones((3, 4, 3)),
@@ -105,7 +88,6 @@ class TestPytrees:
         assert n_pad == 1
         leaves = jax.tree.leaves(padded)
         assert all(leaf.shape[0] == 4 for leaf in leaves)
-        # Structure is preserved, so the tree still maps.
         assert jax.tree.structure(padded) == jax.tree.structure(tree)
 
     def test_leaf_dtypes_preserved(self):
@@ -120,7 +102,7 @@ class TestPytrees:
         assert padded["bool"].dtype == bool
 
     def test_already_divisible_returns_the_input_untouched(self):
-        # Documented as "no allocation, no copy" -- the same object comes back.
+        # No copy: the same object comes back.
         tree = {"a": jnp.ones((4, 2)), "b": jnp.zeros((4,))}
         padded, n_pad = pad_to_multiple(tree, 4, 4)
 
@@ -128,18 +110,12 @@ class TestPytrees:
         assert padded is tree
 
 
-# ---------------------------------------------------------------------------
-# The motivating use case
-# ---------------------------------------------------------------------------
-
-
 class TestFeedsLaxMap:
+    """Check that padded arrays map through ``lax.map`` as at call sites."""
+
     def test_padded_output_maps_in_whole_chunks(self):
-        # NOTE: as of jax 0.10 ``lax.map`` accepts a non-divisible leading
-        # axis directly (it scans the batched part and handles the remainder),
-        # so the divisibility claim in padding.py's module docstring no longer
-        # holds for the installed jax.  What this test pins is that a padded
-        # input still maps to the same answer for the real entries.
+        # jax 0.10 already accepts a non-divisible axis in lax.map, so this
+        # only checks that padding doesn't change the real entries' result.
         chunk = 4
         n = 6
         x = jnp.arange(n, dtype=jnp.float32)
@@ -152,14 +128,13 @@ class TestFeedsLaxMap:
             np.asarray(out[:-n_pad]), np.asarray(x) * 2.0
         )
 
-    def test_works_on_a_tuple_of_keys_like_the_call_sites(self):
-        # burn_in.py pads the population *and* the per-walker key array.
+    def test_works_on_a_key_array_like_the_call_sites(self):
+        # burn_in.py pads the per-walker key array alongside the population.
         keys = jax.random.split(jax.random.key(0), 5)
         padded, n_pad = pad_to_multiple(keys, 5, 4)
 
         assert n_pad == 3
         assert padded.shape[0] == 8
-        # Padded keys are copies of the last real key, so they are valid keys.
         assert jnp.array_equal(
             jax.random.key_data(padded[-1]), jax.random.key_data(keys[-1])
         )

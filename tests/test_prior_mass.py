@@ -1,4 +1,4 @@
-"""Tests for jaxrens.prior_mass — the shared n_cull-aware prior-mass ladder.
+"""Tests for ``jaxrens.prior_mass``, the shared n_cull-aware prior-mass ladder.
 
 The reference is pymatnest's ``ns_analyse.calc_log_a`` (SENS paper, PRX 4,
 031034 (2014), Eq. 3), transcribed verbatim below so the comparison doesn't
@@ -31,6 +31,7 @@ def _pymatnest_calc_log_a(n_Es, n_walkers, n_cull):
     return log_X_n - np.log(n_walkers + 1 - i_range_plus_1_mod_n_cull)
 
 
+# (n_live, n_cull) pairs; n_cull doesn't divide n_live in (50, 3) and (7, 3).
 CASES = [(10, 1), (600, 1), (50, 3), (600, 10), (7, 3)]
 
 
