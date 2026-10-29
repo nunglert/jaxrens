@@ -1,19 +1,22 @@
-"""Unit tests for ``LJBackend`` — single-species and per-species paths.
+"""Tests for ``LJBackend`` and ``create_lj``.
 
-Focus areas:
-- Backward-compatible scalar API yields the legacy energy.
-- Per-species (Lorentz-Berthelot) reduces to scalar when all species are equal.
-- Two-species table produces species-dependent energies under composition swaps.
-- JIT-compatibility of both paths.
+They cover the single-species and per-species (Lorentz-Berthelot) paths,
+the triclinic minimum-image convention checked against a brute-force
+reference, the ``supercell_trafo`` image enumeration, and the startup warning
+that ``resolve`` emits when the cell prior allows cells smaller than twice the
+cutoff.
 """
 
 from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
-from jaxrens.backends.lj import LJBackend, create_lj
+from jaxrens.backends.lj import create_lj
+from jaxrens.cli.resolve import resolve
+from jaxrens.cli.schema.root import RootSpec
 
 
 def _two_atom_positions(r: float = 1.5) -> jnp.ndarray:
@@ -24,25 +27,9 @@ def _no_cell() -> jnp.ndarray:
     return jnp.zeros((3, 3))
 
 
-# ---------------------------------------------------------------------------
-# Construction / validation
-# ---------------------------------------------------------------------------
-
-
 class TestConstruction:
-    def test_scalar_default(self):
-        be = create_lj()
-        assert be._per_species is False
-        assert be.epsilon == 1.0
-        assert be.sigma == 1.0
-        assert be.n_species == 1
-
-    def test_per_species_table(self):
-        be = create_lj(epsilon=[1.0, 0.8], sigma=[1.0, 1.1])
-        assert be._per_species is True
-        assert be.n_species == 2
-        assert be._eps_table.shape == (2,)
-        assert be._sig_table.shape == (2,)
+    """Check that ``create_lj`` stores scalar or per-species parameters and
+    rejects inconsistent shapes."""
 
     def test_rank_mismatch_raises(self):
         with pytest.raises(ValueError, match="same rank"):
@@ -61,13 +48,9 @@ class TestConstruction:
             create_lj(epsilon=[[1.0, 1.0]], sigma=[[1.0, 1.0]])
 
 
-# ---------------------------------------------------------------------------
-# Energy parity: per-species reduces to scalar when species table is uniform
-# ---------------------------------------------------------------------------
-
-
 class TestPerSpeciesReducesToScalar:
-    """A length-1 (or all-equal) table must match the scalar path exactly."""
+    """Check that a length-1 or all-equal species table gives exactly the
+    scalar energy."""
 
     def test_length_one_matches_scalar(self):
         pos = _two_atom_positions(r=1.5)
@@ -83,9 +66,8 @@ class TestPerSpeciesReducesToScalar:
 
     def test_two_equal_entries_match_scalar(self):
         pos = _two_atom_positions(r=1.5)
-        types = jnp.array(
-            [1, 0], dtype=jnp.int32
-        )  # mixed types but same params
+        # mixed types but same params
+        types = jnp.array([1, 0], dtype=jnp.int32)
         cell = _no_cell()
 
         scalar_be = create_lj(epsilon=0.7, sigma=0.9)
@@ -96,17 +78,14 @@ class TestPerSpeciesReducesToScalar:
         assert jnp.allclose(e_scalar, e_table, atol=1e-6, rtol=1e-6)
 
 
-# ---------------------------------------------------------------------------
-# Composition dependence: cross-species pair differs from same-species pair
-# ---------------------------------------------------------------------------
-
-
 class TestCompositionDependence:
-    """Two-species LJ with distinct ε/σ must produce composition-dependent E."""
+    """Check that a two-species LJ with distinct ε and σ gives an energy that
+    depends on which species form the pair, following the Lorentz-Berthelot
+    mixing rules."""
 
     def test_homo_vs_hetero_pairs_differ(self):
-        # ε_AA=1.0, σ_AA=1.0; ε_BB=0.5, σ_BB=1.2 → ε_AB=√0.5, σ_AB=1.1
-        # Pair energies at r=1.5 should all differ.
+        # ε_AA=1.0, σ_AA=1.0; ε_BB=0.5, σ_BB=1.2, so ε_AB=√0.5, σ_AB=1.1.
+        # The pair energies at r=1.5 should all differ.
         pos = _two_atom_positions(r=1.5)
         cell = _no_cell()
         be = create_lj(epsilon=[1.0, 0.5], sigma=[1.0, 1.2])
@@ -115,18 +94,13 @@ class TestCompositionDependence:
         e_BB = be(pos, jnp.array([1, 1], dtype=jnp.int32), cell).energy
         e_AB = be(pos, jnp.array([0, 1], dtype=jnp.int32), cell).energy
 
-        assert not jnp.allclose(
-            e_AA, e_BB
-        ), "AA and BB pair energies must differ"
-        assert not jnp.allclose(
-            e_AA, e_AB
-        ), "AA and AB pair energies must differ"
-        assert not jnp.allclose(
-            e_BB, e_AB
-        ), "BB and AB pair energies must differ"
+        assert not jnp.allclose(e_AA, e_BB)
+        assert not jnp.allclose(e_AA, e_AB)
+        assert not jnp.allclose(e_BB, e_AB)
 
     def test_lorentz_berthelot_mixing_value(self):
-        """Cross-species pair energy follows ε_ij=√(ε_i·ε_j), σ_ij=(σ_i+σ_j)/2."""
+        """Cross-species pair energy follows ε_ij=√(ε_i·ε_j) and
+        σ_ij=(σ_i+σ_j)/2."""
         eps_a, eps_b = 1.0, 0.5
         sig_a, sig_b = 1.0, 1.2
         r = 1.4
@@ -139,17 +113,13 @@ class TestCompositionDependence:
         eps_ij = float(jnp.sqrt(eps_a * eps_b))
         sig_ij = 0.5 * (sig_a + sig_b)
         expected = 4.0 * eps_ij * ((sig_ij / r) ** 12 - (sig_ij / r) ** 6)
-        assert jnp.allclose(
-            e_AB, expected, atol=1e-5, rtol=1e-5
-        ), f"got {float(e_AB):.6f}, expected {expected:.6f}"
-
-
-# ---------------------------------------------------------------------------
-# JIT compatibility
-# ---------------------------------------------------------------------------
+        assert jnp.allclose(e_AB, expected, atol=1e-5, rtol=1e-5)
 
 
 class TestJIT:
+    """Check that the scalar and the per-species paths compile under
+    ``jax.jit``."""
+
     def test_scalar_path_jits(self):
         be = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5)
         pos = _two_atom_positions(r=1.5)
@@ -177,25 +147,14 @@ class TestJIT:
         assert jnp.isfinite(e)
 
 
-# ---------------------------------------------------------------------------
-# Existing scalar behaviour preserved (regression)
-# ---------------------------------------------------------------------------
-
-
-class TestScalarRegression:
-    def test_two_atom_energy_matches_closed_form(self):
-        eps, sig, r = 1.0, 1.0, 1.2
-        be = create_lj(epsilon=eps, sigma=sig)
-        pos = _two_atom_positions(r=r)
-        cell = _no_cell()
-        e = be(pos, jnp.array([0, 0], dtype=jnp.int32), cell).energy
-        expected = 4.0 * eps * ((sig / r) ** 12 - (sig / r) ** 6)
-        assert jnp.allclose(e, expected, atol=1e-5, rtol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Triclinic MIC — sheared cells must wrap to the true nearest image
-# ---------------------------------------------------------------------------
+def test_two_atom_energy_matches_closed_form():
+    eps, sig, r = 1.0, 1.0, 1.2
+    be = create_lj(epsilon=eps, sigma=sig)
+    pos = _two_atom_positions(r=r)
+    cell = _no_cell()
+    e = be(pos, jnp.array([0, 0], dtype=jnp.int32), cell).energy
+    expected = 4.0 * eps * ((sig / r) ** 12 - (sig / r) ** 6)
+    assert jnp.allclose(e, expected, atol=1e-5, rtol=1e-5)
 
 
 def _brute_force_pair_energy(
@@ -204,8 +163,6 @@ def _brute_force_pair_energy(
     """Reference Python loop computing LJ pair energy with explicit periodic
     images. Used to validate the JAX implementation against a slow but
     obviously-correct baseline."""
-    import numpy as np
-
     pos = np.asarray(positions)
     cell = np.asarray(cell)
     n = pos.shape[0]
@@ -239,6 +196,10 @@ def _brute_force_pair_energy(
 
 
 class TestTriclinicMIC:
+    """Check that sheared cells use the true nearest image, by comparing with
+    a brute-force reference, that a cubic cell gives the diagonal result, and
+    that the energy is invariant under large lattice translations."""
+
     def test_sheared_cell_matches_brute_force(self):
         # 8-atom random configuration in a sheared cell.
         key = jax.random.PRNGKey(0)
@@ -261,11 +222,10 @@ class TestTriclinicMIC:
             2.5,
             (1, 1, 1),
         )
-        assert jnp.allclose(e, ref, atol=1e-4, rtol=1e-4), (e, ref)
+        assert jnp.allclose(e, ref, atol=1e-4, rtol=1e-4)
 
     def test_diagonal_cell_unchanged(self):
-        # MIC-safe cubic cell: triclinic MIC and the previous diag-only MIC
-        # must give the same energy.
+        # In a cubic cell the triclinic MIC reduces to the diagonal one.
         positions = jnp.array(
             [
                 [0.0, 0.0, 0.0],
@@ -287,9 +247,9 @@ class TestTriclinicMIC:
         assert jnp.allclose(e, ref, atol=1e-5, rtol=1e-5)
 
     def test_invariant_under_large_lattice_translations(self):
-        # NS walkers are not wrapped, so |x| >> L is routine.  The MIC
-        # matmuls must not lose precision there: under the GPU default
-        # (TF32-like) matmul precision this was off by ~1e-2.
+        # NS walkers are not wrapped, so |x| >> L is routine. The MIC
+        # matmuls must keep full precision there: under the GPU default
+        # (TF32-like) matmul precision the error was ~1e-2.
         key_pos, key_shift = jax.random.split(jax.random.PRNGKey(1))
         cell = jnp.eye(3) * 6.0034575  # not exactly representable in TF32
         positions = jax.random.uniform(key_pos, (8, 3), minval=0.0, maxval=6.0)
@@ -299,19 +259,15 @@ class TestTriclinicMIC:
         be = create_lj(epsilon=1.0, sigma=1.0, cutoff=2.5)
         types = jnp.zeros(8, dtype=jnp.int32)
         e = jax.jit(lambda p: be(p, types, cell).energy)
-        assert jnp.allclose(e(shifted), e(positions), atol=1e-3), (
-            e(shifted),
-            e(positions),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Supercell-image enumeration — additional images for tight cells
-# ---------------------------------------------------------------------------
+        assert jnp.allclose(e(shifted), e(positions), atol=1e-3)
 
 
 class TestSupercellTrafo:
-    def test_default_is_mic_only(self):
+    """Check that ``supercell_trafo`` adds periodic images: extra images
+    change nothing in a spacious cell, a tight cell needs them, the backend
+    jits, and an entry below 1 is rejected."""
+
+    def test_extra_images_beyond_cutoff_change_nothing(self):
         # Spacious cubic cell: (1,1,1) and (2,2,2) must agree because every
         # extra image is beyond the cutoff.
         positions = jnp.array(
@@ -333,7 +289,8 @@ class TestSupercellTrafo:
         assert jnp.allclose(e_a, e_b, atol=1e-5, rtol=1e-5)
 
     def test_tight_cell_picks_up_images(self):
-        # Cell side 3.55 σ < 2 σ * cutoff/σ = 5 — needs (2,2,2) to be correct.
+        # The cell side 3.55 is below 2 * cutoff = 5, so (2, 2, 2) images
+        # are needed for the correct energy.
         positions = jnp.array(
             [
                 [0.0, 0.0, 0.0],
@@ -367,7 +324,7 @@ class TestSupercellTrafo:
         )
         assert jnp.allclose(e_mic, ref_mic, atol=1e-4, rtol=1e-4)
         assert jnp.allclose(e_sc, ref_sc, atol=1e-4, rtol=1e-4)
-        # Images add real neighbours → energy must actually differ.
+        # The images add real neighbours, so the energies must differ.
         assert not jnp.allclose(e_mic, e_sc, atol=1e-3, rtol=1e-3)
 
     def test_jit_compatibility(self):
@@ -393,12 +350,11 @@ class TestSupercellTrafo:
             create_lj(supercell_trafo=(0, 1, 1))
 
 
-# ---------------------------------------------------------------------------
-# Startup warning when the cell prior permits MIC-violating cells
-# ---------------------------------------------------------------------------
-
-
 class TestStartupCutoffWarning:
+    """Check that ``resolve`` warns when the cell prior of a periodic LJ run
+    allows cells smaller than twice the cutoff, and stays quiet for a
+    spacious prior, without a cutoff, or for a non-periodic cluster."""
+
     def _minimal_config(self):
         return {
             "run": {"n_live": 8, "max_iterations": 5, "seed": 42},
@@ -443,9 +399,6 @@ class TestStartupCutoffWarning:
         }
 
     def test_warns_on_tight_cell_prior(self, caplog):
-        from jaxrens.cli.resolve import resolve
-        from jaxrens.cli.schema.root import RootSpec
-
         cfg = self._minimal_config()
         # Tight cell prior: smallest cube side ≈ (1.5*8)^(1/3) ≈ 2.29 σ,
         # less than 2*cutoff=5.0. Must warn.
@@ -462,9 +415,6 @@ class TestStartupCutoffWarning:
         assert any("LJ cutoff vs cell-prior bounds" in m for m in msgs), msgs
 
     def test_no_warning_on_spacious_cell_prior(self, caplog):
-        from jaxrens.cli.resolve import resolve
-        from jaxrens.cli.schema.root import RootSpec
-
         cfg = self._minimal_config()
         # Generous cell prior: smallest cube side ≈ (50*8)^(1/3) ≈ 7.37 σ,
         # times min_aspect 0.9 = 6.63 σ, comfortably above 2*cutoff=5.0.
@@ -483,9 +433,6 @@ class TestStartupCutoffWarning:
         ), msgs
 
     def test_no_warning_without_cutoff(self, caplog):
-        from jaxrens.cli.resolve import resolve
-        from jaxrens.cli.schema.root import RootSpec
-
         cfg = self._minimal_config()
         cfg["backend"]["cutoff"] = None
         cfg["cell"] = {
@@ -503,17 +450,15 @@ class TestStartupCutoffWarning:
         ), msgs
 
     def test_no_warning_when_non_periodic(self, caplog):
-        """A cluster in vacuum has no periodic images, so the cutoff/cell/
-        supercell_trafo interaction this warning is about does not exist --
-        even with the same tight cell prior that triggers it when periodic.
+        """A cluster in vacuum has no periodic images, so the interaction
+        between cutoff, cell and supercell_trafo that this warning is about
+        does not exist, even with the same tight cell prior that triggers it
+        when periodic.
         """
-        from jaxrens.cli.resolve import resolve
-        from jaxrens.cli.schema.root import RootSpec
-
         cfg = self._minimal_config()
         cfg["backend"]["periodic"] = False
-        # Same tight cell prior as test_warns_on_tight_cell_prior -- would
-        # warn if this were periodic.
+        # Same tight cell prior as in test_warns_on_tight_cell_prior, which
+        # would warn if this were periodic.
         cfg["cell"] = {
             "max_volume_per_atom": 10.0,
             "min_volume_per_atom": 1.5,

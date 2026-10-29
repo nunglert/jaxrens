@@ -1,17 +1,10 @@
 """Tests for the soft-core NeuralIL variants and their jaxrens wiring.
 
-The soft-core model augments NeuralIL with a fixed (non-trainable)
-repulsive Morse term. Tests confirm:
-
-1. ``SoftCoreNeuralIL`` initializes with the same params tree as plain
-   ``NeuralIL`` (no ``morse`` subtree).
-2. Close-contact configurations get a repulsion that matches a direct
-   ``FixedRepulsiveMorse`` evaluation.
-3. ``jax.jit`` compilation succeeds (mandatory per project policy).
-4. ``SoftCorePlainEnsemble`` returns one energy per ensemble member, and
-   the soft-core penalty is identical across members.
-5. The ``_build_dynamics_model`` plumbing rejects ``softcore=True`` +
-   ``has_morse=True`` as mutually exclusive.
+The soft-core model augments NeuralIL with a fixed (non-trainable) repulsive
+Morse term. The tests check the params tree, the close-contact penalty,
+``jit``, the ensemble variant, the native forces and committee spread of the
+backend, and the plumbing in ``_build_dynamics_model``. Everything is skipped
+when NeuralIL or its soft-core module is not installed.
 """
 
 from __future__ import annotations
@@ -21,7 +14,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jaxrens.backends.neuralil import _NEURALIL_IMPORT_ERROR, is_available
+from jaxrens.backends.base import committee_uncertainty, get_committee_backend
+from jaxrens.backends.ensemble import EnsembleBackend
+from jaxrens.backends.neuralil import (
+    _NEURALIL_IMPORT_ERROR,
+    NeuralILBackend,
+    _build_dynamics_model,
+    is_available,
+)
 
 pytestmark = pytest.mark.neuralil
 
@@ -111,7 +111,7 @@ def _far_positions():
 
 
 def _close_positions():
-    """Same as far, but atom 1 placed at r=0.4 from atom 0 (inside r_switch)."""
+    """Same as far, but atom 1 at r=0.4 from atom 0 (inside r_switch)."""
     return jnp.array(
         [
             [0.0, 0.0, 0.0],
@@ -137,14 +137,13 @@ def _params_leaf_keys(params):
     return set(inner.keys())
 
 
-# ---------------------------------------------------------------------------
-# Module tests
-# ---------------------------------------------------------------------------
-
-
 @neuralil_required
 @softcore_required
 class TestSoftCoreNeuralIL:
+    """Check that ``SoftCoreNeuralIL`` has the same params tree as a plain
+    NeuralIL, adds a repulsive penalty at close contact, and compiles under
+    ``jit``."""
+
     @pytest.fixture
     def model(self):
         return _build_softcore_model()
@@ -162,7 +161,8 @@ class TestSoftCoreNeuralIL:
         )
 
     def test_initializes_with_plain_neuralil_params_tree(self, model, params):
-        """SoftCore has no trainable Morse params → params tree must match plain NeuralIL."""
+        """The soft-core has no trainable Morse params, so its params tree
+        must match a plain NeuralIL's."""
         plain = _build_plain_model()
         key = jax.random.key(0)
         plain_params = plain.init(
@@ -173,10 +173,7 @@ class TestSoftCoreNeuralIL:
             max_neighbors=8,
             method=plain.calc_potential_energy,
         )
-        assert _params_leaf_keys(params) == _params_leaf_keys(plain_params), (
-            f"SoftCore params keys {_params_leaf_keys(params)} != plain "
-            f"NeuralIL keys {_params_leaf_keys(plain_params)}"
-        )
+        assert _params_leaf_keys(params) == _params_leaf_keys(plain_params)
 
     def test_penalises_close_contact(self, model, params):
         """Close-contact energy ≈ far energy + direct soft-core penalty."""
@@ -198,9 +195,10 @@ class TestSoftCoreNeuralIL:
         e_close = float(energy(_close_positions()))
 
         # Direct evaluation of the soft-core contribution at r=0.4. The
-        # repulsive Morse is symmetric in i↔j and smooth_cutoff(0.4, 0.75, 1.25)
-        # = 1.0 (well below r_switch), so the pair contributes
-        # 0.5 * phi(0.4) per atom on each side → total = phi(0.4).
+        # repulsive Morse is symmetric in i and j, and
+        # smooth_cutoff(0.4, 0.75, 1.25) = 1.0 (well below r_switch), so the
+        # pair contributes 0.5 * phi(0.4) per atom on each side, which totals
+        # phi(0.4).
         phi = D0 * np.exp(-2.0 * A0 * (0.4 - B0))
         expected_softcore_penalty = float(phi)
 
@@ -208,13 +206,11 @@ class TestSoftCoreNeuralIL:
         # the descriptors at atom 0 change. Bound the test by checking the
         # soft-core delta is at least 90% of the bare Morse term.
         delta = e_close - e_far
-        assert delta > 0.9 * expected_softcore_penalty, (
-            f"Close-contact energy delta {delta:.4f} smaller than expected "
-            f"soft-core lower bound {0.9 * expected_softcore_penalty:.4f}"
-        )
+        assert delta > 0.9 * expected_softcore_penalty
 
     def test_jit_compiles(self, model, params):
-        """``jax.jit`` of calc_potential_energy must succeed and return finite energy."""
+        """``jax.jit`` of calc_potential_energy succeeds and gives a finite
+        energy."""
         cell = _cell()
         types = _types()
         max_neighbors = 8
@@ -231,17 +227,16 @@ class TestSoftCoreNeuralIL:
             )
 
         e = jitted_energy(_far_positions())
-        assert jnp.isfinite(e), f"JIT'd energy is not finite: {e}"
-
-
-# ---------------------------------------------------------------------------
-# Ensemble tests
-# ---------------------------------------------------------------------------
+        assert jnp.isfinite(e)
 
 
 @neuralil_required
 @softcore_required
 class TestSoftCorePlainEnsemble:
+    """Check that ``SoftCorePlainEnsemble`` returns one energy per member, adds
+    no trainable parameters for the soft-core, and that the soft-core penalty
+    depends only on geometry."""
+
     @pytest.fixture
     def ensemble(self):
         return SoftCorePlainEnsemble(_build_softcore_model(), n_models=3)
@@ -268,31 +263,23 @@ class TestSoftCorePlainEnsemble:
             max_neighbors=8,
             method=ensemble.calc_potential_energy,
         )
-        assert e.shape == (3,), f"Expected (3,), got {e.shape}"
+        assert e.shape == (3,)
 
     def test_softcore_piece_is_parameter_free(self, ensemble, params):
-        """The soft-core has no trainable params → the ensemble's params
-        tree must contain only the NN sub-tree under ``params/neuralil``,
-        with no ``soft_core`` or ``morse`` leaves."""
+        """The soft-core has no trainable params, so the ensemble's params
+        tree contains only the NN sub-tree under ``params/neuralil``, with no
+        ``soft_core`` or ``morse`` leaves."""
         inner = params.get("params", params)
         # PlainEnsemble nests the NeuralIL submodule under "neuralil".
-        assert (
-            "neuralil" in inner
-        ), f"Expected 'neuralil' key in ensemble params, got {inner.keys()}"
+        assert "neuralil" in inner
         sub_keys = set(inner["neuralil"].keys())
         # Standard NeuralIL has core_model + embed + denormalizer.
-        assert "morse" not in sub_keys, (
-            f"Soft-core must not introduce a trainable Morse sub-tree, "
-            f"but params/neuralil has keys {sub_keys}"
-        )
-        assert "soft_core" not in sub_keys, (
-            f"Soft-core must be parameter-free, but params/neuralil has "
-            f"keys {sub_keys}"
-        )
+        assert "morse" not in sub_keys
+        assert "soft_core" not in sub_keys
 
     def test_softcore_geometry_only_penalty(self, ensemble, params):
         """Direct evaluation of ``FixedRepulsiveMorse`` matches the
-        geometry-only soft-core penalty the ensemble adds — confirming
+        geometry-only soft-core penalty the ensemble adds, confirming that
         the soft-core piece depends only on geometry, not on params."""
         cell = _cell()
         types = _types()
@@ -310,15 +297,12 @@ class TestSoftCorePlainEnsemble:
             all_types,
             method=softcore.calc_atomic_energies,
         )
-        # Shape is (n_atoms,) — single evaluation, no ensemble axis.
-        assert morse_atomic.shape == (types.shape[0],), (
-            f"FixedRepulsiveMorse output has shape {morse_atomic.shape}; "
-            f"expected ({types.shape[0]},)"
-        )
-        # Atoms 0 and 1 at r=0.4 → both feel a strong repulsion.
+        # Shape is (n_atoms,): a single evaluation, no ensemble axis.
+        assert morse_atomic.shape == (types.shape[0],)
+        # Atoms 0 and 1 at r=0.4 both feel a strong repulsion.
         assert float(morse_atomic[0]) > 0.0
         assert float(morse_atomic[1]) > 0.0
-        # Atoms 2 and 3 are well past r_core_cut → ~0.
+        # Atoms 2 and 3 are well past r_core_cut, so ~0.
         assert abs(float(morse_atomic[2])) < 1e-3
         assert abs(float(morse_atomic[3])) < 1e-3
 
@@ -326,18 +310,17 @@ class TestSoftCorePlainEnsemble:
 @neuralil_required
 @softcore_required
 class TestSoftCoreEnsembleForces:
-    """Native ``energy_and_forces`` on an ensemble soft-core backend.
+    """Check the native ``energy_and_forces`` of an ensemble soft-core
+    backend.
 
-    Confirms the ``(n_ensemble, N, 3)`` member-force Jacobian is reduced to
-    the committee mean ``(N, 3)`` (mirroring the energy ``.mean()``), and that
-    the soft-core repulsion is included in the native forces (they match the
+    The ``(n_ensemble, N, 3)`` member-force Jacobian must be reduced to the
+    committee mean ``(N, 3)`` (mirroring the energy ``.mean()``), and the
+    soft-core repulsion must be included in the native forces (they match the
     autodiff fallback of the full ``__call__``).
     """
 
     @pytest.fixture
     def backend(self):
-        from jaxrens.backends.neuralil import NeuralILBackend
-
         n_ensemble = 3
         model = SoftCorePlainEnsemble(
             _build_softcore_model(), n_models=n_ensemble
@@ -393,8 +376,6 @@ class TestSoftCoreEnsembleForces:
         """``members()`` keeps the per-member axis; ``committee_uncertainty``
         reduces it to energy-σ + per-atom force-σ, both > 0 for a real
         (random-init) committee."""
-        from jaxrens.backends.base import committee_uncertainty
-
         positions, species, cell = _close_positions(), _types(), _cell()
         n_atoms = positions.shape[0]
         res = backend.members(positions, species, cell, 8)
@@ -416,9 +397,6 @@ class TestSoftCoreEnsembleForces:
         assert float(jnp.max(f_std)) > 0.0
 
     def test_get_committee_backend_unwraps(self, backend):
-        from jaxrens.backends.base import get_committee_backend
-        from jaxrens.backends.ensemble import EnsembleBackend
-
         # The committee backend itself is returned directly.
         assert get_committee_backend(backend) is backend
         # And it is found through a Hamiltonian with an EnsembleTerm.
@@ -426,73 +404,64 @@ class TestSoftCoreEnsembleForces:
         assert get_committee_backend(wrapped) is backend
 
     def test_get_committee_backend_none_for_non_committee(self):
-        from jaxrens.backends.base import get_committee_backend
-
         assert get_committee_backend(object()) is None
         assert get_committee_backend(None) is None
 
 
+@pytest.fixture
+def single_model_backend():
+    model = _build_plain_model()
+    key = jax.random.key(0)
+    params = model.init(
+        key,
+        _far_positions(),
+        _types(),
+        _cell(),
+        max_neighbors=8,
+        method=model.calc_potential_energy,
+    )
+    return NeuralILBackend(
+        model_params=params,
+        r_cutoff=4.0,
+        sorted_elements=["H", "Si"],
+        supercell_trafo=(1, 1, 1),
+        n_max=3,
+        embed_d=4,
+        core_widths=[8, 4],
+        is_ensemble=False,
+        has_morse=False,
+        n_ensemble=1,
+        softcore=False,
+    )
+
+
 @neuralil_required
-class TestSingleModelMembers:
-    """A non-ensemble model: ``members()`` adds a leading M=1 axis so the
+def test_members_m1_zero_spread(single_model_backend):
+    """For a non-ensemble model, ``members()`` adds a leading M=1 axis so the
     ``(M, …)`` contract holds, and the committee spread is exactly zero."""
+    backend = single_model_backend
+    positions, species, cell = _far_positions(), _types(), _cell()
+    n_atoms = positions.shape[0]
+    res = backend.members(positions, species, cell, 8)
 
-    @pytest.fixture
-    def backend(self):
-        from jaxrens.backends.neuralil import NeuralILBackend
+    assert res.energy_members.shape == (1,)
+    assert res.forces_members.shape == (1, n_atoms, 3)
+    assert abs(float(res.energy) - float(res.energy_members.mean())) < 1e-6
 
-        model = _build_plain_model()
-        key = jax.random.key(0)
-        params = model.init(
-            key,
-            _far_positions(),
-            _types(),
-            _cell(),
-            max_neighbors=8,
-            method=model.calc_potential_energy,
-        )
-        return NeuralILBackend(
-            model_params=params,
-            r_cutoff=4.0,
-            sorted_elements=["H", "Si"],
-            supercell_trafo=(1, 1, 1),
-            n_max=3,
-            embed_d=4,
-            core_widths=[8, 4],
-            is_ensemble=False,
-            has_morse=False,
-            n_ensemble=1,
-            softcore=False,
-        )
-
-    def test_members_m1_zero_spread(self, backend):
-        from jaxrens.backends.base import committee_uncertainty
-
-        positions, species, cell = _far_positions(), _types(), _cell()
-        n_atoms = positions.shape[0]
-        res = backend.members(positions, species, cell, 8)
-
-        assert res.energy_members.shape == (1,)
-        assert res.forces_members.shape == (1, n_atoms, 3)
-        assert abs(float(res.energy) - float(res.energy_members.mean())) < 1e-6
-
-        e_std, f_std = committee_uncertainty(res)
-        assert float(e_std) == 0.0
-        assert f_std.shape == (n_atoms,)
-        assert float(jnp.max(jnp.abs(f_std))) == 0.0
-
-
-# ---------------------------------------------------------------------------
-# Backend wiring tests
-# ---------------------------------------------------------------------------
+    e_std, f_std = committee_uncertainty(res)
+    assert float(e_std) == 0.0
+    assert f_std.shape == (n_atoms,)
+    assert float(jnp.max(jnp.abs(f_std))) == 0.0
 
 
 @neuralil_required
 @softcore_required
 class TestBackendWiring:
-    def test_build_dynamics_model_rejects_softcore_plus_morse(self):
-        from jaxrens.backends.neuralil import _build_dynamics_model
+    """Check that ``_build_dynamics_model`` rejects ``softcore=True`` together
+    with ``has_morse=True``, returns a ``SoftCoreNeuralIL`` for
+    ``softcore=True``, and lets ``softcore_kwargs`` override the defaults."""
 
+    def test_build_dynamics_model_rejects_softcore_plus_morse(self):
         with pytest.raises(ValueError, match="mutually exclusive"):
             _build_dynamics_model(
                 n_types=2,
@@ -508,8 +477,6 @@ class TestBackendWiring:
             )
 
     def test_build_dynamics_model_softcore_returns_softcore_model(self):
-        from jaxrens.backends.neuralil import _build_dynamics_model
-
         model = _build_dynamics_model(
             n_types=2,
             embed_d=4,
@@ -528,8 +495,6 @@ class TestBackendWiring:
         assert model.r_core_cut == 1.25
 
     def test_build_dynamics_model_softcore_kwargs_override_defaults(self):
-        from jaxrens.backends.neuralil import _build_dynamics_model
-
         model = _build_dynamics_model(
             n_types=2,
             embed_d=4,
