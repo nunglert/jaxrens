@@ -1,23 +1,12 @@
 """Tests for the backend-agnostic soft-core term (``SoftCoreTerm``).
 
-``SoftCoreBackend(base)`` is the convenience factory for
-``Hamiltonian(base, [SoftCoreTerm()])``.  The term adds a fixed
-(parameter-free) repulsive Morse contribution to any EnergyBackend.
-Tests confirm:
-
-1. The pure-function ``_softcore_energy`` matches the analytic Morse
-   formula on hand-built two-atom configurations.
-2. Parity with the NeuralIL ``FixedRepulsiveMorse`` ground truth for a
-   small cluster (when neuralil is installed).
-3. Far-apart atoms contribute exactly zero (cutoff respected).
-4. The wrapper preserves the base backend's energy at large distances.
-5. ``jax.jit`` and ``jax.vmap`` are both compatible.
-6. Composition with ``EnsembleBackend`` (NPT stack) returns
-   ``U + E_core + P * V``.
-7. Model attributes are reached via ``.model`` (no ``__getattr__`` forwarding).
-8. Close-contact pairs incur a strong, finite penalty.
-9. The schema mutex on NeuralILBackendSpec rejects the
-   ``softcore: true`` + ``softcore_repulsion: {...}`` combo.
+The term adds a fixed, parameter-free repulsive Morse contribution to any
+energy backend; ``SoftCoreBackend(base)`` is the convenience factory for
+``Hamiltonian(base, [SoftCoreTerm()])``. The pure energy function is checked
+against the analytic Morse formula on two-atom configurations, the wrapper
+against the base backend and under ``jit``/``vmap``, and the backend specs for
+the soft-core settings they validate. A parity test against NeuralIL's
+``FixedRepulsiveMorse`` runs only when ``neuralil`` is installed.
 """
 
 from __future__ import annotations
@@ -26,7 +15,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
+from jaxrens.backends.ensemble import EnsembleBackend
 from jaxrens.backends.softcore import (
     DEFAULT_SOFTCORE_KWARGS,
     SoftCoreBackend,
@@ -34,6 +25,12 @@ from jaxrens.backends.softcore import (
     _softcore_energy,
 )
 from jaxrens.backends.toy import HarmonicBackend
+from jaxrens.cli.schema.backend import (
+    LJBackendSpec,
+    NeuralILBackendSpec,
+    SoftCoreSpec,
+)
+from jaxrens.utils.cell import get_volume
 
 A0 = DEFAULT_SOFTCORE_KWARGS["a0"]
 B0 = DEFAULT_SOFTCORE_KWARGS["b0"]
@@ -54,12 +51,11 @@ def _species(n: int = 2) -> jnp.ndarray:
     return jnp.zeros(n, dtype=jnp.int32)
 
 
-# ---------------------------------------------------------------------------
-# Pure-function tests
-# ---------------------------------------------------------------------------
-
-
 class TestSoftCoreEnergy:
+    """Check the pure energy function: it matches the analytic Morse formula
+    for two atoms, is exactly zero past the cutoff and for a single atom,
+    counts a pair across a periodic boundary, and compiles under ``jit``."""
+
     @pytest.mark.parametrize("r", [0.3, 0.5, 0.7, 0.9, 1.1])
     def test_matches_analytic_formula(self, r):
         """E_pair(r) = phi(r) * smooth_cutoff(r) for a two-atom config.
@@ -103,7 +99,7 @@ class TestSoftCoreEnergy:
                     R_CUT,
                 )
             )
-            assert E == 0.0, f"r={r}: expected 0, got {E}"
+            assert E == 0.0, f"r={r}"
 
     def test_diagonal_is_masked(self):
         """A configuration with a single atom yields zero (no self-pair)."""
@@ -146,16 +142,15 @@ class TestSoftCoreEnergy:
                 R_CUT,
             )
         )
-        # MIC distance 0.16 Å < r_switch → full Morse term.
+        # MIC distance 0.16 Å < r_switch, so the full Morse term applies.
         expected = D0 * np.exp(-2.0 * A0 * (0.16 - B0))
         assert e_mic == pytest.approx(expected, rel=1e-3)
-        # Raw distance 3.84 Å > r_cut → contributes ~nothing (float32 noise
-        # in the smooth cutoff far past r_cut, vs ~293 eV from MIC).
+        # Raw distance 3.84 Å > r_cut: only float32 noise in the smooth
+        # cutoff far past r_cut, against ~293 eV from MIC.
         assert e_raw < 1e-6
         assert e_mic > 1e6 * e_raw
 
     def test_mic_path_jit_compatible(self):
-        """The periodic (MIC) branch compiles under jax.jit."""
         cell = 4.0 * jnp.eye(3, dtype=jnp.float32)
         pos = jnp.array(
             [[0.08, 0.0, 0.0], [3.92, 0.0, 0.0]],
@@ -171,26 +166,24 @@ class TestSoftCoreEnergy:
 
     def test_smooth_cutoff_endpoints(self):
         """smooth_cutoff is exactly 1 below r_switch, 0 above r_cut."""
-        # Below r_switch: exactly 1
         for r in (0.1, 0.5, 0.74):
             assert float(
                 _smooth_cutoff(jnp.asarray(r), R_SWITCH, R_CUT)
             ) == pytest.approx(1.0, abs=1e-6)
-        # Above r_cut: exactly 0
         for r in (1.26, 1.5, 5.0):
             assert float(
                 _smooth_cutoff(jnp.asarray(r), R_SWITCH, R_CUT)
             ) == pytest.approx(0.0, abs=1e-6)
 
 
-# ---------------------------------------------------------------------------
-# Wrapper tests
-# ---------------------------------------------------------------------------
-
-
 class TestSoftCoreBackendWrapper:
+    """Check that ``SoftCoreBackend`` leaves the base energy alone past the
+    cutoff, adds the Morse penalty at close contact, passes the cell through
+    for minimum-image distances, works under ``jit`` and ``vmap``, reaches the
+    model only via ``.model``, and composes with ``EnsembleBackend``."""
+
     def test_base_preserved_past_cutoff(self):
-        """Atoms past r_core_cut → wrapped energy equals base alone."""
+        """Atoms past r_core_cut: the wrapped energy equals the base alone."""
         base = HarmonicBackend(k=2.0)
         wrapped = SoftCoreBackend(base)
         positions = _two_atoms_at(2.0)  # > R_CUT
@@ -215,7 +208,8 @@ class TestSoftCoreBackendWrapper:
         assert float(E_wrapped) == pytest.approx(expected, rel=1e-4)
 
     def test_wrapper_threads_cell_for_mic(self):
-        """SoftCoreBackend.__call__ passes cell → catches a boundary pair."""
+        """SoftCoreBackend.__call__ passes the cell, so it catches a pair
+        across the boundary."""
         base = HarmonicBackend(k=0.0)  # isolate the soft-core term
         wrapped = SoftCoreBackend(base)
         cell = 4.0 * jnp.eye(3, dtype=jnp.float32)
@@ -268,7 +262,7 @@ class TestSoftCoreBackendWrapper:
         assert float(Es[2]) == pytest.approx(float(E_base_far), rel=1e-5)
 
     def test_model_reached_explicitly(self):
-        """The model is reached via ``.model``; attributes are not forwarded."""
+        """The model is reached via ``.model``; attributes aren't forwarded."""
         base = HarmonicBackend(k=3.0)
         wrapped = SoftCoreBackend(base)
         # ``r_cutoff`` is mirrored explicitly.
@@ -279,9 +273,6 @@ class TestSoftCoreBackendWrapper:
 
     def test_compose_with_ensemble_backend(self):
         """EnsembleBackend(SoftCoreBackend(base)) returns U + E_core + P*V."""
-        from jaxrens.backends.ensemble import EnsembleBackend
-        from jaxrens.utils.cell import get_volume
-
         base = HarmonicBackend(k=1.0)
         stacked = EnsembleBackend(
             SoftCoreBackend(base),
@@ -293,7 +284,6 @@ class TestSoftCoreBackendWrapper:
 
         E = stacked(positions, species, cell, 0).energy
 
-        # Reconstruct expected.
         E_U = 0.5 * 1.0 * float(jnp.sum(positions**2))
         E_core = float(
             _softcore_energy(positions, cell, A0, B0, D0, R_SWITCH, R_CUT)
@@ -301,11 +291,6 @@ class TestSoftCoreBackendWrapper:
         V = float(get_volume(cell))
         expected = E_U + E_core + 0.5 * V
         assert float(E) == pytest.approx(expected, rel=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Parity with the NeuralIL FixedRepulsiveMorse (when neuralil is installed)
-# ---------------------------------------------------------------------------
 
 
 try:
@@ -324,13 +309,16 @@ fixed_morse_required = pytest.mark.skipif(
 
 @fixed_morse_required
 class TestParityWithFixedRepulsiveMorse:
+    """Check that the soft-core energy matches NeuralIL's
+    ``FixedRepulsiveMorse`` (runs only when ``neuralil`` is installed)."""
+
     def test_two_atom_parity(self):
-        """At a single intra-cell distance the wrapper matches FixedRepulsiveMorse.
+        """At a single intra-cell distance the wrapper matches
+        FixedRepulsiveMorse.
 
         FixedRepulsiveMorse returns per-atom contributions; total = sum.
         For one pair at distance r both atoms see 0.5 * phi(r) so the sum
-        equals phi(r) — the same value the wrapper's pure function
-        returns.
+        equals phi(r), the same value the wrapper's pure function returns.
         """
         from neuralil.softcore.model import FixedRepulsiveMorse
 
@@ -368,18 +356,14 @@ class TestParityWithFixedRepulsiveMorse:
         assert wrapper_total == pytest.approx(ref_total, rel=1e-5)
 
 
-# ---------------------------------------------------------------------------
-# Schema mutex test
-# ---------------------------------------------------------------------------
+class TestSoftCoreSchema:
+    """Check that the backend specs validate and carry the soft-core
+    settings: NeuralIL rejects ``softcore`` together with
+    ``softcore_repulsion``, the switch radius must be below the cutoff, and
+    ``to_backend_config`` keeps the soft-core dict (or ``None``)."""
 
-
-class TestSchemaMutex:
     def test_neuralil_spec_rejects_both_softcore_flags(self):
-        """NeuralILBackendSpec rejects softcore=True + softcore_repulsion={}."""
-        from pydantic import ValidationError
-
-        from jaxrens.cli.schema.backend import NeuralILBackendSpec
-
+        """NeuralILBackendSpec rejects softcore plus softcore_repulsion."""
         with pytest.raises(ValidationError, match="not both"):
             NeuralILBackendSpec(
                 checkpoint_path="/tmp/nonexistent.pkl",
@@ -395,17 +379,11 @@ class TestSchemaMutex:
 
     def test_softcore_spec_rejects_inverted_cutoffs(self):
         """SoftCoreSpec rejects r_core_switch >= r_core_cut."""
-        from pydantic import ValidationError
-
-        from jaxrens.cli.schema.backend import SoftCoreSpec
-
         with pytest.raises(ValidationError, match="strictly"):
             SoftCoreSpec(r_core_switch=1.5, r_core_cut=1.0)
 
     def test_backend_config_carries_softcore_dict(self):
-        """A spec with softcore_repulsion ends up in BackendConfig as a dict."""
-        from jaxrens.cli.schema.backend import LJBackendSpec
-
+        """A spec's softcore_repulsion ends up in BackendConfig as a dict."""
         spec = LJBackendSpec(
             epsilon=1.0,
             sigma=1.0,
@@ -423,8 +401,6 @@ class TestSchemaMutex:
         assert cfg.softcore_repulsion["r_core_cut"] == 1.25
 
     def test_backend_config_softcore_none_by_default(self):
-        from jaxrens.cli.schema.backend import LJBackendSpec
-
         spec = LJBackendSpec(epsilon=1.0, sigma=1.0)
         cfg = spec.to_backend_config()
         assert cfg.softcore_repulsion is None

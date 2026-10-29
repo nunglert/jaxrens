@@ -1,7 +1,9 @@
-"""Test MACE-JAX energy backend.
+"""Tests for the MACE-JAX energy backend.
 
-Tests supercell edge finding (no model needed) and full backend
-integration (requires test fixture from save_mace_test_fixture.py).
+The supercell edge finding and the ``create_mace`` path dispatch need no
+model. The backend tests use the small model bundle in
+``tests/_assets/models/mace_mp_small``, with reference energies in its
+``reference.npz``. One opt-in test downloads and converts a foundation model.
 """
 
 import importlib.util
@@ -16,12 +18,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import jaxrens.backends.mace as mace_mod
 from jaxrens.backends.mace import (
-    _build_mace_data,
     _make_image_offsets,
     _supercell_edges,
+    create_mace,
     is_available,
 )
+from jaxrens.sampling.move_kernel import MoveKernel
+from jaxrens.sampling.moves import random_walk
+from jaxrens.sampling.mwg import build_mwg
+from jaxrens.sampling.nested_sampling import init_ns, ns_step
 
 pytestmark = pytest.mark.mace
 
@@ -60,14 +67,12 @@ def _host_reachable(host: str = "github.com", port: int = 443) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Supercell edge finding (no model needed)
-# ---------------------------------------------------------------------------
-
-
 class TestImageOffsets:
+    """Check the periodic image offsets: shape, that the origin and both
+    signs are present, and that ``sc=3`` gives the same offsets as ``sc=2``."""
+
     def test_shape(self):
-        # sc=2 -> offsets [-1, 0, 1] per axis -> 3^3 = 27
+        # sc=2 gives offsets [-1, 0, 1] per axis, so 3^3 = 27
         offsets = _make_image_offsets(2, 2, 2)
         assert offsets.shape == (27, 3)
 
@@ -82,14 +87,18 @@ class TestImageOffsets:
         assert any(np.all(o == [-1, 0, 0]) for o in offsets)
 
     def test_count_sc3(self):
-        # sc=3 -> offsets [-1, 0, 1] per axis -> 3^3 = 27
+        # sc=3 gives the same [-1, 0, 1] per axis
         offsets = _make_image_offsets(3, 3, 3)
         assert offsets.shape[0] == 27
 
 
 class TestSupercellEdges:
+    """Check the supercell edge finder without a model: the edge count for a
+    known pair, overflow detection, ``jit``, and that the shift vectors
+    reproduce distances inside the cutoff."""
+
     def test_two_atoms_cubic(self):
-        """Two atoms in a cubic box — known edge count."""
+        """Two atoms in a cubic box with a known edge count."""
         positions = jnp.array([[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]])
         cell = jnp.eye(3) * 5.0
         r_cutoff = 2.0
@@ -109,20 +118,18 @@ class TestSupercellEdges:
             positions, cell, r_cutoff, max_edges, image_offsets
         )
 
-        # In a 5A box with cutoff 2A, atom 0 and atom 1 are 1.5A apart
-        # With (2,2,2) supercell, each atom sees the other in the (0,0,0) image
-        # plus images where the wrapped distance < 2A
-        # (0,0,0) image: d=1.5 -> 2 edges (0->1, 1->0)
-        # (1,0,0) image: atom 1 at 1.5+5.0=6.5 from atom 0 -> d=6.5 > 2 -> no
-        # etc.
-        # So we expect exactly 2 edges
+        # In a 5 A box with cutoff 2 A, atom 0 and atom 1 are 1.5 A apart.
+        # With the (2,2,2) supercell each atom sees the other in the (0,0,0)
+        # image (d=1.5 gives 2 edges: 0->1 and 1->0). In the (1,0,0) image
+        # atom 1 sits at 1.5+5.0=6.5 from atom 0, beyond the cutoff, and the
+        # other images are farther still. So we expect exactly 2 edges.
         assert int(n_actual) == 2
         assert not overflow
         # Each atom has exactly one in-cutoff neighbor (the other atom).
         assert int(true_max) == 1
 
     def test_overflow_detected(self):
-        """Too few max_edges -> overflow."""
+        """Too few max_edges gives overflow."""
         positions = jnp.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
         cell = jnp.eye(3) * 3.0
         r_cutoff = 2.0
@@ -144,7 +151,7 @@ class TestSupercellEdges:
         assert int(true_max) >= 1
 
     def test_no_overflow_with_budget(self):
-        """Sufficient max_edges -> no overflow."""
+        """Sufficient max_edges gives no overflow."""
         positions = jnp.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
         cell = jnp.eye(3) * 5.0
         r_cutoff = 2.0
@@ -210,17 +217,13 @@ class TestSupercellEdges:
             assert dist > 1e-10, f"Edge {i}: self-interaction"
 
 
-# ---------------------------------------------------------------------------
-# create_mace path dispatch (no model / GPU needed)
-# ---------------------------------------------------------------------------
-
-
 class TestCreateMaceDispatch:
-    """create_mace routes by path suffix without touching the heavy loaders.
+    """Check that ``create_mace`` routes by path suffix (``.pkl`` to the
+    pickle loader, anything else to the bundle loader) without touching the
+    heavy loaders.
 
-    Both loaders are stubbed to raise a marker so the test asserts *which*
-    branch was taken, independent of mace-jax being installed or a GPU being
-    reachable.
+    Both loaders are stubbed to raise a marker, so the test sees which branch
+    was taken whether or not mace-jax is installed or a GPU is reachable.
     """
 
     class _Reached(Exception):
@@ -229,8 +232,6 @@ class TestCreateMaceDispatch:
 
     @pytest.fixture
     def stubbed(self, monkeypatch):
-        import jaxrens.backends.mace as mace_mod
-
         monkeypatch.setattr(mace_mod, "_require_mace", lambda: None)
 
         def _bundle_stub(*args, **kwargs):
@@ -270,21 +271,15 @@ class TestCreateMaceDispatch:
             stubbed.create_mace(model_path=None)
 
 
-# ---------------------------------------------------------------------------
-# End-to-end conversion loop (download -> convert -> load)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.mace
 @pytest.mark.heavy
 class TestConversionRoundtrip:
-    """Close the loop: ``mace-jax-from-torch`` downloads + converts the
-    ``small`` mp foundation model, and jaxrens' ``create_mace`` loads the
-    emitted output.
+    """Check the full loop: ``mace-jax-from-torch`` downloads and converts the
+    ``small`` mp foundation model, and ``create_mace`` loads the output.
 
-    Opt-in (``mace`` + ``heavy``) and network-bound.  Downloads a *fresh* copy
+    Opt-in (``mace`` + ``heavy``) and network-bound. Downloads a *fresh* copy
     of the torch checkpoint into a throwaway ``XDG_CACHE_HOME`` so it never
-    reads or writes the user's ``~/.cache/mace``.  Needs the mace-torch
+    reads or writes the user's ``~/.cache/mace``. Needs the mace-torch
     converter, a GPU (cuequivariance dlopens ``libcuda`` at import time), and
     outbound HTTPS to github.com; skips cleanly when any is missing.
     """
@@ -303,14 +298,13 @@ class TestConversionRoundtrip:
 
         import certifi
 
-        # Force a genuine fresh download into scratch; leave ~/.cache/mace alone.
+        # Force a fresh download into scratch; leave ~/.cache/mace alone.
         cache = tmp_path / "xdg_cache"
         cache.mkdir()
         env = dict(os.environ)
         env["XDG_CACHE_HOME"] = str(cache)
-        env[
-            "SSL_CERT_FILE"
-        ] = certifi.where()  # this box has no default CA path
+        # This machine has no default CA path.
+        env["SSL_CERT_FILE"] = certifi.where()
         env.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
         out_npz = tmp_path / "small-jax.npz"
@@ -338,12 +332,10 @@ class TestConversionRoundtrip:
         out_json = out_npz.with_suffix(".json")
         assert out_npz.exists(), proc.stderr
         assert out_json.exists(), proc.stderr
-        # It really downloaded — the throwaway cache is now populated.
+        # It really downloaded: the throwaway cache is now populated.
         assert any(
             cache.glob("mace/*model")
         ), "nothing landed in the fresh cache"
-
-        from jaxrens.backends.mace import create_mace
 
         backend = create_mace(
             model_path=str(out_npz), supercell_trafo=(4, 4, 4)
@@ -353,24 +345,17 @@ class TestConversionRoundtrip:
         assert len(backend.atomic_numbers) == backend.num_species
 
 
-# ---------------------------------------------------------------------------
-# Full MACE backend (requires fixture)
-# ---------------------------------------------------------------------------
-
-
 @mace_required
 class TestMACEBackend:
+    """Check the MACE backend on the small model bundle: the protocol
+    attributes, the energy against a stored reference, ``jit``, finite
+    forces, and overflow with a tiny neighbor budget."""
+
     @pytest.fixture
     def backend(self):
-        from jaxrens.backends.mace import create_mace
-
+        # SrTiO3 has a = 3.9 A and r_cutoff = 6 A, so it needs sc >= 4.
         return create_mace(
-            model_path=str(FIXTURE_DIR),
-            supercell_trafo=(
-                4,
-                4,
-                4,
-            ),  # SrTiO3 a=3.9A, r_cutoff=6A -> need sc>=4
+            model_path=str(FIXTURE_DIR), supercell_trafo=(4, 4, 4)
         )
 
     @pytest.fixture
@@ -391,11 +376,9 @@ class TestMACEBackend:
         _r = backend(positions, species, cell, max_neighbors=100)
         energy, count, overflow = _r.energy, _r.max_neighbor_count, _r.overflow
 
-        assert not overflow, "Overflow with max_neighbors=100"
-        assert jnp.isfinite(energy), "Energy is not finite"
-        assert (
-            abs(float(energy) - ref_energy) < 1e-2
-        ), f"Energy mismatch: {float(energy):.6f} vs ref {ref_energy:.6f}"
+        assert not overflow
+        assert jnp.isfinite(energy)
+        assert abs(float(energy) - ref_energy) < 1e-2
 
     def test_jit_compatible(self, backend, reference):
         positions = jnp.array(reference["positions"])
@@ -419,7 +402,7 @@ class TestMACEBackend:
             return e
 
         forces = -jax.grad(energy_fn)(positions)
-        assert jnp.all(jnp.isfinite(forces)), "Forces contain NaN/Inf"
+        assert jnp.all(jnp.isfinite(forces))
         assert forces.shape == positions.shape
 
     def test_overflow_with_tiny_budget(self, backend, reference):
@@ -428,21 +411,15 @@ class TestMACEBackend:
         cell = jnp.array(reference["cell"])
 
         overflow = backend(positions, species, cell, max_neighbors=1).overflow
-        assert overflow, "Should overflow with max_neighbors=1"
+        assert overflow
 
 
 @mace_required
 class TestMACENSStep:
-    """Test ns_step with the MACE backend under JIT."""
+    """Check that ``ns_step`` runs with the MACE backend under ``jit``."""
 
     @pytest.fixture
     def mace_ns_setup(self):
-        from jaxrens.backends.mace import create_mace
-        from jaxrens.sampling.move_kernel import MoveKernel
-        from jaxrens.sampling.moves import random_walk
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import init_ns, ns_step
-
         ref = np.load(FIXTURE_DIR / "reference.npz")
         backend = create_mace(
             model_path=str(FIXTURE_DIR),

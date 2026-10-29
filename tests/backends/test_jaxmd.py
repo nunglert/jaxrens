@@ -1,22 +1,11 @@
-"""Unit tests for the jax-md backend (Tersoff path).
+"""Tests for the jax-md backend (Tersoff path).
 
-EAM is wired up in the backend but not tested here — no LAMMPS-format
-EAM fixture is shipped with the repo, and jax-md does not bundle one.
-EAM coverage comes via integration tests once a fixture is added.
-
-The tests cover:
-* Energy on Si dimer + Si diamond (sanity / known-sign).
-* JIT compatibility under varying cell.
-* vmap over a walker axis.
-* ``jax.value_and_grad`` produces finite forces and forces vanish at
-  the relaxed lattice constant.
-* Wrap in ``EnsembleBackend`` for NPT — H = U + P·V monotonic in V.
-* LAMMPS-file path (using jax-md's bundled ``Si.tersoff`` fixture).
+EAM is wired up in the backend but not tested here: no LAMMPS-format EAM
+fixture is shipped with the repo, and jax-md does not bundle one. EAM
+coverage will come from integration tests once a fixture is added.
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -26,21 +15,35 @@ import pytest
 pytest.importorskip("jax_md")
 
 from jaxrens.backends.ensemble import EnsembleBackend
-from jaxrens.backends.jaxmd import create_jaxmd, is_available
+from jaxrens.backends.jaxmd import create_jaxmd
 
 pytestmark = pytest.mark.jaxmd
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
 SI_LATTICE_CONST = 5.431  # Tersoff '88 has a different relaxed `a` than '89.
 
-_JAXMD_SRC_TERSOFF_FIXTURE = Path(
-    "/home/nico.unglert/code/jax-md/tests/data/Si.tersoff"
-)
+# The Si.tersoff file distributed with LAMMPS (and with jax-md's tests). The
+# test below writes it to a temporary file to exercise the file-loading path.
+_SI_TERSOFF_FILE = """\
+# DATE: 2007-10-25 UNITS: metal CONTRIBUTOR: Aidan Thompson, athomps@sandia.gov CITATION: Tersoff, Phys Rev B, 37, 6991 (1988)
+
+# Tersoff parameters for various elements and mixtures
+# multiple entries can be added to this file, LAMMPS reads the ones it needs
+# these entries are in LAMMPS "metal" units:
+#   A,B = eV; lambda1,lambda2,lambda3 = 1/Angstroms; R,D = Angstroms
+#   other quantities are unitless
+
+# This is the Si parameterization from a particular Tersoff paper:
+# J. Tersoff, PRB, 37, 6991 (1988)
+# See the SiCGe.tersoff file for different Si variants.
+
+# format of a single entry (one or more lines):
+#   element 1, element 2, element 3,
+#   m, gamma, lambda3, c, d, costheta0, n, beta, lambda2, B, R, D, lambda1, A
+
+Si  Si   Si  3.0 1.0 1.3258 4.8381 2.0417 0.0000 22.956
+             0.33675  1.3258  95.373  3.0  0.2  3.2394  3264.7
+"""
 
 
 def _si_diamond_positions(a: float = SI_LATTICE_CONST) -> jnp.ndarray:
@@ -68,15 +71,6 @@ def _make_backend(periodic: bool = True):
         periodic=periodic,
         tersoff_params="si",
     )
-
-
-# ---------------------------------------------------------------------------
-# Availability + factory
-# ---------------------------------------------------------------------------
-
-
-def test_available():
-    assert is_available()
 
 
 def test_factory_rejects_unknown_potential():
@@ -119,11 +113,6 @@ def test_backend_attributes():
     assert b.num_species == 1
 
 
-# ---------------------------------------------------------------------------
-# Energy values
-# ---------------------------------------------------------------------------
-
-
 def test_si_dimer_energy_negative_and_finite():
     """Si-Si dimer at d ≈ 2.35 Å should yield a bound (negative) energy."""
     b = _make_backend(periodic=False)
@@ -141,15 +130,13 @@ def test_si_dimer_energy_negative_and_finite():
     assert bool(overflow) is False
 
 
-def test_si_diamond_energy_finite():
-    """8-atom diamond Si at a = 5.431 Å must yield Tersoff '88 cohesive E.
+def test_si_diamond_energy_matches_tersoff_88():
+    """8-atom diamond Si at a = 5.431 Å gives the Tersoff '88 cohesive energy.
 
-    With the ``fractional_coordinates=True`` convention now used in
-    ``_build_displacement_fn`` (jax-md's Tersoff is broken otherwise —
-    see that helper's docstring), the published Tersoff '88 minimum
-    sits at a ≈ 5.431 Å with E/atom = -4.630 eV.  The narrow tolerance
-    below catches accidental reversions to ``fractional_coordinates=False``,
-    which would push this back up toward -2.77 eV/atom.
+    The published minimum sits at a ≈ 5.431 Å with E/atom = -4.630 eV. The
+    narrow window catches a switch back to ``fractional_coordinates=False``
+    in ``_build_displacement_fn`` (jax-md's Tersoff is wrong in that mode),
+    which would give about -2.77 eV/atom.
     """
     b = _make_backend(periodic=True)
     positions = _si_diamond_positions()
@@ -159,23 +146,15 @@ def test_si_diamond_energy_finite():
     e, n, overflow = _r.energy, _r.max_neighbor_count, _r.overflow
     assert jnp.isfinite(e)
     e_per_atom = float(e) / 8.0
-    assert -4.7 < e_per_atom < -4.5, (
-        f"Si diamond energy/atom = {e_per_atom:.3f} eV, "
-        f"expected ≈ -4.63 eV (Tersoff '88 cohesive minimum at a = 5.431)"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Cell variability + JIT
-# ---------------------------------------------------------------------------
+    assert -4.7 < e_per_atom < -4.5
 
 
 def test_energy_changes_with_cell():
-    """Same positions, two different cells → two different energies.
+    """Same positions, two different cells give two different energies.
 
     Confirms the ``new_box=`` kwarg threading on which the backend
-    architecture depends.  If it silently broke, both calls would
-    return identical energies.
+    architecture depends. If it silently broke, both calls would return
+    identical energies.
     """
     b = _make_backend(periodic=True)
     positions = _si_diamond_positions()
@@ -186,10 +165,7 @@ def test_energy_changes_with_cell():
 
     e_a, *_ = b(positions, species, cell_a)
     e_b, *_ = b(positions, species, cell_b)
-    assert not jnp.allclose(e_a, e_b, atol=1e-4), (
-        f"new_box threading broken: E(a)={float(e_a):.4f}, "
-        f"E(b)={float(e_b):.4f}"
-    )
+    assert not jnp.allclose(e_a, e_b, atol=1e-4), "new_box threading broken"
 
 
 def test_jit_compiles_and_no_retrace_across_cells():
@@ -213,17 +189,9 @@ def test_jit_compiles_and_no_retrace_across_cells():
     e3 = jitted_energy(positions, (SI_LATTICE_CONST + 0.2) * jnp.eye(3))
     e3.block_until_ready()
 
-    assert trace_counter["n"] == 1, (
-        f"expected 1 JIT trace across 3 calls with different cells, "
-        f"got {trace_counter['n']}"
-    )
+    assert trace_counter["n"] == 1
     # Sanity: energies must differ since cells differ.
     assert not jnp.allclose(e1, e3, atol=1e-4)
-
-
-# ---------------------------------------------------------------------------
-# vmap
-# ---------------------------------------------------------------------------
 
 
 def test_vmap_over_walker_axis():
@@ -245,11 +213,6 @@ def test_vmap_over_walker_axis():
     assert jnp.all(jnp.isfinite(energies))
 
 
-# ---------------------------------------------------------------------------
-# Gradients (forces)
-# ---------------------------------------------------------------------------
-
-
 def test_value_and_grad_finite():
     """value_and_grad produces finite forces; magnitude is bounded."""
     b = _make_backend(periodic=True)
@@ -267,11 +230,6 @@ def test_value_and_grad_finite():
     # Si diamond is bound; forces at a near-relaxed structure should be
     # bounded.  Loose check: per-atom |F| < 100 eV/Å.
     assert float(jnp.max(jnp.abs(grad))) < 100.0
-
-
-# ---------------------------------------------------------------------------
-# NPT wrap
-# ---------------------------------------------------------------------------
 
 
 def test_ensemble_backend_wraps_jaxmd():
@@ -306,22 +264,16 @@ def test_ensemble_backend_wraps_jaxmd():
     )
 
 
-# ---------------------------------------------------------------------------
-# LAMMPS-file path
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(
-    not _JAXMD_SRC_TERSOFF_FIXTURE.exists(),
-    reason="jax-md source's Si.tersoff fixture not at expected path",
-)
-def test_tersoff_from_lammps_file_matches_inline():
-    """Loading jax-md's bundled Si.tersoff should match inline ``"si"``.
+def test_tersoff_from_lammps_file_matches_inline(tmp_path):
+    """Loading a LAMMPS-format Si.tersoff file should match inline ``"si"``.
 
     The inline ``_TERSOFF_SI_88`` was copied from that file, so the
     energies must agree to machine precision on a representative
     structure.
     """
+    params_file = tmp_path / "Si.tersoff"
+    params_file.write_text(_SI_TERSOFF_FILE)
+
     b_inline = create_jaxmd(
         potential="tersoff",
         periodic=True,
@@ -330,7 +282,7 @@ def test_tersoff_from_lammps_file_matches_inline():
     b_file = create_jaxmd(
         potential="tersoff",
         periodic=True,
-        tersoff_params_file=str(_JAXMD_SRC_TERSOFF_FIXTURE),
+        tersoff_params_file=str(params_file),
     )
 
     positions = _si_diamond_positions()
@@ -339,6 +291,4 @@ def test_tersoff_from_lammps_file_matches_inline():
 
     e_inline, *_ = b_inline(positions, species, cell)
     e_file, *_ = b_file(positions, species, cell)
-    assert jnp.allclose(
-        e_inline, e_file, atol=1e-5
-    ), f"inline vs file disagree: {float(e_inline)} vs {float(e_file)}"
+    assert jnp.allclose(e_inline, e_file, atol=1e-5)

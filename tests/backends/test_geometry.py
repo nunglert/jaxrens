@@ -1,4 +1,5 @@
-"""Tests for the shared minimum-image pairwise-distance helper."""
+"""Tests for ``pairwise_distances``, the shared minimum-image distance
+helper."""
 
 from __future__ import annotations
 

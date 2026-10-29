@@ -1,4 +1,4 @@
-"""Tests for the flat Hamiltonian = model + additive EnergyTerms composition.
+"""Tests for ``Hamiltonian``: one energy model plus additive ``EnergyTerm``s.
 
 Regression target: wrapper backends used to forward attribute access to
 their base via ``__getattr__``, so ``eval_energy_and_forces`` found the
@@ -63,6 +63,11 @@ def _autodiff_reference(backend, positions, species, cell, ensemble_params):
 
 
 class TestComposedForces:
+    """Check that the Hamiltonian sums each layer's own energy and forces:
+    the model's native forces are used as they are (or autodiff of the model
+    when it has none), every term adds its energy and forces, and the result
+    matches autodiff of the full energy, also under ``jit``."""
+
     @pytest.mark.parametrize(
         "ensemble_params",
         [
@@ -88,8 +93,8 @@ class TestComposedForces:
         assert jnp.allclose(res.forces, f_ref, rtol=1e-5, atol=1e-5)
 
     def test_energy_includes_every_term(self):
-        """Energy on the force path = U + E_core + P·V − μ·N (the old bug
-        returned bare U here)."""
+        """Energy on the force path is U + E_core + P·V − μ·N, not the bare
+        model energy U."""
         model = _NativeForcesHarmonic(k=1.0)
         mu = jnp.array([0.2, -0.5])
         H = EnsembleBackend(
@@ -102,6 +107,7 @@ class TestComposedForces:
         U = 0.5 * jnp.sum(positions**2)
         E_core = SoftCoreTerm().energy(positions, species, cell)
         assert float(E_core) > 0.0  # the 0.6 Å pair is inside the core
+        # μ·N with one atom of species 0 and two of species 1
         expected = U + E_core + 0.25 * get_volume(cell) - (0.2 * 1 - 0.5 * 2)
         assert float(res.energy) == pytest.approx(float(expected), rel=1e-5)
         assert float(res.energy) == pytest.approx(
@@ -151,6 +157,7 @@ class TestComposedForces:
         term = EnsembleTerm(pressure=0.5, chemical_potentials=jnp.ones(2))
         e, f = term.energy_and_forces(positions, species, cell)
         assert jnp.array_equal(f, jnp.zeros_like(positions))
+        # P·V − μ·N, with μ·N = 1*1 + 1*2 = 3
         assert float(e) == pytest.approx(
             float(0.5 * get_volume(cell) - 3.0), rel=1e-6
         )
@@ -177,6 +184,10 @@ class TestComposedForces:
 
 
 class TestComposition:
+    """Check how a Hamiltonian is assembled: nesting is flattened,
+    ``with_terms`` returns a new object, the model's attributes are not
+    forwarded, and a custom term gets autodiff forces by default."""
+
     def test_nesting_is_flattened(self):
         model = HarmonicBackend()
         a, b = SoftCoreTerm(), EnsembleTerm(pressure=0.1)
