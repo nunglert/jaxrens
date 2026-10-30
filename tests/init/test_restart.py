@@ -1,15 +1,14 @@
-"""Tests for jaxrens.init.restart.load_restart and RestartBundle.
+"""Tests for the restart loaders in jaxrens.init.restart.
 
-Covers:
-- Round-trip: save_checkpoint -> load_restart
-- FileNotFoundError on missing path
-- ValueError on bare walker-set file (no NS-state fields)
-- NVT restart: dead_volumes is None
-- NPT restart: dead_volumes is an array
+The tests cover load_restart for single-run, parallel (n_runs,) and
+multi-GPU (G, P) checkpoints, RestartBundle, infer_restart_shape, and
+load_restart_batched.  They also check how init_ns, run_ns and the Mode D
+resolver (_resolve_init with restart_file) use a loaded checkpoint.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import h5py
@@ -19,14 +18,34 @@ import numpy as np
 import pytest
 
 import jaxrens.sampling.moves.random_walk as _rw_mod
+from jaxrens.backends.toy import create_harmonic
+from jaxrens.cli.resolve import (
+    ResolvedInit,
+    _finalise_initial_energies_and_counts,
+    _resolve_init,
+    resolve,
+)
+from jaxrens.cli.schema import RootSpec
+from jaxrens.cli.schema.cell import CellSpec
+from jaxrens.cli.schema.init import InitSpec
 from jaxrens.init.restart import (
     RestartBundle,
     infer_restart_shape,
     load_restart,
+    load_restart_batched,
 )
 from jaxrens.init.walker_set import WalkerSet
 from jaxrens.io.checkpoint import save_checkpoint
 from jaxrens.sampling.move_kernel import MoveKernel
+from jaxrens.sampling.mwg import build_mwg
+from jaxrens.sampling.nested_sampling import (
+    init_ns,
+    ns_step,
+    run_ns,
+    run_ns_multi_gpu,
+    run_ns_parallel,
+)
+from jaxrens.sampling.termination import IterationTermination
 
 
 def _rw_descriptor():
@@ -38,11 +57,6 @@ def _rw_descriptor():
         kernel_kwargs={},
         extra_state_fields={},
     )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_ns_state_dict(
@@ -96,7 +110,7 @@ def _make_ns_state_dict_no_dead(
     n_atoms: int = 1,
     n_dead: int = 3,
 ) -> dict:
-    """NS-state dict WITHOUT dead arrays — matches production checkpoints.
+    """NS-state dict without dead arrays, as in production checkpoints.
 
     ``_ns_state_to_checkpoint_dict`` never embeds dead-point history (it is
     streamed to ``.energies`` / ``.traj``), so real checkpoints lack
@@ -116,12 +130,13 @@ def _write_checkpoint(
     return p
 
 
-# ---------------------------------------------------------------------------
-# Round-trip: save_checkpoint + load_restart
-# ---------------------------------------------------------------------------
-
-
 class TestRoundTrip:
+    """Check that load_restart returns what save_checkpoint wrote.
+
+    The tests cover the walker set, the bundle fields, and checkpoints
+    without dead-point arrays (as production checkpoints are written).
+    """
+
     def test_walker_set_positions_shape(self, tmp_path):
         state = _make_ns_state_dict(n_walkers=4, n_atoms=2, n_dead=3)
         p = _write_checkpoint(tmp_path, state)
@@ -129,14 +144,14 @@ class TestRoundTrip:
         assert ws.positions.shape == (4, 2, 3)
 
     def test_checkpoint_without_dead_arrays_loads(self, tmp_path):
-        """Real checkpoints omit dead arrays (streamed to disk) — must load."""
+        """Real checkpoints omit the dead arrays (streamed to disk)."""
         state = _make_ns_state_dict_no_dead(n_walkers=4, n_atoms=2, n_dead=7)
         p = _write_checkpoint(tmp_path, state)
         ws, bundle = load_restart(p)
         assert ws.positions.shape == (4, 2, 3)
         assert bundle.iteration == 7
         assert bundle.n_dead == 7
-        # Dead arrays absent → None, and init_ns never reads them.
+        # Absent dead arrays load as None; init_ns never reads them.
         assert bundle.dead_energies is None
         assert bundle.dead_positions is None
 
@@ -209,12 +224,9 @@ class TestRoundTrip:
         assert isinstance(bundle, RestartBundle)
 
 
-# ---------------------------------------------------------------------------
-# Step sizes (single-run / scalar branch)
-# ---------------------------------------------------------------------------
-
-
 class TestStepSizes:
+    """Check that adapted step sizes survive a checkpoint round trip."""
+
     def test_step_sizes_round_trip(self, tmp_path):
         """Scalar checkpoint round-trips adapted step sizes into the bundle."""
         state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=3)
@@ -236,12 +248,12 @@ class TestStepSizes:
         assert bundle.step_sizes is None
 
 
-# ---------------------------------------------------------------------------
-# Error conditions
-# ---------------------------------------------------------------------------
-
-
 class TestErrors:
+    """Check the errors raised by load_restart.
+
+    The tests cover a missing file and a bare walker-set file.
+    """
+
     def test_missing_file_raises_file_not_found(self, tmp_path):
         p = tmp_path / "nonexistent.h5"
         with pytest.raises(FileNotFoundError, match="not found"):
@@ -257,29 +269,16 @@ class TestErrors:
             f.create_dataset(
                 "cells", data=np.stack([np.eye(3)] * 4).astype(np.float32)
             )
-        with pytest.raises(ValueError, match="not a valid NS checkpoint"):
+        with pytest.raises(
+            ValueError, match="not a valid NS checkpoint"
+        ) as exc_info:
             load_restart(p)
-
-    def test_bare_walker_set_error_mentions_start_walker_set(self, tmp_path):
-        p = tmp_path / "walkers.h5"
-        with h5py.File(p, "w") as f:
-            f.create_dataset(
-                "positions", data=np.zeros((4, 1, 3), dtype=np.float32)
-            )
-            f.create_dataset("types", data=np.zeros((4, 1), dtype=np.int32))
-            f.create_dataset(
-                "cells", data=np.stack([np.eye(3)] * 4).astype(np.float32)
-            )
-        with pytest.raises(ValueError, match="start_walker_set"):
-            load_restart(p)
-
-
-# ---------------------------------------------------------------------------
-# NVT restart: dead_volumes is None
-# ---------------------------------------------------------------------------
+        assert "start_walker_set" in str(exc_info.value)
 
 
 class TestNVTRestart:
+    """Check the bundle loaded from an NVT checkpoint (no volumes)."""
+
     def test_nvt_dead_volumes_is_none(self, tmp_path):
         state = _make_ns_state_dict(
             n_walkers=4, n_atoms=1, n_dead=3, npt=False
@@ -298,18 +297,8 @@ class TestNVTRestart:
             bundle.n_dead = 99  # type: ignore[misc]
 
 
-# ---------------------------------------------------------------------------
-# NPT restart: dead_volumes is an array
-# ---------------------------------------------------------------------------
-
-
 class TestNPTRestart:
-    def test_npt_dead_volumes_is_array(self, tmp_path):
-        state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=3, npt=True)
-        p = _write_checkpoint(tmp_path, state)
-        _, bundle = load_restart(p)
-        assert bundle.dead_volumes is not None
-        assert hasattr(bundle.dead_volumes, "shape")
+    """Check the bundle loaded from an NPT checkpoint (with volumes)."""
 
     def test_npt_dead_volumes_shape(self, tmp_path):
         state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=3, npt=True)
@@ -328,134 +317,62 @@ class TestNPTRestart:
         )
 
 
-# ---------------------------------------------------------------------------
-# init_ns restart seeding
-# ---------------------------------------------------------------------------
+def _init_ns_from_checkpoint(tmp_path, state, *, use_restart_state=True):
+    """Load a checkpoint and seed init_ns with it.
+
+    Returns:
+        (ns_state, bundle, step_fn)
+    """
+    p = _write_checkpoint(tmp_path, state)
+    ws, bundle = load_restart(p)
+
+    backend = create_harmonic()
+    init_fn, step_fn, _ = build_mwg(backend, [_rw_descriptor()])
+
+    energies = jax.vmap(lambda pos, typs, cel: backend(pos, typs, cel, 0)[0])(
+        ws.positions, ws.types, ws.cells
+    )
+    ns_state = init_ns(
+        init_fn,
+        ws.positions,
+        ws.types[0],
+        energies,
+        ws.cells,
+        jax.random.key(5),
+        restart_state=bundle if use_restart_state else None,
+    )
+    return ns_state, bundle, step_fn
 
 
 class TestInitNsRestart:
+    """Check that init_ns seeds its state from a loaded RestartBundle.
+
+    The tests cover iteration and log-evidence seeding, zero initialisation
+    without a bundle, and running ns_step on the seeded state under jit.
+    """
+
     def test_init_ns_with_restart_state_seeds_iteration(self, tmp_path):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import init_ns
-
         state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=7)
-        p = _write_checkpoint(tmp_path, state)
-        ws, bundle = load_restart(p)
-
-        backend = create_harmonic()
-        init_fn, _, _ = build_mwg(backend, [_rw_descriptor()])
-
-        positions = ws.positions
-        types = ws.types[0]
-        energies = jax.vmap(
-            lambda pos, typs, cel: backend(pos, typs, cel, 0)[0]
-        )(positions, ws.types, ws.cells)
-        key = jax.random.key(5)
-
-        ns_state = init_ns(
-            init_fn,
-            positions,
-            types,
-            energies,
-            ws.cells,
-            key,
-            restart_state=bundle,
-        )
-
+        ns_state, bundle, _ = _init_ns_from_checkpoint(tmp_path, state)
         assert int(ns_state.iteration) == bundle.iteration
 
     def test_init_ns_with_restart_state_seeds_log_evidence(self, tmp_path):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import init_ns
-
         state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=3)
         state["log_evidence"] = -5.5
-        p = _write_checkpoint(tmp_path, state)
-        ws, bundle = load_restart(p)
-
-        backend = create_harmonic()
-        init_fn, _, _ = build_mwg(backend, [_rw_descriptor()])
-
-        positions = ws.positions
-        types = ws.types[0]
-        energies = jax.vmap(
-            lambda pos, typs, cel: backend(pos, typs, cel, 0)[0]
-        )(positions, ws.types, ws.cells)
-        key = jax.random.key(5)
-
-        ns_state = init_ns(
-            init_fn,
-            positions,
-            types,
-            energies,
-            ws.cells,
-            key,
-            restart_state=bundle,
-        )
-
+        ns_state, bundle, _ = _init_ns_from_checkpoint(tmp_path, state)
         assert abs(float(ns_state.log_evidence) - bundle.log_evidence) < 1e-5
 
     def test_init_ns_without_restart_state_zero_initializes(self, tmp_path):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import init_ns
-
         state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=5)
-        p = _write_checkpoint(tmp_path, state)
-        ws, _ = load_restart(p)
-
-        backend = create_harmonic()
-        init_fn, _, _ = build_mwg(backend, [_rw_descriptor()])
-
-        positions = ws.positions
-        types = ws.types[0]
-        energies = jax.vmap(
-            lambda pos, typs, cel: backend(pos, typs, cel, 0)[0]
-        )(positions, ws.types, ws.cells)
-        key = jax.random.key(5)
-
-        ns_state = init_ns(
-            init_fn,
-            positions,
-            types,
-            energies,
-            ws.cells,
-            key,
+        ns_state, _, _ = _init_ns_from_checkpoint(
+            tmp_path, state, use_restart_state=False
         )
-
         assert int(ns_state.iteration) == 0
 
     def test_init_ns_restart_under_jit(self, tmp_path):
-        """init_ns with restart_state: the produced NSState must survive ns_step under jit."""
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import init_ns, ns_step
-
+        """ns_step runs under jit on an NSState seeded by a restart state."""
         state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=3)
-        p = _write_checkpoint(tmp_path, state)
-        ws, bundle = load_restart(p)
-
-        backend = create_harmonic()
-        init_fn, step_fn, _ = build_mwg(backend, [_rw_descriptor()])
-
-        positions = ws.positions
-        types = ws.types[0]
-        energies = jax.vmap(
-            lambda pos, typs, cel: backend(pos, typs, cel, 0)[0]
-        )(positions, ws.types, ws.cells)
-        key = jax.random.key(5)
-
-        ns_state = init_ns(
-            init_fn,
-            positions,
-            types,
-            energies,
-            ws.cells,
-            key,
-            restart_state=bundle,
-        )
+        ns_state, bundle, step_fn = _init_ns_from_checkpoint(tmp_path, state)
 
         jit_ns_step = jax.jit(
             ns_step, static_argnames=("step_fn", "n_mcmc_steps")
@@ -466,11 +383,6 @@ class TestInitNsRestart:
         assert jnp.isfinite(info["emax"])
 
 
-# ---------------------------------------------------------------------------
-# Mode D resolver tests (moved from test_schema.py::TestInitSpecResolverModeD)
-# ---------------------------------------------------------------------------
-
-
 def _make_ns_checkpoint_resolver(
     tmp_path: Path,
     n_walkers: int = 4,
@@ -478,19 +390,15 @@ def _make_ns_checkpoint_resolver(
     n_dead: int = 5,
     name: str = "ns.checkpoint.h5",
 ) -> Path:
-    """Write a minimal NS checkpoint for Mode D resolver tests."""
-    import numpy as _np
-
-    from jaxrens.io.checkpoint import save_checkpoint
-
-    rng = _np.random.default_rng(0)
-    positions = rng.uniform(-2, 2, (n_walkers, n_atoms, 3)).astype(_np.float32)
-    types = _np.zeros((n_walkers, n_atoms), dtype=_np.int32)
-    energies = rng.uniform(1, 10, n_walkers).astype(_np.float32)
-    cells = _np.stack([_np.eye(3, dtype=_np.float32) * 6.0] * n_walkers)
-    dead_energies = rng.uniform(10, 20, n_dead).astype(_np.float32)
+    """Write a minimal NS checkpoint for the Mode D resolver tests."""
+    rng = np.random.default_rng(0)
+    positions = rng.uniform(-2, 2, (n_walkers, n_atoms, 3)).astype(np.float32)
+    types = np.zeros((n_walkers, n_atoms), dtype=np.int32)
+    energies = rng.uniform(1, 10, n_walkers).astype(np.float32)
+    cells = np.stack([np.eye(3, dtype=np.float32) * 6.0] * n_walkers)
+    dead_energies = rng.uniform(10, 20, n_dead).astype(np.float32)
     dead_positions = rng.uniform(-2, 2, (n_dead, n_atoms, 3)).astype(
-        _np.float32
+        np.float32
     )
 
     state = {
@@ -514,8 +422,6 @@ def _make_ns_checkpoint_resolver(
 
 
 def _cell_cfg_permissive_restart():
-    from jaxrens.cli.schema.cell import CellSpec
-
     return CellSpec(
         max_volume_per_atom=10000.0,
         min_volume_per_atom=0.01,
@@ -524,16 +430,14 @@ def _cell_cfg_permissive_restart():
 
 
 class TestInitSpecResolverModeD:
-    """Mode D resolver tests: restart_file.
+    """Check _resolve_init for an init spec with restart_file (Mode D).
 
-    Moved verbatim from test_schema.py::TestInitSpecResolverModeD.
+    The tests cover the resolved fields, the warning for random_initialise_*,
+    the error for multi-replica ensembles, and continuing a run from the
+    restart state.
     """
 
     def test_mode_d_returns_resolved_init(self, tmp_path):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import ResolvedInit, _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         p = _make_ns_checkpoint_resolver(
             tmp_path, n_walkers=4, n_atoms=1, n_dead=5
         )
@@ -548,11 +452,6 @@ class TestInitSpecResolverModeD:
         assert isinstance(result, ResolvedInit)
 
     def test_mode_d_restart_state_populated(self, tmp_path):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.init.restart import RestartBundle
-
         p = _make_ns_checkpoint_resolver(
             tmp_path, n_walkers=4, n_atoms=1, n_dead=5
         )
@@ -568,10 +467,6 @@ class TestInitSpecResolverModeD:
         assert isinstance(result.restart_state, RestartBundle)
 
     def test_mode_d_restart_state_n_dead(self, tmp_path):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         p = _make_ns_checkpoint_resolver(
             tmp_path, n_walkers=4, n_atoms=1, n_dead=5
         )
@@ -586,10 +481,6 @@ class TestInitSpecResolverModeD:
         assert result.restart_state.n_dead == 5
 
     def test_mode_d_restart_state_iteration(self, tmp_path):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         p = _make_ns_checkpoint_resolver(
             tmp_path, n_walkers=4, n_atoms=1, n_dead=5
         )
@@ -604,10 +495,6 @@ class TestInitSpecResolverModeD:
         assert result.restart_state.iteration == 5
 
     def test_mode_d_symbol_map_populated(self, tmp_path):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         p = _make_ns_checkpoint_resolver(
             tmp_path, n_walkers=4, n_atoms=1, n_dead=5
         )
@@ -622,13 +509,6 @@ class TestInitSpecResolverModeD:
         assert result.symbol_map == {0: "Si"}
 
     def test_mode_d_energies_recomputed(self, tmp_path):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import (
-            _finalise_initial_energies_and_counts,
-            _resolve_init,
-        )
-        from jaxrens.cli.schema.init import InitSpec
-
         p = _make_ns_checkpoint_resolver(
             tmp_path, n_walkers=4, n_atoms=1, n_dead=5
         )
@@ -641,7 +521,7 @@ class TestInitSpecResolverModeD:
             energy_backend=backend,
             cell_cfg=_cell_cfg_permissive_restart(),
         )
-        # _resolve_init now leaves energies as None; caller finalizes.
+        # _resolve_init leaves energies as None; the caller finalises them.
         energies, _ = _finalise_initial_energies_and_counts(
             backend,
             result.initial_positions,
@@ -653,12 +533,6 @@ class TestInitSpecResolverModeD:
         assert jnp.all(jnp.isfinite(energies))
 
     def test_mode_d_random_initialise_pos_true_warns(self, tmp_path, caplog):
-        import logging
-
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         p = _make_ns_checkpoint_resolver(
             tmp_path, n_walkers=4, n_atoms=1, n_dead=5
         )
@@ -678,9 +552,6 @@ class TestInitSpecResolverModeD:
         )
 
     def test_multi_replica_with_restart_file_raises(self, tmp_path):
-        from jaxrens.cli.resolve import resolve
-        from jaxrens.cli.schema import RootSpec
-
         p = _make_ns_checkpoint_resolver(
             tmp_path, n_walkers=4, n_atoms=1, n_dead=5
         )
@@ -702,17 +573,12 @@ class TestInitSpecResolverModeD:
             "init": {"restart_file": str(p)},
         }
         root = RootSpec.model_validate(d)
-        import pytest as _pytest
-
-        with _pytest.raises(ValueError, match="restart_file"):
+        with pytest.raises(ValueError, match="restart_file"):
             resolve(root)
 
     def test_multi_replica_restart_error_message_contains_n_total(
         self, tmp_path
     ):
-        from jaxrens.cli.resolve import resolve
-        from jaxrens.cli.schema import RootSpec
-
         p = _make_ns_checkpoint_resolver(
             tmp_path, n_walkers=4, n_atoms=1, n_dead=5
         )
@@ -734,24 +600,11 @@ class TestInitSpecResolverModeD:
             "init": {"restart_file": str(p)},
         }
         root = RootSpec.model_validate(d)
-        import pytest as _pytest
-
-        with _pytest.raises(ValueError, match="3"):
+        with pytest.raises(ValueError, match="3"):
             resolve(root)
 
     def test_mode_d_end_to_end_jit(self, tmp_path):
-        """Mode D: load checkpoint, init_ns with restart_state, run ns_step under JIT."""
-        import jaxrens.sampling.moves.random_walk as rw_mod
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import (
-            _finalise_initial_energies_and_counts,
-            _resolve_init,
-        )
-        from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.sampling.move_kernel import MoveKernel
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import init_ns, ns_step
-
+        """Load a checkpoint, seed init_ns with it, run ns_step under jit."""
         n_dead_checkpoint = 5
         p = _make_ns_checkpoint_resolver(
             tmp_path, n_walkers=4, n_atoms=1, n_dead=n_dead_checkpoint
@@ -766,7 +619,7 @@ class TestInitSpecResolverModeD:
             energy_backend=backend,
             cell_cfg=_cell_cfg_permissive_restart(),
         )
-        # Finalize is the caller's job after the refactor.
+        # The caller finalises the energies.
         energies, _ = _finalise_initial_energies_and_counts(
             backend,
             result.initial_positions,
@@ -776,7 +629,7 @@ class TestInitSpecResolverModeD:
 
         desc = MoveKernel(
             name="random_walk",
-            build_kernel=rw_mod.build_kernel,
+            build_kernel=_rw_mod.build_kernel,
             step_size=0.3,
             weight=1.0,
             kernel_kwargs={},
@@ -806,19 +659,7 @@ class TestInitSpecResolverModeD:
         assert jnp.isfinite(info["emax"])
 
     def test_mode_d_continued_run_n_dead_increments(self, tmp_path):
-        """After restart, run_ns for N more steps: n_dead >= checkpoint + N."""
-        import jaxrens.sampling.moves.random_walk as rw_mod
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import (
-            _finalise_initial_energies_and_counts,
-            _resolve_init,
-        )
-        from jaxrens.cli.schema.init import InitSpec
-        from jaxrens.sampling.move_kernel import MoveKernel
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import run_ns
-        from jaxrens.sampling.termination import IterationTermination
-
+        """After a restart, N more steps give n_dead = checkpoint + N."""
         n_dead_checkpoint = 5
         n_extra_iters = 5
         p = _make_ns_checkpoint_resolver(
@@ -834,7 +675,7 @@ class TestInitSpecResolverModeD:
             energy_backend=backend,
             cell_cfg=_cell_cfg_permissive_restart(),
         )
-        # Finalize is the caller's job after the refactor.
+        # The caller finalises the energies.
         energies, _ = _finalise_initial_energies_and_counts(
             backend,
             result.initial_positions,
@@ -844,7 +685,7 @@ class TestInitSpecResolverModeD:
 
         desc = MoveKernel(
             name="random_walk",
-            build_kernel=rw_mod.build_kernel,
+            build_kernel=_rw_mod.build_kernel,
             step_size=0.3,
             weight=1.0,
             kernel_kwargs={},
@@ -869,13 +710,8 @@ class TestInitSpecResolverModeD:
             restart_state=result.restart_state,
         )
 
-        assert out["n_dead"] >= n_dead_checkpoint
+        assert out["n_dead"] == n_dead_checkpoint + n_extra_iters
         assert jnp.isfinite(out["log_evidence"])
-
-
-# ---------------------------------------------------------------------------
-# Shape-aware dispatcher: load_restart (batched checkpoints)
-# ---------------------------------------------------------------------------
 
 
 def _make_batched_ns_state_dict(
@@ -961,7 +797,11 @@ def _make_batched_ns_state_dict(
 
 
 class TestLoadRestartParallel:
-    """load_restart on a (n_runs,)-shaped checkpoint → list[RestartBundle]."""
+    """Check load_restart on a (n_runs,)-shaped checkpoint.
+
+    It returns a list[RestartBundle], one per run, that run_ns_parallel
+    accepts as restart_states.
+    """
 
     def test_returns_list(self, tmp_path):
         n_runs = 3
@@ -1052,12 +892,7 @@ class TestLoadRestartParallel:
             assert b.dead_volumes.shape == (b.n_dead,)
 
     def test_run_ns_parallel_roundtrip(self, tmp_path):
-        """load_restart on a parallel checkpoint feeds directly into run_ns_parallel."""
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import run_ns_parallel
-        from jaxrens.sampling.termination import IterationTermination
-
+        """A parallel checkpoint loads straight into run_ns_parallel."""
         n_runs = 2
         n_walkers = 6
         n_atoms = 1
@@ -1071,7 +906,7 @@ class TestLoadRestartParallel:
         energies = rng.uniform(0, 2, (n_runs, n_walkers)).astype(np.float32)
         types = np.zeros(n_atoms, dtype=np.int32)
 
-        # Build a parallel checkpoint with exactly n_dead_checkpoint dead points per run.
+        # A parallel checkpoint with n_dead_checkpoint dead points per run.
         dead_energies = rng.uniform(5, 10, (n_runs, n_dead_checkpoint)).astype(
             np.float32
         )
@@ -1124,7 +959,11 @@ class TestLoadRestartParallel:
 
 
 class TestLoadRestartMultiGpu:
-    """load_restart on a (G, P)-shaped checkpoint → list[list[RestartBundle]]."""
+    """Check load_restart on a (G, P)-shaped checkpoint.
+
+    It returns a list[list[RestartBundle]] that run_ns_multi_gpu accepts as
+    restart_states, and raises when the device count differs from G.
+    """
 
     def test_returns_nested_list(self, tmp_path):
         G, P = 1, 2
@@ -1182,9 +1021,8 @@ class TestLoadRestartMultiGpu:
                 assert abs(result[g][pp].log_evidence - expected) < 1e-4
 
     def test_topology_mismatch_raises(self, tmp_path, monkeypatch):
-        """Restarting a multi-GPU checkpoint on a host with a different
-        device count must raise with a clear message — silent topology
-        coercion is not supported (per §D plan)."""
+        """A multi-GPU checkpoint restarted on a host with a different
+        device count raises; the topology is never coerced silently."""
         # Save a (G=2, P=2) checkpoint.
         G, P = 2, 2
         state = _make_batched_ns_state_dict(batch_shape=(G, P))
@@ -1192,22 +1030,13 @@ class TestLoadRestartMultiGpu:
         save_checkpoint(p, state)
 
         # Force ``len(jax.local_devices())`` to disagree with G.
-        import jax as _jax
-
-        monkeypatch.setattr(
-            _jax, "local_devices", lambda *_a, **_k: [object()]
-        )
+        monkeypatch.setattr(jax, "local_devices", lambda *_a, **_k: [object()])
 
         with pytest.raises(ValueError, match="Cross-topology restart is not"):
             load_restart(p)
 
     def test_run_ns_multi_gpu_roundtrip(self, tmp_path):
-        """load_restart on a (G, P) checkpoint feeds into run_ns_multi_gpu."""
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import run_ns_multi_gpu
-        from jaxrens.sampling.termination import IterationTermination
-
+        """A (G, P) checkpoint loads straight into run_ns_multi_gpu."""
         n_gpu, n_per_gpu = 1, 2
         n_total = n_gpu * n_per_gpu
         n_walkers = 8
@@ -1290,11 +1119,9 @@ class TestLoadRestartMultiGpu:
 
 
 class TestLoadRestartShapeError:
-    """load_restart raises ValueError for ndim >= 3 checkpoints."""
+    """Check that load_restart rejects checkpoints with a 3-D batch prefix."""
 
     def test_ndim3_raises_value_error(self, tmp_path):
-        import h5py
-
         # Build a synthetic file with a 3-D log_evidence array.
         p = tmp_path / "bad_ndim3.checkpoint.h5"
         rng = np.random.default_rng(0)
@@ -1349,8 +1176,6 @@ class TestLoadRestartShapeError:
             load_restart(p)
 
     def test_ndim3_error_message_has_shape(self, tmp_path):
-        import h5py
-
         p = tmp_path / "bad_ndim3_msg.checkpoint.h5"
         rng = np.random.default_rng(1)
         shape3d = (2, 3, 4)
@@ -1386,77 +1211,13 @@ class TestLoadRestartShapeError:
             f.create_dataset("n_dead", data=np.ones(shape3d, dtype=np.int32))
             f.attrs["n_walkers"] = 4
 
-        # New format (post-§D): error mentions the shape and rank explicitly.
+        # The error names the rank and the shape.
         with pytest.raises(ValueError, match=r"rank 3|\(2, 3, 4\)"):
             load_restart(p)
 
 
-class TestSchemaDrift:
-    """If a field is added to RestartBundle, load_restart must still cover it."""
-
-    def test_all_dataclass_fields_present_in_scalar_bundle(self, tmp_path):
-        """Every public field of RestartBundle appears in a loaded scalar bundle."""
-        import dataclasses
-
-        state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=3)
-        p = _write_checkpoint(tmp_path, state)
-        _, bundle = load_restart(p)
-
-        bundle_field_names = {
-            f.name for f in dataclasses.fields(RestartBundle)
-        }
-        for name in bundle_field_names:
-            assert hasattr(bundle, name), (
-                f"RestartBundle field '{name}' missing from loaded scalar bundle. "
-                f"If you added a new field to RestartBundle, update load_restart "
-                f"(specifically _build_bundle_from_ckpt) to populate it."
-            )
-
-    def test_all_dataclass_fields_present_in_parallel_bundle(self, tmp_path):
-        """Every public field of RestartBundle appears in a loaded parallel (ndim=1) bundle."""
-        import dataclasses
-
-        n_runs = 2
-        state = _make_batched_ns_state_dict(batch_shape=(n_runs,))
-        p = tmp_path / "schema_par.checkpoint.h5"
-        save_checkpoint(p, state)
-        bundles = load_restart(p)
-
-        bundle_field_names = {
-            f.name for f in dataclasses.fields(RestartBundle)
-        }
-        for b in bundles:
-            for name in bundle_field_names:
-                assert hasattr(b, name), (
-                    f"RestartBundle field '{name}' missing from loaded parallel bundle. "
-                    f"Update _build_bundle_from_ckpt if you added a new field."
-                )
-
-    def test_all_dataclass_fields_present_in_multi_gpu_bundle(self, tmp_path):
-        """Every public field of RestartBundle appears in a loaded multi-GPU (ndim=2) bundle."""
-        import dataclasses
-
-        G, P = 1, 2
-        state = _make_batched_ns_state_dict(batch_shape=(G, P))
-        p = tmp_path / "schema_mgpu.checkpoint.h5"
-        save_checkpoint(p, state)
-        bundles = load_restart(p)
-
-        bundle_field_names = {
-            f.name for f in dataclasses.fields(RestartBundle)
-        }
-        for g in range(G):
-            for pp in range(P):
-                b = bundles[g][pp]
-                for name in bundle_field_names:
-                    assert hasattr(b, name), (
-                        f"RestartBundle field '{name}' missing from multi-GPU bundle "
-                        f"at [{g}][{pp}]. Update _build_bundle_from_ckpt."
-                    )
-
-
 class TestInferRestartShape:
-    """Unit tests for infer_restart_shape helper."""
+    """Check infer_restart_shape on the three shapes load_restart returns."""
 
     def test_single_run_tuple(self, tmp_path):
         state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=3)
@@ -1479,23 +1240,18 @@ class TestInferRestartShape:
         assert infer_restart_shape(loaded) == "multi_gpu"
 
     def test_invalid_type_raises_type_error(self):
-        from jaxrens.init.restart import infer_restart_shape
-
         with pytest.raises(TypeError, match="unrecognised"):
             infer_restart_shape("not_a_bundle")
 
 
-# ---------------------------------------------------------------------------
-# load_restart_batched: multi-replica restart loader
-# ---------------------------------------------------------------------------
-
-
 class TestLoadRestartBatched:
-    """Multi-replica loader returning flat (n_total, ...) arrays + 2-D bundles."""
+    """Check load_restart_batched, the multi-replica loader.
+
+    It returns flat (n_total, ...) arrays and a nested (n_gpu, n_per_gpu)
+    list of bundles.
+    """
 
     def test_vmap_1d_checkpoint_returns_single_gpu_layout(self, tmp_path):
-        from jaxrens.init.restart import load_restart_batched
-
         n_runs = 4
         state = _make_batched_ns_state_dict(
             batch_shape=(n_runs,), n_walkers=3, n_atoms=2
@@ -1515,8 +1271,6 @@ class TestLoadRestartBatched:
         assert all(isinstance(b, RestartBundle) for b in batched.bundles_2d[0])
 
     def test_pmap_2d_checkpoint_preserves_g_p_split(self, tmp_path):
-        from jaxrens.init.restart import load_restart_batched
-
         G, P = 1, 4  # n_gpu=1 to avoid the cross-topology guard on this host.
         state = _make_batched_ns_state_dict(
             batch_shape=(G, P), n_walkers=3, n_atoms=2
@@ -1533,8 +1287,6 @@ class TestLoadRestartBatched:
         assert len(batched.bundles_2d[0]) == P
 
     def test_bundles_flat_round_trips_through_bundles_2d(self, tmp_path):
-        from jaxrens.init.restart import load_restart_batched
-
         state = _make_batched_ns_state_dict(batch_shape=(1, 6), n_walkers=2)
         p = tmp_path / "rt.checkpoint.h5"
         save_checkpoint(p, state)
@@ -1549,8 +1301,6 @@ class TestLoadRestartBatched:
         assert rebuilt == batched.bundles_2d
 
     def test_single_run_checkpoint_rejected(self, tmp_path):
-        from jaxrens.init.restart import load_restart_batched
-
         state = _make_ns_state_dict(n_walkers=4, n_atoms=1, n_dead=3)
         p = _write_checkpoint(tmp_path, state, name="scalar.checkpoint.h5")
 
@@ -1558,17 +1308,13 @@ class TestLoadRestartBatched:
             load_restart_batched(p)
 
     def test_missing_file_raises_file_not_found(self, tmp_path):
-        from jaxrens.init.restart import load_restart_batched
-
         with pytest.raises(FileNotFoundError):
             load_restart_batched(tmp_path / "nope.h5")
 
     def test_per_slot_bundles_independent(self, tmp_path):
-        """Each bundle carries its own iteration / n_dead, not a single shared one."""
-        from jaxrens.init.restart import load_restart_batched
-
+        """Each bundle carries its own iteration and n_dead."""
         state = _make_batched_ns_state_dict(batch_shape=(1, 3), n_walkers=2)
-        # Stamp distinct iteration values so we can tell slots apart.
+        # Distinct values tell the slots apart.
         state["iteration"] = np.array([[10, 20, 30]], dtype=np.int32)
         state["n_dead"] = np.array([[5, 6, 7]], dtype=np.int32)
         p = tmp_path / "per_slot.checkpoint.h5"

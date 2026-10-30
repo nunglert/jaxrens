@@ -57,8 +57,8 @@ def _propose_shear(
     """Propose a volume-preserving shear of `cell`.
 
     Selects a random cell vector index (0, 1, or 2) and displaces it within the
-    plane spanned by the other two vectors.  Shear of a column-lattice does not
-    change the determinant.
+    plane spanned by the other two vectors.  The shear leaves the determinant
+    unchanged.
 
     Args:
         cell: (3, 3) cell matrix, rows are lattice vectors.
@@ -94,19 +94,17 @@ def sample_initial_volume(
     V_lo = n_atoms * min_volume_per_atom and V_hi = n_atoms * max_volume_per_atom.
     ``min_volume_per_atom`` is the *initial* volume floor: it lets walkers start
     on a low-density grid, decoupled from the sampling-constraint floor.  The
-    default of 0.0 reproduces the historical unbounded-below behaviour.
+    default of 0.0 puts no lower bound on the volume.
 
     Two prior modes:
 
     flat_V_prior=True:
         V ~ Uniform(V_lo, V_hi).  The edge length is lc = V ** (1/3).
 
-    flat_V_prior=False (legacy default, pymatnest convention):
+    flat_V_prior=False (default, pymatnest convention):
         V drawn with density proportional to V^N (N = n_atoms) truncated to
-        [V_lo, V_hi], biasing toward larger volumes; this matches the pymatnest
-        / jaxnest convention used in
-        randomization.py::create_random_initialise_cell (lines 218-225).  With
-        V_lo = 0 this reduces to
+        [V_lo, V_hi], biasing toward larger volumes.  With V_lo = 0 this
+        reduces to
         lc = (V_hi * U ** (1 / (n_atoms + 1))) ** (1/3), U ~ Uniform(0, 1).
 
     Args:
@@ -152,9 +150,8 @@ def cell_shape_walk(
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Run n_steps shear+stretch moves on a cell, keeping volume constant.
 
-    At each step a random key selects either a shear or stretch proposal
-    (matching the legacy random-choice convention in randomization.py lines
-    154-163).  A proposal is accepted only if the resulting cell satisfies
+    At each step a random draw selects either a shear or a stretch proposal.
+    A proposal is accepted only if the resulting cell satisfies
     min_aspect_ratio_val; volume is held constant by construction of both
     proposal kernels.
 
