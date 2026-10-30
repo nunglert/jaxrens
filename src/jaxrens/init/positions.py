@@ -7,10 +7,9 @@ Two public functions:
 
 from __future__ import annotations
 
-import numpy as np
-
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 def uniform_positions_in_cell(
@@ -43,8 +42,15 @@ def grid_positions_in_cell(
     Grid counts per axis are derived from cell edge lengths (||a||, ||b||, ||c||)
     divided by min_distance, floored to an integer.  Grid sites are built in
     fractional coordinates using numpy (the integer index ranges are Python-side
-    scalars), then jax.random.choice selects n_atoms sites without replacement.
-    Conversion to Cartesian uses selected @ cell.
+    scalars), at the centre of each grid cell, then jax.random.choice selects
+    n_atoms sites without replacement.  Conversion to Cartesian uses
+    selected @ cell.
+
+    The spacing along each edge is at least min_distance, but the distance
+    between sites that differ along several axes is not checked.  In an
+    oblique cell, for example one with two nearly parallel edges, some pairs of
+    sites can be closer than min_distance.  The guarantee holds for
+    orthogonal cells.
 
     Args:
         key: JAX PRNG key.
@@ -82,7 +88,8 @@ def grid_positions_in_cell(
 
     ga, gb, gc = np.meshgrid(fa, fb, fc, indexing="ij")
     grid_frac = jnp.array(
-        np.stack([ga.ravel(), gb.ravel(), gc.ravel()], axis=1), dtype=jnp.float32
+        np.stack([ga.ravel(), gb.ravel(), gc.ravel()], axis=1),
+        dtype=jnp.float32,
     )
 
     indices = jax.random.choice(key, n_grid, (n_atoms,), replace=False)
