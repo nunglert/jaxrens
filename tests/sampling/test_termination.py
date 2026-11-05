@@ -1,13 +1,4 @@
-"""Tests for termination criteria (Step 14).
-
-Tests:
-- TempTermination converges on harmonic potential with known Z(T)
-- EnergyTermination triggers at correct energy
-- IterationTermination and PriorMassTermination basic behavior
-- Pluggable TerminationCriterion protocol (custom criterion)
-- check_any helper
-- Batch termination: all parallel runs must converge
-"""
+"""Tests for the termination criteria and check_any."""
 
 from __future__ import annotations
 
@@ -17,8 +8,16 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from jaxrens.backends.toy import create_harmonic
+from jaxrens.cli.resolve import resolve
+from jaxrens.cli.schema import RootSpec
+from jaxrens.prior_mass import log_alpha, log_dead_weights
+from jaxrens.sampling.batch_descriptor import VmapRuns
+from jaxrens.sampling.move_kernel import MoveKernel
+from jaxrens.sampling.moves import random_walk
+from jaxrens.sampling.mwg import build_mwg
+from jaxrens.sampling.nested_sampling import run_ns
 from jaxrens.sampling.termination import (
-    KB_EV,
     EnergyTermination,
     IterationTermination,
     PriorMassTermination,
@@ -26,10 +25,10 @@ from jaxrens.sampling.termination import (
     check_any,
 )
 
-# ── IterationTermination ─────────────────────────────────────────────────
-
 
 class TestIterationTermination:
+    """Check that IterationTermination stops at the last iteration."""
+
     def test_triggers_at_max(self):
         t = IterationTermination(max_iterations=100)
         assert not t.check(98, 0.0)
@@ -40,40 +39,31 @@ class TestIterationTermination:
         assert "10" in t.message()
 
 
-# ── PriorMassTermination ─────────────────────────────────────────────────
-
-
 class TestPriorMassTermination:
+    """Check PriorMassTermination with and without an evidence estimate."""
+
     def test_never_triggers_without_evidence(self):
-        """Without update_evidence, log_evidence is -inf, so check is always False."""
+        """Without update_evidence the log-evidence is -inf: never triggers."""
         t = PriorMassTermination(n_live=100)
         assert not t.check(0, 0.0)
         assert not t.check(50, 0.0)
 
     def test_triggers_when_mass_negligible(self):
         t = PriorMassTermination(n_live=50, threshold=0.1)
-        t.update_evidence(-5.0)  # relatively high evidence
-        # At iteration 1000, log_remaining = -1000/50 = -20, well below -5.1
+        t.update_evidence(-5.0)
+        # At iteration 1000, log_remaining = -1000/50 = -20, below -5.1.
         assert t.check(1000, 0.0)
-
-    def test_does_not_trigger_without_evidence(self):
-        t = PriorMassTermination(n_live=50)
-        # Without calling update_evidence, _log_evidence = -inf
-        # log_remaining < -inf is always False
-        assert not t.check(500, 0.0)
 
 
 class TestNCullAwareTermination:
-    """Criteria use the shared pymatnest ladder (``jaxrens.prior_mass``)."""
+    """Check that the criteria use the n_cull ladder of jaxrens.prior_mass."""
 
     def test_prior_mass_uses_n_cull(self):
-        from jaxrens.prior_mass import log_alpha
-
         n, c = 50, 5
         t = PriorMassTermination(n_live=n, threshold=1.0, n_cull=c)
-        # log X after iteration i is (i + 1) * log_alpha; with log_Z = 0 and
-        # emax = 0 it triggers as soon as that drops below log(threshold)=0,
-        # i.e. right after the "every walker replaced once" guard.
+        # log X after iteration i is (i + 1) * log_alpha.  With log_Z = 0 and
+        # emax = 0 it triggers once that is below log(threshold) = 0, right
+        # after the guard that every walker is replaced once.
         t.update_evidence(0.0)
         assert not t.check(n // c, 0.0)  # guard: i * c <= n
         assert t.check(n // c + 1, 0.0)
@@ -89,19 +79,16 @@ class TestNCullAwareTermination:
         assert first["fast"] * 8 < first["slow"]
 
     def test_temp_termination_weight_is_contour_dead_point(self):
-        from jaxrens.prior_mass import log_dead_weights
-
         n, c, i = 40, 4, 17
         t = TempTermination(n_walkers=n, target_temp=1000.0, n_cull=c)
-        t.check(i, 0.0)  # emax = 0 → log_Z_term is the bare weight
+        t.check(i, 0.0)  # emax = 0: log_Z_term is the bare weight
         expected = log_dead_weights((i + 1) * c, n, c)[-1]
         assert t.log_Z_term_last == pytest.approx(expected)
 
 
-# ── EnergyTermination ────────────────────────────────────────────────────
-
-
 class TestEnergyTermination:
+    """Check that EnergyTermination stops when emax drops below the target."""
+
     def test_triggers_below_target(self):
         t = EnergyTermination(min_energy=-1.0)
         assert not t.check(0, 0.5)
@@ -119,20 +106,21 @@ class TestEnergyTermination:
         assert "-2.0" in t.message()
 
 
-# ── TempTermination ──────────────────────────────────────────────────────
-
-
 class TestTempTermination:
+    """Check TempTermination on synthetic sequences of dead-point energies.
+
+    The tests cover convergence, the threshold, n_cull, the log-term
+    properties and the message.
+    """
+
     def test_basic_convergence(self):
-        """Feed decreasing energies; once contributions fall off, should trigger."""
+        """Exponentially decaying energies trigger the criterion."""
         n_walkers = 100
         target_temp = 300.0
         t = TempTermination(
             n_walkers=n_walkers, target_temp=target_temp, threshold=10.0
         )
 
-        # Simulate a nested sampling run with exponentially decaying energies
-        # (realistic: energies decrease fast then plateau near ground state)
         n_iters = 5000
         energies = [
             10.0 * math.exp(-i / (n_walkers * 0.5)) for i in range(n_iters)
@@ -144,66 +132,25 @@ class TestTempTermination:
                 triggered_at = i
                 break
 
-        assert (
-            triggered_at is not None
-        ), "TempTermination should have triggered"
-        assert triggered_at > 0, "Should not trigger on first iteration"
+        assert triggered_at is not None
+        assert triggered_at > 0
 
-    def test_never_triggers_if_energies_flat(self):
-        """If energies stay constant, prior mass shrinks but Z terms shrink too."""
+    def test_triggers_with_flat_energies(self):
+        """A constant energy still triggers once the prior-mass weight decays.
+
+        With a constant energy, log_Z_term only falls through the weight term
+        i * log_alpha, so it drops below the maximum after enough iterations.
+        """
         t = TempTermination(n_walkers=50, target_temp=1000.0, threshold=10.0)
-        # Constant energy: log_Z_term = i*log_t + log_shell - beta*E
-        # The i*log_t term makes this decrease, so eventually it will trigger
-        # once log_t decay outweighs constant -beta*E
         triggered = False
         for i in range(10000):
             if t.check(i, 5.0):
                 triggered = True
                 break
-        # With constant energy and enough iterations, the weight decay
-        # will cause convergence
         assert triggered
 
-    def test_harmonic_potential_convergence(self):
-        """Test on harmonic potential with known Z(T).
-
-        For a 1D harmonic oscillator E = 0.5*k*x^2:
-        Z(T) = sqrt(2*pi*kB*T/k) (per degree of freedom)
-
-        We simulate a nested sampling sequence of energies and check that
-        TempTermination triggers at a reasonable point.
-        """
-        n_walkers = 200
-        target_temp = 300.0  # K
-        k = 1.0  # eV/Å^2
-        beta = 1.0 / (KB_EV * target_temp)
-
-        t = TempTermination(
-            n_walkers=n_walkers,
-            target_temp=target_temp,
-            threshold=10.0,
-        )
-
-        # Simulate NS on harmonic: energies decrease from some max toward 0
-        # In NS, dead point energies decrease monotonically
-        n_iters = 5000
-        # Exponentially decreasing energies (typical NS behavior)
-        energies = [
-            5.0 * math.exp(-i / (n_walkers * 0.5)) for i in range(n_iters)
-        ]
-
-        triggered_at = None
-        for i, e in enumerate(energies):
-            if t.check(i, e):
-                triggered_at = i
-                break
-
-        assert triggered_at is not None, "Should converge on harmonic"
-        # Should terminate well before all iterations are used
-        assert triggered_at < n_iters - 1
-
     def test_n_cull_greater_than_one(self):
-        """Multi-cull should still work."""
+        """The criterion also triggers with n_cull = 3."""
         t = TempTermination(
             n_walkers=100, target_temp=500.0, n_cull=3, threshold=10.0
         )
@@ -218,7 +165,7 @@ class TestTempTermination:
         assert triggered_at is not None
 
     def test_threshold_sensitivity(self):
-        """Smaller threshold should trigger earlier."""
+        """A smaller threshold triggers earlier."""
         energies = [10.0 * math.exp(-i / 50.0) for i in range(5000)]
 
         t5 = TempTermination(n_walkers=100, target_temp=300.0, threshold=5.0)
@@ -235,12 +182,10 @@ class TestTempTermination:
                 break
 
         assert trigger_5 is not None and trigger_15 is not None
-        assert (
-            trigger_5 < trigger_15
-        ), "Smaller threshold should trigger earlier"
+        assert trigger_5 < trigger_15
 
     def test_log_Z_term_properties(self):
-        """Properties track internal state correctly."""
+        """log_Z_term_max and log_Z_term_last start at -inf and then update."""
         t = TempTermination(n_walkers=100, target_temp=300.0)
         assert t.log_Z_term_max == -math.inf
         assert t.log_Z_term_last == -math.inf
@@ -250,9 +195,8 @@ class TestTempTermination:
         assert t.log_Z_term_last > -math.inf
 
     def test_message_format(self):
-        """Message includes temperature and convergence info."""
+        """The message includes the temperature and the word converged."""
         t = TempTermination(n_walkers=100, target_temp=300.0)
-        # Feed some data so it triggers
         for i in range(3000):
             if t.check(i, 10.0 * math.exp(-i / 50.0)):
                 break
@@ -261,16 +205,15 @@ class TestTempTermination:
         assert "converged" in msg
 
 
-# ── check_any helper ─────────────────────────────────────────────────────
-
-
 class TestCheckAny:
+    """Check that check_any returns the first criterion that is satisfied."""
+
     def test_returns_first_satisfied(self):
         c1 = IterationTermination(max_iterations=1000)
-        c2 = EnergyTermination(min_energy=5.0)  # triggers when emax < 5
+        c2 = EnergyTermination(min_energy=5.0)
         done, msg = check_any([c1, c2], iteration=10, emax=3.0)
         assert done
-        assert "energy" in msg.lower() or "5.0" in msg
+        assert msg == c2.message()
 
     def test_returns_false_when_none_satisfied(self):
         c1 = IterationTermination(max_iterations=1000)
@@ -288,15 +231,11 @@ class TestCheckAny:
         c2 = EnergyTermination(min_energy=10.0)
         done, msg = check_any([c1, c2], iteration=10, emax=0.0)
         assert done
-        # First criterion (iteration) should match
-        assert "iteration" in msg.lower() or "max" in msg.lower()
-
-
-# ── Pluggable protocol ──────────────────────────────────────────────────
+        assert msg == c1.message()
 
 
 class CustomCriterion:
-    """Custom termination: stop when energy oscillates."""
+    """Custom criterion that stops when the energy oscillates."""
 
     def __init__(self, max_oscillations: int = 3):
         self.max_oscillations = max_oscillations
@@ -321,12 +260,13 @@ class CustomCriterion:
 
 
 class TestPluggableProtocol:
+    """Check that a custom criterion works with check_any."""
+
     def test_custom_criterion_with_check_any(self):
-        """Custom criterion works with check_any."""
         custom = CustomCriterion(max_oscillations=2)
         criteria = [IterationTermination(max_iterations=1000), custom]
 
-        # Oscillating energies: 5, 3, 6, 2, 7 -> oscillations at indices 2, 3, 4
+        # Oscillations occur at indices 2, 3 and 4.
         energies = [5.0, 3.0, 6.0, 2.0, 7.0, 1.0, 8.0]
         for i, e in enumerate(energies):
             done, msg = check_any(criteria, i, e)
@@ -337,19 +277,17 @@ class TestPluggableProtocol:
             pytest.fail("Custom criterion should have triggered")
 
 
-# ── Batch termination (all parallel runs must converge) ──────────────────
-
-
 class TestBatchTermination:
+    """Check TempTermination on parallel runs and the batch reduction."""
+
     def test_all_runs_must_converge(self):
-        """Simulate multiple parallel runs; all must satisfy criterion."""
+        """Four runs with different schedules converge at different times."""
         n_runs = 4
         criteria = [
             TempTermination(n_walkers=100, target_temp=300.0, threshold=10.0)
             for _ in range(n_runs)
         ]
 
-        # Different energy schedules for each run (exponentially decaying)
         schedules = [
             [10.0 * math.exp(-i / 50.0) for i in range(5000)],
             [8.0 * math.exp(-i / 60.0) for i in range(5000)],
@@ -368,58 +306,55 @@ class TestBatchTermination:
             if all(t is not None for t in all_triggered):
                 break
 
-        # All runs should have converged
         assert all(t is not None for t in all_triggered)
-        # They converge at different iterations
-        assert (
-            len(set(all_triggered)) > 1
-        ), "Runs should converge at different times"
+        assert len(set(all_triggered)) > 1
 
     def test_slowest_run_determines_batch_termination(self):
-        """Batch terminates when the slowest run converges."""
+        """The batch criterion fires when the slowest run converges.
+
+        VmapRuns.reduce_for_termination takes the worst case across runs, the
+        maximum energy.  The slow run has the highest energy at every
+        iteration, so the batch criterion sees the slow run's energies and
+        fires at the same iteration as the slow run's own criterion.
+        """
         n_runs = 3
-        criteria = [
+        n_iters = 5000
+        batcher = VmapRuns(n_runs=n_runs)
+        run_criteria = [
             TempTermination(n_walkers=100, target_temp=300.0, threshold=10.0)
             for _ in range(n_runs)
         ]
+        batch_criterion = TempTermination(
+            n_walkers=100, target_temp=300.0, threshold=10.0
+        )
+        decay_lengths = [40.0, 40.0, 100.0]  # two fast runs and one slow run
 
-        # One slow run (slow decay), two fast
-        schedules = [
-            [10.0 * math.exp(-i / 40.0) for i in range(5000)],  # fast
-            [10.0 * math.exp(-i / 40.0) for i in range(5000)],  # fast
-            [10.0 * math.exp(-i / 100.0) for i in range(5000)],  # slow
-        ]
-
-        per_run_trigger = [None] * n_runs
-        batch_done_at = None
-
-        for i in range(5000):
+        run_trigger = [None] * n_runs
+        batch_trigger = None
+        for i in range(n_iters):
+            energies = [10.0 * math.exp(-i / d) for d in decay_lengths]
             for r in range(n_runs):
-                if per_run_trigger[r] is None and criteria[r].check(
-                    i, schedules[r][i]
+                if run_trigger[r] is None and run_criteria[r].check(
+                    i, energies[r]
                 ):
-                    per_run_trigger[r] = i
-
-            if (
-                all(t is not None for t in per_run_trigger)
-                and batch_done_at is None
-            ):
-                batch_done_at = i
+                    run_trigger[r] = i
+            _, hmax = batcher.reduce_for_termination(
+                jnp.zeros(n_runs), jnp.array(energies)
+            )
+            if batch_criterion.check(i, hmax):
+                batch_trigger = i
                 break
 
-        assert batch_done_at is not None
-        # Batch termination should be at the slowest run's trigger
-        assert batch_done_at == max(
-            t for t in per_run_trigger if t is not None
-        )
-
-
-# ── Existing fallback termination still works ────────────────────────────
+        assert batch_trigger is not None
+        assert batch_trigger == run_trigger[2]
+        assert batch_trigger > run_trigger[0]
 
 
 class TestFallbackTermination:
+    """Check that IterationTermination stops a run that never converges."""
+
     def test_iteration_fallback(self):
-        """IterationTermination as fallback when temp termination not reached."""
+        """IterationTermination stops the run when TempTermination does not."""
         t_temp = TempTermination(
             n_walkers=100, target_temp=0.001, threshold=50.0
         )
@@ -428,7 +363,6 @@ class TestFallbackTermination:
         for i in range(200):
             done, msg = check_any([t_temp, t_iter], i, 10.0 - i * 0.001)
             if done:
-                # Iteration should trigger first at i=99
                 assert i == 99
                 assert "iteration" in msg.lower() or "max" in msg.lower()
                 break
@@ -436,19 +370,12 @@ class TestFallbackTermination:
             pytest.fail("Should have terminated")
 
 
-# ── Integration: TempTermination with run_ns ───────────────────────────
-
-
 @pytest.mark.heavy
 class TestTempTerminationIntegration:
+    """Check that run_ns stops early with a temperature or energy criterion."""
+
     def test_run_ns_with_temp_termination(self):
         """TempTermination terminates a real NS run before max_iterations."""
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.move_kernel import MoveKernel
-        from jaxrens.sampling.moves import random_walk
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import run_ns
-
         backend = create_harmonic(k=1.0)
         init_fn, step_fn, _ = build_mwg(
             backend,
@@ -490,20 +417,11 @@ class TestTempTerminationIntegration:
             termination_criteria=[temp_crit, iter_crit],
         )
 
-        # TempTermination should have stopped the run early
-        assert (
-            result["iteration"] < max_iters
-        ), f"Expected early termination, but ran all {max_iters} iterations"
+        assert result["iteration"] < max_iters
         assert jnp.isfinite(result["log_evidence"])
 
     def test_energy_termination_with_run_ns(self):
         """EnergyTermination stops run_ns when emax drops below target."""
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.move_kernel import MoveKernel
-        from jaxrens.sampling.moves import random_walk
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import run_ns
-
         backend = create_harmonic(k=1.0)
         init_fn, step_fn, _ = build_mwg(
             backend,
@@ -525,10 +443,8 @@ class TestTempTerminationIntegration:
             positions
         )
 
-        # Set energy target that should be reached well before 5000 iters
-        energy_target = (
-            1.0  # harmonic energies start ~5-10, decrease during NS
-        )
+        # Harmonic energies start around 5-10 and decrease during NS.
+        energy_target = 1.0
         max_iters = 5000
 
         result = run_ns(
@@ -549,31 +465,16 @@ class TestTempTerminationIntegration:
         )
 
         assert result["iteration"] < max_iters
-        # Dead-point history is no longer returned in the result dict (it is
-        # persisted to disk by callbacks).  EnergyTermination fires when the
-        # contour (worst live energy) drops below the target, so every
-        # surviving live walker sits at or below it.
+        # EnergyTermination fires when the worst live energy is below the
+        # target, so every surviving walker sits below it too.
         assert float(jnp.max(result["energies"])) < energy_target
 
 
-# ---------------------------------------------------------------------------
-# TerminationSpec end-to-end JIT test (moved from test_schema.py)
-# ---------------------------------------------------------------------------
-
-
 class TestTerminationEndToEndJit:
+    """Check that a termination spec stops run_ns, which jits ns_step."""
+
     def test_iteration_termination_stops_early_under_jit(self):
-        """IterationTermination(5) causes run_ns to stop at iteration 5.
-
-        run_ns internally JITs ns_step, satisfying the JIT testing policy.
-        Moved verbatim from test_schema.py::TestTerminationEndToEndJit.
-        """
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import resolve
-        from jaxrens.cli.schema import RootSpec
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import run_ns
-
+        """IterationTermination(5) makes run_ns stop at iteration 5."""
         d = {
             "run": {
                 "n_live": 10,
