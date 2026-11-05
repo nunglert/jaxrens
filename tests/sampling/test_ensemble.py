@@ -1,41 +1,30 @@
-"""Tests for ensemble corrections (NPT/μPT) via EnsembleBackend.
+"""Tests for the NPT and muPT corrections of EnsembleBackend."""
 
-Verifies:
-- EnsembleBackend correctly adds the P·V (NPT) and −μ·N (μPT) terms
-- the resolver threads per-replica ensemble params into the initial energy
-  so resolved energies match the runtime NS loop by construction
-- NS state tracking of dead_volumes
-- NPT NS runs converge correctly
-- Post-processing with volumes
-- Checkpoint round-trip of volumes
-"""
-
-import tempfile
-from pathlib import Path
+from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jaxrens.backends.ensemble import EnsembleBackend
+from jaxrens.backends.ensemble import EnsembleBackend, make_ensemble_params
 from jaxrens.backends.toy import create_harmonic
+from jaxrens.cli.resolve import (
+    _finalise_initial_energies_and_counts,
+    _stack_ensemble_params,
+)
 from jaxrens.postprocess.thermodynamics import partition_function
+from jaxrens.sampling.batch_descriptor import VmapRuns
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, ns_step, run_ns
-from jaxrens.utils.cell import get_volume
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 
 def _make_periodic_setup(
     n_walkers=20, n_atoms=2, cell_size=5.0, seed=0, pressure=None
 ):
-    """Create a periodic harmonic system with cells."""
+    """Create a periodic harmonic system, with PV added if pressure is set."""
     base_backend = create_harmonic(k=1.0)
     if pressure:
         backend = EnsembleBackend(base_backend, pressure=pressure)
@@ -57,7 +46,6 @@ def _make_periodic_setup(
     types = jnp.zeros((n_atoms,), dtype=jnp.int32)
     cells = jnp.tile(cell_size * jnp.eye(3), (n_walkers, 1, 1))
 
-    # Compute energies through the backend (includes PV if NPT)
     energies = jax.vmap(lambda pos, cell: backend(pos, types, cell, 0)[0])(
         positions, cells
     )
@@ -85,12 +73,9 @@ def periodic_setup_npt():
     return _make_periodic_setup(pressure=0.01)
 
 
-# ---------------------------------------------------------------------------
-# EnsembleBackend correctness
-# ---------------------------------------------------------------------------
-
-
 class TestEnsembleBackend:
+    """Check the P*V and -mu*N terms that EnsembleBackend adds to U."""
+
     def test_no_pressure_returns_raw_energy(self):
         base = create_harmonic(k=1.0)
         backend = EnsembleBackend(base, pressure=0.0)
@@ -121,16 +106,14 @@ class TestEnsembleBackend:
         cell_b = 6.0 * jnp.eye(3)
         e_a = backend(pos, types, cell_a, 0).energy
         e_b = backend(pos, types, cell_b, 0).energy
-        # Different volumes → different PV → different energies
-        assert float(e_b) > float(e_a)
+        assert jnp.allclose(e_b - e_a, 0.1 * (6.0**3 - 4.0**3), atol=1e-4)
 
     def test_chemical_potentials_subtract_muN(self):
-        # Grand-canonical: H = U - μ·N, applied via the per-call
-        # ensemble_params key "chemical_potentials".
+        # Per-call ensemble_params["chemical_potentials"] gives H = U - mu*N.
         base = create_harmonic(k=1.0)
         backend = EnsembleBackend(base, pressure=0.0)
         pos = jnp.zeros((3, 3))
-        types = jnp.array([0, 0, 1])  # counts: species 0 → 2, species 1 → 1
+        types = jnp.array([0, 0, 1])  # N = [2, 1]
         cell = 5.0 * jnp.eye(3)
         mu = jnp.array([1.0, 2.0], dtype=jnp.float32)
         e_raw = base(pos, types, cell, 0).energy
@@ -141,11 +124,11 @@ class TestEnsembleBackend:
             0,
             ensemble_params={"chemical_potentials": mu},
         ).energy
-        # U - (1*2 + 2*1) = U - 4
+        # mu.N = 1*2 + 2*1 = 4
         assert jnp.allclose(e_ens, e_raw - 4.0, atol=1e-5)
 
     def test_chemical_potentials_closured_default(self):
-        # μ supplied to the constructor is used when no per-call override.
+        # A mu given to the constructor is the default.
         base = create_harmonic(k=1.0)
         mu = jnp.array([1.0, 2.0], dtype=jnp.float32)
         backend = EnsembleBackend(base, chemical_potentials=mu)
@@ -172,23 +155,17 @@ class TestEnsembleBackend:
             ensemble_params={"chemical_potentials": mu},
         ).energy
         V = 5.0**3
-        # H = U + P*V - μ·N
         assert jnp.allclose(e_ens, e_raw + 0.01 * V - 4.0, atol=1e-4)
 
 
 class TestInitialEnergyEnsembleThreading:
-    """The resolver's initial-energy compute must thread the SAME per-replica
-    ensemble params the runtime NS loop uses, so resolved energies include
-    P·V and −μ·N by construction — keeping the first NS contour consistent
-    with the running chain and with ``SemiGrandSwap``'s ``Ω = U − μ·N``.
+    """Check that initial energies use the per-replica ensemble params.
+
+    The initial energies must include P*V and -mu*N exactly as the NS loop
+    does, so the first contour matches the running chain.
     """
 
     def test_finalise_threads_chemical_potentials_per_replica(self):
-        import jax
-
-        from jaxrens.cli.resolve import _finalise_initial_energies_and_counts
-        from jaxrens.sampling.batch_descriptor import VmapRuns
-
         base = create_harmonic(k=1.0)
         backend = EnsembleBackend(base, pressure=0.0)
 
@@ -198,12 +175,11 @@ class TestInitialEnergyEnsembleThreading:
         )
         cells = jnp.tile(5.0 * jnp.eye(3), (n_runs, K, 1, 1))
         types = jnp.array([0, 1], dtype=jnp.int32)  # N = [1, 1]
-        # The finalize seam maps types over the batcher's (n_runs,) axis and
-        # the walker axis, so it needs the full (n_runs, K, n_atoms) shape —
-        # matching what the multi-replica resolver actually produces.
+        # The seam maps types over the run and walker axes, so it needs the
+        # full (n_runs, K, n_atoms) shape.
         types_batched = jnp.broadcast_to(types, (n_runs, K, n_atoms))
 
-        # Distinct μ per replica → distinct −μ·N shift per run.
+        # A distinct mu per replica gives a distinct -mu.N shift per run.
         mu = jnp.array([[1.0, 2.0], [0.5, 0.5]], dtype=jnp.float32)
         ep_batched = {"chemical_potentials": mu}
 
@@ -222,15 +198,10 @@ class TestInitialEnergyEnsembleThreading:
             positions, cells
         )
         N = jnp.array([1.0, 1.0])
-        expected = U - (mu @ N)[:, None]  # per-run μ·N, broadcast over K
+        expected = U - (mu @ N)[:, None]
         assert jnp.allclose(energies, expected, atol=1e-4)
 
     def test_finalise_without_ensemble_params_is_raw_energy(self):
-        import jax
-
-        from jaxrens.cli.resolve import _finalise_initial_energies_and_counts
-        from jaxrens.sampling.batch_descriptor import VmapRuns
-
         base = create_harmonic(k=1.0)
         n_runs, K, n_atoms = 2, 3, 2
         positions = jax.random.uniform(
@@ -238,8 +209,6 @@ class TestInitialEnergyEnsembleThreading:
         )
         cells = jnp.tile(5.0 * jnp.eye(3), (n_runs, K, 1, 1))
         types = jnp.array([0, 1], dtype=jnp.int32)
-        # (n_runs, K, n_atoms) — aligned with the batcher's (n_runs,) prefix
-        # and the per-walker axis the finalize seam vmaps over.
         types_batched = jnp.broadcast_to(types, (n_runs, K, n_atoms))
 
         energies, counts = _finalise_initial_energies_and_counts(
@@ -256,8 +225,6 @@ class TestInitialEnergyEnsembleThreading:
         assert jnp.allclose(energies, U, atol=1e-5)
 
     def test_stack_ensemble_params_shapes_and_keys(self):
-        from jaxrens.cli.resolve import _stack_ensemble_params
-
         params = [
             {"pressure": 0.01, "chemical_potentials": jnp.array([1.0, 2.0])},
             {"pressure": 0.02, "chemical_potentials": jnp.array([3.0, 4.0])},
@@ -271,13 +238,11 @@ class TestInitialEnergyEnsembleThreading:
         assert jnp.allclose(
             out["chemical_potentials"], jnp.array([[1.0, 2.0], [3.0, 4.0]])
         )
-        # 2-D (G, P) prefix reshapes leaves correctly.
+        # A 2-D (G, P) prefix reshapes the leaves.
         out2 = _stack_ensemble_params(params, ("chemical_potentials",), (1, 2))
         assert out2["chemical_potentials"].shape == (1, 2, 2)
 
     def test_stack_ensemble_params_none_when_no_energy_keys(self):
-        from jaxrens.cli.resolve import _stack_ensemble_params
-
         # target_composition is an XRENS morph target, not an energy term.
         params = [
             {"target_composition": jnp.array([1, 1])},
@@ -292,22 +257,14 @@ class TestInitialEnergyEnsembleThreading:
 
     def test_stack_ensemble_params_skips_partial_keys(self):
         # A key present in only some replicas is skipped (no ragged stack).
-        from jaxrens.cli.resolve import _stack_ensemble_params
-
         params = [{"pressure": 0.01}, {}]
         assert _stack_ensemble_params(params, ("pressure",), (2,)) is None
 
 
-# ---------------------------------------------------------------------------
-# ns_step with pressure
-# ---------------------------------------------------------------------------
-
-
 class TestNSStepDeadWalker:
-    """``info['dead_walker']`` is a ``WalkerState`` pytree (positions /
-    types / energy / cell) holding the dead walker's pre-cull state.  This
-    replaces the older parallel ``dead_position`` / ``dead_volume`` /
-    ``dead_cell`` / ``dead_energy`` keys.
+    """Check info['dead_walker'], the pre-cull WalkerState of the dead point.
+
+    It holds positions, types, energy and cell of the walker at ``worst_idx``.
     """
 
     def test_dead_walker_has_walker_state_fields(self, periodic_setup_npt):
@@ -330,28 +287,8 @@ class TestNSStepDeadWalker:
         assert dw.cell.shape == (3, 3)
         assert dw.energy.shape == ()
 
-    def test_dead_walker_volume_from_cell_matches_fixture(
-        self,
-        periodic_setup_npt,
-    ):
-        """Volume must derive correctly from ``dead_walker.cell``."""
-        s = periodic_setup_npt
-        state = init_ns(
-            s["init_fn"],
-            s["positions"],
-            s["types"],
-            s["energies"],
-            cells=s["cells"],
-            rng_key=s["key"],
-        )
-        _, info = ns_step(state, s["step_fn"], n_mcmc_steps=5)
-        vol = float(jnp.abs(jnp.linalg.det(info["dead_walker"].cell)))
-        assert vol == pytest.approx(125.0, abs=1e-3)
-
     def test_dead_walker_cell_matches_pre_cull_slot(self, periodic_setup_npt):
-        """Dead walker's cell is the pre-cull cell at ``worst_idx``, not the
-        clone's post-MCMC cell that now occupies that slot.
-        """
+        """The cell is the pre-cull one at ``worst_idx``, not the clone's."""
         s = periodic_setup_npt
         state = init_ns(
             s["init_fn"],
@@ -371,13 +308,10 @@ class TestNSStepDeadWalker:
         )
 
 
-# ---------------------------------------------------------------------------
-# run_ns with pressure
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.heavy
 class TestRunNSPressure:
+    """Check run_ns with and without a pressure term."""
+
     def test_nvt_no_volumes(self, periodic_setup):
         s = periodic_setup
         result = run_ns(
@@ -392,14 +326,11 @@ class TestRunNSPressure:
             n_mcmc_steps=5,
             initial_step_size=0.3,
         )
-        # Dead-point history (incl. dead_volumes) is no longer returned in the
-        # result dict — it is persisted to disk by callbacks.  For an NVT run
-        # the live-volume array is None because no pressure/ensemble term is set.
+        # Without a pressure or ensemble term there are no live volumes.
         assert result["live_volumes"] is None
 
     def test_npt_converges(self, periodic_setup_npt):
         s = periodic_setup_npt
-        from jaxrens.backends.ensemble import make_ensemble_params
 
         result = run_ns(
             s["positions"],
@@ -417,13 +348,37 @@ class TestRunNSPressure:
         assert jnp.isfinite(result["log_evidence"])
         assert result["n_dead"] > 0
 
+    def test_chemical_potential_converges(self, periodic_setup_npt):
+        s = periodic_setup_npt
+        params = make_ensemble_params(
+            pressure=0.01, chemical_potentials=jnp.array([1.0])
+        )
+        energies = jax.vmap(
+            lambda pos, cell: s["backend"](
+                pos, s["types"], cell, 0, ensemble_params=params
+            )[0]
+        )(s["positions"], s["cells"])
 
-# ---------------------------------------------------------------------------
-# Post-processing with volumes
-# ---------------------------------------------------------------------------
+        result = run_ns(
+            s["positions"],
+            s["types"],
+            energies,
+            cells=s["cells"],
+            init_fn=s["init_fn"],
+            step_fn=s["step_fn"],
+            rng_key=s["key"],
+            max_iterations=100,
+            n_mcmc_steps=5,
+            initial_step_size=0.3,
+            ensemble_params=params,
+        )
+        assert jnp.isfinite(result["log_evidence"])
+        assert result["n_dead"] > 0
 
 
 class TestPartitionFunctionWithVolumes:
+    """Check how dead and live volumes enter partition_function."""
+
     def test_pv_changes_partition_function(self):
         dead_E = jnp.linspace(0.5, 10.0, 100)
         live_E = jnp.linspace(10.0, 12.0, 20)
@@ -442,8 +397,8 @@ class TestPartitionFunctionWithVolumes:
             live_volumes=live_vols,
         )
 
-        assert not jnp.allclose(log_Z_nvt, log_Z_npt)
-        assert float(log_Z_npt) < float(log_Z_nvt)
+        # A constant contribution c shifts log Z by -beta * c.
+        assert jnp.allclose(log_Z_npt, log_Z_nvt - 1.25, atol=1e-5)
 
     def test_zero_volumes_unchanged(self):
         dead_E = jnp.linspace(0.5, 10.0, 100)

@@ -1,14 +1,8 @@
-"""Tests for ``build_adapt_step``.
-
-Covers:
-- Inactive cases return ``None`` (no per_move_fns, no descriptors, interval<=0).
-- SingleRun: closure returns expected diagnostic dict + shape ``(n_moves, ...)``;
-  step sizes finite/positive; rng key advances.
-- VmapRuns: closure returns shape-prefixed diagnostics ``(n_runs, n_moves, ...)``.
-- JIT cache stability: the second call must not recompile the per-round body.
-"""
+"""Tests for the step-size adaptation closure from build_adapt_step."""
 
 from __future__ import annotations
+
+import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -24,33 +18,31 @@ from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, init_ns_parallel, ns_step
 
 
-# ---------------------------------------------------------------------------
-# Shared fixtures
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture(scope="module")
 def harmonic_setup():
-    """Build a harmonic backend with 2 random-walk move types.
+    """Harmonic backend with two random-walk moves and 20 walkers.
 
-    Returns a dict with:
-    - ns_state: SingleRun NSState (n_walkers=20)
-    - ns_states_batched: VmapRuns NSState (n_runs=2, n_walkers=20)
-    - per_move_fns: list of 2 per-move step functions
-    - descriptors: list of 2 MoveKernel descriptors
-    - n_runs, n_walkers, step_fn
+    Returns a dict with a single-run ``ns_state``, a two-run
+    ``ns_states_batched``, ``per_move_fns``, ``descriptors``, ``n_runs``,
+    ``n_walkers`` and ``step_fn``.
     """
     backend = create_harmonic(k=1.0)
     descriptors = [
         MoveKernel(
-            "rw_1", random_walk.build_kernel,
-            step_size=0.2, step_size_max=5.0,
-            min_rate=0.2, max_rate=0.7,
+            "rw_1",
+            random_walk.build_kernel,
+            step_size=0.2,
+            step_size_max=5.0,
+            min_rate=0.2,
+            max_rate=0.7,
         ),
         MoveKernel(
-            "rw_2", random_walk.build_kernel,
-            step_size=0.3, step_size_max=5.0,
-            min_rate=0.2, max_rate=0.7,
+            "rw_2",
+            random_walk.build_kernel,
+            step_size=0.3,
+            step_size_max=5.0,
+            min_rate=0.2,
+            max_rate=0.7,
         ),
     ]
     init_fn, step_fn, per_move_fns = build_mwg(backend, descriptors)
@@ -66,8 +58,12 @@ def harmonic_setup():
     )(positions)
 
     ns_state = init_ns(
-        init_fn, positions, types, energies,
-        cells=None, rng_key=key,
+        init_fn,
+        positions,
+        types,
+        energies,
+        cells=None,
+        rng_key=key,
     )
     for _ in range(20):
         ns_state, _ = ns_step(ns_state, step_fn, n_mcmc_steps=5)
@@ -75,12 +71,17 @@ def harmonic_setup():
     key2 = jax.random.key(1)
     run_keys = jax.random.split(key2, n_runs)
     pos_batch = jnp.broadcast_to(
-        positions[None, :, :, :], (n_runs, n_walkers, 1, 3),
+        positions[None, :, :, :],
+        (n_runs, n_walkers, 1, 3),
     )
     energies_batch = jnp.broadcast_to(energies[None, :], (n_runs, n_walkers))
     ns_states_batched = init_ns_parallel(
-        init_fn, pos_batch, types, energies_batch,
-        cells=None, rng_keys=run_keys,
+        init_fn,
+        pos_batch,
+        types,
+        energies_batch,
+        cells=None,
+        rng_keys=run_keys,
     )
 
     return {
@@ -94,67 +95,43 @@ def harmonic_setup():
     }
 
 
-# ---------------------------------------------------------------------------
-# Inactive cases return None
-# ---------------------------------------------------------------------------
-
-
 class TestInactiveReturnsNone:
-    def test_none_per_move_fns(self, harmonic_setup):
+    """Check that build_adapt_step returns None when adaptation is off.
+
+    That happens with no per_move_fns, no descriptors or adjust_interval <= 0.
+    """
+
+    @pytest.mark.parametrize(
+        "use_descriptors,per_move_fns,interval",
+        [
+            pytest.param(True, None, 50, id="none_fns"),
+            pytest.param(True, [], 50, id="empty_fns"),
+            pytest.param(False, "setup", 50, id="no_descriptors"),
+            pytest.param(True, "setup", 0, id="zero_interval"),
+        ],
+    )
+    def test_inactive(
+        self, harmonic_setup, use_descriptors, per_move_fns, interval
+    ):
+        if per_move_fns == "setup":
+            per_move_fns = harmonic_setup["per_move_fns"]
         adapt = build_adapt_step(
-            move_descriptors=harmonic_setup["descriptors"],
-            per_move_fns=None,
+            move_descriptors=(
+                harmonic_setup["descriptors"] if use_descriptors else []
+            ),
+            per_move_fns=per_move_fns,
             batcher=SingleRun(),
             adjust_n_samples=10,
             adjust_factor=1.5,
             adjust_max_rounds=5,
-            adjust_interval=50,
+            adjust_interval=interval,
         )
         assert adapt is None
-
-    def test_empty_per_move_fns(self, harmonic_setup):
-        adapt = build_adapt_step(
-            move_descriptors=harmonic_setup["descriptors"],
-            per_move_fns=[],
-            batcher=SingleRun(),
-            adjust_n_samples=10,
-            adjust_factor=1.5,
-            adjust_max_rounds=5,
-            adjust_interval=50,
-        )
-        assert adapt is None
-
-    def test_empty_descriptors(self, harmonic_setup):
-        adapt = build_adapt_step(
-            move_descriptors=[],
-            per_move_fns=harmonic_setup["per_move_fns"],
-            batcher=SingleRun(),
-            adjust_n_samples=10,
-            adjust_factor=1.5,
-            adjust_max_rounds=5,
-            adjust_interval=50,
-        )
-        assert adapt is None
-
-    def test_zero_interval(self, harmonic_setup):
-        adapt = build_adapt_step(
-            move_descriptors=harmonic_setup["descriptors"],
-            per_move_fns=harmonic_setup["per_move_fns"],
-            batcher=SingleRun(),
-            adjust_n_samples=10,
-            adjust_factor=1.5,
-            adjust_max_rounds=5,
-            adjust_interval=0,
-        )
-        assert adapt is None
-
-
-# ---------------------------------------------------------------------------
-# SingleRun: closure shapes and contracts
-# ---------------------------------------------------------------------------
 
 
 class TestSingleRun:
+    """Check the diagnostics, step sizes and rng key of a single run."""
+
     def _build(self, harmonic_setup):
         return build_adapt_step(
             move_descriptors=harmonic_setup["descriptors"],
@@ -166,11 +143,6 @@ class TestSingleRun:
             adjust_interval=50,
         )
 
-    def test_returns_callable(self, harmonic_setup):
-        adapt = self._build(harmonic_setup)
-        assert adapt is not None
-        assert callable(adapt)
-
     def test_diag_keys_present(self, harmonic_setup):
         adapt = self._build(harmonic_setup)
         ns_state = harmonic_setup["ns_state"]
@@ -178,9 +150,15 @@ class TestSingleRun:
         key = jax.random.key(10)
         _, diag, _ = adapt(ns_state, emax, key)
         assert set(diag.keys()) == {
-            "rate", "counts", "n_rounds", "converged",
-            "cap_hits", "floor_hits", "bracket_detected",
-            "trial_n_evaluations", "trial_n_grad_evaluations",
+            "rate",
+            "counts",
+            "n_rounds",
+            "converged",
+            "cap_hits",
+            "floor_hits",
+            "bracket_detected",
+            "trial_n_evaluations",
+            "trial_n_grad_evaluations",
         }
 
     def test_diag_shapes(self, harmonic_setup):
@@ -193,26 +171,27 @@ class TestSingleRun:
         assert diag["rate"].shape == (n_moves,)
         assert diag["counts"].shape == (n_moves, 4)
         for k in (
-            "n_rounds", "converged", "cap_hits", "floor_hits",
-            "bracket_detected", "trial_n_evaluations",
+            "n_rounds",
+            "converged",
+            "cap_hits",
+            "floor_hits",
+            "bracket_detected",
+            "trial_n_evaluations",
             "trial_n_grad_evaluations",
         ):
             assert diag[k].shape == (n_moves,), k
 
     def test_step_sizes_written_back(self, harmonic_setup):
-        """``adapt_step`` writes ``new_ss`` into ``ns_state.population.step_sizes``."""
+        """The new step sizes are written into ``population.step_sizes``."""
         adapt = self._build(harmonic_setup)
         ns_state = harmonic_setup["ns_state"]
         emax = jnp.max(ns_state.population.energy)
         key = jax.random.key(12)
         new_ns_state, _, _ = adapt(ns_state, emax, key)
-        # Step sizes live as (n_walkers, n_moves) under SingleRun; ensure
-        # broadcast across walkers and finite/positive.
         ss_pop = new_ns_state.population.step_sizes
         assert ss_pop.shape == ns_state.population.step_sizes.shape
         assert jnp.all(ss_pop > 0.0)
         assert jnp.all(jnp.isfinite(ss_pop))
-        # Every walker carries the same per-move ss.
         first_row = ss_pop[0]
         assert jnp.all(ss_pop == first_row[None, :])
 
@@ -236,13 +215,84 @@ class TestSingleRun:
             np.asarray(jax.random.key_data(key_out)),
         )
 
+    @pytest.mark.parametrize(
+        "start,grows",
+        [(50.0, False), (1e-4, True)],
+        ids=["too_large_shrinks", "too_small_grows"],
+    )
+    def test_step_size_moves_towards_target_rate(
+        self, harmonic_setup, start, grows
+    ):
+        adapt = self._build(harmonic_setup)
+        ns_state = harmonic_setup["ns_state"]
+        pop = ns_state.population
+        ns_state = ns_state.set(
+            population=pop.set(step_sizes=jnp.full_like(pop.step_sizes, start))
+        )
+        emax = jnp.max(ns_state.population.energy)
+        new_state, _, _ = adapt(ns_state, emax, jax.random.key(15))
+        new_ss = new_state.population.step_sizes[0]
+        if grows:
+            assert jnp.all(new_ss > start)
+        else:
+            assert jnp.all(new_ss < start)
 
-# ---------------------------------------------------------------------------
-# VmapRuns: closure shapes
-# ---------------------------------------------------------------------------
+    def test_step_size_max_caps_growth(self, harmonic_setup):
+        # 8 rounds of x1.5 from 1e-4 would reach 2.6e-3, above the cap.
+        cap = 1e-3
+        capped = [
+            dataclasses.replace(d, step_size_max=cap)
+            for d in harmonic_setup["descriptors"]
+        ]
+        adapt = build_adapt_step(
+            move_descriptors=capped,
+            per_move_fns=harmonic_setup["per_move_fns"],
+            batcher=SingleRun(),
+            adjust_n_samples=20,
+            adjust_factor=1.5,
+            adjust_max_rounds=8,
+            adjust_interval=50,
+        )
+        ns_state = harmonic_setup["ns_state"]
+        pop = ns_state.population
+        ns_state = ns_state.set(
+            population=pop.set(step_sizes=jnp.full_like(pop.step_sizes, 1e-4))
+        )
+        emax = jnp.max(ns_state.population.energy)
+        new_state, diag, _ = adapt(ns_state, emax, jax.random.key(16))
+        assert jnp.all(diag["cap_hits"] > 0)
+        assert jnp.all(new_state.population.step_sizes <= cap)
+
+    def test_trial_batch_size_matches_full_vmap(self, harmonic_setup):
+        """trial_batch_size=4 gives the same step sizes as a full vmap."""
+        common = dict(
+            move_descriptors=harmonic_setup["descriptors"],
+            per_move_fns=harmonic_setup["per_move_fns"],
+            batcher=SingleRun(),
+            adjust_n_samples=8,
+            adjust_factor=1.5,
+            adjust_max_rounds=3,
+            adjust_interval=50,
+        )
+        adapt_full = build_adapt_step(**common)
+        adapt_chunked = build_adapt_step(trial_batch_size=4, **common)
+
+        ns_state = harmonic_setup["ns_state"]
+        emax = jnp.max(ns_state.population.energy)
+        key = jax.random.key(17)
+        state_full, _, _ = adapt_full(ns_state, emax, key)
+        state_chunked, _, _ = adapt_chunked(ns_state, emax, key)
+
+        np.testing.assert_allclose(
+            state_full.population.step_sizes[0],
+            state_chunked.population.step_sizes[0],
+            rtol=1e-5,
+        )
 
 
 class TestVmapRuns:
+    """Check the same outputs with a leading run axis (n_runs=2)."""
+
     def _build(self, harmonic_setup):
         return build_adapt_step(
             move_descriptors=harmonic_setup["descriptors"],
@@ -265,8 +315,12 @@ class TestVmapRuns:
         assert diag["rate"].shape == (n_runs, n_moves)
         assert diag["counts"].shape == (n_runs, n_moves, 4)
         for k in (
-            "n_rounds", "converged", "cap_hits", "floor_hits",
-            "bracket_detected", "trial_n_evaluations",
+            "n_rounds",
+            "converged",
+            "cap_hits",
+            "floor_hits",
+            "bracket_detected",
+            "trial_n_evaluations",
             "trial_n_grad_evaluations",
         ):
             assert diag[k].shape == (n_runs, n_moves), k

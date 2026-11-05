@@ -1,13 +1,13 @@
-"""Constraint-gate behavior in build_mwg.
+"""Tests for the configuration-constraint gate in build_mwg.
 
-Uses an unreachable minimum-distance threshold so the gate's effect is
-deterministic regardless of the random proposal: every proposed move is
-constraint-violated, hence every step must be rejected with reject_reason 4
-and the walker must never move. The no-constraint / satisfiable-constraint
-runs are the controls.
+An unreachable minimum distance makes every proposal violate the constraint,
+so the outcome does not depend on the random proposal.  Runs without a
+constraint, or with a satisfiable one, are the controls.
 """
 
 from __future__ import annotations
+
+import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -17,20 +17,26 @@ from jaxrens.cli.schema.moves import RandomWalkMoveSpec
 from jaxrens.constraints.min_distance import min_distance_descriptor
 from jaxrens.sampling.mwg import build_mwg
 
-# Two atoms 0.5 A apart; harmonic energy keeps every proposal below the
-# (huge) likelihood threshold, so acceptance is governed purely by the
-# constraint gate.
+# Two atoms 0.5 apart.  With the huge EMAX every proposal passes the energy
+# test, so only the constraint gate decides acceptance.
 POSITIONS = jnp.array([[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
 TYPES = jnp.array([0, 0], dtype=jnp.int32)
 CELL = jnp.zeros((3, 3))
 EMAX = 1.0e9
 
 
-def _make(constraint_descriptors):
+def _make(constraint_descriptors, mutates=None):
+    """Build step_fn and the initial state with the given constraints.
+
+    ``mutates`` overrides the aspects the move declares it writes.
+    """
     backend = create_harmonic()
+    move = RandomWalkMoveSpec(step_size=0.3).to_descriptor()
+    if mutates is not None:
+        move = dataclasses.replace(move, mutates=frozenset(mutates))
     init_fn, step_fn, _ = build_mwg(
         backend,
-        [RandomWalkMoveSpec(step_size=0.3).to_descriptor()],
+        [move],
         constraint_descriptors=constraint_descriptors,
     )
     energy = backend(POSITIONS, TYPES, CELL, 0).energy
@@ -39,6 +45,7 @@ def _make(constraint_descriptors):
 
 
 def _run(step_fn, state, n_steps=25, seed=0):
+    """Run n_steps and return the state, reject reasons and accepts."""
     key = jax.random.key(seed)
     reasons, accepts = [], []
     for _ in range(n_steps):
@@ -50,25 +57,24 @@ def _run(step_fn, state, n_steps=25, seed=0):
 
 
 def test_unreachable_constraint_rejects_every_move():
+    """Every proposal violates the constraint and is rejected with reason 4."""
     desc = (
         min_distance_descriptor(jnp.full((1, 1), 100.0), type_dependent=False),
     )
     step_fn, state0 = _make(desc)
     state, reasons, accepts = _run(step_fn, state0)
 
-    assert not any(accepts)  # nothing accepted
-    assert all(r == 4 for r in reasons)  # all blamed on the constraint
+    assert not any(accepts)
+    assert all(r == 4 for r in reasons)
     assert int(state.n_accepted.sum()) == 0
-    # Walker never moved off its initial configuration.
+    assert int(state.n_proposed.sum()) == 25
     assert jnp.allclose(state.positions, POSITIONS)
 
 
 def test_satisfiable_constraint_matches_unconstrained():
-    # A passing gate (d_min=0) must not change which moves are accepted
-    # relative to no constraint at all, on the same seed.
-    _, base_state = _make(())
+    """A gate that always passes (d_min=0) does not change the accepts."""
     step_fn_free, s0_free = _make(())
-    _, _, accepts_free = _run(step_fn_free, s0_free)
+    state_free, _, accepts_free = _run(step_fn_free, s0_free)
 
     desc = (
         min_distance_descriptor(jnp.full((1, 1), 0.0), type_dependent=False),
@@ -76,15 +82,25 @@ def test_satisfiable_constraint_matches_unconstrained():
     step_fn_gated, s0_gated = _make(desc)
     _, reasons_gated, accepts_gated = _run(step_fn_gated, s0_gated)
 
-    assert accepts_gated == accepts_free  # identical accept pattern
-    assert any(accepts_free)  # control actually moves
-    assert all(r != 4 for r in reasons_gated)  # gate never fires
+    assert accepts_gated == accepts_free
+    assert any(accepts_free)
+    assert not jnp.allclose(state_free.positions, POSITIONS)
+    assert all(r != 4 for r in reasons_gated)
 
 
-def test_unconstrained_walker_moves():
-    # Sanity: with no constraint the walker does move (so the block in the
-    # first test is really the gate, not a frozen setup).
-    step_fn, state0 = _make(())
-    state, _, accepts = _run(step_fn, state0)
+def test_constraint_does_not_gate_a_move_that_leaves_its_aspect_alone():
+    """A move that only mutates types is not gated by a distance constraint.
+
+    The move still displaces the atoms here, but build_mwg pairs constraints
+    with moves by their declared ``mutates``, so no gate is attached and
+    reason 4 never appears.
+    """
+    desc = (
+        min_distance_descriptor(jnp.full((1, 1), 100.0), type_dependent=False),
+    )
+    step_fn, state0 = _make(desc, mutates={"types"})
+
+    _, reasons, accepts = _run(step_fn, state0)
+
     assert any(accepts)
-    assert not jnp.allclose(state.positions, POSITIONS)
+    assert all(r != 4 for r in reasons)

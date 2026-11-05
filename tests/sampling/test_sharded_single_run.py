@@ -1,18 +1,7 @@
-"""Tests for the sharded-single-run NS mode (``ShardedSingleRun``).
+"""Tests for the sharded single-run NS mode (ShardedSingleRun).
 
-Covers:
-- bit-exact parity between ``ShardedSingleRun(n_gpu=1)`` and ``SingleRun()``
-- bit-exact parity between ``ShardedSingleRun(n_gpu=2)`` and ``SingleRun()``
-  on a small harmonic problem
-- end-to-end smoke test for ``run_ns_sharded``
-- resolver dispatch on the ``run.shard_n_gpu`` schema field
-- divisibility / cohort incompatibility error paths
-
-The parity tests use a harmonic toy backend so the run is fast and the
-parity comparison is deterministic.  The ``n_gpu=1`` case runs on every
-CI job; the ``n_gpu=2`` case is marked ``@pytest.mark.multi_gpu`` so it
-is collected only when pytest is invoked with ``-m multi_gpu`` (the
-multi-GPU CI job and local 2-GPU dev boxes).
+The ``n_gpu=2`` cases are marked ``multi_gpu`` and run only with
+``-m multi_gpu`` on a machine with two GPUs.
 """
 
 from __future__ import annotations
@@ -23,15 +12,16 @@ import numpy as np
 import pytest
 
 from jaxrens.backends.toy import create_harmonic
+from jaxrens.cli.resolve import resolve
+from jaxrens.cli.schema import RootSpec
+from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
+from jaxrens.init.burn_in import initial_walk
 from jaxrens.sampling.batch_descriptor import ShardedSingleRun, SingleRun
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import (
-    init_ns,
     init_ns_sharded,
-    ns_step,
-    ns_step_sharded,
     run_ns,
     run_ns_sharded,
 )
@@ -76,28 +66,18 @@ def _make_harmonic_problem(seed: int, n_walkers: int):
     }
 
 
-# ---------------------------------------------------------------------------
-# Parity: ShardedSingleRun vs SingleRun
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("n_extra", [0, 4])
 @pytest.mark.parametrize(
     "n_gpu",
     [1, pytest.param(2, marks=pytest.mark.multi_gpu)],
 )
 def test_run_ns_sharded_matches_single_run(n_gpu, n_extra):
-    """Sharded run reproduces the SingleRun reference exactly.
+    """run_ns_sharded matches run_ns on 8 walkers and 3 iterations.
 
-    Uses a small harmonic problem (K=8, n_atoms=1) and runs 3 NS
-    iterations from the same seed.  All shards make the same global
-    decisions (same RNG broadcast), so the result is bit-exact at
-    G=1 and effectively bit-exact at G=2 on this toy problem.
-
-    ``n_extra > 0`` is the case that exercises the cross-shard chain
-    distribution: the ``1 + n_extra`` walked chains are split across
-    devices (here 5 chains over 2 shards, padded to 3 each), gathered,
-    and must still match the single-device walk.
+    All shards make the same global decisions from the same broadcast key.
+    With ``n_extra > 0`` the ``1 + n_extra`` walked chains are split across
+    devices (5 chains over 2 shards, padded to 3 each) and gathered, and
+    the result must still match the single-device walk.
     """
     if n_gpu > 1 and 8 % n_gpu != 0:
         pytest.skip("n_walkers must divide n_gpu")
@@ -139,12 +119,12 @@ def test_run_ns_sharded_matches_single_run(n_gpu, n_extra):
         termination_criteria=[IterationTermination(n_iter)],
     )
 
-    # ``out["log_evidence"]`` is shape (G,) with identical entries.
+    # log_evidence has shape (G,) with identical entries.
     sharded_log_z = float(np.asarray(out["log_evidence"])[0])
     ref_log_z = float(ref["log_evidence"])
     np.testing.assert_allclose(sharded_log_z, ref_log_z, rtol=1e-5, atol=1e-7)
 
-    # Energies: flatten sharded (G, K/G) to (K,) and compare.
+    # Flatten the sharded (G, K/G) energies to (K,) and compare sorted.
     sharded_energies = np.asarray(out["energies"]).reshape(-1)
     ref_energies = np.asarray(ref["energies"]).reshape(-1)
     sharded_sorted = np.sort(sharded_energies)
@@ -159,7 +139,7 @@ def test_run_ns_sharded_matches_single_run(n_gpu, n_extra):
 
 @pytest.mark.multi_gpu
 def test_init_ns_sharded_divisibility_error():
-    """``init_ns_sharded`` rejects K not divisible by n_gpu."""
+    """init_ns_sharded rejects K not divisible by n_gpu."""
     setup = _make_harmonic_problem(seed=0, n_walkers=7)
     with pytest.raises(ValueError, match="divisible"):
         init_ns_sharded(
@@ -175,7 +155,7 @@ def test_init_ns_sharded_divisibility_error():
 
 @pytest.mark.multi_gpu
 def test_run_ns_sharded_divisibility_error():
-    """``run_ns_sharded`` rejects K not divisible by n_gpu."""
+    """run_ns_sharded rejects K not divisible by n_gpu."""
     setup = _make_harmonic_problem(seed=0, n_walkers=7)
     with pytest.raises(ValueError, match="divisible"):
         run_ns_sharded(
@@ -195,19 +175,8 @@ def test_run_ns_sharded_divisibility_error():
         )
 
 
-# ---------------------------------------------------------------------------
-# Resolver dispatch
-# ---------------------------------------------------------------------------
-
-
 def _minimal_root(tmp_path, *, shard_n_gpu, n_live=8, pressures=None):
-    """Build a minimal LJ NPT config and validate it through RootSpec.
-
-    Mirrors ``experiments/examples/lj8_npt/config.yaml`` minus the
-    full burn-in / adaptation machinery so resolve() runs quickly.
-    """
-    from jaxrens.cli.schema import RootSpec
-
+    """Validate a small LJ NPT config through RootSpec so resolve() is fast."""
     cfg = {
         "run": {
             "n_live": n_live,
@@ -261,9 +230,7 @@ def _minimal_root(tmp_path, *, shard_n_gpu, n_live=8, pressures=None):
 
 
 def test_resolver_routes_shard_to_sharded_batcher(tmp_path):
-    """``shard_n_gpu > 1`` ⇒ resolver returns ``ShardedSingleRun(n_gpu)``."""
-    from jaxrens.cli.resolve import resolve
-
+    """shard_n_gpu > 1 gives a ShardedSingleRun batcher."""
     root = _minimal_root(tmp_path, shard_n_gpu=2)
     resolved = resolve(root)
     assert isinstance(resolved.batcher, ShardedSingleRun)
@@ -271,35 +238,24 @@ def test_resolver_routes_shard_to_sharded_batcher(tmp_path):
 
 
 def test_resolver_default_keeps_single_run(tmp_path):
-    """``shard_n_gpu=1`` (default) keeps the ``SingleRun`` batcher."""
-    from jaxrens.cli.resolve import resolve
-
+    """The default shard_n_gpu=1 keeps the SingleRun batcher."""
     root = _minimal_root(tmp_path, shard_n_gpu=1)
     resolved = resolve(root)
     assert isinstance(resolved.batcher, SingleRun)
 
 
 def test_resolver_rejects_shard_with_pressure_list(tmp_path):
-    """Sharded single run cannot combine with a multi-pressure cohort."""
-    from jaxrens.cli.resolve import resolve
-
+    """A sharded run cannot be combined with a list of pressures."""
     root = _minimal_root(tmp_path, shard_n_gpu=2, pressures=[1.0, 2.0])
     with pytest.raises(ValueError, match="shard_n_gpu"):
         resolve(root)
 
 
 def test_resolver_rejects_indivisible_n_live(tmp_path):
-    """n_live % shard_n_gpu != 0 raises a clear error."""
-    from jaxrens.cli.resolve import resolve
-
+    """n_live not divisible by shard_n_gpu raises ValueError."""
     root = _minimal_root(tmp_path, shard_n_gpu=3, n_live=8)
     with pytest.raises(ValueError, match="divisible"):
         resolve(root)
-
-
-# ---------------------------------------------------------------------------
-# Burn-in (initial_walk) under ShardedSingleRun
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -307,15 +263,11 @@ def test_resolver_rejects_indivisible_n_live(tmp_path):
     [1, pytest.param(2, marks=pytest.mark.multi_gpu)],
 )
 def test_burn_in_sharded_completes_under_emax(n_gpu):
-    """Sharded burn-in finishes; final energies stay below the fixed Emax.
+    """Sharded burn-in finishes with all energies below the fixed Emax.
 
-    For G=1 this is the trivial-pmap case; for G=2 it exercises the
-    per-shard distinct-key walking dispatch (each shard walks its own
-    walkers independently) plus the broadcast-key adaptation path.
+    At G=2 each shard walks its own walkers with its own key, while the
+    adaptation uses a key broadcast to all shards.
     """
-    from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
-    from jaxrens.init.burn_in import initial_walk
-
     if 8 % n_gpu != 0:
         pytest.skip("n_walkers must divide n_gpu")
 
@@ -334,9 +286,7 @@ def test_burn_in_sharded_completes_under_emax(n_gpu):
     n_atoms = setup["positions"].shape[1]
     emax_offset_per_atom = 1.0
     batcher = ShardedSingleRun(n_gpu=n_gpu)
-    # ``reduce_emax`` returns shape ``(G,)`` (every entry identical
-    # by construction) — take ``[0]`` for the Python-scalar Emax used
-    # in the assertion.
+    # reduce_emax returns shape (G,) with identical entries; take the first.
     fixed_emax = float(
         batcher.reduce_emax(ns_state.population.energy)[0]
         + emax_offset_per_atom * n_atoms
@@ -367,16 +317,12 @@ def test_burn_in_sharded_completes_under_emax(n_gpu):
 
     final_energies = np.asarray(ns_state_after.population.energy)
     assert np.all(np.isfinite(final_energies))
-    assert np.all(
-        final_energies <= fixed_emax + 1e-6
-    ), f"Some walkers exceed Emax={fixed_emax:.4g}: max={final_energies.max():.4g}"
+    assert np.all(final_energies <= fixed_emax + 1e-6)
 
 
 @pytest.mark.multi_gpu
 def test_burn_in_sharded_g2_shards_walk_independently():
-    """At G=2 each shard must walk its own walkers — populations must differ."""
-    from jaxrens.init.burn_in import initial_walk
-
+    """At G=2 both shards move their walkers, and not in the same way."""
     setup = _make_harmonic_problem(seed=2, n_walkers=8)
     ns_state = init_ns_sharded(
         setup["init_fn"],
@@ -387,6 +333,8 @@ def test_burn_in_sharded_g2_shards_walk_independently():
         jax.random.key(0),
         n_gpu=2,
     )
+
+    pos_before = np.asarray(ns_state.population.positions)
 
     ns_state_after = initial_walk(
         key=jax.random.key(11),
@@ -400,27 +348,19 @@ def test_burn_in_sharded_g2_shards_walk_independently():
         batcher=ShardedSingleRun(n_gpu=2),
     )
 
-    pos = np.asarray(ns_state_after.population.positions)  # (G=2, K/G=4, A, 3)
-    shard0 = pos[0].reshape(-1)
-    shard1 = pos[1].reshape(-1)
-    assert not np.allclose(shard0, shard1, atol=1e-6), (
-        "Per-shard populations are identical — shards are running the same "
-        "chain, defeating burn-in's per-shard independence."
-    )
+    pos_after = np.asarray(ns_state_after.population.positions)
+    for shard in range(2):
+        assert not np.allclose(pos_after[shard], pos_before[shard], atol=1e-6)
+    assert not np.allclose(pos_after[0], pos_after[1], atol=1e-6)
 
 
 @pytest.mark.multi_gpu
 def test_burn_in_sharded_g2_step_sizes_equal_across_shards():
-    """Adaptation under sharding must produce identical step sizes per shard.
+    """Adaptation gives bit-equal step sizes on both shards.
 
-    Bisection runs ``lax.psum`` over the per-shard accept/eval counters,
-    so every shard sees the same global rate and converges to the same
-    step size.  Final ``step_sizes`` must therefore be bit-equal across
-    the leading G axis.
+    The bisection sums the accept and evaluation counters over shards with
+    ``lax.psum``, so every shard sees the same global rate.
     """
-    from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
-    from jaxrens.init.burn_in import initial_walk
-
     setup = _make_harmonic_problem(seed=3, n_walkers=8)
     ns_state = init_ns_sharded(
         setup["init_fn"],
@@ -455,73 +395,5 @@ def test_burn_in_sharded_g2_step_sizes_equal_across_shards():
         adjust_max_rounds=3,
     )
 
-    # population.step_sizes shape: (G=2, K/G=4, n_moves=1).  Per-shard
-    # values must agree along the leading G axis (post-`lax.psum`
-    # bisection invariant).
     ss = np.asarray(ns_state_after.population.step_sizes)
-    np.testing.assert_allclose(
-        ss[0],
-        ss[1],
-        rtol=0,
-        atol=0,
-        err_msg="Per-shard step sizes differ — adaptation broke "
-        "the cross-shard `lax.psum` invariant.",
-    )
-
-
-# ---------------------------------------------------------------------------
-# build_adapt_step.trial_batch_size parity
-# ---------------------------------------------------------------------------
-
-
-def test_adapt_step_trial_batch_size_matches_full_vmap():
-    """``build_adapt_step(trial_batch_size=N)`` results match ``trial_batch_size=None``.
-
-    Pins the chunked-trial-vmap path's correctness on the cheapest
-    batcher (``SingleRun``) at a divisor chunk size.  Ensures the
-    closure that propagates ``trial_batch_size`` to ``adjust_step_size``
-    doesn't perturb the result.
-    """
-    from jaxrens.sampling.adaptation.manager import build_adapt_step
-
-    setup = _make_harmonic_problem(seed=4, n_walkers=8)
-    ns_state = init_ns(
-        setup["init_fn"],
-        setup["positions"],
-        setup["types"],
-        setup["energies"],
-        None,
-        jax.random.key(0),
-    )
-
-    common = dict(
-        move_descriptors=setup["descriptors"],
-        per_move_fns=setup["per_move_fns"],
-        batcher=SingleRun(),
-        adjust_n_samples=8,
-        adjust_factor=1.5,
-        adjust_max_rounds=3,
-        adjust_interval=1,
-    )
-
-    adapt_full = build_adapt_step(**common)
-    adapt_chunked = build_adapt_step(trial_batch_size=4, **common)
-
-    emax = jnp.max(ns_state.population.energy) + 1.0
-    key = jax.random.key(0)
-    init_ss = jnp.array([0.2])
-    ns_state = ns_state.set(
-        population=ns_state.population.set(
-            step_sizes=jnp.broadcast_to(
-                init_ss[None, :],
-                ns_state.population.step_sizes.shape,
-            ),
-        ),
-    )
-
-    state_full, _, _ = adapt_full(ns_state, emax, key)
-    state_chunked, _, _ = adapt_chunked(ns_state, emax, key)
-
-    ss_full = state_full.population.step_sizes[0]
-    ss_chunked = state_chunked.population.step_sizes[0]
-    np.testing.assert_allclose(ss_full, ss_chunked, rtol=1e-5)
+    np.testing.assert_allclose(ss[0], ss[1], rtol=0, atol=0)

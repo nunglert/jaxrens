@@ -494,6 +494,110 @@ class TestMixedMoves:
         )
 
 
+class TestSpeciesSwapSpec:
+    """Check that SpeciesSwapMoveSpec turns element symbols into type codes."""
+
+    SYMBOLS = {0: "Ge", 1: "Si", 2: "Sn"}
+
+    def test_unscoped_descriptor(self):
+        desc = SpeciesSwapMoveSpec().to_descriptor(
+            n_atoms=6, symbol_map=self.SYMBOLS
+        )
+        assert desc.name == "species_swap"
+        assert desc.kernel_kwargs == {"n_species": 3}
+        assert desc.mutates == frozenset({"types"})
+
+    def test_scoped_descriptor_resolves_symbols_to_codes(self):
+        desc = SpeciesSwapMoveSpec(species=("Si", "Sn")).to_descriptor(
+            n_atoms=6, symbol_map=self.SYMBOLS
+        )
+        assert desc.name == "species_swap_Si_Sn"
+        assert desc.kernel_kwargs == {"n_species": 3, "species": (1, 2)}
+
+    def test_bare_symbol_shorthand_rejected_at_parse_time(self):
+        with pytest.raises(ValidationError, match="at least two elements"):
+            SpeciesSwapMoveSpec(species="Ge")
+
+    def test_single_distinct_element_rejected_at_parse_time(self):
+        with pytest.raises(ValidationError, match="distinct element"):
+            SpeciesSwapMoveSpec(species=("Ge", "Ge"))
+
+    def test_absent_element_rejected(self):
+        with pytest.raises(ValueError, match="not present in the system"):
+            SpeciesSwapMoveSpec(species=("Ge", "Pu")).to_descriptor(
+                n_atoms=6, symbol_map=self.SYMBOLS
+            )
+
+    def test_missing_symbol_map_rejected(self):
+        with pytest.raises(ValueError, match="requires symbol_map"):
+            SpeciesSwapMoveSpec().to_descriptor(n_atoms=6, symbol_map=None)
+
+
+class TestGMCSpeciesSchema:
+    """Check how GMCMoveSpec resolves species, names and direction fields."""
+
+    SYMBOL_MAP = {0: "Ge", 1: "Si"}
+
+    def test_bare_string_species_is_wrapped(self):
+        assert GMCMoveSpec(species="Ge").species == ("Ge",)
+
+    def test_symbols_resolve_to_type_codes(self):
+        spec = GMCMoveSpec(species=["Si"])
+        kwargs = spec._kernel_kwargs(symbol_map=self.SYMBOL_MAP)
+        assert kwargs["species"] == (1,)
+        assert kwargs["direction_field"] == "direction_gmc_Si"
+        assert kwargs["n_reflect"] == 5
+
+    def test_auto_name_and_explicit_name(self):
+        assert GMCMoveSpec(species=["Ge"])._effective_name() == "gmc_Ge"
+        assert (
+            GMCMoveSpec(species=["Ge", "Si"])._effective_name() == "gmc_Ge_Si"
+        )
+        assert (
+            GMCMoveSpec(species=["Ge"], name="fast")._effective_name()
+            == "fast"
+        )
+        # An explicit name still gets its own direction field when scoped.
+        assert (
+            GMCMoveSpec(species=["Ge"], name="fast")._direction_field()
+            == "direction_fast"
+        )
+
+    def test_unscoped_spec_is_unchanged(self):
+        spec = GMCMoveSpec()
+        assert spec._effective_name() == "gmc"
+        assert spec._direction_field() == "direction"
+        # The kernel defaults supply everything except n_reflect.
+        assert spec._kernel_kwargs(symbol_map=self.SYMBOL_MAP) == {
+            "n_reflect": 5
+        }
+        assert "direction" in spec._extra_state_fields()
+
+    def test_refresh_direction_reaches_kernel_kwargs(self):
+        spec = GMCMoveSpec(refresh_direction=True)
+        assert spec._kernel_kwargs(symbol_map=self.SYMBOL_MAP) == {
+            "n_reflect": 5,
+            "refresh_direction": True,
+        }
+
+    def test_unknown_species_raises(self):
+        spec = GMCMoveSpec(species=["Xe"])
+        with pytest.raises(ValueError, match="not present in the system"):
+            spec.to_descriptor(symbol_map=self.SYMBOL_MAP)
+
+    def test_missing_symbol_map_raises(self):
+        spec = GMCMoveSpec(species=["Ge"])
+        with pytest.raises(ValueError, match="requires symbol_map"):
+            spec.to_descriptor()
+
+    def test_unscoped_spec_needs_no_symbol_map(self):
+        """An unscoped spec resolves without a symbol_map."""
+        desc = GMCMoveSpec(n_reflect=4).to_descriptor()
+        assert desc.name == "gmc"
+        assert desc.kernel_kwargs == {"n_reflect": 4}
+        assert "direction" in desc.extra_state_fields
+
+
 # ---------------------------------------------------------------------------
 # 16. BackendSpec discriminated union: per-type instantiation
 # ---------------------------------------------------------------------------
