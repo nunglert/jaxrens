@@ -235,9 +235,10 @@ A few invariants worth pinning down:
 
 ### Pressure-RENS
 
-The two replicas keep their configurations; only the *thermodynamic
-context* is swapped. Configuration $r_i$ from replica $i$ is
-evaluated under replica $j$'s ensemble:
+The two selected walkers trade replicas: configuration $r_i$ moves
+from replica $i$ to replica $j$ and is evaluated under replica $j$'s
+ensemble, and symmetrically for $r_j$. The pressures stay with their
+replicas:
 
 $$
 \alpha_{ij} = \mathbf{1}\bigl[H_j(r_i) < E_{\max, j}\bigr] \cdot
@@ -285,28 +286,36 @@ $\tilde U_i < E_{\max,j} \,\wedge\, \tilde U_j < E_{\max,i}$.
 ### Semi-grand swap
 
 Each replica $i$ carries a per-species chemical-potential vector
-$\boldsymbol\mu_i \in \mathbb R^{S}$. Walkers, cells, and species
-stay put — only the $\boldsymbol\mu$ assignment is exchanged. Let
-$\mathbf N(\sigma)_s = \#\{a : \sigma_a = s\}$ be the species-count
-vector of walker $\sigma$. The grand-canonical energy under the
-*new* chemical-potential vector after the swap is
+$\boldsymbol\mu_i \in \mathbb R^{S}$, fixed for the whole run. As in
+Pressure-RENS, the two selected walkers trade replicas (positions,
+species and cell) and the $\boldsymbol\mu$ vectors stay where they
+are. Let $\mathbf N(\sigma)_s = \#\{a : \sigma_a = s\}$ be the
+species-count vector of walker $\sigma$. A walker that arrives in
+replica $j$ is scored with replica $j$'s grand-canonical energy
 
 $$
-\Omega_i^{\text{new}} = U_i \;-\; \boldsymbol\mu_j \cdot \mathbf N(\sigma_i),
-\qquad
-\Omega_j^{\text{new}} = U_j \;-\; \boldsymbol\mu_i \cdot \mathbf N(\sigma_j),
+\Omega_j(r_i) = U_i + P_j\, V(h_i) - \boldsymbol\mu_j \cdot \mathbf N(\sigma_i),
 $$
 
-and because nothing moves, each replica simply checks its own NS
-threshold:
+and the swap is accepted when each walker fits the contour of the
+replica it enters:
 
 $$
-\alpha_{ij} = \mathbf 1\!\bigl[\Omega_i^{\text{new}} < E_{\max,i}\bigr]\,
-              \mathbf 1\!\bigl[\Omega_j^{\text{new}} < E_{\max,j}\bigr].
+\alpha_{ij} = \mathbf 1\!\bigl[\Omega_j(r_i) < E_{\max,j}\bigr]\,
+              \mathbf 1\!\bigl[\Omega_i(r_j) < E_{\max,i}\bigr].
 $$
 
-Zero backend calls — the $U_i$'s are already stored, so the
-update is a pair of $S$-dimensional dot products.
+On acceptance $\Omega_j(r_i)$ becomes the stored energy of the walker
+in replica $j$, so every stored energy in a replica uses that
+replica's $\boldsymbol\mu$ (and $P$). In μVT the $PV$ term drops.
+
+Exchanging the $\boldsymbol\mu$ of a single walker instead of moving
+it does not work here: a replica is a population sharing one contour
+$E_{\max}$, and that contour is defined only if all its walkers are
+scored with the same $\boldsymbol\mu$.
+
+Zero backend calls: $U_i$ is recovered from the stored energy, so the
+update costs two $S$-dimensional dot products (plus the $PV$ terms).
 
 
 ## Where this lives in the code

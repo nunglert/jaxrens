@@ -10,7 +10,8 @@ Coverage:
 - semi_grand_replica_exchange_step: single-run (no swaps possible).
 - End-to-end: two-run NS with flavor='semi_grand', no errors, n_energy_evals==0.
 - n_species mismatch guard: SemiGrandSwap(n_species=3) + 2-element μ → clear error.
-- Sign convention: Ω_A = U_A - μ_B · N_A  (not μ_A · N_A).
+- Energy convention: a walker arriving in run R carries U + P_R·V - μ_R·N.
+- Accepted swaps move walkers between runs; each run keeps its μ.
 - CLI schema: semi_grand flavor validates chemical_potentials.
 - CLI schema: missing chemical_potentials raises.
 - CLI schema: row-length mismatch raises.
@@ -53,7 +54,9 @@ def _ens(mu):
 
 
 class TestSemiGrandProposeConvention:
-    """Verify the sign convention Ω_A = U_A - μ_B · N_A."""
+    """Check that propose() exchanges the walkers and re-bases each energy
+    to the receiving run's μ: energy_a = U_B - μ_A · N_B (walker B in run A),
+    energy_b = U_A - μ_B · N_A (walker A in run B)."""
 
     def test_hand_calculated_energies_match(self):
         """propose() must return energies matching the hand-derived formula.
@@ -72,8 +75,8 @@ class TestSemiGrandProposeConvention:
           stored_A = U_A - μ_A · N_A = 3.0 - 0 = 3.0
           stored_B = U_B - μ_B · N_B = 5.0 - (0.5·1 + 1.0·2) = 5.0 - 2.5 = 2.5
 
-          Ω_A_new = U_A - μ_B · N_A = 3.0 - (0.5·2 + 1.0·1) = 3.0 - 2.0 = 1.0
-          Ω_B_new = U_B - μ_A · N_B = 5.0 - (0.0·1 + 0.0·2) = 5.0
+          walker B in run A: U_B - μ_A · N_B = 5.0 - 0 = 5.0
+          walker A in run B: U_A - μ_B · N_A = 3.0 - (0.5·2 + 1.0·1) = 1.0
         """
         kernel = SemiGrandSwap(n_species=2)
         key = jax.random.key(0)
@@ -93,15 +96,8 @@ class TestSemiGrandProposeConvention:
 
         proposed, n_e, n_g = kernel.propose(sa, sb, ea, eb, key, None)
 
-        expected_omega_a = 3.0 - (0.5 * 2 + 1.0 * 1)  # = 1.0
-        expected_omega_b = 5.0 - (0.0 * 1 + 0.0 * 2)  # = 5.0
-
-        assert (
-            abs(float(proposed["energy_a"]) - expected_omega_a) < 1e-5
-        ), f"Ω_A_new = {float(proposed['energy_a'])}, expected {expected_omega_a}"
-        assert (
-            abs(float(proposed["energy_b"]) - expected_omega_b) < 1e-5
-        ), f"Ω_B_new = {float(proposed['energy_b'])}, expected {expected_omega_b}"
+        assert abs(float(proposed["energy_a"]) - 5.0) < 1e-5
+        assert abs(float(proposed["energy_b"]) - 1.0) < 1e-5
 
     def test_no_backend_calls(self):
         """propose() must return (proposed, 0, 0) — zero energy/grad evals."""
@@ -119,8 +115,8 @@ class TestSemiGrandProposeConvention:
         assert n_e == 0, f"Expected 0 energy evals, got {n_e}"
         assert n_g == 0, f"Expected 0 grad evals, got {n_g}"
 
-    def test_positions_and_types_unchanged(self):
-        """Positions and types in proposed must match originals."""
+    def test_positions_and_types_swapped(self):
+        """Side A receives walker B's configuration and side B walker A's."""
         kernel = SemiGrandSwap(n_species=2)
         key = jax.random.key(2)
 
@@ -128,25 +124,21 @@ class TestSemiGrandProposeConvention:
         pos_b = jax.random.normal(key, (3, 3)) + 1.0
         types_a = jnp.array([0, 0, 1], dtype=jnp.int32)
         types_b = jnp.array([1, 1, 0], dtype=jnp.int32)
-        sa = _state(pos_a, types_a, jnp.array(1.0))
-        sb = _state(pos_b, types_b, jnp.array(2.0))
+        cell_a = jnp.eye(3)
+        cell_b = 2.0 * jnp.eye(3)
+        sa = _state(pos_a, types_a, jnp.array(1.0), cell_a)
+        sb = _state(pos_b, types_b, jnp.array(2.0), cell_b)
 
         proposed, _, _ = kernel.propose(
             sa, sb, _ens([0.0, 0.0]), _ens([0.5, 1.0]), key, None
         )
 
-        assert jnp.allclose(
-            proposed["positions_a"], pos_a
-        ), "positions_a should be A's positions"
-        assert jnp.allclose(
-            proposed["positions_b"], pos_b
-        ), "positions_b should be B's positions"
-        assert jnp.array_equal(
-            proposed["types_a"], types_a
-        ), "types_a must be unchanged"
-        assert jnp.array_equal(
-            proposed["types_b"], types_b
-        ), "types_b must be unchanged"
+        assert jnp.allclose(proposed["positions_a"], pos_b)
+        assert jnp.allclose(proposed["positions_b"], pos_a)
+        assert jnp.array_equal(proposed["types_a"], types_b)
+        assert jnp.array_equal(proposed["types_b"], types_a)
+        assert jnp.allclose(proposed["cell_a"], cell_b)
+        assert jnp.allclose(proposed["cell_b"], cell_a)
 
     def test_hand_calculated_energies_both_mu_nonzero(self):
         """Self-subtract: μ_A ≠ 0 AND μ_B ≠ 0.
@@ -161,8 +153,9 @@ class TestSemiGrandProposeConvention:
           U_A     = 3.0   (raw potential energy)
           state.energy_A = U_A - μ_A · N_A = 3.0 - (1·2 + 2·1) = -1.0
 
-          Expected Ω_A_new = U_A - μ_B · N_A = 3.0 - 0 = 3.0
+          walker A in run B: U_A - μ_B · N_A = 3.0 - 0 = 3.0
             kernel: state.energy_A + μ_A·N_A - μ_B·N_A = -1.0 + 4.0 - 0 = 3.0
+          walker B in run A: U_B - μ_A · N_B = 5.0 - (1·1 + 2·2) = 0.0
         """
         kernel = SemiGrandSwap(n_species=2)
         key = jax.random.key(0)
@@ -183,17 +176,11 @@ class TestSemiGrandProposeConvention:
             sa, sb, _ens(mu_a), _ens(mu_b), key, None
         )
 
-        # Ω_A_new = U_A - μ_B · N_A = 3.0 - 0 = 3.0
-        # Ω_B_new = U_B - μ_A · N_B = 5.0 - (1·1 + 2·2) = 0.0
-        assert (
-            abs(float(proposed["energy_a"]) - 3.0) < 1e-5
-        ), f"Ω_A_new = {float(proposed['energy_a'])}, expected 3.0"
-        assert (
-            abs(float(proposed["energy_b"]) - 0.0) < 1e-5
-        ), f"Ω_B_new = {float(proposed['energy_b'])}, expected 0.0"
+        assert abs(float(proposed["energy_a"]) - 0.0) < 1e-5
+        assert abs(float(proposed["energy_b"]) - 3.0) < 1e-5
 
     def test_symmetric_zero_mu(self):
-        """With μ_A = μ_B = 0, propose returns Ω = U (unchanged energies)."""
+        """With μ_A = μ_B = 0, each walker keeps Ω = U in the other run."""
         kernel = SemiGrandSwap(n_species=2)
         key = jax.random.key(3)
 
@@ -208,8 +195,33 @@ class TestSemiGrandProposeConvention:
             sa, sb, _ens([0.0, 0.0]), _ens([0.0, 0.0]), key, None
         )
 
-        assert abs(float(proposed["energy_a"]) - float(u_a)) < 1e-5
-        assert abs(float(proposed["energy_b"]) - float(u_b)) < 1e-5
+        assert abs(float(proposed["energy_a"]) - float(u_b)) < 1e-5
+        assert abs(float(proposed["energy_b"]) - float(u_a)) < 1e-5
+
+    def test_pressure_rebased_with_cells(self):
+        """μPT: the P·V term is also re-based to the receiving run.
+
+        Setup: μ_A = μ_B = 0, P_A = 1.0, P_B = 3.0.
+          walker A: U_A = 2.0, cell 1·I (V = 1),  stored 2.0 + 1·1 = 3.0
+          walker B: U_B = 4.0, cell 2·I (V = 8),  stored 4.0 + 3·8 = 28.0
+          walker B in run A: 4.0 + 1·8 = 12.0
+          walker A in run B: 2.0 + 3·1 = 5.0
+        """
+        kernel = SemiGrandSwap(n_species=2)
+        types = jnp.zeros(3, dtype=jnp.int32)
+        sa = _state(jnp.zeros((3, 3)), types, jnp.array(3.0), jnp.eye(3))
+        sb = _state(
+            jnp.zeros((3, 3)), types, jnp.array(28.0), 2.0 * jnp.eye(3)
+        )
+        ens_a = dict(_ens([0.0, 0.0]), pressure=jnp.array(1.0))
+        ens_b = dict(_ens([0.0, 0.0]), pressure=jnp.array(3.0))
+
+        proposed, _, _ = kernel.propose(
+            sa, sb, ens_a, ens_b, jax.random.key(0), None
+        )
+
+        assert jnp.allclose(proposed["energy_a"], 12.0)
+        assert jnp.allclose(proposed["energy_b"], 5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +230,8 @@ class TestSemiGrandProposeConvention:
 
 
 class TestSemiGrandAccept:
-    """accept() checks Ω_A < Emax_A AND Ω_B < Emax_B."""
+    """accept() checks energy_a < Emax_A AND energy_b < Emax_B, where
+    energy_a is the walker arriving in run A."""
 
     def _make_proposed(self, omega_a, omega_b):
         return {
@@ -453,30 +466,103 @@ class TestSemiGrandStepFunction:
             int(swap_info["n_attempted"]) > 0
         ), f"Expected >0 attempted swaps, got {swap_info['n_attempted']}"
 
-    def test_positions_unchanged_after_swap(self):
-        """Positions and types must never change in semi-grand RE."""
-        positions, types, energies, emax, chem_pots = self._make_inputs()
-        kernel = SemiGrandSwap(n_species=2)
-        key = jax.random.key(9)
+    @staticmethod
+    def _two_walkers(u_a, u_b, emax, cells=None, pressures=None):
+        """One walker per run, 2 atoms, 2 species.
 
-        new_pos, new_types, _, _, _ = semi_grand_replica_exchange_step(
-            rng_key=key,
+        run 0: μ = [0, 0],     walker A types [0, 0] -> N_A = [2, 0]
+        run 1: μ = [0.5, 1.0], walker B types [1, 1] -> N_B = [0, 2]
+        """
+        chem_pots = jnp.array([[0.0, 0.0], [0.5, 1.0]], dtype=jnp.float32)
+        types = jnp.array([[[0, 0]], [[1, 1]]], dtype=jnp.int32)
+        positions = jnp.stack([jnp.zeros((1, 2, 3)), jnp.ones((1, 2, 3))])
+        counts = jax.vmap(lambda t: jnp.bincount(t[0], length=2))(types)
+        energies = (
+            jnp.array([u_a, u_b]) - jnp.sum(chem_pots * counts, axis=1)
+        )[:, None]
+        out = semi_grand_replica_exchange_step(
+            rng_key=jax.random.key(0),
             all_positions=positions,
             all_types=types,
             all_energies=energies,
-            all_cells=None,
-            all_emax=emax,
+            all_cells=cells,
+            all_emax=jnp.array(emax),
             chemical_potentials=chem_pots,
-            semi_grand_kernel=kernel,
+            semi_grand_kernel=SemiGrandSwap(n_species=2),
+            pressures=pressures,
             n_swap_cycles=1,
         )
-        # Positions and types must be unchanged (only energies update on swap).
-        assert jnp.allclose(
-            new_pos, positions
-        ), "positions must not change in semi-grand RE"
-        assert jnp.array_equal(
-            new_types, types
-        ), "types must not change in semi-grand RE"
+        return positions, types, energies, chem_pots, out
+
+    def test_accepted_swap_moves_walkers(self):
+        """An accepted swap exchanges positions and types between runs."""
+        positions, types, _, _, out = self._two_walkers(
+            0.0, 0.0, emax=[1e6, 1e6]
+        )
+        new_pos, new_types, _, _, swap_info = out
+        assert int(swap_info["n_accepted"]) == 1
+        assert jnp.allclose(new_pos[0], positions[1])
+        assert jnp.allclose(new_pos[1], positions[0])
+        assert jnp.array_equal(new_types[0], types[1])
+        assert jnp.array_equal(new_types[1], types[0])
+
+    def test_stored_energy_matches_run_mu_after_swap(self):
+        """After a swap every stored energy is U - μ_run · N of the run the
+        walker is in.
+
+        U = 0: before the swap the stored energies are [0, -2]; walker B
+        arrives in run 0 with -μ_0·N_B = 0 and walker A in run 1 with
+        -μ_1·N_A = -1, so the result is [0, -1].
+        """
+        _, _, _, chem_pots, out = self._two_walkers(0.0, 0.0, emax=[1e6, 1e6])
+        _, new_types, new_ene, _, swap_info = out
+        assert int(swap_info["n_accepted"]) == 1
+        counts = jax.vmap(lambda t: jnp.bincount(t[0], length=2))(new_types)
+        expected = -jnp.sum(chem_pots * counts, axis=1)
+        assert jnp.allclose(new_ene[:, 0], expected)
+        assert jnp.allclose(new_ene[:, 0], jnp.array([0.0, -1.0]))
+
+    def test_acceptance_uses_receiving_emax(self):
+        """Each walker is checked against the Emax of the run it enters.
+
+        U_A = 0, U_B = 0.5: walker A in run 1 has -1, walker B in run 0
+        has 0.5. With Emax = [0.6, -0.9] both fit their new run (the old
+        rule, A against Emax_0 and B against Emax_1, rejected this swap).
+        With Emax = [0.4, -0.9] walker B does not fit run 0.
+        """
+        *_, out = self._two_walkers(0.0, 0.5, emax=[0.6, -0.9])
+        assert int(out[4]["n_accepted"]) == 1
+        *_, out = self._two_walkers(0.0, 0.5, emax=[0.4, -0.9])
+        assert int(out[4]["n_accepted"]) == 0
+
+    def test_swap_moves_cells_and_rebases_pressure(self):
+        """μPT: cells move with the walkers and P·V uses the new run's P.
+
+        U = 0, cells 1·I (V = 1) in run 0 and 2·I (V = 8) in run 1,
+        P = [1, 3]. Walker B in run 0: 1·8 - μ_0·N_B = 8.
+        Walker A in run 1: 3·1 - μ_1·N_A = 3 - 1 = 2.
+        """
+        cells = jnp.stack([jnp.eye(3)[None], 2.0 * jnp.eye(3)[None]])
+        pressures = jnp.array([1.0, 3.0])
+        # Stored U + P·V - μ·N: run 0 is 0 + 1 - 0, run 1 is 0 + 24 - 2.
+        energies = jnp.array([[1.0], [22.0]])
+        out = semi_grand_replica_exchange_step(
+            rng_key=jax.random.key(0),
+            all_positions=jnp.zeros((2, 1, 2, 3)),
+            all_types=jnp.array([[[0, 0]], [[1, 1]]], dtype=jnp.int32),
+            all_energies=energies,
+            all_cells=cells,
+            all_emax=jnp.array([1e6, 1e6]),
+            chemical_potentials=jnp.array([[0.0, 0.0], [0.5, 1.0]]),
+            semi_grand_kernel=SemiGrandSwap(n_species=2),
+            pressures=pressures,
+            n_swap_cycles=1,
+        )
+        _, _, new_ene, new_cells, swap_info = out
+        assert int(swap_info["n_accepted"]) == 1
+        assert jnp.allclose(new_cells[0], cells[1])
+        assert jnp.allclose(new_cells[1], cells[0])
+        assert jnp.allclose(new_ene[:, 0], jnp.array([8.0, 2.0]))
 
     def test_identical_mu_zero_grand_potential_accepts(self):
         """With μ_A = μ_B = 0, Ω = U, so swap accepts iff U < Emax."""

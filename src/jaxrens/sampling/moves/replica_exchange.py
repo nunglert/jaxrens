@@ -20,10 +20,10 @@ XRENS:
     ``XRENSSwap`` instance to the generic ``replica_exchange_step``.
 
 SemiGrand:
-    ``SemiGrandSwap`` performs chemical-potential RE.  Walkers' positions,
-    cells, and types stay unchanged; only the μ assignment is swapped.  The
-    grand-canonical energy ``Ω = U - μ·N`` is recomputed with the receiving
-    run's μ and compared to Emax.  Zero backend calls are required.  Use
+    ``SemiGrandSwap`` performs chemical-potential RE.  Walkers move between
+    runs (positions, cells and types) while each run keeps its μ.  The
+    grand-canonical energy ``Ω = U - μ·N`` is re-based to the receiving
+    run's μ and compared to that run's Emax.  Zero backend calls.  Use
     ``semi_grand_replica_exchange_step`` (not the generic
     ``replica_exchange_step``) for this kernel.
 """
@@ -1251,41 +1251,33 @@ def xrens_replica_exchange_step(
 
 
 class SemiGrandSwap(SwapKernel):
-    """Semi-grand (μVT / μPT) RE: swap chemical-potential assignments.
+    """Semi-grand (μVT / μPT) RE: exchange walkers between runs at fixed μ.
 
-    Each replica i holds a per-species chemical potential vector μ_i of
-    shape ``(n_species,)``.  On a swap between replicas A and B, replica A
-    adopts μ_B and replica B adopts μ_A.  Positions, cells, and types are
-    **never** changed — only the μ assignment moves.
+    Each run i holds a per-species chemical potential vector μ_i of shape
+    ``(n_species,)``, fixed for the whole run.  A swap moves walker A from
+    run A into run B and walker B from run B into run A, positions, types
+    and cell included, as in :class:`PressureRENSSwap`.  The chemical
+    potentials stay with their runs.
 
-    **Sign convention (consistent with ``EnsembleTerm``):**
+    **Energy convention (consistent with ``EnsembleTerm``):**
 
-    The stored ``state.energy`` is the grand-canonical energy at the run's own
-    chemical potential, ``Ω_self = U - μ_self · N`` (matching the
-    ``H = H - μ · N`` line in ``backends/ensemble.py``).  Under the swap,
-    replica A adopts μ_B and replica B adopts μ_A.  To obtain the new
-    grand-canonical energy at the *partner's* μ we first recover U from the
-    stored Ω, then re-subtract the partner's μN term::
+    The stored ``state.energy`` is the grand-canonical energy at the run's
+    own chemical potential (and pressure, for μPT),
+    ``Ω_self = U + P_self · V - μ_self · N``.  A walker that changes run must
+    carry its energy in the receiving run's frame, so the self terms are
+    removed and the receiving run's terms added::
 
-        Ω_A_new = U_A - μ_B · N_A
-                = (state.energy_A + μ_A · N_A) - μ_B · N_A
-
-        Ω_B_new = U_B - μ_A · N_B
-                = (state.energy_B + μ_B · N_B) - μ_A · N_B
+        Ω_B_in_A = Ω_B + μ_B · N_B - μ_A · N_B  (+ (P_A - P_B) · V_B)
+        Ω_A_in_B = Ω_A + μ_A · N_A - μ_B · N_A  (+ (P_B - P_A) · V_A)
 
     where ``N[s] = number of atoms of species s`` (i.e.
-    ``jnp.bincount(types, length=n_species)``).
+    ``jnp.bincount(types, length=n_species)``).  The pressure term is used
+    only when both ensemble_params carry ``'pressure'``.
 
-    The swap is accepted iff both ``Ω_A_new < Emax_A`` and
-    ``Ω_B_new < Emax_B``.
+    The swap is accepted iff ``Ω_B_in_A < Emax_A`` and ``Ω_A_in_B < Emax_B``:
+    each walker must satisfy the NS constraint of the run that receives it.
 
-    Zero backend calls are made.  No morphing, no position change.
-
-    .. note::
-        This matches the legacy ``jaxnest`` ``create_perform_semi_grand_swap``
-        (subtract self μN to recover U, then re-add partner μN) up to the sign
-        flip introduced by ``EnsembleTerm`` storing ``Ω = U - μN`` instead
-        of the legacy ``E_stored = U + μN``.
+    Zero backend calls.  No morphing.
 
     Args:
         n_species: Static Python int; number of distinct species labels.
@@ -1309,31 +1301,30 @@ class SemiGrandSwap(SwapKernel):
         rng_key: Key[Array, ""],
         backend: Any,
     ) -> tuple[dict[str, Any], int, int]:
-        """Compute grand-canonical energies under swapped μ assignments.
+        """Exchange the two walkers and re-base their energies.
 
-        Positions, cells, and types are copied through unchanged.  The
-        ``energy`` fields in the returned ``proposed`` dict are the
-        grand-canonical energies ``Ω = U - μ_new · N`` with the *swapped*
-        chemical potentials.
+        The ``*_a`` entries of ``proposed`` describe the walker that would
+        arrive in run A (walker B), and the ``*_b`` entries the walker that
+        would arrive in run B (walker A).  Energies are in the receiving
+        run's frame, ``Ω = U + P_recv · V - μ_recv · N``.
 
         Args:
             state_a: Dict with keys ``'positions'``, ``'cell'``, ``'types'``,
-                ``'energy'`` (stored grand-canonical energy
-                ``Ω_self_A = U_A - μ_A · N_A`` from ``EnsembleTerm``).
+                ``'energy'`` (stored ``Ω_self_A`` from ``EnsembleTerm``).
             state_b: Same structure for replica B.
-            ensemble_params_a: Dict with key ``'chemical_potentials'`` — float
-                array of shape ``(n_species,)``.
+            ensemble_params_a: Dict with key ``'chemical_potentials'``, a
+                float array of shape ``(n_species,)``, and optionally
+                ``'pressure'``.
             ensemble_params_b: Same structure for replica B.
             rng_key: Unused; accepted for API uniformity.
             backend: Unused; accepted for API uniformity (zero backend calls).
 
         Returns:
-            ``(proposed, 0, 0)`` where ``proposed`` is a dict with keys
-            ``{'positions_a', 'cell_a', 'types_a', 'energy_a', 'positions_b', 'cell_b', 'types_b', 'energy_b'}``.
-            ``energy_a`` = ``state_a.energy + μ_A · N_A - μ_B · N_A``
-            (= ``U_A - μ_B · N_A``).
-            ``energy_b`` = ``state_b.energy + μ_B · N_B - μ_A · N_B``
-            (= ``U_B - μ_A · N_B``).
+            ``(proposed, 0, 0)`` where ``proposed`` has keys
+            ``{'positions_a', 'cell_a', 'types_a', 'energy_a',
+            'positions_b', 'cell_b', 'types_b', 'energy_b'}``.
+            ``positions_a``, ``cell_a`` and ``types_a`` are walker B's;
+            ``energy_a`` is ``Ω_B_in_A``.  Symmetrically for ``*_b``.
 
         Raises:
             ValueError: If ``'chemical_potentials'`` is absent from either
@@ -1380,21 +1371,38 @@ class SemiGrandSwap(SwapKernel):
         N_A = jnp.bincount(types_a, length=n_species)  # (n_species,)
         N_B = jnp.bincount(types_b, length=n_species)  # (n_species,)
 
-        # Stored state.energy = Ω_self = U - μ_self·N (EnsembleTerm
-        # convention).  Recover U by adding μ_self·N back, then subtract the
-        # partner's μ·N to get the post-swap grand-canonical energy.
-        omega_a = state_a["energy"] + jnp.dot(mu_a, N_A) - jnp.dot(mu_b, N_A)
-        omega_b = state_b["energy"] + jnp.dot(mu_b, N_B) - jnp.dot(mu_a, N_B)
+        # Stored state.energy = Ω_self = U + P_self·V - μ_self·N
+        # (EnsembleTerm convention).  Remove the self terms and add the
+        # receiving run's terms.
+        omega_b_in_a = (
+            state_b["energy"] + jnp.dot(mu_b, N_B) - jnp.dot(mu_a, N_B)
+        )
+        omega_a_in_b = (
+            state_a["energy"] + jnp.dot(mu_a, N_A) - jnp.dot(mu_b, N_A)
+        )
+
+        p_a = ensemble_params_a.get("pressure")
+        p_b = ensemble_params_b.get("pressure")
+        cell_a = state_a.get("cell")
+        cell_b = state_b.get("cell")
+        if (
+            p_a is not None
+            and p_b is not None
+            and cell_a is not None
+            and cell_b is not None
+        ):
+            omega_b_in_a = omega_b_in_a + (p_a - p_b) * get_volume(cell_b)
+            omega_a_in_b = omega_a_in_b + (p_b - p_a) * get_volume(cell_a)
 
         proposed = {
-            "positions_a": state_a.get("positions"),
-            "cell_a": state_a.get("cell"),
-            "types_a": types_a,
-            "energy_a": omega_a,  # grand-canonical energy under new μ
-            "positions_b": state_b.get("positions"),
-            "cell_b": state_b.get("cell"),
-            "types_b": types_b,
-            "energy_b": omega_b,  # grand-canonical energy under new μ
+            "positions_a": state_b.get("positions"),
+            "cell_a": cell_b,
+            "types_a": types_b,
+            "energy_a": omega_b_in_a,
+            "positions_b": state_a.get("positions"),
+            "cell_b": cell_a,
+            "types_b": types_a,
+            "energy_b": omega_a_in_b,
         }
         return proposed, 0, 0
 
@@ -1406,13 +1414,13 @@ class SemiGrandSwap(SwapKernel):
         ensemble_params_a: Any,
         ensemble_params_b: Any,
     ) -> Bool[Array, ""]:
-        """Accept iff grand-canonical energies are below Emax on both sides.
+        """Accept iff each walker is below the Emax of the run receiving it.
 
-        ``proposed['energy_a']`` and ``proposed['energy_b']`` are already the
-        grand-canonical energies Ω = U - μ_new · N computed by :meth:`propose`,
-        so the acceptance criterion reduces to a simple threshold check::
+        ``proposed['energy_a']`` is walker B's grand-canonical energy in run
+        A's frame and ``proposed['energy_b']`` walker A's in run B's frame,
+        both computed by :meth:`propose`, so the check is::
 
-            Ω_A_new < Emax_A  AND  Ω_B_new < Emax_B
+            Ω_B_in_A < Emax_A  AND  Ω_A_in_B < Emax_B
 
         Args:
             proposed: Dict from :meth:`propose` with keys ``'energy_a'``,
@@ -1455,9 +1463,10 @@ def semi_grand_replica_exchange_step(
 ]:
     """Perform semi-grand (μVT/μPT) replica exchange across P parallel runs.
 
-    Swaps chemical-potential *assignments* between pairs of runs.  Positions,
-    cells, and types are never changed.  Each run's walkers are updated only
-    when the grand-canonical energy under the new μ falls below Emax.
+    Exchanges walkers between pairs of runs at fixed chemical potentials,
+    like :func:`replica_exchange_step` does at fixed pressures.  On an
+    accepted swap the two walkers' positions, types and cells trade places,
+    and each stored energy is re-based to the receiving run's μ (and P).
 
     Zero backend calls per swap cycle.
 
@@ -1468,22 +1477,22 @@ def semi_grand_replica_exchange_step(
     In each swap, randomly select one walker from each run in the pair.
     The acceptance condition is::
 
-        (U_i - μ_j · N_i) < Emax_i  AND  (U_j - μ_i · N_j) < Emax_j
+        Ω_j_in_i < Emax_i  AND  Ω_i_in_j < Emax_j
 
-    When a swap is accepted, positions and types stay put; only the walkers'
-    energy fields are updated to their new grand-canonical values.
+    with ``Ω_x_in_r = U_x + P_r · V_x - μ_r · N_x``.
 
     Args:
         rng_key: JAX PRNG key.
         all_positions: ``(P, K, n_atoms, 3)`` positions for all runs.
         all_types: ``(P, K, n_atoms)`` per-walker types.
-        all_energies: ``(P, K)`` raw potential energies for all runs.
+        all_energies: ``(P, K)`` stored grand-canonical energies
+            ``U + P_p · V - μ_p · N`` for all runs.
         all_cells: ``(P, K, 3, 3)`` or None.
         all_emax: ``(P,)`` current Emax for each run.
         chemical_potentials: ``(P, n_species)`` float array; row p is μ for run p.
         semi_grand_kernel: ``SemiGrandSwap`` instance.
-        pressures: ``(P,)`` or None (unused by semi-grand; accepted for
-            interface parity).
+        pressures: ``(P,)`` or None.  When given together with cells, the
+            ``P · V`` term is re-based for walkers that change run.
         n_swap_cycles: Number of even+odd swap phases per call.
 
     Returns:
@@ -1564,6 +1573,10 @@ def semi_grand_replica_exchange_step(
                 "chemical_potentials": chemical_potentials[run_j]
             }
 
+            if pressures is not None and bxs is not None:
+                ens_i["pressure"] = pressures[run_i]
+                ens_j["pressure"] = pressures[run_j]
+
             proposed, _, _ = semi_grand_kernel.propose(
                 state_i, state_j, ens_i, ens_j, swap_key, None
             )
@@ -1576,17 +1589,25 @@ def semi_grand_replica_exchange_step(
             )
             do_swap = accepted & valid
 
-            # Positions, cells, types are unchanged; only energies update
-            # (to the grand-canonical value under the new μ).
-            # Walkers do NOT physically move to the other run; instead the
-            # energy field is updated to reflect the new μ assignment.
-            # The swap is symmetric: run i's selected walker now "lives" under
-            # μ_j, and run j's selected walker now "lives" under μ_i.
-            new_ene = ene.at[run_i, wi].set(
-                jnp.where(do_swap, proposed["energy_a"], ene[run_i, wi])
+            # proposed["*_a"] is walker j arriving in run i, and
+            # proposed["*_b"] is walker i arriving in run j.
+            def _write(arr, new_i, new_j):
+                arr = arr.at[run_i, wi].set(
+                    jnp.where(do_swap, new_i, arr[run_i, wi])
+                )
+                return arr.at[run_j, wj].set(
+                    jnp.where(do_swap, new_j, arr[run_j, wj])
+                )
+
+            new_pos = _write(
+                pos, proposed["positions_a"], proposed["positions_b"]
             )
-            new_ene = new_ene.at[run_j, wj].set(
-                jnp.where(do_swap, proposed["energy_b"], ene[run_j, wj])
+            new_typ = _write(typ, proposed["types_a"], proposed["types_b"])
+            new_ene = _write(ene, proposed["energy_a"], proposed["energy_b"])
+            new_bxs = (
+                _write(bxs, proposed["cell_a"], proposed["cell_b"])
+                if bxs is not None
+                else bxs
             )
 
             # Per-pair scatter-add (see replica_exchange_step for the
@@ -1595,7 +1616,7 @@ def semi_grand_replica_exchange_step(
             delta = valid.astype(jnp.int32) * do_swap.astype(jnp.int32)
             new_acc_per_pair = acc_per_pair_in.at[pair_id].add(delta)
 
-            return (pos, typ, new_ene, bxs, new_acc_per_pair), None
+            return (new_pos, new_typ, new_ene, new_bxs, new_acc_per_pair), None
 
         scan_inputs = (pairs, mask, pair_keys)
         (positions, types, energies, cells, acc_per_pair), _ = jax.lax.scan(

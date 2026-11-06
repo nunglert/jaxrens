@@ -9,6 +9,20 @@ The version is derived from git tags by `setuptools-scm` (tag `v0.1.0` →
 version `0.1.0`). To cut a release: add a dated section below, merge to `main`,
 then `git tag -a vX.Y.Z`.
 
+## [Unreleased]
+
+### Fixed
+- **Semi-grand replica exchange left stored energies in the wrong frame.**
+  An accepted `semi_grand` swap kept both walkers in their runs but wrote
+  their energies with the partner run's μ, while each run kept its own μ.
+  The stored energies then no longer matched the run's contour, so the next
+  culls picked the wrong walker and the Emax sequence was off. Acceptance
+  also compared each walker with its own run's Emax instead of the
+  receiving run's. The swap now moves the walkers between runs (positions,
+  types and cell), re-bases each energy to the receiving run's μ and, for
+  μPT, its pressure, and checks it against the receiving run's Emax, as
+  pressure RE does.
+
 ## [0.7.0] — 2026-10-19
 
 ### Added
