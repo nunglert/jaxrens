@@ -9,19 +9,30 @@ The version is derived from git tags by `setuptools-scm` (tag `v0.1.0` →
 version `0.1.0`). To cut a release: add a dated section below, merge to `main`,
 then `git tag -a vX.Y.Z`.
 
-## [Unreleased]
+## [0.7.1] — 2026-11-06
+
+Bug-fix release for semi-grand replica exchange. No config changes.
 
 ### Fixed
-- **Semi-grand replica exchange left stored energies in the wrong frame.**
-  An accepted `semi_grand` swap kept both walkers in their runs but wrote
-  their energies with the partner run's μ, while each run kept its own μ.
-  The stored energies then no longer matched the run's contour, so the next
-  culls picked the wrong walker and the Emax sequence was off. Acceptance
-  also compared each walker with its own run's Emax instead of the
-  receiving run's. The swap now moves the walkers between runs (positions,
-  types and cell), re-bases each energy to the receiving run's μ and, for
-  μPT, its pressure, and checks it against the receiving run's Emax, as
-  pressure RE does.
+- **Semi-grand replica exchange stored energies with the wrong μ.** Affects
+  runs with `inter_re: {flavor: semi_grand}` and two or more replicas;
+  pressure RE and XRENS are unchanged. An accepted swap kept both walkers
+  in their runs but overwrote their stored energies with
+  `U − μ_partner · N`, while each run went on using its own μ. A swapped
+  walker then carried an energy that did not match its run's contour, so
+  later culls could remove the wrong walker and the Emax sequence, and with
+  it the evidence and every thermodynamic quantity, was biased. Acceptance
+  also compared each walker with its own run's Emax instead of the Emax of
+  the run it would enter. The swap now works like pressure RE: the two
+  walkers trade runs (positions, types and cell), each energy is re-based
+  to the receiving run's μ (and, for μPT, its pressure), and each walker
+  must fit below the receiving run's Emax. Semi-grand RE results from
+  earlier versions should be rerun, and seeded runs are not reproducible
+  against them.
+- **Replica-exchange docs.** In `user/concepts/replicas.md` the semi-grand
+  section describes the new exchange and why a single walker cannot take
+  another run's μ. The Pressure-RENS section no longer says that replicas
+  keep their configurations: the walkers move, as the code has always done.
 
 ## [0.7.0] — 2026-10-19
 
