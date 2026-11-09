@@ -142,10 +142,12 @@ def partition_function(
             ``(n_live,)``.
         n_live: Number of live walkers.
         n_cull: Number culled per iteration.
-        dead_volumes: Optional PV contributions for dead points, shape must
-            broadcast with ``dead_energies``.
-        live_volumes: Optional PV contributions for live points, shape must
-            broadcast with ``live_energies``.
+        dead_volumes: Optional ``P V`` terms added to ``dead_energies``,
+            for energies that do not include them yet.  Shape must
+            broadcast with ``dead_energies``.  Energies streamed by an NPT
+            run are already ``H = U + P V``: pass nothing then.
+        live_volumes: Optional ``P V`` terms added to ``live_energies``,
+            same rules as ``dead_volumes``.
 
     Returns:
         ``log Z(beta)`` with shape ``batch`` — scalar for 1-D input.

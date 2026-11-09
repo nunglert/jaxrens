@@ -31,11 +31,19 @@ class Monitor:
     iteration trace.  All scientific computations delegate to
     postprocess.thermodynamics.
 
+    In NPT the stored energies are already enthalpies ``H = U + P V``
+    (``EnsembleTerm`` adds ``P V`` during sampling), so the observables use
+    them as they are.  The cell volumes are kept as data only: they set
+    ``is_npt`` and feed ``<V>(T)`` via ``expectation(volume_trace, T)``.
+
     Attributes:
-        dead_energies: Dead-point energies, shape (n_dead,).
-        dead_volumes: Dead-point volumes for NPT runs, shape (n_dead,), or None.
+        dead_energies: Dead-point energies, shape (n_dead,); enthalpies in
+            NPT.
+        dead_volumes: Dead-point cell volumes for NPT runs, shape (n_dead,),
+            or None.
         live_energies: Live-walker energies at run end, shape (n_live_actual,).
-        live_volumes: Live-walker volumes for NPT, shape (n_live_actual,), or None.
+        live_volumes: Live-walker cell volumes for NPT, shape
+            (n_live_actual,), or None.
         log_evidence: Scalar log Z stored in the checkpoint.
         iteration: Iteration number at checkpoint.
         n_live: Number of live walkers used in the run.
@@ -52,6 +60,9 @@ class Monitor:
             opted in via ``output.save_max_neighbors``.
         label: Human-readable label for plots.
         path: Source directory, or None.
+        volume_trace: Cell volume of each dead point from the .energies
+            log, shape (n_dead,).  Set by ``from_directory`` (and by
+            ``MonitorCollection.from_multi_run_directory``) only.
     """
 
     @classmethod
@@ -187,7 +198,7 @@ class Monitor:
 
             max_neighbors_trace = MaxNeighborsLogger.read(mn_path)
 
-        return cls(
+        monitor = cls(
             dead_energies=dead_energies,
             dead_volumes=dead_volumes,
             live_energies=live_energies,
@@ -208,6 +219,12 @@ class Monitor:
             label=label,
             path=path,
         )
+        # Bare cell volume per dead point, for <V>(T); same attribute as
+        # MonitorCollection.from_multi_run_directory sets.
+        monitor.volume_trace = np.asarray(
+            energies_log.volumes, dtype=np.float64
+        )
+        return monitor
 
     def __init__(
         self,
@@ -289,21 +306,15 @@ class Monitor:
         return 1.0 / (k_B * T)
 
     def _arrays(self):
-        """Cache the energies / volumes as float64 numpy arrays."""
+        """Cache the energies as float64 numpy arrays.
+
+        The volumes are deliberately not used: in NPT the energies already
+        contain ``P V``, and adding the volume again double-counts it.
+        """
         if not hasattr(self, "_cached_np"):
             self._cached_np = {
                 "dead_e": np.asarray(self.dead_energies, dtype=np.float64),
                 "live_e": np.asarray(self.live_energies, dtype=np.float64),
-                "dead_v": (
-                    np.asarray(self.dead_volumes, dtype=np.float64)
-                    if self.dead_volumes is not None
-                    else None
-                ),
-                "live_v": (
-                    np.asarray(self.live_volumes, dtype=np.float64)
-                    if self.live_volumes is not None
-                    else None
-                ),
             }
         return self._cached_np
 
@@ -331,8 +342,6 @@ class Monitor:
                 arrs["live_e"],
                 n_live=self.n_live,
                 n_cull=self.n_cull,
-                dead_volumes=arrs["dead_v"],
-                live_volumes=arrs["live_v"],
             )
 
         results = self._map_over_beta(scalar_fn, betas)
@@ -423,8 +432,6 @@ class Monitor:
                 arrs["live_e"],
                 n_live=self.n_live,
                 n_cull=self.n_cull,
-                dead_volumes=arrs["dead_v"],
-                live_volumes=arrs["live_v"],
             )
             return _free_energy(beta, logZ)
 
@@ -447,8 +454,6 @@ class Monitor:
                 arrs["live_e"],
                 n_live=self.n_live,
                 n_cull=self.n_cull,
-                dead_volumes=arrs["dead_v"],
-                live_volumes=arrs["live_v"],
             )
 
         results = self._map_over_beta(scalar_fn, betas)
