@@ -207,6 +207,13 @@ A few invariants worth pinning down:
   `jax.jit(jax.shard_map(...))` over the batcher's cached `"gpu"`
   mesh (`batcher.mesh`), the same mesh the NS step uses. See
   {ref}`the shard_map notes <multi-device-shard-map>`.
+- **What travels with a swapped walker.** The configuration
+  (positions, types, cell, energy re-based to the new run) and every
+  other per-walker field that describes it: move-specific state such
+  as GMC's `direction`, and the neighbour bookkeeping
+  (`max_neighbor_count`, `overflow`). The run's own state stays in
+  the slot: ensemble params, adapted step sizes and acceptance
+  counters (`state/mc_state.py::RUN_BOUND_FIELDS`).
 - **Identical swap decisions across devices.** For
   `PmapVmapRuns`, the same scalar `swap_key` is broadcast to all
   devices before the `shard_map` call. After the `all_gather` every

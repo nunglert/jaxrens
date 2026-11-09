@@ -103,6 +103,42 @@ def make_mc_state_class(extra_fields: dict[str, type] | None = None) -> type:
 
 
 # ---------------------------------------------------------------------------
+# Which fields belong to the walker and which to the run
+# ---------------------------------------------------------------------------
+
+#: Fields describing the *run* a walker slot belongs to, not the
+#: configuration in it.  When replica exchange moves a configuration to
+#: another run these stay with the slot: the run's ensemble params, its
+#: adapted step sizes (``step_size`` is re-derived from ``step_sizes`` on every
+#: move) and the acceptance counters of the moves made in this run.  Every
+#: other non-static field -- including all move-specific extra fields such as
+#: GMC's ``direction`` -- describes the configuration and travels with it.
+#: A move whose extra field is per-run state must be added here.
+RUN_BOUND_FIELDS: frozenset[str] = frozenset(
+    {"ensemble_params", "step_size", "step_sizes", "n_accepted", "n_proposed"}
+)
+
+
+def walker_bound_fields(state) -> tuple[str, ...]:
+    """Names of the non-static fields of ``state`` that travel with the walker.
+
+    Args:
+        state: An MCState instance (any field set built by
+            :func:`make_mc_state_class`).
+
+    Returns:
+        Field names in declaration order, excluding static fields and
+        :data:`RUN_BOUND_FIELDS`.
+    """
+    return tuple(
+        f.name
+        for f in dataclasses.fields(state)
+        if not f.metadata.get("static", False)
+        and f.name not in RUN_BOUND_FIELDS
+    )
+
+
+# ---------------------------------------------------------------------------
 # Convenience: default MCState with no extra fields
 # ---------------------------------------------------------------------------
 

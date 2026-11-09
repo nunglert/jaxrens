@@ -56,6 +56,16 @@ then `git tag -a vX.Y.Z`.
   energy now also gets the receiving run's `chemical_potentials` when the
   run has them, and a non-periodic walker is evaluated with `cell=None`
   instead of a zero cell.
+- **Swapped walkers take their per-walker state with them.** Besides
+  positions, types, cell and energy, an accepted inter-RE swap now also
+  moves the fields that describe the configuration: move-specific state
+  such as GMC's `direction`, and `max_neighbor_count` / `overflow`.
+  Previously these stayed in the slot, so a configuration arriving in a
+  run continued its GMC walk with the departed walker's direction. Run
+  state (ensemble params, adapted step sizes, acceptance counters) still
+  stays with the run; `state.mc_state.RUN_BOUND_FIELDS` lists it. Swap
+  decisions are unchanged, but seeded GMC runs with inter-RE are not
+  reproducible against 0.7.0.
 - **`run_ns_parallel` / `run_ns_multi_gpu`** no longer initialise the NS
   state twice when `inter_re_config` is given: XRENS / semi-grand per-run
   inputs are merged into `ensemble_params_per_run` before the first init.

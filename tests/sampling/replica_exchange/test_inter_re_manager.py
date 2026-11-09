@@ -17,7 +17,7 @@ from jaxrens.backends.toy import create_harmonic
 from jaxrens.sampling.batch_descriptor import PmapVmapRuns, SingleRun, VmapRuns
 from jaxrens.sampling.inter_re_manager import InterREManager
 from jaxrens.sampling.move_kernel import MoveKernel
-from jaxrens.sampling.moves import random_walk
+from jaxrens.sampling.moves import galilean, random_walk
 from jaxrens.sampling.moves.replica_exchange import (
     EnsembleSwap,
     SwapWalker,
@@ -561,3 +561,114 @@ class TestPerPairTracking:
         assert int(swap_info["n_attempted_per_pair"].sum()) == int(
             swap_info["n_attempted"]
         )
+
+
+# ---------------------------------------------------------------------------
+# Which MCState fields move with a swapped configuration
+# ---------------------------------------------------------------------------
+
+
+class TestSwapCarriesWalkerState:
+    """Configuration-bound fields (move extras such as GMC's direction, the
+    neighbour bookkeeping) follow the configuration; run-bound fields
+    (ensemble params, step sizes, acceptance counters) stay with the slot."""
+
+    @staticmethod
+    def _two_run_state():
+        backend = create_harmonic(k=1.0)
+        descriptors = [
+            MoveKernel(
+                "gmc",
+                galilean.build_kernel,
+                step_size=0.2,
+                extra_state_fields={
+                    "direction": (
+                        jnp.ndarray,
+                        lambda pos, types: jnp.zeros_like(pos),
+                    )
+                },
+            )
+        ]
+        init_fn, _, _ = build_mwg(backend, descriptors)
+        n_runs, n_walkers = 2, 1
+        positions = jnp.stack(
+            [jnp.zeros((n_walkers, 2, 3)), jnp.ones((n_walkers, 2, 3))]
+        )
+        types = jnp.zeros((2,), dtype=jnp.int32)
+        energies = jnp.array([[0.0], [1.0]])
+        ns_state = init_ns_parallel(
+            init_fn,
+            positions,
+            types,
+            energies,
+            None,
+            jax.random.split(jax.random.key(0), n_runs),
+            step_sizes=jnp.array([0.2]),
+            ensemble_params_per_run=[
+                {"pressure": jnp.array(0.0)},
+                {"pressure": jnp.array(0.0)},
+            ],
+        )
+        pop = ns_state.population
+        # Tag every per-walker field with its run index so we can see where
+        # each ends up after the swap.
+        run_tag = jnp.arange(n_runs)
+        pop = pop.set(
+            direction=jnp.broadcast_to(
+                run_tag[:, None, None, None] + 10.0, pop.direction.shape
+            ),
+            max_neighbor_count=jnp.broadcast_to(
+                run_tag[:, None] + 20, pop.max_neighbor_count.shape
+            ).astype(pop.max_neighbor_count.dtype),
+            overflow=jnp.array([[True], [False]]),
+            step_sizes=jnp.broadcast_to(
+                run_tag[:, None, None] + 0.5, pop.step_sizes.shape
+            ),
+            n_accepted=jnp.broadcast_to(
+                run_tag[:, None, None] + 30, pop.n_accepted.shape
+            ).astype(pop.n_accepted.dtype),
+        )
+        return ns_state.set(population=pop, emax=jnp.array([1e6, 1e6]))
+
+    def test_accepted_swap_moves_configuration_state(self):
+        ns_state = self._two_run_state()
+        old = ns_state.population
+        mgr = InterREManager(
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=1
+        )
+        new_state, stats, _ = mgr.apply(ns_state, jax.random.key(1))
+        new = new_state.population
+        assert stats["n_swap_pairs_accepted"] == 1
+
+        # Moved with the configuration.
+        for name in (
+            "positions",
+            "direction",
+            "max_neighbor_count",
+            "overflow",
+        ):
+            got, want = getattr(new, name), getattr(old, name)
+            assert jnp.array_equal(got[0], want[1]), name
+            assert jnp.array_equal(got[1], want[0]), name
+
+        # Stayed with the run.
+        for name in ("step_sizes", "n_accepted"):
+            assert jnp.array_equal(
+                getattr(new, name), getattr(old, name)
+            ), name
+        assert jnp.array_equal(
+            new.ensemble_params["pressure"], old.ensemble_params["pressure"]
+        )
+
+    def test_walker_bound_fields_classification(self):
+        from jaxrens.state.mc_state import (
+            RUN_BOUND_FIELDS,
+            walker_bound_fields,
+        )
+
+        pop = self._two_run_state().population
+        fields = walker_bound_fields(pop)
+        assert "direction" in fields
+        assert {"positions", "max_neighbor_count", "overflow"} <= set(fields)
+        assert not set(fields) & RUN_BOUND_FIELDS
+        assert "max_neighbors" not in fields  # static

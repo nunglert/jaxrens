@@ -57,12 +57,19 @@ class SwapWalker(NamedTuple):
             (``U + P·V − μ·N``, the ``EnsembleTerm`` convention), shape
             ``(*B,)``.
         cell: Unit cell, shape ``(*B, 3, 3)``, or ``None``.
+        extras: Other per-walker state that belongs to the configuration
+            and moves with it (e.g. GMC's ``direction``, the neighbour-count
+            bookkeeping; see
+            :data:`~jaxrens.state.mc_state.RUN_BOUND_FIELDS` for what stays
+            with the run).  Kernels pass it through unchanged; ``None`` when
+            there is none.
     """
 
     positions: Float[Array, "*B N 3"]
     types: Int[Array, "*B N"]
     energy: Float[Array, "*B"]
     cell: Float[Array, "*B 3 3"] | None = None
+    extras: dict[str, Array] | None = None
 
 
 class SwapKernel(ABC):

@@ -39,6 +39,7 @@ from jaxrens.sampling.moves.replica_exchange import (
     SwapWalker,
     replica_exchange_step,
 )
+from jaxrens.state.mc_state import walker_bound_fields
 from jaxrens.state.ns import NSState
 
 
@@ -263,6 +264,7 @@ class InterREManager:
             types=new_walkers.types,
             energy=new_walkers.energy,
             cell=new_walkers.cell,
+            **(new_walkers.extras or {}),
         )
         new_ns_state = ns_state.set(population=new_pop)
         return new_ns_state, self._build_stats(swap_info), rng_key
@@ -345,6 +347,11 @@ class InterREManager:
         contour set by the most recent ``ns_step``.  Not re-derived from
         ``pop.energy`` (which would be strictly tighter post-MCMC).
 
+        The walkers carry, besides positions / types / energy / cell, every
+        other field of the population that belongs to the configuration
+        (:func:`~jaxrens.state.mc_state.walker_bound_fields`), so e.g. a GMC
+        direction follows its configuration into the other run.
+
         Per-run params are the kernel's ``param_keys`` found in
         ``population.ensemble_params``.  After vmapping init_ns those carry
         a walker axis (all walkers of a run hold the same value), which is
@@ -355,11 +362,19 @@ class InterREManager:
                 missing.
         """
         pop = ns_state.population
+        # Everything that describes the configuration moves with it; run
+        # state (ensemble params, step sizes, counters) stays in the slot.
+        extras = {
+            name: getattr(pop, name)
+            for name in walker_bound_fields(pop)
+            if name not in SwapWalker._fields
+        }
         walkers = SwapWalker(
             positions=pop.positions,
             types=pop.types,
             energy=pop.energy,
             cell=pop.cell,
+            extras=extras or None,
         )
 
         shape_prefix = tuple(self._batcher.shape_prefix)
