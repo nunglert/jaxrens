@@ -164,27 +164,24 @@ flowchart TB
     FIRES -- no --> CONT["continue NS step"]
     FIRES -- yes --> APPLY["manager.apply(state, key)"]
 
-    APPLY --> EXTR["_extract_swap_inputs(state):<br/>positions, types, energies, cells, emax,<br/>+ pressures / composition_targets / μ<br/>(from pop.ensemble_params)"]
+    APPLY --> EXTR["_extract_swap_inputs(state):<br/>SwapWalker(positions, types, energy, cell), emax,<br/>+ kernel.param_keys: pressure / μ / target_composition<br/>(from pop.ensemble_params)"]
     EXTR --> DESC{"BatchDescriptor"}
 
     DESC -- SingleRun --> NOOP["no-op<br/>(empty stats)"]
-    DESC -- VmapRuns --> VMAP["_jit_vmap_swap<br/>(R, K, …) directly"]
+    DESC -- VmapRuns --> VMAP["jit(replica_exchange_step)<br/>(R, K, …) directly"]
     DESC -- PmapVmapRuns --> AGG["shard_map on batcher.mesh ('gpu')<br/>lax.all_gather: (P, K, …) → (G, P, K, …)<br/>on every device"]
     AGG --> FLAT["reshape (G·P, K, …)<br/>same RNG ⇒ identical decisions"]
-    FLAT --> SWAP["_jit_pmap_swap<br/>(stats out_specs=P(), replicated)"]
+    FLAT --> CYC
 
-    VMAP --> KFLAV{"swap kernel"}
-    SWAP --> KFLAV
+    VMAP --> CYC["replica_exchange_step:<br/>loop n_swap_cycles ×<br/>(even pass, odd pass)"]
+    CYC --> KFLAV{"kernel.propose<br/>(walkers entering each run,<br/>energy in that run's frame)"}
 
-    KFLAV -- "PressureRENS" --> PR["replica_exchange_step<br/>swap thermo context only<br/>(0 backend calls)"]
-    KFLAV -- "XRENSSwap" --> XR["xrens_replica_exchange_step<br/>swap species labels<br/>(re-evaluates U)"]
-    KFLAV -- "SemiGrandSwap" --> SG["semi_grand_replica_exchange_step<br/>swap N at fixed μ<br/>(0 backend calls)"]
+    KFLAV -- "EnsembleSwap<br/>(pressure, semi_grand)" --> PR["walkers trade runs,<br/>energy re-based to P, μ<br/>(0 backend calls)"]
+    KFLAV -- "XRENSSwap" --> XR["morph types to target,<br/>re-evaluate U<br/>(2 backend calls)"]
 
-    PR --> CYC["loop n_swap_cycles ×<br/>(even pass, odd pass)"]
-    XR --> CYC
-    SG --> CYC
-
-    CYC --> SHARDQ{"PmapVmapRuns?"}
+    PR --> ACC["accept iff each incoming<br/>energy &lt; receiving Emax"]
+    XR --> ACC
+    ACC --> SHARDQ{"PmapVmapRuns?"}
     SHARDQ -- yes --> SHARD["slice this device's shard<br/>via lax.axis_index('gpu')"]
     SHARDQ -- no --> WRITE
     SHARD --> WRITE["population.set(positions=…, types=…,<br/>energy=…, cell=…)"]
@@ -197,17 +194,16 @@ flowchart TB
     classDef io fill:#f5f5f5,stroke:#444,color:#222
 
     class FIRES,DESC,KFLAV,SHARDQ decision
-    class VMAP,AGG,FLAT,SWAP,SHARD,CYC path
-    class PR,XR,SG kernel
+    class VMAP,AGG,FLAT,SHARD,CYC,ACC path
+    class PR,XR kernel
     class LOOP,APPLY,EXTR,WRITE,RET,CONT,NOOP io
 ```
 
 A few invariants worth pinning down:
 
-- **Cached compilation.** `_build_jit_fns` runs once in
-  `__init__` and stores `_jit_vmap_swap` / `_jit_pmap_swap`.
-  Subsequent `apply` calls hit the cache — no re-tracing per
-  iteration. Despite its name, `_jit_pmap_swap` is a
+- **Cached compilation.** `_build_jit_fn` runs once in
+  `__init__` and stores `_jit_swap`. Subsequent `apply` calls hit
+  the cache — no re-tracing per iteration. For `PmapVmapRuns` it is a
   `jax.jit(jax.shard_map(...))` over the batcher's cached `"gpu"`
   mesh (`batcher.mesh`), the same mesh the NS step uses. See
   {ref}`the shard_map notes <multi-device-shard-map>`.
@@ -325,5 +321,6 @@ update costs two $S$-dimensional dot products (plus the $PV$ terms).
 | Topology derivation | `cli/resolve.py::_derive_replica_axes` |
 | Multi-run dispatch | {func}`jaxrens.sampling.nested_sampling.run_ns_multi_gpu` |
 | Swap manager | `sampling/inter_re_manager.py::InterREManager` |
-| Swap kernels (3 flavors) | `sampling/moves/replica_exchange.py` |
+| Swap driver + kernels (`EnsembleSwap`, `XRENSSwap`) | `sampling/moves/replica_exchange.py` |
+| Ensemble energy / re-basing (`P·V − μ·N`) | `backends/ensemble.py::ensemble_energy`, `rebase_ensemble_energy` |
 | Even/odd pair helper | `sampling/moves/replica_exchange.py::get_swap_pairs` |

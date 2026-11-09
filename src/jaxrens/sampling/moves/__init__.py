@@ -13,6 +13,7 @@ from jaxrens.sampling.moves import (
     volume,
 )
 from jaxrens.sampling.moves.replica_exchange import (
-    PressureRENSSwap,
+    EnsembleSwap,
     SwapKernel,
+    SwapWalker,
 )

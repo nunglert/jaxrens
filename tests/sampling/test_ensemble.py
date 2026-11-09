@@ -180,7 +180,7 @@ class TestInitialEnergyEnsembleThreading:
     """The resolver's initial-energy compute must thread the SAME per-replica
     ensemble params the runtime NS loop uses, so resolved energies include
     P·V and −μ·N by construction — keeping the first NS contour consistent
-    with the running chain and with ``SemiGrandSwap``'s ``Ω = U − μ·N``.
+    with the running chain and with the swap re-basing (``Ω = U − μ·N``).
     """
 
     def test_finalise_threads_chemical_potentials_per_replica(self):

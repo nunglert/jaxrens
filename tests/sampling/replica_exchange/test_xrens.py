@@ -2,8 +2,7 @@
 
 Coverage:
 - XRENSSwap.propose: morphed types match target compositions exactly.
-- XRENSSwap.accept: boolean output, JIT-compatible.
-- XRENSSwap.accept delegates to PressureRENSSwap acceptance math.
+- XRENSSwap.propose: re-evaluated energy uses the receiving run's pressure.
 - n_species mismatch guard: XRENSSwap(n_species=3) + targets of width 2 raises.
 - End-to-end: two-run NS at different compositions, assert:
     - No errors during run.
@@ -22,8 +21,9 @@ import pytest
 
 from jaxrens.backends.base import BackendResult
 from jaxrens.sampling.moves.replica_exchange import (
+    SwapWalker,
     XRENSSwap,
-    xrens_replica_exchange_step,
+    replica_exchange_step,
 )
 from jaxrens.state.config import InterREConfig
 
@@ -64,13 +64,52 @@ class SpeciesHarmonicBackend:
 
 
 def _make_state(positions, types, energy, cell=None):
-    """Build a minimal state dict as expected by XRENSSwap.propose."""
-    return {
-        "positions": positions,
-        "types": types,
-        "energy": energy,
-        "cell": cell if cell is not None else jnp.zeros((3, 3)),
-    }
+    """One walker as passed to XRENSSwap.propose."""
+    return SwapWalker(positions, types, jnp.asarray(energy), cell)
+
+
+def _propose(kernel, walker_a, walker_b, ens_a, ens_b, key, backend):
+    """``kernel.propose`` repackaged as ``*_a`` / ``*_b`` keys: ``*_a`` is the
+    walker entering run A (built from walker B), ``*_b`` the one entering B."""
+    into_a, into_b = kernel.propose(
+        walker_a, walker_b, ens_a, ens_b, key, backend
+    )
+    proposed = {}
+    for suffix, w in (("a", into_a), ("b", into_b)):
+        proposed[f"positions_{suffix}"] = w.positions
+        proposed[f"types_{suffix}"] = w.types
+        proposed[f"energy_{suffix}"] = w.energy
+        proposed[f"cell_{suffix}"] = w.cell
+    return proposed, kernel.n_energy_evals, 0
+
+
+def _xrens_step(
+    rng_key,
+    all_positions,
+    all_types,
+    all_energies,
+    all_cells,
+    all_emax,
+    composition_targets,
+    backend,
+    xrens_kernel,
+    pressures=None,
+    n_swap_cycles=1,
+):
+    """Old positional-array calling convention on top of the generic driver."""
+    run_params = {"target_composition": composition_targets}
+    if pressures is not None:
+        run_params["pressure"] = pressures
+    new, info = replica_exchange_step(
+        rng_key,
+        SwapWalker(all_positions, all_types, all_energies, all_cells),
+        all_emax,
+        run_params,
+        xrens_kernel,
+        backend=backend,
+        n_swap_cycles=n_swap_cycles,
+    )
+    return new.positions, new.types, new.energy, new.cell, info
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +147,8 @@ class TestXRENSProposeMorphedTypes:
         ens_a = {"target_composition": jnp.array(target_a, dtype=jnp.int32)}
         ens_b = {"target_composition": jnp.array(target_b, dtype=jnp.int32)}
 
-        proposed, n_e, n_g = kernel.propose(
-            state_a, state_b, ens_a, ens_b, morph_key, backend
+        proposed, n_e, n_g = _propose(
+            kernel, state_a, state_b, ens_a, ens_b, morph_key, backend
         )
         return proposed, n_e, n_g
 
@@ -169,8 +208,8 @@ class TestXRENSProposeMorphedTypes:
         ens_a = {"target_composition": jnp.array([4, 0])}
         ens_b = {"target_composition": jnp.array([2, 2])}
 
-        proposed, _, _ = kernel.propose(
-            state_a, state_b, ens_a, ens_b, mkey, backend
+        proposed, _, _ = _propose(
+            kernel, state_a, state_b, ens_a, ens_b, mkey, backend
         )
         # A receives B's positions; B receives A's positions.
         assert jnp.allclose(
@@ -200,115 +239,44 @@ class TestXRENSProposeMorphedTypes:
 
 
 # ---------------------------------------------------------------------------
-# XRENSSwap.accept: boolean, JIT-compatible
+# XRENSSwap.propose: energies in the receiving run's frame
 # ---------------------------------------------------------------------------
 
 
-class TestXRENSAccept:
-    """accept() must return a boolean scalar and be JIT-compatible."""
+class _PressureAwareBackend(SpeciesHarmonicBackend):
+    """SpeciesHarmonicBackend + P·V from ensemble_params, like EnsembleTerm."""
 
-    def _make_proposed(self, e_a, e_b, cell_a=None, cell_b=None):
-        cell = jnp.zeros((3, 3))
-        return {
-            "energy_a": jnp.array(e_a),
-            "energy_b": jnp.array(e_b),
-            "cell_a": cell_a if cell_a is not None else cell,
-            "cell_b": cell_b if cell_b is not None else cell,
-            "types_a": jnp.zeros(4, dtype=jnp.int32),
-            "types_b": jnp.zeros(4, dtype=jnp.int32),
-            "positions_a": jnp.zeros((4, 3)),
-            "positions_b": jnp.zeros((4, 3)),
-        }
+    def __call__(
+        self, positions, types, cell, max_neighbors=0, ensemble_params=None
+    ):
+        result = super().__call__(positions, types, cell, max_neighbors)
+        p = (ensemble_params or {}).get("pressure", 0.0)
+        return BackendResult(energy=result.energy + p * jnp.linalg.det(cell))
 
-    def test_accept_returns_bool(self):
+
+class TestXRENSReceivingFrame:
+    def test_energy_uses_receiving_pressure(self):
+        """The walker entering run A is evaluated at P_A, not at its home P."""
+        backend = _PressureAwareBackend([1.0, 1.0])
         kernel = XRENSSwap(n_species=2)
-        proposed = self._make_proposed(0.5, 0.3)
-        result = kernel.accept(
-            proposed,
-            emax_a=jnp.array(1.0),
-            emax_b=jnp.array(1.0),
-            ensemble_params_a={},
-            ensemble_params_b={},
+        pos = jnp.ones((4, 3))
+        types = jnp.zeros(4, dtype=jnp.int32)
+        cell_a, cell_b = jnp.eye(3), 2.0 * jnp.eye(3)  # V = 1, 8
+        u = float(SpeciesHarmonicBackend([1.0, 1.0])(pos, types, None).energy)
+        wa = _make_state(pos, types, 0.0, cell_a)
+        wb = _make_state(pos, types, 0.0, cell_b)
+        target = jnp.array([4, 0])
+        ens_a = {"target_composition": target, "pressure": jnp.array(0.1)}
+        ens_b = {"target_composition": target, "pressure": jnp.array(0.5)}
+
+        proposed, _, _ = _propose(
+            kernel, wa, wb, ens_a, ens_b, jax.random.key(0), backend
         )
-        assert result.dtype == jnp.bool_ or jnp.issubdtype(
-            result.dtype, jnp.bool_
-        ), f"accept() should return bool, got {result.dtype}"
 
-    def test_accept_low_energy_accepts(self):
-        """Both energies below emax → accepted."""
-        kernel = XRENSSwap(n_species=2)
-        proposed = self._make_proposed(0.1, 0.2)
-        result = kernel.accept(
-            proposed,
-            emax_a=jnp.array(5.0),
-            emax_b=jnp.array(5.0),
-            ensemble_params_a={},
-            ensemble_params_b={},
-        )
-        assert bool(result), "Expected accept when energies << emax"
-
-    def test_accept_high_energy_rejects(self):
-        """Energy above emax → rejected."""
-        kernel = XRENSSwap(n_species=2)
-        proposed = self._make_proposed(10.0, 0.2)
-        result = kernel.accept(
-            proposed,
-            emax_a=jnp.array(1.0),
-            emax_b=jnp.array(1.0),
-            ensemble_params_a={},
-            ensemble_params_b={},
-        )
-        assert not bool(result), "Expected reject when energy > emax"
-
-    def test_accept_jit_compatible(self):
-        """accept() must work under jax.jit."""
-        kernel = XRENSSwap(n_species=2)
-        proposed = self._make_proposed(0.5, 0.3)
-
-        @jax.jit
-        def jitted_accept(prop, ea, eb):
-            return kernel.accept(prop, ea, eb, {}, {})
-
-        result = jitted_accept(proposed, jnp.array(1.0), jnp.array(1.0))
-        assert (
-            jnp.isscalar(result) or result.shape == ()
-        ), f"accept() under jit should return scalar, got shape {result.shape}"
-
-    def test_accept_uses_destination_pressure_via_propose(self):
-        """XRENS no longer delegates to PressureRENSSwap.accept.
-
-        After the unified-fix landed (matching production state.energy
-        semantics), ``XRENSSwap.propose`` threads each receiving run's
-        ensemble_params (incl. pressure) into the backend call, so the
-        returned ``energy_a``/``energy_b`` are already enthalpies at the
-        destination pressure.  ``XRENSSwap.accept`` is therefore a plain
-        ``E < Emax`` threshold check.
-
-        This test asserts that ``XRENSSwap.accept`` returns the same boolean
-        as a hand-evaluated ``e < emax`` check, regardless of whether
-        ensemble_params carry a pressure — the kernel must NOT add another
-        PV term on top.
-        """
-        kernel = XRENSSwap(n_species=2)
-        proposed = self._make_proposed(0.5, 0.4)
-        # With pressure dicts present in ensemble_params: accept must still
-        # be a simple threshold check (no PV double-add).
-        ens_a = {"pressure": jnp.array(0.1)}
-        ens_b = {"pressure": jnp.array(0.2)}
-        proposed["cell_a"] = jnp.eye(3) * 2.0
-        proposed["cell_b"] = jnp.eye(3) * 2.0
-
-        # Emax just above the stored energies → must accept.
-        emax_a = jnp.array(1.0)
-        emax_b = jnp.array(1.0)
-        assert bool(kernel.accept(proposed, emax_a, emax_b, ens_a, ens_b))
-
-        # Emax just below energy_a → must reject (even though delegated to
-        # PressureRENSSwap.accept with double-counted PV would still accept).
-        emax_a_tight = jnp.array(0.45)
-        assert not bool(
-            kernel.accept(proposed, emax_a_tight, emax_b, ens_a, ens_b)
-        )
+        # Walker B (V = 8) enters run A (P = 0.1); walker A (V = 1) enters
+        # run B (P = 0.5).
+        assert float(proposed["energy_a"]) == pytest.approx(u + 0.8, rel=1e-5)
+        assert float(proposed["energy_b"]) == pytest.approx(u + 0.5, rel=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -328,44 +296,17 @@ class TestNSpeciesMismatch:
             XRENSSwap(n_species=-1)
 
     def test_propose_composition_target_width_mismatch(self):
-        """Proposing with target of width != n_species → morph with wrong result.
-
-        XRENSSwap(n_species=3) with a 2-element target will pass the wrong
-        n_species to morph_types_to_composition; this should raise or produce
-        obviously wrong output. We verify at least that propose() runs without
-        silent corruption by checking the types length still matches n_atoms.
-
-        Note: morph_types_to_composition silently produces wrong results for
-        wrong n_species, so this test documents the behavior rather than
-        testing a guard.
-        """
-        kernel = XRENSSwap(n_species=3)  # expects 3-element targets
+        """A 2-element target for XRENSSwap(n_species=3) raises."""
+        kernel = XRENSSwap(n_species=3)
         backend = SpeciesHarmonicBackend([1.0, 2.0, 3.0])
         key = jax.random.key(0)
-        n_atoms = 6
-        types_a = jnp.array([0, 1, 2, 0, 1, 2], dtype=jnp.int32)
-        types_b = jnp.array([0, 0, 0, 1, 1, 1], dtype=jnp.int32)
-        pos = jax.random.normal(key, (n_atoms, 3)) * 0.1
-        e = backend(pos, types_a, jnp.zeros((3, 3))).energy
-
-        state_a = _make_state(pos, types_a, e)
-        state_b = _make_state(pos, types_b, e)
-
-        # 2-element target passed to a kernel that expects n_species=3.
+        types = jnp.array([0, 1, 2, 0, 1, 2], dtype=jnp.int32)
+        pos = jax.random.normal(key, (6, 3)) * 0.1
+        state = _make_state(pos, types, 0.0)
         ens_a = {"target_composition": jnp.array([3, 3], dtype=jnp.int32)}
         ens_b = {"target_composition": jnp.array([6, 0], dtype=jnp.int32)}
-
-        # This may or may not raise; just check it doesn't crash silently
-        # in a way that corrupts shapes.
-        try:
-            proposed, _, _ = kernel.propose(
-                state_a, state_b, ens_a, ens_b, key, backend
-            )
-            # If it didn't raise, types must still have correct shape.
-            assert proposed["types_a"].shape == (n_atoms,)
-            assert proposed["types_b"].shape == (n_atoms,)
-        except Exception:
-            pass  # Expected — mismatched n_species should fail
+        with pytest.raises(ValueError, match="n_species"):
+            kernel.propose(state, state, ens_a, ens_b, key, backend)
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +428,7 @@ class TestXRENSEndToEnd:
         result, re_stats_log = self._run()
         # re_stats_log may be empty if callbacks aren't wired through run_ns_parallel;
         # verify by checking the energy evals via a direct manager-level test instead.
-        # Direct test: run xrens_replica_exchange_step on a small example.
+        # Direct test: run _xrens_step on a small example.
         n_runs, n_walkers, n_atoms, n_species = 2, 5, 8, 2
         backend = SpeciesHarmonicBackend([1.0, 1.5])
         kernel = XRENSSwap(n_species=n_species)
@@ -513,7 +454,7 @@ class TestXRENSEndToEnd:
         )
         emax = jnp.max(energies, axis=1)
 
-        _, _, _, _, swap_info = xrens_replica_exchange_step(
+        _, _, _, _, swap_info = _xrens_step(
             rng_key=k2,
             all_positions=positions,
             all_types=types,
@@ -535,7 +476,7 @@ class TestXRENSEndToEnd:
         ), f"Expected > 0 attempted swaps, got {swap_info['n_attempted']}"
 
     def test_jit_xrens_step(self):
-        """xrens_replica_exchange_step must be JIT-compatible."""
+        """_xrens_step must be JIT-compatible."""
         n_runs, n_walkers, n_atoms, n_species = 2, 4, 6, 2
         backend = SpeciesHarmonicBackend([1.0, 2.0])
         kernel = XRENSSwap(n_species=n_species)
@@ -560,7 +501,7 @@ class TestXRENSEndToEnd:
 
         @jax.jit
         def jitted_step(rng_key):
-            return xrens_replica_exchange_step(
+            return _xrens_step(
                 rng_key=rng_key,
                 all_positions=positions,
                 all_types=types,
@@ -590,7 +531,7 @@ class TestXRENSEndToEnd:
 
 
 class TestXRENSSingleRunSkip:
-    """With n_runs=1, xrens_replica_exchange_step returns state unchanged."""
+    """With n_runs=1, _xrens_step returns state unchanged."""
 
     def test_single_run_no_swaps(self):
         """n_runs=1 means no pairs possible → state unchanged."""
@@ -618,7 +559,7 @@ class TestXRENSSingleRunSkip:
             new_ene,
             new_cells,
             swap_info,
-        ) = xrens_replica_exchange_step(
+        ) = _xrens_step(
             rng_key=key,
             all_positions=positions,
             all_types=types,

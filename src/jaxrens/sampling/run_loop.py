@@ -551,7 +551,7 @@ def _run_loop(
             info["inter_re_stats"] = re_stats
             # Roll RE energy evals into the cumulative counters so that the
             # monitor's nE= / nG= tally stays accurate.
-            # PressureRENSSwap has zero eval counts; XRENSSwap will have non-zero.
+            # EnsembleSwap has zero eval counts; XRENSSwap has two per swap.
             # We add a scalar to all per-move counters (uniform distribution
             # assumption — simplest approach that keeps the tally consistent).
             re_n_evals = re_stats.get("n_energy_evals", 0)

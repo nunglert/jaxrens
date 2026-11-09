@@ -32,11 +32,7 @@ from jaxrens.sampling.batch_descriptor import (
     VmapRuns,
 )
 from jaxrens.sampling.inter_re_manager import InterREManager
-from jaxrens.sampling.moves.replica_exchange import (
-    PressureRENSSwap,
-    SemiGrandSwap,
-    XRENSSwap,
-)
+from jaxrens.sampling.moves.replica_exchange import make_swap_kernel
 from jaxrens.sampling.run_loop import (  # noqa: F401  (re-exported; no longer used in annotations)
     NSCallback,
     _bump_cumulative_counters,
@@ -1303,6 +1299,45 @@ def init_ns_parallel(
     return jax.tree.map(lambda *xs: jnp.stack(xs), *runs)
 
 
+def _inject_inter_re_params(
+    inter_re_config: Any,
+    ensemble_params_per_run: list[dict] | None,
+    n_runs: int,
+) -> list[dict] | None:
+    """Merge the inter-RE per-run inputs into ``ensemble_params_per_run``.
+
+    XRENS reads ``target_composition`` and semi-grand RE reads
+    ``chemical_potentials`` from each run's ensemble params, so they have to
+    be on the population from ``init_ns_*`` on.  The CLI already puts them
+    there (``cli/resolve.py``); this covers direct Python-API callers that
+    only set them on the ``InterREConfig``.  Values are stored as JAX arrays
+    (not lists) so stacking across walkers gives ``(K, n_species)``.
+    """
+    if inter_re_config is None:
+        return ensemble_params_per_run
+    if inter_re_config.flavor == "xrens":
+        key, values, dtype = (
+            "target_composition",
+            inter_re_config.composition_targets,
+            jnp.int32,
+        )
+    elif inter_re_config.flavor == "semi_grand":
+        key, values, dtype = (
+            "chemical_potentials",
+            inter_re_config.chemical_potentials,
+            jnp.float32,
+        )
+    else:
+        return ensemble_params_per_run
+    if values is None:
+        return ensemble_params_per_run
+    base = ensemble_params_per_run or [{} for _ in range(n_runs)]
+    return [
+        dict(base[i], **{key: jnp.array(values[i], dtype=dtype)})
+        for i in range(n_runs)
+    ]
+
+
 def run_ns_parallel(
     positions: jnp.ndarray,
     types: jnp.ndarray,
@@ -1407,6 +1442,15 @@ def run_ns_parallel(
         max_neighbors_offset,
     )
 
+    # Build the swap kernel first so a bad inter_re config fails before init.
+    swap_kernel = (
+        make_swap_kernel(inter_re_config)
+        if inter_re_config is not None
+        else None
+    )
+    ensemble_params_per_run = _inject_inter_re_params(
+        inter_re_config, ensemble_params_per_run, n_runs
+    )
     ns_states = init_ns_parallel(
         init_fn,
         positions,
@@ -1444,114 +1488,14 @@ def run_ns_parallel(
         trial_batch_size=trial_batch_size,
     )
 
-    # Construct InterREManager when inter_re_config is provided.
     inter_re_mgr = None
     if inter_re_config is not None:
-        from jaxrens.state.config import InterREConfig
-
-        cfg: InterREConfig = inter_re_config
-        if cfg.flavor == "pressure":
-            swap_kernel = PressureRENSSwap()
-        elif cfg.flavor == "xrens":
-            if cfg.composition_targets is None:
-                raise ValueError(
-                    "inter_re flavor 'xrens' requires composition_targets in "
-                    "InterREConfig. Each run must have a target composition."
-                )
-            n_species = len(cfg.composition_targets[0])
-            swap_kernel = XRENSSwap(n_species=n_species)
-            # Inject target_composition into ensemble_params for each run so
-            # InterREManager can extract them from ns_state.population.ensemble_params.
-            # Store as a JAX array (not a plain list) so that pytree stacking across
-            # walkers produces shape (n_walkers, n_species) rather than (n_species, n_walkers).
-            if ensemble_params_per_run is None:
-                ensemble_params_per_run = [
-                    {
-                        "target_composition": jnp.array(
-                            cfg.composition_targets[i], dtype=jnp.int32
-                        )
-                    }
-                    for i in range(n_runs)
-                ]
-            else:
-                ensemble_params_per_run = [
-                    dict(
-                        ensemble_params_per_run[i],
-                        target_composition=jnp.array(
-                            cfg.composition_targets[i], dtype=jnp.int32
-                        ),
-                    )
-                    for i in range(n_runs)
-                ]
-            # Re-initialize with updated ensemble_params_per_run now that we've
-            # injected target_composition. Re-run init_ns_parallel.
-            ns_states = init_ns_parallel(
-                init_fn,
-                positions,
-                types,
-                energies,
-                cells,
-                rng_keys,
-                step_sizes=jnp.full(n_moves, initial_step_size),
-                ensemble_params_per_run=ensemble_params_per_run,
-                restart_states=restart_states,
-                max_neighbors=starting_bucket,
-                max_neighbor_counts=initial_max_neighbor_counts,
-            )
-        elif cfg.flavor == "semi_grand":
-            if cfg.chemical_potentials is None:
-                raise ValueError(
-                    "inter_re flavor 'semi_grand' requires chemical_potentials in "
-                    "InterREConfig. Each run must have a per-species μ vector."
-                )
-            n_species = len(cfg.chemical_potentials[0])
-            swap_kernel = SemiGrandSwap(n_species=n_species)
-            # Inject chemical_potentials into ensemble_params for each run so
-            # InterREManager can extract them from ns_state.population.ensemble_params.
-            if ensemble_params_per_run is None:
-                ensemble_params_per_run = [
-                    {
-                        "chemical_potentials": jnp.array(
-                            cfg.chemical_potentials[i], dtype=jnp.float32
-                        )
-                    }
-                    for i in range(n_runs)
-                ]
-            else:
-                ensemble_params_per_run = [
-                    dict(
-                        ensemble_params_per_run[i],
-                        chemical_potentials=jnp.array(
-                            cfg.chemical_potentials[i], dtype=jnp.float32
-                        ),
-                    )
-                    for i in range(n_runs)
-                ]
-            # Re-initialize with updated ensemble_params_per_run.
-            ns_states = init_ns_parallel(
-                init_fn,
-                positions,
-                types,
-                energies,
-                cells,
-                rng_keys,
-                step_sizes=jnp.full(n_moves, initial_step_size),
-                ensemble_params_per_run=ensemble_params_per_run,
-                restart_states=restart_states,
-                max_neighbors=starting_bucket,
-                max_neighbor_counts=initial_max_neighbor_counts,
-            )
-        else:
-            raise NotImplementedError(
-                f"inter_re flavor {cfg.flavor!r} is not yet implemented. "
-                f"Supported flavors: 'pressure', 'xrens', 'semi_grand'."
-            )
         inter_re_mgr = InterREManager(
             swap_kernel=swap_kernel,
             batcher=batcher,
             backend=backend,
-            re_interval=cfg.re_interval,
-            n_swap_cycles=cfg.n_swap_cycles,
+            re_interval=inter_re_config.re_interval,
+            n_swap_cycles=inter_re_config.n_swap_cycles,
         )
 
     # Per-run PRNG keys used during adaptation (independent of ns_states.rng_key).
@@ -2042,6 +1986,15 @@ def run_ns_multi_gpu(
 
     # Initialize (G, P, ...) state via init_ns_multi_gpu.
     logger.debug("[stage] run_ns_multi_gpu: init_ns_multi_gpu — starting")
+    # Build the swap kernel first so a bad inter_re config fails before init.
+    swap_kernel = (
+        make_swap_kernel(inter_re_config)
+        if inter_re_config is not None
+        else None
+    )
+    ensemble_params_per_run = _inject_inter_re_params(
+        inter_re_config, ensemble_params_per_run, n_gpu * n_per_gpu
+    )
     ns_states = init_ns_multi_gpu(
         init_fn,
         positions,
@@ -2098,114 +2051,14 @@ def run_ns_multi_gpu(
         trial_batch_size=trial_batch_size,
     )
 
-    # Construct InterREManager when inter_re_config is provided.
     inter_re_mgr = None
     if inter_re_config is not None:
-        from jaxrens.state.config import InterREConfig
-
-        cfg: InterREConfig = inter_re_config
-        if cfg.flavor == "pressure":
-            swap_kernel_mg = PressureRENSSwap()
-        elif cfg.flavor == "xrens":
-            if cfg.composition_targets is None:
-                raise ValueError(
-                    "inter_re flavor 'xrens' requires composition_targets in "
-                    "InterREConfig."
-                )
-            n_species_mg = len(cfg.composition_targets[0])
-            swap_kernel_mg = XRENSSwap(n_species=n_species_mg)
-            # Inject target_composition into ensemble_params for each run.
-            # Store as a JAX array to ensure correct pytree stacking across walkers.
-            n_total_runs = n_gpu * n_per_gpu
-            if ensemble_params_per_run is None:
-                ensemble_params_per_run = [
-                    {
-                        "target_composition": jnp.array(
-                            cfg.composition_targets[i], dtype=jnp.int32
-                        )
-                    }
-                    for i in range(n_total_runs)
-                ]
-            else:
-                ensemble_params_per_run = [
-                    dict(
-                        ensemble_params_per_run[i],
-                        target_composition=jnp.array(
-                            cfg.composition_targets[i], dtype=jnp.int32
-                        ),
-                    )
-                    for i in range(n_total_runs)
-                ]
-            # Re-initialize with updated ensemble_params_per_run.
-            ns_states = init_ns_multi_gpu(
-                init_fn,
-                positions,
-                types,
-                energies,
-                cells,
-                rng_keys_flat,
-                n_gpu,
-                n_per_gpu,
-                step_sizes=jnp.full(n_moves, initial_step_size),
-                ensemble_params_per_run=ensemble_params_per_run,
-                restart_states=restart_states,
-                max_neighbors=starting_bucket,
-                max_neighbor_counts=initial_max_neighbor_counts,
-            )
-        elif cfg.flavor == "semi_grand":
-            if cfg.chemical_potentials is None:
-                raise ValueError(
-                    "inter_re flavor 'semi_grand' requires chemical_potentials in "
-                    "InterREConfig."
-                )
-            n_species_mg = len(cfg.chemical_potentials[0])
-            swap_kernel_mg = SemiGrandSwap(n_species=n_species_mg)
-            n_total_runs = n_gpu * n_per_gpu
-            if ensemble_params_per_run is None:
-                ensemble_params_per_run = [
-                    {
-                        "chemical_potentials": jnp.array(
-                            cfg.chemical_potentials[i], dtype=jnp.float32
-                        )
-                    }
-                    for i in range(n_total_runs)
-                ]
-            else:
-                ensemble_params_per_run = [
-                    dict(
-                        ensemble_params_per_run[i],
-                        chemical_potentials=jnp.array(
-                            cfg.chemical_potentials[i], dtype=jnp.float32
-                        ),
-                    )
-                    for i in range(n_total_runs)
-                ]
-            ns_states = init_ns_multi_gpu(
-                init_fn,
-                positions,
-                types,
-                energies,
-                cells,
-                rng_keys_flat,
-                n_gpu,
-                n_per_gpu,
-                step_sizes=jnp.full(n_moves, initial_step_size),
-                ensemble_params_per_run=ensemble_params_per_run,
-                restart_states=restart_states,
-                max_neighbors=starting_bucket,
-                max_neighbor_counts=initial_max_neighbor_counts,
-            )
-        else:
-            raise NotImplementedError(
-                f"inter_re flavor {cfg.flavor!r} is not yet implemented. "
-                f"Supported flavors: 'pressure', 'xrens', 'semi_grand'."
-            )
         inter_re_mgr = InterREManager(
-            swap_kernel=swap_kernel_mg,
+            swap_kernel=swap_kernel,
             batcher=batcher,
             backend=backend,
-            re_interval=cfg.re_interval,
-            n_swap_cycles=cfg.n_swap_cycles,
+            re_interval=inter_re_config.re_interval,
+            n_swap_cycles=inter_re_config.n_swap_cycles,
         )
 
     # Per-run PRNG keys for adaptation (shape (G, P)).

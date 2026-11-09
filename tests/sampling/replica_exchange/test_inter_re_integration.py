@@ -27,7 +27,6 @@ from jaxrens.sampling.nested_sampling import (
 from jaxrens.sampling.termination import IterationTermination
 from jaxrens.state.config import InterREConfig
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -53,7 +52,9 @@ def _make_parallel_problem(
         eval_backend = backend
 
     descriptors = [
-        MoveKernel("rw", random_walk.build_kernel, step_size=0.3, step_size_max=2.0)
+        MoveKernel(
+            "rw", random_walk.build_kernel, step_size=0.3, step_size_max=2.0
+        )
     ]
     init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
@@ -69,7 +70,9 @@ def _make_parallel_problem(
 
     # Evaluate energies using base (non-ensemble) backend for initial walkers.
     energies = jax.vmap(
-        lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+        lambda pos: jax.vmap(
+            lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+        )(pos)
     )(positions)
 
     return {
@@ -104,12 +107,15 @@ class TestPressureRENSEndToEnd:
         # Use seed=123 — verified by inspection that at least one swap is accepted
         # in 5 iterations at pressures [0.01, 0.1] for harmonic backend.
         prob = _make_parallel_problem(
-            n_runs=2, n_walkers=15,
+            n_runs=2,
+            n_walkers=15,
             pressures=[0.01, 0.1],
             seed=123,
         )
 
-        inter_re_cfg = InterREConfig(flavor="pressure", re_interval=1, n_swap_cycles=1)
+        inter_re_cfg = InterREConfig(
+            flavor="pressure", re_interval=1, n_swap_cycles=1
+        )
         re_stats_log = []
 
         class _Collector:
@@ -174,7 +180,7 @@ class TestPressureRENSEndToEnd:
     def test_result_shapes(self):
         self._run()
         result = self._result
-        assert result["positions"].shape[0] == 2   # n_runs
+        assert result["positions"].shape[0] == 2  # n_runs
         assert result["log_evidence"].shape == (2,)
         assert result["n_dead"].shape == (2,)
 
@@ -209,17 +215,23 @@ class TestSingleRunInterRE:
 
     def test_single_run_via_parallel_n_runs_1(self):
         backend = create_harmonic(k=1.0)
-        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        descriptors = [
+            MoveKernel("rw", random_walk.build_kernel, step_size=0.2)
+        ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
         n_walkers = 10
         key = jax.random.key(0)
         pos_key, rng_key = jax.random.split(key)
 
-        positions = jax.random.uniform(pos_key, (1, n_walkers, 1, 3), minval=-2.0, maxval=2.0)
+        positions = jax.random.uniform(
+            pos_key, (1, n_walkers, 1, 3), minval=-2.0, maxval=2.0
+        )
         types = jnp.zeros((1,), dtype=jnp.int32)
         energies = jax.vmap(
-            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
         )(positions)
         rng_keys = jax.random.split(rng_key, 1)
 
@@ -258,7 +270,9 @@ class TestPmapVmapRunsInterRE:
         from jaxrens.sampling.nested_sampling import run_ns_multi_gpu
 
         backend = create_harmonic(k=1.0)
-        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        descriptors = [
+            MoveKernel("rw", random_walk.build_kernel, step_size=0.2)
+        ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
         n_gpu, n_per_gpu, n_walkers = 1, 2, 8
@@ -268,11 +282,16 @@ class TestPmapVmapRunsInterRE:
         pos_key = keys[-1]
 
         positions = jax.random.uniform(
-            pos_key, (n_gpu * n_per_gpu, n_walkers, 1, 3), minval=-2.0, maxval=2.0
+            pos_key,
+            (n_gpu * n_per_gpu, n_walkers, 1, 3),
+            minval=-2.0,
+            maxval=2.0,
         )
         types = jnp.zeros((1,), dtype=jnp.int32)
         energies = jax.vmap(
-            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
         )(positions)
 
         inter_re_cfg = InterREConfig(flavor="pressure", re_interval=1)
@@ -300,26 +319,38 @@ class TestPmapVmapRunsInterRE:
         """Stats dict should be consistent (no exception, correct key types)."""
         from jaxrens.sampling.batch_descriptor import PmapVmapRuns
         from jaxrens.sampling.inter_re_manager import InterREManager
-        from jaxrens.sampling.moves.replica_exchange import PressureRENSSwap
+        from jaxrens.sampling.moves.replica_exchange import EnsembleSwap
         from jaxrens.sampling.nested_sampling import init_ns_multi_gpu
 
         backend = create_harmonic(k=1.0)
-        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        descriptors = [
+            MoveKernel("rw", random_walk.build_kernel, step_size=0.2)
+        ]
         init_fn, _, _ = build_mwg(backend, descriptors)
 
         n_gpu, n_per_gpu, n_walkers = 1, 2, 8
         key = jax.random.key(5)
         rng_keys = jax.random.split(key, n_gpu * n_per_gpu)
         pos_key, _ = jax.random.split(key)
-        positions = jax.random.uniform(pos_key, (n_gpu * n_per_gpu, n_walkers, 1, 3))
+        positions = jax.random.uniform(
+            pos_key, (n_gpu * n_per_gpu, n_walkers, 1, 3)
+        )
         types = jnp.zeros((1,), dtype=jnp.int32)
         energies = jax.vmap(
-            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
         )(positions)
 
         ns_state = init_ns_multi_gpu(
-            init_fn, positions, types, energies, None,
-            rng_keys, n_gpu=n_gpu, n_per_gpu=n_per_gpu,
+            init_fn,
+            positions,
+            types,
+            energies,
+            None,
+            rng_keys,
+            n_gpu=n_gpu,
+            n_per_gpu=n_per_gpu,
             step_sizes=jnp.array([0.2]),
         )
 
@@ -328,7 +359,9 @@ class TestPmapVmapRunsInterRE:
         ns_state = ns_state.set(
             emax=descriptor.reduce_emax(ns_state.population.energy),
         )
-        mgr = InterREManager(PressureRENSSwap(), descriptor, backend, re_interval=1)
+        mgr = InterREManager(
+            EnsembleSwap(), descriptor, backend, re_interval=1
+        )
 
         swap_key = jax.random.key(7)
         new_state, stats, _ = mgr.apply(ns_state, swap_key)
@@ -337,7 +370,10 @@ class TestPmapVmapRunsInterRE:
         assert isinstance(stats["n_swap_pairs_attempted"], int)
         assert isinstance(stats["n_swap_pairs_accepted"], int)
         assert isinstance(stats["acceptance_rate"], float)
-        assert new_state.population.positions.shape == ns_state.population.positions.shape
+        assert (
+            new_state.population.positions.shape
+            == ns_state.population.positions.shape
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +385,7 @@ class TestFlavourValidation:
     def test_xrens_accepted_at_cli_level_with_composition_targets(self):
         """CLI schema (pydantic) accepts xrens flavor when composition_targets given."""
         from jaxrens.cli.schema.inter_re import InterRESpec
+
         spec = InterRESpec(
             flavor="xrens",
             composition_targets=[[8, 0], [4, 4]],
@@ -358,13 +395,16 @@ class TestFlavourValidation:
     def test_xrens_raises_at_cli_level_without_composition_targets(self):
         """CLI schema (pydantic) rejects xrens flavor when composition_targets absent."""
         from jaxrens.cli.schema.inter_re import InterRESpec
+
         with pytest.raises((ValueError, Exception)):
             InterRESpec(flavor="xrens")
 
     def test_xrens_raises_at_run_time_without_composition_targets(self):
         """run_ns_parallel raises ValueError for xrens without composition_targets."""
         backend = create_harmonic(k=1.0)
-        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        descriptors = [
+            MoveKernel("rw", random_walk.build_kernel, step_size=0.2)
+        ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
         n_runs, n_walkers = 2, 8
@@ -374,15 +414,23 @@ class TestFlavourValidation:
         positions = jax.random.uniform(pos_key, (n_runs, n_walkers, 1, 3))
         types = jnp.zeros((1,), dtype=jnp.int32)
         energies = jax.vmap(
-            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
         )(positions)
 
         bad_cfg = InterREConfig(flavor="xrens")  # No composition_targets
         with pytest.raises((ValueError, NotImplementedError)):
             run_ns_parallel(
-                positions=positions, types=types, energies=energies, cells=None,
-                init_fn=init_fn, step_fn=step_fn, rng_keys=rng_keys,
-                max_iterations=3, n_mcmc_steps=2,
+                positions=positions,
+                types=types,
+                energies=energies,
+                cells=None,
+                init_fn=init_fn,
+                step_fn=step_fn,
+                rng_keys=rng_keys,
+                max_iterations=3,
+                n_mcmc_steps=2,
                 termination_criteria=[IterationTermination(3)],
                 inter_re_config=bad_cfg,
             )
@@ -390,7 +438,9 @@ class TestFlavourValidation:
     def test_semi_grand_missing_chemical_potentials_raises(self):
         """semi_grand without chemical_potentials must raise ValueError (implemented in commit 5)."""
         backend = create_harmonic(k=1.0)
-        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        descriptors = [
+            MoveKernel("rw", random_walk.build_kernel, step_size=0.2)
+        ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
         n_runs, n_walkers = 2, 8
@@ -400,16 +450,26 @@ class TestFlavourValidation:
         positions = jax.random.uniform(pos_key, (n_runs, n_walkers, 1, 3))
         types = jnp.zeros((1,), dtype=jnp.int32)
         energies = jax.vmap(
-            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
         )(positions)
 
         # semi_grand without chemical_potentials → ValueError (not NotImplementedError)
-        bad_cfg = InterREConfig(flavor="semi_grand")  # chemical_potentials=None
+        bad_cfg = InterREConfig(
+            flavor="semi_grand"
+        )  # chemical_potentials=None
         with pytest.raises((ValueError, NotImplementedError, Exception)):
             run_ns_parallel(
-                positions=positions, types=types, energies=energies, cells=None,
-                init_fn=init_fn, step_fn=step_fn, rng_keys=rng_keys,
-                max_iterations=3, n_mcmc_steps=2,
+                positions=positions,
+                types=types,
+                energies=energies,
+                cells=None,
+                init_fn=init_fn,
+                step_fn=step_fn,
+                rng_keys=rng_keys,
+                max_iterations=3,
+                n_mcmc_steps=2,
                 termination_criteria=[IterationTermination(3)],
                 inter_re_config=bad_cfg,
             )
@@ -435,7 +495,9 @@ class TestRECallbackEndToEnd:
         from jaxrens.io.re_stats_log import RELogger
 
         backend = create_harmonic(k=1.0)
-        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        descriptors = [
+            MoveKernel("rw", random_walk.build_kernel, step_size=0.2)
+        ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
         n_gpu, n_per_gpu, n_walkers = 1, 3, 8
@@ -444,11 +506,16 @@ class TestRECallbackEndToEnd:
         rng_keys = jax.random.split(key, n_total)
         pos_key, _ = jax.random.split(key)
         positions = jax.random.uniform(
-            pos_key, (n_total, n_walkers, 1, 3), minval=-1.5, maxval=1.5,
+            pos_key,
+            (n_total, n_walkers, 1, 3),
+            minval=-1.5,
+            maxval=1.5,
         )
         types = jnp.zeros((1,), dtype=jnp.int32)
         energies = jax.vmap(
-            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
         )(positions)
 
         inter_re_cfg = InterREConfig(flavor="pressure", re_interval=1)
@@ -458,11 +525,18 @@ class TestRECallbackEndToEnd:
         callbacks = [RECallback(re_logger)]
 
         run_ns_multi_gpu(
-            positions=positions, types=types, energies=energies, cells=None,
-            init_fn=init_fn, step_fn=step_fn, rng_keys=rng_keys,
-            n_gpu=n_gpu, n_per_gpu=n_per_gpu,
+            positions=positions,
+            types=types,
+            energies=energies,
+            cells=None,
+            init_fn=init_fn,
+            step_fn=step_fn,
+            rng_keys=rng_keys,
+            n_gpu=n_gpu,
+            n_per_gpu=n_per_gpu,
             n_walkers=n_walkers,
-            max_iterations=5, n_mcmc_steps=3,
+            max_iterations=5,
+            n_mcmc_steps=3,
             termination_criteria=[IterationTermination(5)],
             inter_re_config=inter_re_cfg,
             callbacks=callbacks,
@@ -485,7 +559,9 @@ class TestRECallbackEndToEnd:
         from jaxrens.io.re_stats_log import RELogger
 
         backend = create_harmonic(k=1.0)
-        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        descriptors = [
+            MoveKernel("rw", random_walk.build_kernel, step_size=0.2)
+        ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
         n_gpu, n_per_gpu, n_walkers = 1, 2, 8
@@ -494,11 +570,14 @@ class TestRECallbackEndToEnd:
         rng_keys = jax.random.split(key, n_total)
         pos_key, _ = jax.random.split(key)
         positions = jax.random.uniform(
-            pos_key, (n_total, n_walkers, 1, 3),
+            pos_key,
+            (n_total, n_walkers, 1, 3),
         )
         types = jnp.zeros((1,), dtype=jnp.int32)
         energies = jax.vmap(
-            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
         )(positions)
 
         # re_interval=999 with max_iterations=3 → no fires.
@@ -509,11 +588,18 @@ class TestRECallbackEndToEnd:
         callbacks = [RECallback(re_logger)]
 
         run_ns_multi_gpu(
-            positions=positions, types=types, energies=energies, cells=None,
-            init_fn=init_fn, step_fn=step_fn, rng_keys=rng_keys,
-            n_gpu=n_gpu, n_per_gpu=n_per_gpu,
+            positions=positions,
+            types=types,
+            energies=energies,
+            cells=None,
+            init_fn=init_fn,
+            step_fn=step_fn,
+            rng_keys=rng_keys,
+            n_gpu=n_gpu,
+            n_per_gpu=n_per_gpu,
             n_walkers=n_walkers,
-            max_iterations=3, n_mcmc_steps=2,
+            max_iterations=3,
+            n_mcmc_steps=2,
             termination_criteria=[IterationTermination(3)],
             inter_re_config=inter_re_cfg,
             callbacks=callbacks,
@@ -523,12 +609,15 @@ class TestRECallbackEndToEnd:
 
     def test_re_interval_2_writes_subsampled_iterations(self, tmp_path):
         """With re_interval=2 and max_iterations=5, file should have entries
-        at iterations {2, 4} (manager fires when iter > 0 and iter % 2 == 0)."""
+        at iterations {2, 4} (manager fires when iter > 0 and iter % 2 == 0).
+        """
         from jaxrens.cli.monitor import RECallback
         from jaxrens.io.re_stats_log import RELogger
 
         backend = create_harmonic(k=1.0)
-        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        descriptors = [
+            MoveKernel("rw", random_walk.build_kernel, step_size=0.2)
+        ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
         n_gpu, n_per_gpu, n_walkers = 1, 2, 8
@@ -537,11 +626,14 @@ class TestRECallbackEndToEnd:
         rng_keys = jax.random.split(key, n_total)
         pos_key, _ = jax.random.split(key)
         positions = jax.random.uniform(
-            pos_key, (n_total, n_walkers, 1, 3),
+            pos_key,
+            (n_total, n_walkers, 1, 3),
         )
         types = jnp.zeros((1,), dtype=jnp.int32)
         energies = jax.vmap(
-            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
         )(positions)
 
         inter_re_cfg = InterREConfig(flavor="pressure", re_interval=2)
@@ -551,11 +643,18 @@ class TestRECallbackEndToEnd:
         callbacks = [RECallback(re_logger)]
 
         run_ns_multi_gpu(
-            positions=positions, types=types, energies=energies, cells=None,
-            init_fn=init_fn, step_fn=step_fn, rng_keys=rng_keys,
-            n_gpu=n_gpu, n_per_gpu=n_per_gpu,
+            positions=positions,
+            types=types,
+            energies=energies,
+            cells=None,
+            init_fn=init_fn,
+            step_fn=step_fn,
+            rng_keys=rng_keys,
+            n_gpu=n_gpu,
+            n_per_gpu=n_per_gpu,
             n_walkers=n_walkers,
-            max_iterations=5, n_mcmc_steps=2,
+            max_iterations=5,
+            n_mcmc_steps=2,
             termination_criteria=[IterationTermination(5)],
             inter_re_config=inter_re_cfg,
             callbacks=callbacks,
