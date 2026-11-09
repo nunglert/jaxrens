@@ -9,7 +9,7 @@ The version is derived from git tags by `setuptools-scm` (tag `v0.1.0` →
 version `0.1.0`). To cut a release: add a dated section below, merge to `main`,
 then `git tag -a vX.Y.Z`.
 
-## [Unreleased]
+## [0.8.0] — 2026-11-09
 
 ### Fixed
 - **Semi-grand replica exchange stored energies with the wrong μ.** Affects
