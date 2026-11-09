@@ -146,7 +146,12 @@ times.
 
 Every `inter_re.re_interval` iterations, the manager runs `n_swap_cycles`
 even/odd swap passes between adjacent replicas in the pressure (or
-composition / μ) ladder. Three flavors exist:
+composition / μ) ladder. Three flavors exist (`inter_re.flavor`), backed
+by two swap kernels: `pressure` and `semi_grand` both use `EnsembleSwap`
+(pressure RE is the case without μ), `xrens` uses `XRENSSwap`. Every
+kernel builds the walkers that would *enter* each replica, with their
+energy in that replica's frame, and the driver accepts a swap iff both
+fit below the Emax of the replica they enter.
 
 ### How the InterREManager dispatches swaps
 
@@ -154,8 +159,8 @@ The manager is constructed once before the NS loop starts; its
 JIT-compiled swap step is cached and reused. On each NS iteration
 `_run_loop` calls `fires(i)`, and on a fire calls
 `apply(state, key)`, which dispatches on the
-{class}`~jaxrens.sampling.batch_descriptor.BatchDescriptor` and on
-the swap-kernel flavor:
+{class}`~jaxrens.sampling.batch_descriptor.BatchDescriptor`; the only
+flavor-specific step is the kernel's `propose`:
 
 ```{mermaid}
 flowchart TB
@@ -230,10 +235,11 @@ A few invariants worth pinning down:
   no-op and the `shard_map` collapses to `vmap`. The same code path runs
   unconditionally so multi-GPU correctness is exercised by the
   single-GPU test suite.
-- **Kernel choice is set at construction.** `_is_xrens` /
-  `_is_semi_grand` are checked once and select which
-  `replica_exchange_step` variant to JIT; they are not re-checked
-  per call.
+- **Kernels declare what they need.** A kernel lists the per-replica
+  ensemble params it reads (`required_params` / `optional_params`);
+  the manager slices exactly those out of `pop.ensemble_params` and
+  raises if a required one is missing. There is no per-flavor branch
+  in the manager or the driver.
 
 
 ### Pressure-RENS
@@ -271,20 +277,18 @@ $$
 $$
 
 so the configuration arriving at replica $i$ has run-$i$'s target
-composition but is built from run-$j$'s positions and cell. The
-morphed potential energies $\tilde U_i = U(\tilde r_i)$ and
-$\tilde U_j = U(\tilde r_j)$ are recomputed by the backend
-(2 evaluations per attempted pair). Acceptance follows the same
-cross-bound enthalpy form as Pressure-RENS, applied to the new
-energies:
+composition but is built from run-$j$'s positions and cell. Its
+energy is re-evaluated by the backend under replica $i$'s ensemble
+params (2 evaluations per attempted pair),
+$\tilde H_i = U(\tilde r_i) + P_i\, V(h_j)$ (minus
+$\boldsymbol\mu_i \cdot \mathbf N$ if replica $i$ carries chemical
+potentials), and each morphed walker must fit the contour of the
+replica it enters:
 
 $$
-\alpha_{ij} = \mathbf 1\!\bigl[\tilde U_i + P_j\, V(h_j) < E_{\max,j}\bigr]\,
-              \mathbf 1\!\bigl[\tilde U_j + P_i\, V(h_i) < E_{\max,i}\bigr].
+\alpha_{ij} = \mathbf 1\!\bigl[\tilde H_i < E_{\max,i}\bigr]\,
+              \mathbf 1\!\bigl[\tilde H_j < E_{\max,j}\bigr].
 $$
-
-In NVT the $PV$ term drops and the criterion reduces to
-$\tilde U_i < E_{\max,j} \,\wedge\, \tilde U_j < E_{\max,i}$.
 
 ### Semi-grand swap
 
@@ -319,6 +323,11 @@ scored with the same $\boldsymbol\mu$.
 
 Zero backend calls: $U_i$ is recovered from the stored energy, so the
 update costs two $S$-dimensional dot products (plus the $PV$ terms).
+This is the same kernel as Pressure-RENS (`EnsembleSwap`): both
+re-base the stored energy with
+{func}`~jaxrens.backends.ensemble.rebase_ensemble_energy`, which uses
+the same $P V - \boldsymbol\mu \cdot \mathbf N$ definition as
+`EnsembleTerm`.
 
 
 ## Where this lives in the code

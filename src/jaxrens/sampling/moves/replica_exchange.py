@@ -75,7 +75,7 @@ class SwapWalker(NamedTuple):
 class SwapKernel(ABC):
     """One flavor of inter-RE swap.
 
-    Class attributes:
+    Attributes:
         required_params: Per-run ensemble-param keys the kernel cannot work
             without.  The manager raises at construction if one is missing.
         optional_params: Per-run keys the kernel uses when present.
@@ -125,8 +125,7 @@ class EnsembleSwap(SwapKernel):
     entering run r becomes ``U + P_r·V − μ_r·N``
     (:func:`~jaxrens.backends.ensemble.rebase_ensemble_energy`), so every
     stored energy in a run stays in that run's frame and the run's Emax
-    contour stays well-defined.  Missing params drop their term: without
-    pressures and chemical potentials this is plain energy RE.
+    contour stays well-defined.  A missing param drops its term.
 
     Zero backend calls.
 
