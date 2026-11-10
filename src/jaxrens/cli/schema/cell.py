@@ -61,6 +61,18 @@ class CellSpec(BaseModel):
             "convention and starves neighbour lists."
         ),
     )
+    restrict_c_in_plane: bool = Field(
+        default=False,
+        description=(
+            "For layered systems: keep the in-plane part of c (parallel to "
+            "the a, b plane) at its shortest representative modulo a and b, "
+            "i.e. inside the Wigner-Seitz cell of (a, b), so that each "
+            "stacking registry is one prior state.  The aspect-ratio test "
+            "is then taken at the worst tilt of c, so all tilts are allowed "
+            "or excluded together.  Required by ``stacking_shift``; starting "
+            "cells outside the domain are an error."
+        ),
+    )
     flat_V_prior: bool = Field(
         default=False,
         description=(

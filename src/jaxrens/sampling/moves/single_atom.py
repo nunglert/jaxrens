@@ -3,7 +3,7 @@
 Moves that perturb one atom at a time, efficient for large systems where
 displacing all atoms simultaneously has low acceptance.
 
-- build_kernel: move one random atom per step
+- build_kernel: move one random atom per step, optionally of given species
 - build_sweep_kernel: sweep through all atoms sequentially via lax.scan
 
 Single-walker functions, designed for shard_map(vmap(vmap(...))) wrapping.
@@ -20,11 +20,17 @@ from jaxrens.sampling.base import MoveInfo
 from jaxrens.unvalidated import unvalidated
 
 
-def build_kernel(backend: Any):
+def build_kernel(backend: Any, species: tuple[int, ...] | None = None):
     """Build a single-atom random displacement kernel.
 
     Args:
         backend: EnergyBackend instance.
+        species: Type codes the move may pick from.  ``None`` (the default)
+            picks any atom.  Otherwise the atom is drawn uniformly among the
+            atoms whose current type is in ``species``, and the proposal is
+            rejected when the walker has none.  The selection set is read
+            from ``state.types`` on every call, so it stays correct under
+            moves that change types.
 
     Returns:
         step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
@@ -33,8 +39,16 @@ def build_kernel(backend: Any):
     def step(rng_key, state, likelihood_constraint):
         key_atom, key_disp = jax.random.split(rng_key)
 
-        n_atoms = state.positions.shape[0]
-        atom_idx = jax.random.randint(key_atom, (), 0, n_atoms)
+        if species is None:
+            n_atoms = state.positions.shape[0]
+            atom_idx = jax.random.randint(key_atom, (), 0, n_atoms)
+            has_atom = True
+        else:
+            codes = jnp.asarray(species, dtype=state.types.dtype)
+            mask = jnp.isin(state.types, codes)
+            logits = jnp.where(mask, 0.0, -jnp.inf)
+            atom_idx = jax.random.categorical(key_atom, logits)
+            has_atom = jnp.any(mask)
 
         displacement = state.step_size * jax.random.normal(key_disp, (3,))
         new_positions = state.positions.at[atom_idx].add(displacement)
@@ -46,7 +60,7 @@ def build_kernel(backend: Any):
             state.max_neighbors,
             ensemble_params=state.ensemble_params,
         )
-        accepted = result.energy < likelihood_constraint
+        accepted = has_atom & (result.energy < likelihood_constraint)
 
         new_state = state.set(
             positions=jnp.where(accepted, new_positions, state.positions),

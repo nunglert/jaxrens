@@ -102,26 +102,127 @@ def min_aspect_ratio(cell: jnp.ndarray, volume: jnp.ndarray) -> jnp.ndarray:
     return jnp.min(jnp.array(ratios))
 
 
+def _in_plane_lattice_vectors(cell: jnp.ndarray) -> jnp.ndarray:
+    """``a, b, a + b, a - b`` and their negatives, shape (8, 3)."""
+    a, b = cell[0], cell[1]
+    vecs = jnp.stack([a, b, a + b, a - b])
+    return jnp.concatenate([vecs, -vecs])
+
+
+def _split_c(cell: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Unit normal of the (a, b) plane and the in-plane part of c."""
+    n = jnp.cross(cell[0], cell[1])
+    n = n / jnp.linalg.norm(n)
+    c = cell[2]
+    return n, c - jnp.dot(c, n) * n
+
+
+def c_in_plane_reduced(cell: jnp.ndarray) -> jnp.ndarray:
+    """Whether the in-plane part of c lies in the Wigner-Seitz cell of (a, b).
+
+    ``c`` and ``c + p a + q b`` describe the same crystal.  Within the
+    Wigner-Seitz cell, the in-plane part ``c_par`` is the shortest of these
+    representatives: ``|c_par . L| <= |L|^2 / 2`` for ``L`` in
+    ``a, b, a + b, a - b``.
+
+    Returns a boolean scalar.  Fully jit-compatible.
+    """
+    _, c_par = _split_c(cell)
+    lat = _in_plane_lattice_vectors(cell)
+    half = 0.5 * jnp.sum(lat * lat, axis=1)
+    return jnp.all(lat @ c_par <= half * (1.0 + 1e-6))
+
+
+def _ws_vertex_candidates(cell: jnp.ndarray):
+    """Candidate vertices of the Wigner-Seitz cell of (a, b), in 3D.
+
+    The cell is the intersection of the half-planes ``x . L <= |L|^2 / 2``
+    over the 8 vectors of :func:`_in_plane_lattice_vectors`; its vertices are
+    among the 28 pairwise intersections of their boundary lines.
+
+    Returns:
+        ``(points, valid)``: shape (28, 3) and (28,), ``valid`` marking the
+        intersections that satisfy all half-planes (the actual vertices).
+    """
+    n = jnp.cross(cell[0], cell[1])
+    n = n / jnp.linalg.norm(n)
+    e1 = cell[0] / jnp.linalg.norm(cell[0])
+    e2 = jnp.cross(n, e1)
+    lat3 = _in_plane_lattice_vectors(cell)
+    lat = jnp.stack([lat3 @ e1, lat3 @ e2], axis=1)  # (8, 2)
+    half = 0.5 * jnp.sum(lat * lat, axis=1)
+    ii, jj = jnp.triu_indices(8, k=1)
+    li, lj = lat[ii], lat[jj]
+    det = li[:, 0] * lj[:, 1] - li[:, 1] * lj[:, 0]
+    ok = jnp.abs(det) > 1e-9 * half[ii]
+    safe = jnp.where(ok, det, 1.0)
+    # Cramer's rule for x . li = half_i, x . lj = half_j.
+    x = (half[ii] * lj[:, 1] - half[jj] * li[:, 1]) / safe
+    y = (li[:, 0] * half[jj] - lj[:, 0] * half[ii]) / safe
+    pts2 = jnp.stack([x, y], axis=1)
+    inside = jnp.all(pts2 @ lat.T <= half * (1.0 + 1e-6), axis=1)
+    points = pts2[:, :1] * e1 + pts2[:, 1:] * e2
+    return points, ok & inside
+
+
+def worst_tilt_aspect(cell: jnp.ndarray) -> jnp.ndarray:
+    """Smallest aspect ratio over all in-plane tilts of c in the WS cell.
+
+    Keeps ``a``, ``b`` and the height of ``c`` above the (a, b) plane, and
+    puts the in-plane part of ``c`` at each vertex of the Wigner-Seitz cell
+    of (a, b).  The heights of a and b are ``V / |b x c|`` and
+    ``V / |a x c|``; both cross products are convex in the in-plane part of
+    c, so the minimum over the cell is reached at a vertex.  The result
+    depends on the cell shape only, not on where c's tilt currently is.
+
+    Returns a scalar.  Fully jit-compatible.
+    """
+    n, c_par = _split_c(cell)
+    c_perp = cell[2] - c_par
+    volume = get_volume(cell)
+    points, valid = _ws_vertex_candidates(cell)
+
+    def aspect_at(p):
+        tilted = cell.at[2].set(c_perp + p)
+        return min_aspect_ratio(tilted, volume)
+
+    aspects = jax.vmap(aspect_at)(points)
+    return jnp.min(jnp.where(valid, aspects, jnp.inf))
+
+
 def check_cell_shape(
     cell: jnp.ndarray,
     n_atoms: int,
     max_vol_per_atom: float = 100.0,
     min_vol_per_atom: float = 1.0,
     min_aspect: float = 0.5,
+    restrict_c_in_plane: bool = False,
 ) -> jnp.ndarray:
     """Check whether cell shape satisfies geometric criteria.
+
+    With ``restrict_c_in_plane`` the in-plane part of c must lie in the
+    Wigner-Seitz cell of (a, b) (see :func:`c_in_plane_reduced`), and the
+    aspect ratio is taken at the worst tilt in that cell
+    (:func:`worst_tilt_aspect`) instead of the current one.  The verdict then
+    depends on the cell shape only, so every tilt of c, i.e. every stacking
+    registry, is allowed or excluded together.
 
     Returns a boolean scalar (True = valid). Fully jit-compatible.
     """
     volume = get_volume(cell)
     vol_per_atom = volume / n_atoms
-    aspect = min_aspect_ratio(cell, volume)
+    if restrict_c_in_plane:
+        aspect = worst_tilt_aspect(cell)
+    else:
+        aspect = min_aspect_ratio(cell, volume)
 
     valid = (
         (vol_per_atom <= max_vol_per_atom)
         & (vol_per_atom >= min_vol_per_atom)
         & (aspect >= min_aspect)
     )
+    if restrict_c_in_plane:
+        valid = valid & c_in_plane_reduced(cell)
     return valid
 
 

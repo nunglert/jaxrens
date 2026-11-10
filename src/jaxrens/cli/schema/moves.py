@@ -9,17 +9,25 @@ side-channel that used to live in ``cli/run.py``.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Union
 
 import jax.numpy as jnp
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import (
     alchemical,
     galilean,
     hmc,
+    layered_moves,
     random_walk,
     shear,
     single_atom,
@@ -223,6 +231,54 @@ class BaseMoveSpec(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _wrap_bare_symbol(v: Any) -> Any:
+    """Accept ``species: Li`` as shorthand for ``species: [Li]``."""
+    return (v,) if isinstance(v, str) else v
+
+
+def _restrict_kwargs(cell_cfg: "CellSpec") -> dict[str, Any]:
+    """``restrict_c_in_plane`` for the cell-move kernels, only when set.
+
+    Left out when false, so cell-move descriptors stay identical to those
+    built before the option existed.
+    """
+    if cell_cfg.restrict_c_in_plane:
+        return {"restrict_c_in_plane": True}
+    return {}
+
+
+def _species_codes(
+    species: tuple[str, ...] | None,
+    symbol_map: dict[int, str] | None,
+    move_label: str,
+    spec_label: str,
+) -> tuple[int, ...] | None:
+    """Resolve element symbols to the contiguous type codes used by types.
+
+    Shared by the species-scoped atom moves.  Returns ``None`` for an
+    unscoped move.
+    """
+    if not species:
+        return None
+    if symbol_map is None:
+        raise ValueError(
+            f"{spec_label} with species=... requires symbol_map to be "
+            "provided by the resolver (it maps element symbols to the "
+            "type codes stored in WalkerState.types). Build descriptors "
+            "via ResolvedConfig.move_descriptors rather than "
+            "setup_mwg()/MoveConfig, which carry no species information."
+        )
+    code_of = {sym: code for code, sym in symbol_map.items()}
+    unknown = [s for s in species if s not in code_of]
+    if unknown:
+        raise ValueError(
+            f"{move_label} species {unknown} not present in the system "
+            f"(symbols: {sorted(code_of)}). A species-scoped move whose "
+            f"element is absent would never move anything."
+        )
+    return tuple(code_of[s] for s in species)
+
+
 class RandomWalkMoveSpec(BaseMoveSpec):
     """Gaussian displacement of every atom at once.
 
@@ -316,7 +372,7 @@ class GMCMoveSpec(BaseMoveSpec):
     @classmethod
     def _wrap_bare_symbol(cls, v: Any) -> Any:
         """Accept ``species: Ge`` as shorthand for ``species: [Ge]``."""
-        return (v,) if isinstance(v, str) else v
+        return _wrap_bare_symbol(v)
 
     def _n_steps(self) -> int:
         return self.n_reflect
@@ -355,26 +411,7 @@ class GMCMoveSpec(BaseMoveSpec):
         self, symbol_map: dict[int, str] | None
     ) -> tuple[int, ...] | None:
         """Resolve element symbols to the contiguous type codes used by types."""
-        if not self.species:
-            return None
-        if symbol_map is None:
-            raise ValueError(
-                "GMCMoveSpec with species=... requires symbol_map to be "
-                "provided by the resolver (it maps element symbols to the "
-                "type codes stored in WalkerState.types). Build descriptors "
-                "via ResolvedConfig.move_descriptors rather than "
-                "setup_mwg()/MoveConfig, which carry no species information."
-            )
-        code_of = {sym: code for code, sym in symbol_map.items()}
-        unknown = [s for s in self.species if s not in code_of]
-        if unknown:
-            raise ValueError(
-                f"gmc species {unknown} not present in the system "
-                f"(symbols: {sorted(code_of)}). A species-scoped move whose "
-                f"element is absent would silently become a no-op that always "
-                f"accepts."
-            )
-        return tuple(code_of[s] for s in self.species)
+        return _species_codes(self.species, symbol_map, "gmc", "GMCMoveSpec")
 
     def _kernel_kwargs(
         self,
@@ -401,7 +438,7 @@ class GMCMoveSpec(BaseMoveSpec):
         return {
             self._direction_field(): (
                 jnp.ndarray,
-                lambda positions, types: jnp.zeros_like(positions),
+                lambda positions, types, cell: jnp.zeros_like(positions),
             ),
         }
 
@@ -456,19 +493,63 @@ class SingleAtomMoveSpec(BaseMoveSpec):
     evaluation per atom moved, which is why it is usually a supporting move
     rather than the main one.
 
+    ``species`` restricts the pick to the atoms of the named element(s).
+    One scoped move per element gives each its own adapted step size, so a
+    mobile species is not held back by a stiff one.  Scoped moves are
+    auto-named ``single_atom_<symbols>``, which is also their key in
+    ``adaptation.per_move``.
+
     ::
 
         moves:
           - {type: single_atom, step_size: 0.2, weight: 1}
+          - {type: single_atom, species: Li, step_size: 0.3, weight: 2}
     """
 
     type: Literal["single_atom"] = Field(
         default="single_atom",
         description="Discriminator selecting this move.",
     )
+    species: tuple[str, ...] | None = Field(
+        default=None,
+        description=(
+            "Pick the displaced atom only among the named element(s).  A "
+            "bare symbol (``species: Li``) is accepted as shorthand for a "
+            "one-element list.  A walker with none of these atoms rejects "
+            "the proposal.  Scoped moves are auto-named "
+            "``single_atom_<symbols>``."
+        ),
+    )
+
+    @field_validator("species", mode="before")
+    @classmethod
+    def _wrap_bare_symbol(cls, v: Any) -> Any:
+        """Accept ``species: Li`` as shorthand for ``species: [Li]``."""
+        return _wrap_bare_symbol(v)
 
     def _build_kernel(self) -> Callable:
         return single_atom.build_kernel
+
+    def _effective_name(self) -> str:
+        """Auto-name scoped moves, as ``GMCMoveSpec`` does."""
+        if self.name is not None:
+            return self.name
+        if self.species:
+            return "single_atom_" + "_".join(self.species)
+        return self.type
+
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        symbol_map: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        # Unscoped specs keep the historical empty kwargs, so their
+        # descriptors stay comparable with ones built before scoping.
+        codes = _species_codes(
+            self.species, symbol_map, "single_atom", "SingleAtomMoveSpec"
+        )
+        return {} if codes is None else {"species": codes}
 
 
 class SingleAtomSweepMoveSpec(BaseMoveSpec):
@@ -679,6 +760,7 @@ class VolumeMoveSpec(BaseMoveSpec):
             "min_vol_per_atom": cell_cfg.min_volume_per_atom,
             "min_aspect": cell_cfg.min_aspect_ratio,
             "flat_v_prior": cell_cfg.flat_V_prior,
+            **_restrict_kwargs(cell_cfg),
         }
 
 
@@ -733,6 +815,7 @@ class ShearMoveSpec(BaseMoveSpec):
             "max_vol_per_atom": cell_cfg.max_volume_per_atom,
             "min_vol_per_atom": cell_cfg.min_volume_per_atom,
             "min_aspect": cell_cfg.min_aspect_ratio,
+            **_restrict_kwargs(cell_cfg),
         }
 
 
@@ -785,6 +868,7 @@ class StretchMoveSpec(BaseMoveSpec):
             "max_vol_per_atom": cell_cfg.max_volume_per_atom,
             "min_vol_per_atom": cell_cfg.min_volume_per_atom,
             "min_aspect": cell_cfg.min_aspect_ratio,
+            **_restrict_kwargs(cell_cfg),
         }
 
 
@@ -900,6 +984,349 @@ class Distance1DMoveSpec(BaseMoveSpec):
 
 
 # ---------------------------------------------------------------------------
+# Layered moves
+# ---------------------------------------------------------------------------
+
+
+class LayeredMoveSpec(BaseMoveSpec):
+    """Shared wiring of the moves acting on sheets and galleries.
+
+    The host atoms must form flat sheets parallel to the (a, b) plane of the
+    cell.  The resolver checks this on the starting walkers
+    (``layered_moves.check_sheets``) and passes the resulting layout to
+    ``to_descriptor``.  Every layered move adds the same ``sheet_id`` state
+    field, so all of them must use the same ``host_species``.
+    """
+
+    host_species: tuple[str, ...] = Field(
+        default=("C",),
+        description=(
+            "Element(s) whose atoms form the sheets, e.g. ``C`` or "
+            "``[C, B]`` for doped sheets.  A bare symbol is accepted.  Must "
+            "be the same for all layered moves of a run."
+        ),
+    )
+    in_plane_repeats: tuple[int, int] = Field(
+        default=(3, 3),
+        description=(
+            "Number of host primitive cells along a and b.  ``a / m_a`` and "
+            "``b / m_b`` are the in-plane lattice vectors of the host.  "
+            "Checked against the sheet size, two host atoms per primitive "
+            "cell (graphene)."
+        ),
+    )
+
+    @field_validator("host_species", mode="before")
+    @classmethod
+    def _wrap_bare_host(cls, v: Any) -> Any:
+        """Accept ``host_species: C`` as shorthand for ``[C]``."""
+        return _wrap_bare_symbol(v)
+
+    def to_descriptor(
+        self,
+        *,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        symbol_map: dict[int, str] | None = None,
+        sheets: "layered_moves.SheetInfo | None" = None,
+    ) -> MoveKernel:
+        """Produce the ``MoveKernel``, adding the sheet layout.
+
+        Args:
+            n_atoms, cell_cfg, symbol_map: As for ``BaseMoveSpec``.
+            sheets: Sheet layout of the starting walkers, from
+                ``check_sheets``.  Required.
+        """
+        if sheets is None:
+            raise ValueError(
+                f"{self.type} needs the sheet layout of the starting walkers, "
+                "computed by the resolver. Build descriptors via "
+                "ResolvedConfig.move_descriptors."
+            )
+        m_a, m_b = self.in_plane_repeats
+        if 2 * m_a * m_b != sheets.sheet_size:
+            raise ValueError(
+                f"{self.type}: in_plane_repeats {self.in_plane_repeats} "
+                f"implies {2 * m_a * m_b} host atoms per sheet (2 per "
+                f"primitive cell), but the sheets have {sheets.sheet_size}."
+            )
+        desc = super().to_descriptor(
+            n_atoms=n_atoms, cell_cfg=cell_cfg, symbol_map=symbol_map
+        )
+        host_codes = _species_codes(
+            self.host_species,
+            symbol_map,
+            f"{self.type} host",
+            type(self).__name__,
+        )
+        return dataclasses.replace(
+            desc,
+            kernel_kwargs={
+                **desc.kernel_kwargs,
+                "host_codes": host_codes,
+                "n_sheets": sheets.n_sheets,
+                "in_plane_repeats": self.in_plane_repeats,
+            },
+            extra_state_fields={
+                "sheet_id": (
+                    jnp.ndarray,
+                    layered_moves.make_sheet_id_initializer(host_codes),
+                )
+            },
+        )
+
+
+class GalleryHopMoveSpec(LayeredMoveSpec):
+    """Move one atom to another gallery or another in-plane site.
+
+    Picks one atom of ``species`` and moves it to the equivalent position in
+    another gallery (keeping its offset from the gallery centre) and/or by a
+    host lattice vector in the plane, plus Gaussian noise of ``step_size``.
+    Lets intercalants change gallery without crossing a sheet, which local
+    moves cannot do.
+
+    ::
+
+        moves:
+          - {type: gallery_hop, species: Li, in_plane_repeats: [3, 3],
+             step_size: 0.1, weight: 2}
+    """
+
+    type: Literal["gallery_hop"] = Field(
+        default="gallery_hop",
+        description="Discriminator selecting this move.",
+    )
+    species: tuple[str, ...] = Field(
+        description=(
+            "Element(s) whose atoms hop.  A bare symbol (``species: Li``) "
+            "is accepted.  Auto-named ``gallery_hop_<symbols>``."
+        ),
+    )
+
+    @field_validator("species", mode="before")
+    @classmethod
+    def _wrap_bare_symbol(cls, v: Any) -> Any:
+        """Accept ``species: Li`` as shorthand for ``species: [Li]``."""
+        return _wrap_bare_symbol(v)
+
+    @model_validator(mode="after")
+    def _species_not_in_sheets(self) -> "GalleryHopMoveSpec":
+        """Sheet atoms cannot hop: they define the galleries."""
+        shared = sorted(set(self.species) & set(self.host_species))
+        if shared:
+            raise ValueError(
+                f"gallery_hop species {shared} also form the sheets "
+                f"(host_species {list(self.host_species)}); only atoms in "
+                "the galleries can hop."
+            )
+        return self
+
+    def _build_kernel(self) -> Callable:
+        return layered_moves.build_gallery_hop_kernel
+
+    def _effective_name(self) -> str:
+        if self.name is not None:
+            return self.name
+        return "gallery_hop_" + "_".join(self.species)
+
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        symbol_map: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        codes = _species_codes(
+            self.species, symbol_map, "gallery_hop", "GalleryHopMoveSpec"
+        )
+        return {"species": codes}
+
+    def _reject_reasons(self) -> frozenset[str]:
+        # "prior": no atom of the species, or the noise left the target
+        # gallery.
+        return frozenset({"energy", "prior"})
+
+
+class LayerSlideMoveSpec(LayeredMoveSpec):
+    """Rigid in-plane translation of one sheet, or of one gallery's atoms.
+
+    With ``species`` equal to ``host_species`` the move picks one sheet
+    uniformly and translates all its atoms; this changes the stacking
+    registry (AA, AB, AC) of the two galleries the sheet bounds.  With
+    species not in the sheets it picks one gallery uniformly and translates
+    the atoms of ``species`` it contains, e.g. Li between alpha-alpha and
+    alpha-beta; an empty gallery rejects the proposal.
+
+    The translation is ``i a / (m_a k) + j b / (m_b k)`` with ``(i, j)``
+    uniform on the grid without ``(0, 0)`` and ``k = subdivisions``, plus
+    in-plane Gaussian noise of ``step_size``.  ``k = 1`` gives host lattice
+    vectors (intercalant hollow to hollow); ``k = 3`` adds the third-cell
+    shifts between AA, AB and AC stacking.
+
+    ::
+
+        moves:
+          - {type: layer_slide, species: C, subdivisions: 3,
+             step_size: 0.02, weight: 1}
+          - {type: layer_slide, species: Li, subdivisions: 1,
+             step_size: 0.02, weight: 1}
+    """
+
+    type: Literal["layer_slide"] = Field(
+        default="layer_slide",
+        description="Discriminator selecting this move.",
+    )
+    species: tuple[str, ...] = Field(
+        description=(
+            "What slides: ``host_species`` slides one sheet; other "
+            "element(s) slide their atoms in one gallery.  Mixing the two "
+            "is an error.  Auto-named ``layer_slide_<symbols>``."
+        ),
+    )
+    subdivisions: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Grid steps per host lattice vector: 1 for host lattice "
+            "translations, 3 to include the AA/AB/AC stacking shifts."
+        ),
+    )
+
+    @field_validator("species", mode="before")
+    @classmethod
+    def _wrap_bare_symbol(cls, v: Any) -> Any:
+        """Accept ``species: C`` as shorthand for ``species: [C]``."""
+        return _wrap_bare_symbol(v)
+
+    @model_validator(mode="after")
+    def _sheet_or_gallery(self) -> "LayerSlideMoveSpec":
+        """``species`` must be the whole host, or contain none of it."""
+        host = set(self.host_species)
+        moving = set(self.species)
+        if moving & host and moving != host:
+            raise ValueError(
+                f"layer_slide species {list(self.species)} mixes sheet atoms "
+                f"(host_species {list(self.host_species)}) with others. Use "
+                "species equal to host_species to slide one sheet, or species "
+                "outside the sheets to slide the atoms of one gallery."
+            )
+        return self
+
+    def _slide_host(self) -> bool:
+        """True when the move slides a sheet, False for a gallery's atoms."""
+        return set(self.species) == set(self.host_species)
+
+    def _build_kernel(self) -> Callable:
+        return layered_moves.build_layer_slide_kernel
+
+    def _effective_name(self) -> str:
+        if self.name is not None:
+            return self.name
+        return "layer_slide_" + "_".join(self.species)
+
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        symbol_map: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        codes = _species_codes(
+            self.species, symbol_map, "layer_slide", "LayerSlideMoveSpec"
+        )
+        return {
+            "species": codes,
+            "subdivisions": self.subdivisions,
+            "slide_host": self._slide_host(),
+        }
+
+    def _reject_reasons(self) -> frozenset[str]:
+        # "prior": the chosen gallery holds no atom of the species.
+        return frozenset({"energy", "prior"})
+
+
+class StackingShiftMoveSpec(LayeredMoveSpec):
+    """Change the stacking registry across one gallery by tilting c.
+
+    Picks one gallery uniformly, moves the cell boundary into it (a change of
+    representation only), and adds an in-plane shift to ``c`` with the atoms
+    fixed: the periodic images above the boundary slide relative to the
+    atoms below, so only that gallery's registry changes, at constant volume.
+    In a two-sheet cell this is the only way to change one gallery's
+    registry without touching the other.
+
+    The shift is ``i a / (m_a k) + j b / (m_b k)`` with ``(i, j)`` in
+    ``{-1, 0, 1}^2`` without ``(0, 0)``, ``k = subdivisions``, plus in-plane
+    noise of ``step_size``.  ``k = 1`` changes the in-plane offset of the
+    intercalants between galleries (alpha-alpha / alpha-beta); ``k = 3``
+    changes the sheet stacking (AA / AB / AC).
+
+    Requires ``cell.restrict_c_in_plane: true``: otherwise the equivalent
+    cells ``c + p a + q b`` weigh the registries unequally in the prior.
+
+    ::
+
+        moves:
+          - {type: stacking_shift, subdivisions: 1, step_size: 0.02}
+          - {type: stacking_shift, subdivisions: 3, step_size: 0.02}
+        cell:
+          restrict_c_in_plane: true
+    """
+
+    type: Literal["stacking_shift"] = Field(
+        default="stacking_shift",
+        description="Discriminator selecting this move.",
+    )
+    subdivisions: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Grid steps per host lattice vector: 1 for host lattice "
+            "translations, 3 to include the AA/AB/AC stacking shifts.  "
+            "Auto-named ``stacking_shift_<subdivisions>``."
+        ),
+    )
+
+    def _build_kernel(self) -> Callable:
+        return layered_moves.build_stacking_shift_kernel
+
+    def _effective_name(self) -> str:
+        if self.name is not None:
+            return self.name
+        return f"stacking_shift_{self.subdivisions}"
+
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        symbol_map: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        if n_atoms is None or cell_cfg is None:
+            raise ValueError(
+                "StackingShiftMoveSpec.to_descriptor() requires n_atoms and "
+                "cell_cfg from the resolver."
+            )
+        if not cell_cfg.restrict_c_in_plane:
+            raise ValueError(
+                "stacking_shift requires cell.restrict_c_in_plane: true. "
+                "Without it the equivalent cells c + p a + q b give the "
+                "stacking registries different prior weights."
+            )
+        return {
+            "subdivisions": self.subdivisions,
+            "n_atoms": n_atoms,
+            "max_vol_per_atom": cell_cfg.max_volume_per_atom,
+            "min_vol_per_atom": cell_cfg.min_volume_per_atom,
+            "min_aspect": cell_cfg.min_aspect_ratio,
+            "restrict_c_in_plane": True,
+        }
+
+    def _reject_reasons(self) -> frozenset[str]:
+        return frozenset({"energy", "cell"})
+
+    def _mutates(self) -> frozenset[str]:
+        return frozenset({"positions", "cell"})
+
+
+# ---------------------------------------------------------------------------
 # Discriminated union
 # ---------------------------------------------------------------------------
 
@@ -917,6 +1344,9 @@ MoveSpec = Annotated[
         ShearMoveSpec,
         StretchMoveSpec,
         AlchemicalMorphMoveSpec,
+        GalleryHopMoveSpec,
+        LayerSlideMoveSpec,
+        StackingShiftMoveSpec,
     ],
     Field(discriminator="type"),
 ]

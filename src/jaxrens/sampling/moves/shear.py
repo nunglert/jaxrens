@@ -57,6 +57,7 @@ def build_kernel(
     max_vol_per_atom: float = 100.0,
     min_vol_per_atom: float = 1.0,
     min_aspect: float = 0.5,
+    restrict_c_in_plane: bool = False,
 ):
     """Build a shear move kernel.
 
@@ -66,6 +67,8 @@ def build_kernel(
         max_vol_per_atom: Upper bound on volume per atom.
         min_vol_per_atom: Lower bound on volume per atom.
         min_aspect: Minimum cell aspect ratio.
+        restrict_c_in_plane: Passed to the cell-geometry guard; see
+            :func:`jaxrens.utils.cell.check_cell_shape`.
 
     Returns:
         step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
@@ -74,7 +77,11 @@ def build_kernel(
     # Cell-geometry guard (kernel-claimed); see
     # jaxrens.constraints.cell_geometry and the volume kernel for rationale.
     cell_geometry = build_cell_geometry(
-        n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect
+        n_atoms,
+        max_vol_per_atom,
+        min_vol_per_atom,
+        min_aspect,
+        restrict_c_in_plane,
     )
 
     def step(rng_key, state, likelihood_constraint):

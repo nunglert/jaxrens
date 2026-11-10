@@ -37,6 +37,7 @@ from jaxrens.cli.schema.backend import LJBackendSpec
 from jaxrens.cli.schema.cell import CellSpec
 from jaxrens.cli.schema.ensemble import SemiGrandEnsembleSpec
 from jaxrens.cli.schema.init import InitSpec
+from jaxrens.cli.schema.moves import LayeredMoveSpec
 from jaxrens.cli.schema.root import RootSpec
 from jaxrens.cli.schema.termination import IterationTerminationSpec
 from jaxrens.constraints.base import ConstraintDescriptor
@@ -60,6 +61,7 @@ from jaxrens.sampling.batch_descriptor import (
     SingleRun,
 )
 from jaxrens.sampling.move_kernel import MoveKernel
+from jaxrens.sampling.moves.layered_moves import SheetInfo, check_sheets
 from jaxrens.sampling.nested_sampling import _choose_starting_bucket
 from jaxrens.sampling.termination import (
     IterationTermination,
@@ -72,7 +74,12 @@ from jaxrens.state.config import (
     NSConfig,
     OutputConfig,
 )
-from jaxrens.utils.cell import get_volume, min_aspect_ratio
+from jaxrens.utils.cell import (
+    c_in_plane_reduced,
+    get_volume,
+    min_aspect_ratio,
+    worst_tilt_aspect,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -282,6 +289,66 @@ def _resolve_constraints(
     return descriptors
 
 
+def _resolve_sheets(
+    root: RootSpec, resolved_init: ResolvedInit
+) -> SheetInfo | None:
+    """Check the sheets of the starting walkers for the layered moves.
+
+    Returns ``None`` when no layered move is configured, so other runs are
+    unaffected.
+    """
+    hosts = {
+        frozenset(m.host_species)
+        for m in root.moves
+        if isinstance(m, LayeredMoveSpec)
+    }
+    if not hosts:
+        return None
+    if len(hosts) > 1:
+        raise ValueError(
+            "layered moves disagree on host_species "
+            f"{sorted(sorted(h) for h in hosts)}; they share one sheet_id "
+            "state field, so they must use the same host."
+        )
+    (host,) = hosts
+    symbol_map = resolved_init.symbol_map
+    if symbol_map is None:
+        raise ValueError(
+            "layered moves require a resolved species map, but none is "
+            "available for this init mode."
+        )
+    code_of = {sym: code for code, sym in symbol_map.items()}
+    missing = sorted(host - set(code_of))
+    if missing:
+        raise ValueError(
+            f"host_species {missing} not present in the system "
+            f"(symbols: {sorted(code_of)})."
+        )
+    return check_sheets(
+        resolved_init.initial_positions,
+        resolved_init.initial_types,
+        resolved_init.initial_cells,
+        tuple(sorted(code_of[h] for h in host)),
+    )
+
+
+def _move_descriptor(
+    m: Any,
+    *,
+    n_atoms: int,
+    cell_cfg: CellSpec,
+    symbol_map: dict[int, str] | None,
+    sheets: SheetInfo | None,
+) -> MoveKernel:
+    """Build one move's descriptor; only layered moves receive ``sheets``."""
+    kwargs: dict[str, Any] = dict(
+        n_atoms=n_atoms, cell_cfg=cell_cfg, symbol_map=symbol_map
+    )
+    if isinstance(m, LayeredMoveSpec):
+        kwargs["sheets"] = sheets
+    return m.to_descriptor(**kwargs)
+
+
 def _build_cells(
     init: InitSpec,
     n_live: int,
@@ -365,6 +432,21 @@ def _describe_cell_violation(
             f"volume/atom = {vol_per_atom:.4f} A^3 exceeds "
             f"cell.max_volume_per_atom = {cell_cfg.max_volume_per_atom}"
         )
+    if cell_cfg.restrict_c_in_plane:
+        if not bool(c_in_plane_reduced(cell)):
+            return (
+                "the in-plane part of c lies outside the Wigner-Seitz cell "
+                "of (a, b), which cell.restrict_c_in_plane requires; use "
+                "the equivalent cell with c replaced by c - p a - q b"
+            )
+        aspect = float(worst_tilt_aspect(cell))
+        if aspect < cell_cfg.min_aspect_ratio:
+            return (
+                f"aspect ratio at the worst tilt of c = {aspect:.4f} is "
+                f"below cell.min_aspect_ratio = {cell_cfg.min_aspect_ratio} "
+                "(cell.restrict_c_in_plane)"
+            )
+        return None
     aspect = float(min_aspect_ratio(cell, jnp.asarray(volume)))
     if aspect < cell_cfg.min_aspect_ratio:
         return (
@@ -1410,13 +1492,17 @@ def _resolve_single_replica(
 
     import dataclasses as _dc
 
+    sheets = _resolve_sheets(root, resolved_init)
+
     moves = tuple(m.to_move_config() for m in root.moves)
     move_descriptors = tuple(
         _dc.replace(
-            m.to_descriptor(
+            _move_descriptor(
+                m,
                 n_atoms=n_atoms,
                 cell_cfg=root.cell,
                 symbol_map=resolved_init.symbol_map,
+                sheets=sheets,
             ),
             min_rate=policy.min_rate,
             max_rate=policy.max_rate,
@@ -1939,13 +2025,17 @@ def _resolve_multi_replica(
 
     import dataclasses as _dc
 
+    sheets = _resolve_sheets(root, stacked_init)
+
     moves = tuple(m.to_move_config() for m in root.moves)
     move_descriptors = tuple(
         _dc.replace(
-            m.to_descriptor(
+            _move_descriptor(
+                m,
                 n_atoms=n_atoms,
                 cell_cfg=root.cell,
                 symbol_map=stacked_init.symbol_map,
+                sheets=sheets,
             ),
             min_rate=policy.min_rate,
             max_rate=policy.max_rate,

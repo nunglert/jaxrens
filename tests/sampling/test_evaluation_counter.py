@@ -63,7 +63,7 @@ def galilean_setup():
                 extra_state_fields={
                     "direction": (
                         jnp.ndarray,
-                        lambda pos, types: jnp.zeros_like(pos),
+                        lambda pos, types, cell: jnp.zeros_like(pos),
                     )
                 },
             ),
@@ -169,7 +169,7 @@ class TestMixedMWGCounters:
                     extra_state_fields={
                         "direction": (
                             jnp.ndarray,
-                            lambda pos, types: jnp.zeros_like(pos),
+                            lambda pos, types, cell: jnp.zeros_like(pos),
                         )
                     },
                 ),  # idx 0

@@ -35,6 +35,7 @@ def build_cell_geometry(
     max_vol_per_atom: float = 100.0,
     min_vol_per_atom: float = 1.0,
     min_aspect: float = 0.5,
+    restrict_c_in_plane: bool = False,
 ) -> object:
     """Build a cell-geometry predicate.
 
@@ -43,6 +44,9 @@ def build_cell_geometry(
         max_vol_per_atom: Upper bound on volume per atom.
         min_vol_per_atom: Lower bound on volume per atom.
         min_aspect: Minimum cell aspect ratio.
+        restrict_c_in_plane: Keep the in-plane part of c in the
+            Wigner-Seitz cell of (a, b) and judge the aspect ratio at the
+            worst tilt; see :func:`jaxrens.utils.cell.check_cell_shape`.
 
     Returns:
         ``is_valid(positions, types, cell) -> bool`` scalar predicate. Only
@@ -52,7 +56,12 @@ def build_cell_geometry(
 
     def is_valid(positions, types, cell):
         return check_cell_shape(
-            cell, n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect
+            cell,
+            n_atoms,
+            max_vol_per_atom,
+            min_vol_per_atom,
+            min_aspect,
+            restrict_c_in_plane,
         )
 
     return is_valid
@@ -63,6 +72,7 @@ def cell_geometry_descriptor(
     max_vol_per_atom: float = 100.0,
     min_vol_per_atom: float = 1.0,
     min_aspect: float = 0.5,
+    restrict_c_in_plane: bool = False,
 ) -> ConstraintDescriptor:
     """Wrap the cell-geometry guard as a :class:`ConstraintDescriptor`.
 
@@ -79,6 +89,7 @@ def cell_geometry_descriptor(
             "max_vol_per_atom": max_vol_per_atom,
             "min_vol_per_atom": min_vol_per_atom,
             "min_aspect": min_aspect,
+            "restrict_c_in_plane": restrict_c_in_plane,
         },
         reject_reason=2,
     )
