@@ -2,13 +2,12 @@
 
 The tests cover load_restart for single-run, parallel (n_runs,) and
 multi-GPU (G, P) checkpoints, RestartBundle, infer_restart_shape, and
-load_restart_batched.  They also check how init_ns, run_ns and the Mode D
-resolver (_resolve_init with restart_file) use a loaded checkpoint.
+load_restart_batched.  They also check that init_ns and run_ns continue
+a run from a loaded checkpoint.
 """
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
 import h5py
@@ -20,12 +19,9 @@ import pytest
 import jaxrens.sampling.moves.random_walk as _rw_mod
 from jaxrens.backends.toy import create_harmonic
 from jaxrens.cli.resolve import (
-    ResolvedInit,
     _finalise_initial_energies_and_counts,
     _resolve_init,
-    resolve,
 )
-from jaxrens.cli.schema import RootSpec
 from jaxrens.cli.schema.cell import CellSpec
 from jaxrens.cli.schema.init import InitSpec
 from jaxrens.init.restart import (
@@ -383,44 +379,6 @@ class TestInitNsRestart:
         assert jnp.isfinite(info["emax"])
 
 
-def _make_ns_checkpoint_resolver(
-    tmp_path: Path,
-    n_walkers: int = 4,
-    n_atoms: int = 1,
-    n_dead: int = 5,
-    name: str = "ns.checkpoint.h5",
-) -> Path:
-    """Write a minimal NS checkpoint for the Mode D resolver tests."""
-    rng = np.random.default_rng(0)
-    positions = rng.uniform(-2, 2, (n_walkers, n_atoms, 3)).astype(np.float32)
-    types = np.zeros((n_walkers, n_atoms), dtype=np.int32)
-    energies = rng.uniform(1, 10, n_walkers).astype(np.float32)
-    cells = np.stack([np.eye(3, dtype=np.float32) * 6.0] * n_walkers)
-    dead_energies = rng.uniform(10, 20, n_dead).astype(np.float32)
-    dead_positions = rng.uniform(-2, 2, (n_dead, n_atoms, 3)).astype(
-        np.float32
-    )
-
-    state = {
-        "positions": positions,
-        "types": types,
-        "energies": energies,
-        "cells": cells,
-        "dead_energies": dead_energies,
-        "dead_positions": dead_positions,
-        "dead_volumes": None,
-        "live_volumes": None,
-        "log_evidence": -7.3,
-        "iteration": n_dead,
-        "n_dead": n_dead,
-        "n_walkers": n_walkers,
-        "rng_key": jax.random.key(1),
-    }
-    p = tmp_path / name
-    save_checkpoint(p, state, symbol_map={0: "Si"})
-    return p
-
-
 def _cell_cfg_permissive_restart():
     return CellSpec(
         max_volume_per_atom=10000.0,
@@ -429,185 +387,16 @@ def _cell_cfg_permissive_restart():
     )
 
 
-class TestInitSpecResolverModeD:
-    """Check _resolve_init for an init spec with restart_file (Mode D).
-
-    The tests cover the resolved fields, the warning for random_initialise_*,
-    the error for multi-replica ensembles, and continuing a run from the
-    restart state.
+class TestResumeFromRestartFile:
+    """Check that walkers and restart state loaded by _resolve_init from a
+    restart_file continue the checkpointed run in init_ns and run_ns.
     """
-
-    def test_mode_d_returns_resolved_init(self, tmp_path):
-        p = _make_ns_checkpoint_resolver(
-            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
-        )
-        cfg = InitSpec(restart_file=p)
-        result = _resolve_init(
-            cfg,
-            n_live=4,
-            seed=0,
-            energy_backend=create_harmonic(),
-            cell_cfg=_cell_cfg_permissive_restart(),
-        )
-        assert isinstance(result, ResolvedInit)
-
-    def test_mode_d_restart_state_populated(self, tmp_path):
-        p = _make_ns_checkpoint_resolver(
-            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
-        )
-        cfg = InitSpec(restart_file=p)
-        result = _resolve_init(
-            cfg,
-            n_live=4,
-            seed=0,
-            energy_backend=create_harmonic(),
-            cell_cfg=_cell_cfg_permissive_restart(),
-        )
-        assert result.restart_state is not None
-        assert isinstance(result.restart_state, RestartBundle)
-
-    def test_mode_d_restart_state_n_dead(self, tmp_path):
-        p = _make_ns_checkpoint_resolver(
-            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
-        )
-        cfg = InitSpec(restart_file=p)
-        result = _resolve_init(
-            cfg,
-            n_live=4,
-            seed=0,
-            energy_backend=create_harmonic(),
-            cell_cfg=_cell_cfg_permissive_restart(),
-        )
-        assert result.restart_state.n_dead == 5
-
-    def test_mode_d_restart_state_iteration(self, tmp_path):
-        p = _make_ns_checkpoint_resolver(
-            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
-        )
-        cfg = InitSpec(restart_file=p)
-        result = _resolve_init(
-            cfg,
-            n_live=4,
-            seed=0,
-            energy_backend=create_harmonic(),
-            cell_cfg=_cell_cfg_permissive_restart(),
-        )
-        assert result.restart_state.iteration == 5
-
-    def test_mode_d_symbol_map_populated(self, tmp_path):
-        p = _make_ns_checkpoint_resolver(
-            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
-        )
-        cfg = InitSpec(restart_file=p)
-        result = _resolve_init(
-            cfg,
-            n_live=4,
-            seed=0,
-            energy_backend=create_harmonic(),
-            cell_cfg=_cell_cfg_permissive_restart(),
-        )
-        assert result.symbol_map == {0: "Si"}
-
-    def test_mode_d_energies_recomputed(self, tmp_path):
-        p = _make_ns_checkpoint_resolver(
-            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
-        )
-        cfg = InitSpec(restart_file=p)
-        backend = create_harmonic()
-        result = _resolve_init(
-            cfg,
-            n_live=4,
-            seed=0,
-            energy_backend=backend,
-            cell_cfg=_cell_cfg_permissive_restart(),
-        )
-        # _resolve_init leaves energies as None; the caller finalises them.
-        energies, _ = _finalise_initial_energies_and_counts(
-            backend,
-            result.initial_positions,
-            result.initial_types,
-            result.initial_cells,
-        )
-        assert energies is not None
-        assert energies.shape == (4,)
-        assert jnp.all(jnp.isfinite(energies))
-
-    def test_mode_d_random_initialise_pos_true_warns(self, tmp_path, caplog):
-        p = _make_ns_checkpoint_resolver(
-            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
-        )
-        cfg = InitSpec(restart_file=p, random_initialise_pos=True)
-        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            _resolve_init(
-                cfg,
-                n_live=4,
-                seed=0,
-                energy_backend=create_harmonic(),
-                cell_cfg=_cell_cfg_permissive_restart(),
-            )
-        assert any(
-            "restart_file" in r.message.lower()
-            or "verbatim" in r.message.lower()
-            for r in caplog.records
-        )
-
-    def test_multi_replica_with_restart_file_raises(self, tmp_path):
-        p = _make_ns_checkpoint_resolver(
-            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
-        )
-        d = {
-            "run": {
-                "n_live": 4,
-                "max_iterations": 5,
-                "n_mcmc_steps": 2,
-                "seed": 0,
-            },
-            "moves": [{"type": "random_walk", "step_size": 0.3}],
-            "backend": {"type": "harmonic"},
-            "output": {
-                "format": "none",
-                "working_dir": ".",
-                "info_interval": 999,
-            },
-            "ensemble": {"type": "npt", "pressure": [0.01, 0.02]},
-            "init": {"restart_file": str(p)},
-        }
-        root = RootSpec.model_validate(d)
-        with pytest.raises(ValueError, match="restart_file"):
-            resolve(root)
-
-    def test_multi_replica_restart_error_message_contains_n_total(
-        self, tmp_path
-    ):
-        p = _make_ns_checkpoint_resolver(
-            tmp_path, n_walkers=4, n_atoms=1, n_dead=5
-        )
-        d = {
-            "run": {
-                "n_live": 4,
-                "max_iterations": 5,
-                "n_mcmc_steps": 2,
-                "seed": 0,
-            },
-            "moves": [{"type": "random_walk", "step_size": 0.3}],
-            "backend": {"type": "harmonic"},
-            "output": {
-                "format": "none",
-                "working_dir": ".",
-                "info_interval": 999,
-            },
-            "ensemble": {"type": "npt", "pressure": [0.01, 0.02, 0.03]},
-            "init": {"restart_file": str(p)},
-        }
-        root = RootSpec.model_validate(d)
-        with pytest.raises(ValueError, match="3"):
-            resolve(root)
 
     def test_mode_d_end_to_end_jit(self, tmp_path):
         """Load a checkpoint, seed init_ns with it, run ns_step under jit."""
         n_dead_checkpoint = 5
-        p = _make_ns_checkpoint_resolver(
-            tmp_path, n_walkers=4, n_atoms=1, n_dead=n_dead_checkpoint
+        p = _write_checkpoint(
+            tmp_path, _make_ns_state_dict(n_dead=n_dead_checkpoint)
         )
 
         cfg = InitSpec(restart_file=p)
@@ -662,8 +451,8 @@ class TestInitSpecResolverModeD:
         """After a restart, N more steps give n_dead = checkpoint + N."""
         n_dead_checkpoint = 5
         n_extra_iters = 5
-        p = _make_ns_checkpoint_resolver(
-            tmp_path, n_walkers=4, n_atoms=1, n_dead=n_dead_checkpoint
+        p = _write_checkpoint(
+            tmp_path, _make_ns_state_dict(n_dead=n_dead_checkpoint)
         )
 
         cfg = InitSpec(restart_file=p)

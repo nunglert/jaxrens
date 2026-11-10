@@ -1,27 +1,31 @@
-"""Dead-point output for ``n_cull > 1``.
+"""Tests for the dead-point output when ``n_cull > 1``.
 
-Covers the IO side of multi-walker culling: the trajectory callbacks write one
-dead point (and one ``.energies`` row) per culled walker in descending
-energy, the HDF5 writer keys them ``"{iter}_{rank}"`` (single-cull files keep
-``"{iter}"``), restart truncation understands both keys, and the energies
-header round-trips ``n_cull`` into ``Monitor``-style analysis.
+The trajectory callbacks write one dead point and one ``.energies`` row per
+culled walker, in descending energy. The HDF5 writer keys them
+``"{iter}_{rank}"`` (``"{iter}"`` with a single cull), restart truncation
+handles both keys, and the ``.energies`` header stores ``n_cull``.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
+import h5py
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from jaxrens.cli.monitor import BatchedTrajectoryCallback, TrajectoryCallback
 from jaxrens.io.energy_log import EnergyLogger
+from jaxrens.io.restart_truncate import truncate_h5_traj
+from jaxrens.io.trajectory import create_trajectory_writer
 from jaxrens.sampling.batch_descriptor import VmapRuns
 from jaxrens.state.walker import WalkerState
 
 
 class _RecWriter:
+    """Trajectory writer that records each dead point it is given."""
+
     def __init__(self):
         self.rows = []
 
@@ -66,14 +70,36 @@ def test_single_run_writes_every_cull(tmp_path):
     np.testing.assert_allclose(log.volumes, 8.0)
 
 
+def test_traj_interval_skips_writer_but_logs_every_energy(tmp_path):
+    """Off a ``traj_interval`` multiple, ``.energies`` still gets all culls.
+
+    NS analysis needs every dead point, so only the trajectory writer is
+    gated.
+    """
+    writer = _RecWriter()
+    elog = EnergyLogger(tmp_path / "ns.energies", n_walkers=10, n_cull=3)
+    cb = TrajectoryCallback(
+        writer, energy_logger=elog, traj_interval=2, snapshot_interval=0
+    )
+    cb.on_iteration(3, None, {"dead_walkers": _dead_walkers([5.0, 4.0, 3.5])})
+    elog.close()
+
+    assert writer.rows == []
+    log = EnergyLogger.read(tmp_path / "ns.energies")
+    assert log.energies.tolist() == [5.0, 4.0, 3.5]
+
+
 def test_single_run_legacy_info_unchanged(tmp_path):
-    """Infos with only ``dead_walker`` (n_cull = 1) write exactly one row
-    without a cull rank, recording ``emax``."""
+    """An info with only ``dead_walker`` (n_cull = 1) writes one row
+    without a cull rank and records ``emax``.
+    """
     writer = _RecWriter()
     cb = TrajectoryCallback(writer, snapshot_interval=0)
     dw = _dead_walkers(2.5)
-    cb.on_iteration(3, None, {"dead_walker": dw, "emax": jnp.float32(2.5)})
-    assert [(r[0], r[1], r[2]) for r in writer.rows] == [(3, 2.5, None)]
+    cb.on_iteration(3, None, {"dead_walker": dw, "emax": jnp.float32(2.7)})
+    assert [(r[0], r[1], r[2]) for r in writer.rows] == [
+        (3, pytest.approx(2.7), None)
+    ]
 
 
 def test_batched_writes_every_cull_per_replica(tmp_path):
@@ -104,10 +130,6 @@ def test_batched_writes_every_cull_per_replica(tmp_path):
 
 
 def test_h5_writer_keys_and_truncation(tmp_path):
-    h5py = pytest.importorskip("h5py")
-    from jaxrens.io.restart_truncate import truncate_h5_traj
-    from jaxrens.io.trajectory import create_trajectory_writer
-
     path = tmp_path / "ns.traj.h5"
     w = create_trajectory_writer("h5", path, {0: "C"})
     one = WalkerState(
@@ -119,7 +141,7 @@ def test_h5_writer_keys_and_truncation(tmp_path):
     for it in range(3):
         for k in range(2):
             w.write_dead_point(it, one, 1.0, cull_rank=k)
-    w.write_dead_point(3, one, 1.0)  # single-cull key
+    w.write_dead_point(3, one, 1.0)  # no cull_rank: key "3"
     w.close()
 
     with h5py.File(path, "r") as f:

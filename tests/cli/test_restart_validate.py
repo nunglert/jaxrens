@@ -1,10 +1,15 @@
-"""Strict restart-compatibility validator: refuse on immutables, warn on soft diffs."""
+"""Tests for ``validate_restart_compatibility`` (restart_validate.py).
+
+On restart the current config is compared with the snapshot of the first
+run: a change to an immutable field exits with code 2, a change to a soft
+field only logs a warning. Both sides are scaled to absolute intervals
+first, and a field missing from an older snapshot matches None.
+"""
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -15,13 +20,8 @@ from jaxrens.cli.restart_validate import validate_restart_compatibility
 PREFIX = "ns"
 
 
-# ---------------------------------------------------------------------------
-# Test scaffolding — fake "root" object that has ``model_dump(mode="json")``
-# ---------------------------------------------------------------------------
-
-
 class _FakeRoot:
-    """Stand-in for ``RootSpec``: holds a payload dict and dumps it back."""
+    """Stand-in for ``RootSpec``: ``model_dump`` returns the given dict."""
 
     def __init__(self, payload: dict):
         self._payload = payload
@@ -31,7 +31,7 @@ class _FakeRoot:
 
 
 def _baseline_config() -> dict:
-    """A complete minimal payload covering every path the validator looks at."""
+    """A minimal dumped config with every path the validator reads."""
     return {
         "interval_units": "absolute",
         "run": {
@@ -73,11 +73,6 @@ def _checkpoint_path(tmp_path: Path) -> Path:
     return p
 
 
-# ---------------------------------------------------------------------------
-# Happy path: identical snapshot and current config → no refusal, no warnings
-# ---------------------------------------------------------------------------
-
-
 def test_identical_config_passes(tmp_path, caplog):
     payload = _baseline_config()
     snap = _write_snapshot(tmp_path, payload)
@@ -89,14 +84,9 @@ def test_identical_config_passes(tmp_path, caplog):
             checkpoint_path=ckpt,
             snapshot_path=snap,
         )
-    # Only the "seed unchanged" warning is expected on an identical config.
-    seed_warnings = [r for r in caplog.records if "seed" in r.getMessage()]
-    assert len(seed_warnings) == 1
-
-
-# ---------------------------------------------------------------------------
-# Hard refusals
-# ---------------------------------------------------------------------------
+    # The unchanged seed is the only warning on an identical config.
+    assert len(caplog.records) == 1
+    assert "seed" in caplog.records[0].getMessage()
 
 
 def test_n_live_change_refused(tmp_path, capsys):
@@ -154,29 +144,34 @@ def test_backend_change_refused(tmp_path, capsys):
     assert "backend" in err
 
 
-def test_inter_re_change_refused(tmp_path):
-    snap_payload = _baseline_config()
-    snap_payload["inter_re"] = {
-        "flavor": "pressure",
-        "pressures": [0.001, 0.01],
-    }
-    snap = _write_snapshot(tmp_path, snap_payload)
+def test_inter_re_change_refused(tmp_path, capsys):
+    def config(n_swap_cycles):
+        c = _baseline_config()
+        c["ensemble"] = {"type": "npt", "pressure": [0.001, 0.01]}
+        c["inter_re"] = {
+            "flavor": "pressure",
+            "re_interval": 1,
+            "n_swap_cycles": n_swap_cycles,
+        }
+        return c
+
+    snap = _write_snapshot(tmp_path, config(50))
     ckpt = _checkpoint_path(tmp_path)
 
-    current = _baseline_config()
-    current["inter_re"] = {"flavor": "pressure", "pressures": [0.001, 0.005]}
-
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as ex:
         validate_restart_compatibility(
-            _FakeRoot(current),
+            _FakeRoot(config(10)),
             checkpoint_path=ckpt,
             snapshot_path=snap,
         )
+    assert ex.value.code == 2
+    assert "inter_re" in capsys.readouterr().err
 
 
 def test_replica_count_change_refused_via_pressure_list(tmp_path, capsys):
-    """Growing/shrinking ``ensemble.pressure`` list across restart is refused
-    with a targeted replica-count message before the generic ensemble diff."""
+    """A longer ``ensemble.pressure`` list gets the replica-count message,
+    which comes before the generic ensemble diff.
+    """
     snap_payload = _baseline_config()
     snap_payload["ensemble"] = {"type": "npt", "pressure": [0.001, 0.005]}
     snap = _write_snapshot(tmp_path, snap_payload)
@@ -231,11 +226,69 @@ def test_replica_count_change_refused_via_composition_targets(
     assert "n_total = 3" in err
 
 
+def test_replica_count_change_refused_via_semi_grand_mu(tmp_path, capsys):
+    """A list of μ-vectors sets the replica count, like a pressure list."""
+    snap_payload = _baseline_config()
+    snap_payload["ensemble"] = {
+        "type": "semi_grand",
+        "chemical_potentials": [[0.0], [0.5]],
+    }
+    snap = _write_snapshot(tmp_path, snap_payload)
+    ckpt = _checkpoint_path(tmp_path)
+
+    current = _baseline_config()
+    current["ensemble"] = {
+        "type": "semi_grand",
+        "chemical_potentials": [[0.0], [0.5], [1.0]],
+    }
+
+    with pytest.raises(SystemExit) as ex:
+        validate_restart_compatibility(
+            _FakeRoot(current),
+            checkpoint_path=ckpt,
+            snapshot_path=snap,
+        )
+    assert ex.value.code == 2
+    err = capsys.readouterr().err
+    assert "replica count changed" in err
+    assert "n_total = 2" in err
+    assert "n_total = 3" in err
+
+
+def test_single_mu_vector_is_one_replica(tmp_path, capsys):
+    """A flat μ list has one entry per species, not one per replica.
+
+    Going from a 2-species μ-vector to an NPT pressure list of 2 changes
+    the replica count from 1 to 2.
+    """
+    snap_payload = _baseline_config()
+    snap_payload["ensemble"] = {
+        "type": "semi_grand",
+        "chemical_potentials": [0.0, 0.5],
+    }
+    snap = _write_snapshot(tmp_path, snap_payload)
+    ckpt = _checkpoint_path(tmp_path)
+
+    current = _baseline_config()
+    current["ensemble"] = {"type": "npt", "pressure": [0.001, 0.005]}
+
+    with pytest.raises(SystemExit):
+        validate_restart_compatibility(
+            _FakeRoot(current),
+            checkpoint_path=ckpt,
+            snapshot_path=snap,
+        )
+    err = capsys.readouterr().err
+    assert "n_total = 1" in err
+    assert "n_total = 2" in err
+
+
 def test_replica_count_unchanged_but_values_changed_still_refused(
     tmp_path, capsys
 ):
-    """Length-preserved value changes fall through to the generic ensemble
-    subtree diff and are still refused — just via the broader path."""
+    """Same number of pressures, one value changed: the generic ensemble
+    diff refuses it, not the replica-count check.
+    """
     snap_payload = _baseline_config()
     snap_payload["ensemble"] = {
         "type": "npt",
@@ -258,28 +311,28 @@ def test_replica_count_unchanged_but_values_changed_still_refused(
         )
     assert ex.value.code == 2
     err = capsys.readouterr().err
-    # The replica-count check must NOT fire (lengths match);
-    # the generic ensemble immutable-subtree check must fire instead.
     assert "replica count changed" not in err
     assert "ensemble" in err
 
 
-def test_cell_change_refused(tmp_path):
+def test_cell_change_refused(tmp_path, capsys):
     snap = _write_snapshot(tmp_path, _baseline_config())
     ckpt = _checkpoint_path(tmp_path)
 
     current = _baseline_config()
     current["cell"]["pbc"] = [True, True, False]
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as ex:
         validate_restart_compatibility(
             _FakeRoot(current),
             checkpoint_path=ckpt,
             snapshot_path=snap,
         )
+    assert ex.value.code == 2
+    assert "cell" in capsys.readouterr().err
 
 
-def test_topology_change_refused(tmp_path):
+def test_topology_change_refused(tmp_path, capsys):
     snap = _write_snapshot(tmp_path, _baseline_config())
     ckpt = _checkpoint_path(tmp_path)
 
@@ -287,12 +340,16 @@ def test_topology_change_refused(tmp_path):
     current["run"]["n_gpu"] = 2
     current["run"]["n_per_gpu"] = 4
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as ex:
         validate_restart_compatibility(
             _FakeRoot(current),
             checkpoint_path=ckpt,
             snapshot_path=snap,
         )
+    assert ex.value.code == 2
+    err = capsys.readouterr().err
+    assert "run.n_gpu" in err
+    assert "run.n_per_gpu" in err
 
 
 def test_multiple_hard_diffs_listed(tmp_path, capsys):
@@ -314,11 +371,6 @@ def test_multiple_hard_diffs_listed(tmp_path, capsys):
     assert "run.n_live" in err
     assert "ensemble" in err
     assert "backend" in err
-
-
-# ---------------------------------------------------------------------------
-# Soft warnings (run proceeds)
-# ---------------------------------------------------------------------------
 
 
 def test_move_retuning_warns_not_refuses(tmp_path, caplog):
@@ -359,20 +411,6 @@ def test_logging_cadence_warns_not_refuses(tmp_path, caplog):
     assert any("snapshot_interval" in m for m in msgs)
 
 
-def test_seed_unchanged_warns(tmp_path, caplog):
-    payload = _baseline_config()
-    snap = _write_snapshot(tmp_path, payload)
-    ckpt = _checkpoint_path(tmp_path)
-
-    with caplog.at_level(logging.WARNING):
-        validate_restart_compatibility(
-            _FakeRoot(payload),
-            checkpoint_path=ckpt,
-            snapshot_path=snap,
-        )
-    assert any("seed" in r.getMessage() for r in caplog.records)
-
-
 def test_seed_changed_does_not_warn(tmp_path, caplog):
     snap = _write_snapshot(tmp_path, _baseline_config())
     ckpt = _checkpoint_path(tmp_path)
@@ -392,11 +430,6 @@ def test_seed_changed_does_not_warn(tmp_path, caplog):
         if "seed" in r.getMessage() and "unchanged" in r.getMessage()
     ]
     assert seed_warnings == []
-
-
-# ---------------------------------------------------------------------------
-# Missing snapshot — legacy artifact dirs
-# ---------------------------------------------------------------------------
 
 
 def test_missing_snapshot_warns_and_proceeds(tmp_path, caplog):
@@ -424,23 +457,15 @@ def test_none_snapshot_path_warns_and_proceeds(tmp_path, caplog):
     assert any("snapshot not found" in r.getMessage() for r in caplog.records)
 
 
-# ---------------------------------------------------------------------------
-# Fix 1: schema-evolution tolerance — a newly-added Optional field (absent in
-# an older snapshot, None in the current dump) must not read as a change.
-# ---------------------------------------------------------------------------
-
-
 def test_snapshot_missing_optional_backend_field_not_refused(tmp_path):
     """Snapshot predates ``backend.softcore_repulsion``; current fills None."""
-    snap = _write_snapshot(
-        tmp_path, _baseline_config()
-    )  # no softcore_repulsion
+    snap = _write_snapshot(tmp_path, _baseline_config())
     ckpt = _checkpoint_path(tmp_path)
 
     current = _baseline_config()
-    current["backend"]["softcore_repulsion"] = None  # schema default
+    current["backend"]["softcore_repulsion"] = None
 
-    # Must NOT raise — missing-vs-None is not a real change.
+    # Missing versus None is not a change, so this must not raise.
     validate_restart_compatibility(
         _FakeRoot(current),
         checkpoint_path=ckpt,
@@ -452,9 +477,7 @@ def test_added_backend_field_with_nondefault_value_still_refused(
     tmp_path, capsys
 ):
     """A newly-set non-default value for an added field IS a real change."""
-    snap = _write_snapshot(
-        tmp_path, _baseline_config()
-    )  # no softcore_repulsion
+    snap = _write_snapshot(tmp_path, _baseline_config())
     ckpt = _checkpoint_path(tmp_path)
 
     current = _baseline_config()
@@ -470,17 +493,11 @@ def test_added_backend_field_with_nondefault_value_still_refused(
     assert "backend" in capsys.readouterr().err
 
 
-# ---------------------------------------------------------------------------
-# Fix 2: interval-unit normalisation — per_walker vs absolute must compare on
-# scaled (absolute) values, not raw, for the immutable inter_re.re_interval.
-# ---------------------------------------------------------------------------
-
-
 def _config_with_inter_re(units: str, re_interval, n_live: int) -> dict:
     c = _baseline_config()
     c["interval_units"] = units
     c["run"]["n_live"] = n_live
-    c["ensemble"] = {"type": "npt", "pressure": [0.001, 0.002]}  # 2 replicas
+    c["ensemble"] = {"type": "npt", "pressure": [0.001, 0.002]}
     c["inter_re"] = {
         "flavor": "pressure",
         "re_interval": re_interval,
@@ -490,7 +507,7 @@ def _config_with_inter_re(units: str, re_interval, n_live: int) -> dict:
 
 
 def test_per_walker_inter_re_interval_scaled_not_refused(tmp_path):
-    """re_interval 0.002 per_walker × n_live 500 = 1 == snapshot's absolute 1."""
+    """0.002 per_walker sweeps x 500 walkers = 1, the snapshot's value."""
     snap = _write_snapshot(
         tmp_path,
         _config_with_inter_re("absolute", 1, n_live=500),
@@ -498,7 +515,6 @@ def test_per_walker_inter_re_interval_scaled_not_refused(tmp_path):
     ckpt = _checkpoint_path(tmp_path)
     current = _config_with_inter_re("per_walker", 0.002, n_live=500)
 
-    # Must NOT raise — both normalise to re_interval=1.
     validate_restart_compatibility(
         _FakeRoot(current),
         checkpoint_path=ckpt,
@@ -507,7 +523,7 @@ def test_per_walker_inter_re_interval_scaled_not_refused(tmp_path):
 
 
 def test_inter_re_interval_genuine_change_still_refused(tmp_path, capsys):
-    """0.01 per_walker × 500 = 5 ≠ snapshot's 1 → genuine change, refused."""
+    """0.01 per_walker sweeps x 500 walkers = 5, not the snapshot's 1."""
     snap = _write_snapshot(
         tmp_path,
         _config_with_inter_re("absolute", 1, n_live=500),
@@ -526,7 +542,7 @@ def test_inter_re_interval_genuine_change_still_refused(tmp_path, capsys):
 
 
 def test_per_walker_inter_re_interval_scaled_by_n_cull(tmp_path):
-    """0.02 per_walker × n_live 500 / n_cull 10 = 1 == snapshot's absolute 1."""
+    """0.02 x 500 walkers / n_cull 10 = 1, the snapshot's value."""
     snap_payload = _config_with_inter_re("absolute", 1, n_live=500)
     snap_payload["run"]["n_cull"] = 10
     snap = _write_snapshot(tmp_path, snap_payload)
@@ -542,7 +558,7 @@ def test_per_walker_inter_re_interval_scaled_by_n_cull(tmp_path):
 
 
 def test_per_walker_n_cull_change_of_scaled_interval_refused(tmp_path, capsys):
-    """0.1 per_walker × n_live 500 / n_cull 10 = 5 ≠ snapshot's 1 → refused."""
+    """0.1 x 500 walkers / n_cull 10 = 5, not the snapshot's 1."""
     snap_payload = _config_with_inter_re("absolute", 1, n_live=500)
     snap_payload["run"]["n_cull"] = 10
     snap = _write_snapshot(tmp_path, snap_payload)
@@ -561,24 +577,24 @@ def test_per_walker_n_cull_change_of_scaled_interval_refused(tmp_path, capsys):
 
 
 def test_per_walker_output_intervals_do_not_warn(tmp_path, caplog):
-    """Soft output.*_interval fields also normalise → no spurious warning."""
-    snap_payload = _baseline_config()  # absolute: traj=1, snapshot=100, ...
-    snap_payload["run"][
-        "n_live"
-    ] = 100  # n_live is immutable — match both sides
+    """per_walker intervals equal to the snapshot's absolute ones after
+    scaling do not warn.
+    """
+    snap_payload = _baseline_config()
+    snap_payload["run"]["n_live"] = 100
     snap = _write_snapshot(tmp_path, snap_payload)
     ckpt = _checkpoint_path(tmp_path)
 
     current = _baseline_config()
     current["interval_units"] = "per_walker"
     current["run"]["n_live"] = 100
-    # per_walker values that scale back to the snapshot's absolute ones.
-    current["output"]["traj_interval"] = 0.01  # *100 = 1
-    current["output"]["snapshot_interval"] = 1.0  # *100 = 100
-    current["output"]["checkpoint_interval"] = 10.0  # *100 = 1000
-    current["output"]["info_interval"] = 0.1  # *100 = 10
-    current["termination"][0]["max_iterations"] = 100.0  # *100 = 10000
-    current["run"]["max_iterations"] = 100.0  # *100 = 10000
+    # Each value times 100 walkers gives the snapshot's absolute value.
+    current["output"]["traj_interval"] = 0.01  # 1
+    current["output"]["snapshot_interval"] = 1.0
+    current["output"]["checkpoint_interval"] = 10.0
+    current["output"]["info_interval"] = 0.1
+    current["termination"][0]["max_iterations"] = 100.0
+    current["run"]["max_iterations"] = 100.0
 
     with caplog.at_level(logging.WARNING):
         validate_restart_compatibility(

@@ -1,10 +1,9 @@
-"""Coverage tests for ``_cmd_run`` in ``jaxrens.cli.cli``.
+"""Tests for ``_cmd_run`` in ``jaxrens.cli.cli`` (``jaxrens run``).
 
-Strategy: monkeypatch the three orchestrators (``_run_single``,
-``run_sharded_from_config``, ``run_multi_gpu_from_config``) to no-op
-stubs that just record they were called.  This isolates ``_cmd_run``
-itself — flag parsing, restart-conflict guards, batcher-based
-dispatch — from the heavy NS execution that lives in ``cli.run``.
+The three orchestrators (``_run_single``, ``run_sharded_from_config`` and
+``run_multi_gpu_from_config``) are replaced by stubs that record their
+calls. The tests then check flag handling, the restart-conflict guards and
+which orchestrator the resolved batcher selects, without running NS.
 """
 
 from __future__ import annotations
@@ -12,35 +11,27 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import jax
 import pytest
+import yaml
 
+from jaxrens.cli import resolve as _r
 from jaxrens.cli.cli import _package_version, main
-
-_DATA = Path(__file__).parent.parent / "_assets" / "data" / "cli"
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+from jaxrens.cli.output_gate import snapshot_filename
 
 
 @pytest.fixture
 def single_device(monkeypatch):
-    """Force ``_local_device_count`` → 1 so minimal.yaml resolves to SingleRun
-    regardless of the host's actual GPU count."""
-    from jaxrens.cli import resolve as _r
-
+    """Make the resolver see one device, whatever the host has."""
     monkeypatch.setattr(_r, "_local_device_count", lambda: 1)
 
 
 @pytest.fixture
 def stub_orchestrators(monkeypatch):
-    """Replace the three NS dispatch functions with no-op recorders.
+    """Replace the three orchestrators with stubs that record their calls.
 
-    Returns a dict ``{name: list_of_calls}`` where each ``list_of_calls``
-    is populated with the ``(args, kwargs)`` of every invocation.  Lets
-    tests assert which orchestrator ran without paying for the actual NS
-    loop or JIT compilation.
+    Returns ``{name: [(args, kwargs), ...]}`` for ``"single"``,
+    ``"sharded"`` and ``"multi_gpu"``.
     """
     calls: dict[str, list] = {
         "single": [],
@@ -69,22 +60,12 @@ def stub_orchestrators(monkeypatch):
     return calls
 
 
-@pytest.fixture
-def fresh_workdir(tmp_path, monkeypatch):
-    """Run with ``output.working_dir`` rebased into ``tmp_path`` so
-    ``configure_file_logging`` writes to a clean directory and the
-    output-dir gate doesn't trip on prior runs."""
-    return tmp_path
-
-
 def _write_minimal_yaml(path: Path, working_dir: Path, **extras) -> Path:
-    """Materialise a tiny valid YAML config rooted at ``working_dir``.
+    """Write a small valid YAML config whose output goes to ``working_dir``.
 
-    ``extras`` may include nested overrides:
-    ``init={"restart_file": "..."}`` etc.
+    Each keyword in ``extras`` replaces a top-level section, for example
+    ``init={"restart_file": "..."}``.
     """
-    import yaml as _yaml
-
     cfg = {
         "run": {
             "n_live": 8,
@@ -102,29 +83,24 @@ def _write_minimal_yaml(path: Path, working_dir: Path, **extras) -> Path:
     }
     for k, v in extras.items():
         cfg[k] = v
-    path.write_text(_yaml.safe_dump(cfg))
+    path.write_text(yaml.safe_dump(cfg))
     return path
 
 
-# ---------------------------------------------------------------------------
-# Restart-conflict guards (cli.py 220-236)
-# ---------------------------------------------------------------------------
-
-
 class TestRestartConflictGuards:
-    """The three mutually-exclusive restart triggers (``--force``,
-    ``--resume``, ``init.restart_file``) form three pairwise conflicts.
-    All three are caught before any I/O and return exit code 2."""
+    """Check that any two of ``--force``, ``--resume`` and
+    ``init.restart_file`` together give exit code 2 before any I/O.
+    """
 
     def test_force_and_resume_conflict(
         self,
-        fresh_workdir,
+        tmp_path,
         single_device,
         capsys,
     ):
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml",
-            fresh_workdir / "out",
+            tmp_path / "cfg.yaml",
+            tmp_path / "out",
         )
         with pytest.raises(SystemExit) as exc_info:
             main(["run", "-c", str(cfg), "--force", "--resume"])
@@ -134,14 +110,14 @@ class TestRestartConflictGuards:
 
     def test_force_and_restart_file_conflict(
         self,
-        fresh_workdir,
+        tmp_path,
         single_device,
         capsys,
     ):
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml",
-            fresh_workdir / "out",
-            init={"restart_file": str(fresh_workdir / "fake.h5")},
+            tmp_path / "cfg.yaml",
+            tmp_path / "out",
+            init={"restart_file": str(tmp_path / "fake.h5")},
         )
         with pytest.raises(SystemExit) as exc_info:
             main(["run", "-c", str(cfg), "--force"])
@@ -151,14 +127,14 @@ class TestRestartConflictGuards:
 
     def test_resume_and_restart_file_conflict(
         self,
-        fresh_workdir,
+        tmp_path,
         single_device,
         capsys,
     ):
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml",
-            fresh_workdir / "out",
-            init={"restart_file": str(fresh_workdir / "fake.h5")},
+            tmp_path / "cfg.yaml",
+            tmp_path / "out",
+            init={"restart_file": str(tmp_path / "fake.h5")},
         )
         with pytest.raises(SystemExit) as exc_info:
             main(["run", "-c", str(cfg), "--resume"])
@@ -167,24 +143,18 @@ class TestRestartConflictGuards:
         assert "--resume and init.restart_file" in err
 
 
-# ---------------------------------------------------------------------------
-# Dispatch by batcher type (cli.py 309-340)
-# ---------------------------------------------------------------------------
-
-
 class TestRunDispatch:
-    """``_cmd_run`` picks one of three orchestrators based on
-    ``resolved.batcher`` — verify each branch reaches the right stub."""
+    """Check that each batcher type reaches its own orchestrator."""
 
     def test_single_run_dispatch(
         self,
-        fresh_workdir,
+        tmp_path,
         single_device,
         stub_orchestrators,
     ):
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml",
-            fresh_workdir / "out",
+            tmp_path / "cfg.yaml",
+            tmp_path / "out",
         )
         with pytest.raises(SystemExit) as exc_info:
             main(["run", "-c", str(cfg)])
@@ -195,17 +165,15 @@ class TestRunDispatch:
 
     def test_logs_package_version_for_reproducibility(
         self,
-        fresh_workdir,
+        tmp_path,
         single_device,
         stub_orchestrators,
         caplog,
     ):
-        """The jaxrens version is logged once per run, regardless of which
-        orchestrator ends up handling it — so a run's log file alone is
-        enough to tell which build produced it."""
+        """The log records the jaxrens version, so it shows which build ran."""
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml",
-            fresh_workdir / "out",
+            tmp_path / "cfg.yaml",
+            tmp_path / "out",
         )
         with caplog.at_level(logging.INFO, logger="jaxrens.cli.cli"):
             with pytest.raises(SystemExit) as exc_info:
@@ -216,20 +184,19 @@ class TestRunDispatch:
 
     def test_multi_replica_dispatch(
         self,
-        fresh_workdir,
+        tmp_path,
         single_device,
         stub_orchestrators,
     ):
-        """NPT pressure list of length 2 with ``_local_device_count → 1``
-        → PmapVmapRuns(n_gpu=1, n_per_gpu=2) → ``run_multi_gpu_from_config``.
+        """Two pressures on one device resolve to PmapVmapRuns(n_gpu=1,
+        n_per_gpu=2) and reach ``run_multi_gpu_from_config``.
 
-        Forcing 1 device avoids the real pmap fan-out that the resolver's
-        consolidated initial-energy compute would otherwise attempt.
-        Same pattern as ``test_multi_run.py::TestRunMultiGpuFromConfig``.
+        With one device the resolver does not try a real pmap over GPUs
+        when it computes the initial energies.
         """
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml",
-            fresh_workdir / "out",
+            tmp_path / "cfg.yaml",
+            tmp_path / "out",
             ensemble={"type": "npt", "pressure": [0.01, 0.02]},
         )
         with pytest.raises(SystemExit) as exc_info:
@@ -241,17 +208,16 @@ class TestRunDispatch:
 
     def test_sharded_single_dispatch(
         self,
-        fresh_workdir,
+        tmp_path,
         single_device,
         stub_orchestrators,
     ):
-        """``run.shard_n_gpu=2`` (with the resolver's single-replica
-        initial-energy compute pinned to ``batcher=SingleRun()``) →
-        ShardedSingleRun → ``run_sharded_from_config``.  Stubbed
-        orchestrator means no actual sharded pmap runs."""
+        """``run.shard_n_gpu=2`` resolves to ShardedSingleRun and reaches
+        ``run_sharded_from_config``.
+        """
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml",
-            fresh_workdir / "out",
+            tmp_path / "cfg.yaml",
+            tmp_path / "out",
         )
         with pytest.raises(SystemExit) as exc_info:
             main(
@@ -269,44 +235,99 @@ class TestRunDispatch:
         assert len(stub_orchestrators["multi_gpu"]) == 0
 
 
-# ---------------------------------------------------------------------------
-# _assert_n_gpus (cli.py 137-170)
-# ---------------------------------------------------------------------------
+class TestFreshRunOutput:
+    """Check the output directory handling of a fresh run.
+
+    The run refuses a directory that already holds artifacts unless
+    ``--force`` is given, writes the config snapshot, and scales
+    ``per_walker`` intervals only once.
+    """
+
+    def test_writes_snapshot_and_log(
+        self, tmp_path, single_device, stub_orchestrators
+    ):
+        cfg = _write_minimal_yaml(tmp_path / "cfg.yaml", tmp_path / "out")
+        with pytest.raises(SystemExit) as exc_info:
+            main(["run", "-c", str(cfg)])
+        assert exc_info.value.code == 0
+        assert (tmp_path / "out" / snapshot_filename("ns")).exists()
+        # The log goes next to the output directory, not inside it.
+        assert (tmp_path / "ns.log").exists()
+
+    def test_dirty_output_dir_refused(
+        self, tmp_path, single_device, stub_orchestrators
+    ):
+        cfg = _write_minimal_yaml(tmp_path / "cfg.yaml", tmp_path / "out")
+        (tmp_path / "out").mkdir()
+        (tmp_path / "out" / "ns.energies").write_text("stale")
+        with pytest.raises(SystemExit) as exc_info:
+            main(["run", "-c", str(cfg)])
+        assert exc_info.value.code == 2
+        assert stub_orchestrators["single"] == []
+
+    def test_force_wipes_dirty_output_dir(
+        self, tmp_path, single_device, stub_orchestrators
+    ):
+        cfg = _write_minimal_yaml(tmp_path / "cfg.yaml", tmp_path / "out")
+        (tmp_path / "out").mkdir()
+        (tmp_path / "out" / "ns.energies").write_text("stale")
+        with pytest.raises(SystemExit) as exc_info:
+            main(["run", "-c", str(cfg), "--force"])
+        assert exc_info.value.code == 0
+        assert not (tmp_path / "out" / "ns.energies").exists()
+        assert len(stub_orchestrators["single"]) == 1
+
+    def test_per_walker_intervals_scaled_once(
+        self, tmp_path, single_device, stub_orchestrators
+    ):
+        """With n_live = 8, 0.5 sweeps is 4 iterations (32 if scaled twice)."""
+        cfg = _write_minimal_yaml(
+            tmp_path / "cfg.yaml",
+            tmp_path / "out",
+            interval_units="per_walker",
+        )
+        data = yaml.safe_load(cfg.read_text())
+        data["output"]["info_interval"] = 0.5
+        # The default adjust_interval (100) would warn in per_walker mode.
+        data["adaptation"] = {"adjust_interval": 0.5}
+        cfg.write_text(yaml.safe_dump(data))
+        with pytest.raises(SystemExit) as exc_info:
+            main(["run", "-c", str(cfg)])
+        assert exc_info.value.code == 0
+        ((args, _),) = stub_orchestrators["single"]
+        assert args[0].output.info_interval == 4
 
 
 class TestAssertNGpus:
-    """``--n-gpus=N`` aborts early with exit code 2 when the visible
-    device count doesn't match."""
+    """Check that ``--n-gpus=N`` gives exit code 2 unless JAX sees N
+    devices.
+    """
 
-    def test_mismatch_returns_2(self, fresh_workdir, monkeypatch, capsys):
-        # Pretend JAX only sees 1 device, while the user asserted 4.
-        import jax
-
+    def test_mismatch_returns_2(self, tmp_path, monkeypatch, capsys):
+        # JAX sees 1 device, the user asserts 4.
         monkeypatch.setattr(jax, "local_devices", lambda: [object()])
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml",
-            fresh_workdir / "out",
+            tmp_path / "cfg.yaml",
+            tmp_path / "out",
         )
         with pytest.raises(SystemExit) as exc_info:
             main(["run", "-c", str(cfg), "--n-gpus", "4"])
         assert exc_info.value.code == 2
         err = capsys.readouterr().err
         assert "but JAX sees 1 local" in err
-        assert "SLURM" in err  # diagnostic text mentions SLURM
+        assert "SLURM" in err
 
     def test_match_proceeds(
         self,
-        fresh_workdir,
+        tmp_path,
         single_device,
         stub_orchestrators,
         monkeypatch,
     ):
-        import jax
-
         monkeypatch.setattr(jax, "local_devices", lambda: [object()])
         cfg = _write_minimal_yaml(
-            fresh_workdir / "cfg.yaml",
-            fresh_workdir / "out",
+            tmp_path / "cfg.yaml",
+            tmp_path / "out",
         )
         with pytest.raises(SystemExit) as exc_info:
             main(["run", "-c", str(cfg), "--n-gpus", "1"])

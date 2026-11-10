@@ -2,8 +2,6 @@
 
 load_structure (structure.py) reads a single-frame file through ASE.
 load_walker_set (walker_set.py) reads a multi-frame extxyz or an HDF5 file.
-The last class checks how _resolve_init (jaxrens.cli.resolve) uses a walker
-set from a file.
 """
 
 from __future__ import annotations
@@ -19,12 +17,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jaxrens.backends.toy import create_harmonic
-from jaxrens.cli.resolve import ResolvedInit, _resolve_init
-from jaxrens.cli.schema.cell import CellSpec
-from jaxrens.cli.schema.init import InitSpec
 from jaxrens.init.structure import load_structure
-from jaxrens.init.walker_set import WalkerSet, load_walker_set
+from jaxrens.init.walker_set import load_walker_set
 
 
 def _make_frames(
@@ -84,14 +78,6 @@ def _write_hdf5(
                 {str(k): v for k, v in symbol_map.items()}
             )
     return p
-
-
-def _cell_cfg_permissive():
-    return CellSpec(
-        max_volume_per_atom=10000.0,
-        min_volume_per_atom=0.01,
-        min_aspect_ratio=0.001,
-    )
 
 
 class TestLoadStructureRoundTrip:
@@ -524,149 +510,3 @@ class TestWalkerSetDispatch:
         ase.io.write(str(p), frames, format="extxyz")
         ws = load_walker_set(p, n_live_expected=2)
         assert ws.positions.shape == (2, 1, 3)
-
-
-class TestInitSpecResolverModeC:
-    """Check _resolve_init for an init spec with start_walker_set.
-
-    The tests cover extxyz and HDF5 files, the warning logged when
-    random_initialise_pos or random_initialise_cell is also set, and the
-    error for a walker cell outside the CellSpec bounds.
-    """
-
-    def test_extxyz_resolved_init_type(self, tmp_path):
-        p = _write_extxyz(tmp_path, _make_frames(4, ["Si"]))
-        cfg = InitSpec(start_walker_set=p)
-        result = _resolve_init(
-            cfg,
-            n_live=4,
-            seed=0,
-            energy_backend=create_harmonic(),
-            cell_cfg=_cell_cfg_permissive(),
-        )
-        assert isinstance(result, ResolvedInit)
-
-    def test_extxyz_positions_shape(self, tmp_path):
-        p = _write_extxyz(tmp_path, _make_frames(4, ["Si", "Si"]))
-        cfg = InitSpec(start_walker_set=p)
-        result = _resolve_init(
-            cfg,
-            n_live=4,
-            seed=0,
-            energy_backend=create_harmonic(),
-            cell_cfg=_cell_cfg_permissive(),
-        )
-        assert result.initial_positions.shape == (4, 2, 3)
-
-    def test_extxyz_types_shape(self, tmp_path):
-        p = _write_extxyz(tmp_path, _make_frames(4, ["Si", "Si"]))
-        cfg = InitSpec(start_walker_set=p)
-        result = _resolve_init(
-            cfg,
-            n_live=4,
-            seed=0,
-            energy_backend=create_harmonic(),
-            cell_cfg=_cell_cfg_permissive(),
-        )
-        assert result.initial_types.shape == (4, 2)
-
-    def test_extxyz_symbol_map_correct(self, tmp_path):
-        p = _write_extxyz(tmp_path, _make_frames(3, ["Si", "O", "O"]))
-        cfg = InitSpec(start_walker_set=p)
-        result = _resolve_init(
-            cfg,
-            n_live=3,
-            seed=0,
-            energy_backend=create_harmonic(),
-            cell_cfg=_cell_cfg_permissive(),
-        )
-        assert result.symbol_map == {0: "Si", 1: "O"}
-
-    def test_hdf5_positions_shape(self, tmp_path):
-        rng = np.random.default_rng(7)
-        positions = rng.uniform(0.5, 5.5, (5, 2, 3)).astype(np.float32)
-        types = np.zeros((5, 2), dtype=np.int32)
-        cells = np.stack([np.eye(3) * 6.0] * 5).astype(np.float32)
-        p = _write_hdf5(tmp_path, positions, types, cells, {0: "Si"})
-        cfg = InitSpec(start_walker_set=p)
-        result = _resolve_init(
-            cfg,
-            n_live=5,
-            seed=0,
-            energy_backend=create_harmonic(),
-            cell_cfg=_cell_cfg_permissive(),
-        )
-        assert result.initial_positions.shape == (5, 2, 3)
-
-    def test_random_initialise_pos_true_keeps_file_positions(
-        self, tmp_path, caplog
-    ):
-        """With random_initialise_pos=True, positions come from the file."""
-
-        p = _write_extxyz(tmp_path, _make_frames(3, ["Si"]))
-        cfg = InitSpec(start_walker_set=p, random_initialise_pos=True)
-        ws = load_walker_set(p, n_live_expected=3)
-        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            result = _resolve_init(
-                cfg,
-                n_live=3,
-                seed=0,
-                energy_backend=create_harmonic(),
-                cell_cfg=_cell_cfg_permissive(),
-            )
-        assert any(
-            "random_initialise_pos" in r.message
-            or "randomiz" in r.message.lower()
-            for r in caplog.records
-        )
-        np.testing.assert_allclose(
-            np.array(result.initial_positions),
-            np.array(ws.positions),
-            atol=1e-5,
-        )
-
-    def test_random_initialise_cell_true_keeps_file_cells(
-        self, tmp_path, caplog
-    ):
-        """With random_initialise_cell=True, cells still come from the file."""
-
-        p = _write_extxyz(tmp_path, _make_frames(3, ["Si"]))
-        cfg = InitSpec(start_walker_set=p, random_initialise_cell=True)
-        ws = load_walker_set(p, n_live_expected=3)
-        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            result = _resolve_init(
-                cfg,
-                n_live=3,
-                seed=0,
-                energy_backend=create_harmonic(),
-                cell_cfg=_cell_cfg_permissive(),
-            )
-        assert any(
-            "random_initialise_cell" in r.message
-            or "randomiz" in r.message.lower()
-            for r in caplog.records
-        )
-        np.testing.assert_allclose(
-            np.array(result.initial_cells),
-            np.array(ws.cells),
-            atol=1e-5,
-        )
-
-    def test_cell_config_violation_raises(self, tmp_path):
-        """A walker cell outside the CellSpec bounds raises RuntimeError."""
-
-        cell = np.eye(3, dtype=np.float32) * 6.0
-        atoms = ase.Atoms(
-            ["Si"], positions=[[3.0, 3.0, 3.0]], cell=cell, pbc=True
-        )
-        p = tmp_path / "toosmall.extxyz"
-        ase.io.write(str(p), [atoms], format="extxyz")
-
-        strict_cfg = CellSpec(
-            max_volume_per_atom=1.0,
-            min_volume_per_atom=0.0001,
-            min_aspect_ratio=0.001,
-        )
-        cfg = InitSpec(start_walker_set=p)
-        with pytest.raises(RuntimeError):
-            _resolve_init(cfg, n_live=1, seed=0, cell_cfg=strict_cfg)

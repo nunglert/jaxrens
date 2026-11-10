@@ -1,9 +1,9 @@
-"""Tests for the progress and energy-check helpers in cli.monitor.
+"""Tests for the progress and energy-check helpers in ``cli.monitor``.
 
-Covers _format_reject_breakdown (the reject-reason column), the column
-layout of ProgressCallback lines for single and batched runs, its header
-for a PmapVmapRuns run, and the per-replica Emax check of
-EnergyCheckCallback.
+They cover ``_format_reject_breakdown`` (the reject-reason column), the
+column layout of ``ProgressCallback`` lines for single and batched runs,
+its header for a PmapVmapRuns run, and the per-replica Emax check of
+``EnergyCheckCallback``.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ class TestFormatRejectBreakdown:
         result = _format_reject_breakdown(
             [10, 0, 5, 0], reasons_used=frozenset({"energy"})
         )
-        assert "???" in result
+        assert result == "   reject: E=  0% ???=5"
 
     def test_pct_token_width_is_four_chars(self):
         """Two-digit percentages take one leading space."""
@@ -136,12 +136,9 @@ def _acc_col_offset(row: str) -> int:
 class TestProgressCallbackAlignment:
     """Check that acc= starts at the same column on every per-move row."""
 
-    def _make_single_run_info(
-        self, n_moves: int = 3, with_rejects: bool = True
-    ):
+    def _make_single_run_info(self, with_rejects: bool = True):
         move_names = ["galilean", "volume", "shear_strain"]
         ss = jnp.array([5.0, 0.011, 0.5])
-        acc = jnp.array([0.62, 0.10, 0.50])
 
         if with_rejects:
             rc = jnp.array(
@@ -186,11 +183,9 @@ class TestProgressCallbackAlignment:
             "n_proposed_per_move": jnp.ones((n_runs, n_moves), dtype=jnp.int32)
             * 1000,
             "reject_reason_counts_per_move": rc,
-            "move_reject_reasons": (
-                frozenset({"energy"}),
-                frozenset({"energy", "cell"}),
-                frozenset({"energy"}),
-            ),
+            # Every move gets energy and cell rejects, so every move
+            # declares both.
+            "move_reject_reasons": (frozenset({"energy", "cell"}),) * n_moves,
         }
 
     def test_single_run_with_rejects_acc_aligned(self):
@@ -203,23 +198,17 @@ class TestProgressCallbackAlignment:
 
     def test_single_run_reject_and_no_reject_same_column(self):
         """A row with a reject suffix and one without have acc= at the same
-        column. galilean accepts everything; volume has rejects."""
+        column.
+        """
         info = {
             "emax": -50.0,
             "step_sizes_per_move": jnp.array([5.0, 0.011]),
             "move_names": ["galilean", "volume"],
             "n_accepted_per_move": jnp.array([1000, 200]),
             "n_proposed_per_move": jnp.array([1000, 1000]),
+            # galilean accepts everything, so its row has no reject suffix.
             "reject_reason_counts_per_move": jnp.array(
-                [
-                    [
-                        1000,
-                        0,
-                        0,
-                        0,
-                    ],  # galilean: all accepted -> no reject suffix
-                    [200, 500, 300, 0],  # volume: energy+cell rejects
-                ]
+                [[1000, 0, 0, 0], [200, 500, 300, 0]]
             ),
             "move_reject_reasons": (
                 frozenset({"energy"}),
@@ -234,6 +223,15 @@ class TestProgressCallbackAlignment:
         assert "reject:" not in move_rows[0]
         assert "reject:" in move_rows[1]
 
+    def test_single_run_row_values(self):
+        """``acc`` is n_accepted / n_proposed; ``ss`` is the step size."""
+        lines = _capture_progress_lines(self._make_single_run_info())
+        rows = {r.split()[0]: r for r in lines if "acc=" in r}
+        assert "acc=0.62" in rows["galilean"]
+        assert "ss=1.100e-02" in rows["volume"]
+        assert "acc=0.10" in rows["volume"]
+        assert "reject: E= 10% C= 90%" in rows["volume"]
+
     def test_batched_acc_aligned(self):
         info = self._make_batched_info()
         lines = _capture_progress_lines(info, batched=True)
@@ -243,47 +241,45 @@ class TestProgressCallbackAlignment:
         assert len(set(offsets)) == 1, "\n".join(move_rows)
 
 
-class TestProgressCallbackPmapVmap:
-    """Check ProgressCallback with a (G, P)-shaped log_evidence."""
+def test_progress_pmap_vmap_header_shows_ranges():
+    """With a (G, P)-shaped log_evidence, the header shows ranges."""
+    n_gpu, n_per_gpu = 1, 2
+    descriptor = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
 
-    def test_pmap_vmap_header_shows_ranges(self):
-        n_gpu, n_per_gpu = 1, 2
-        descriptor = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+    ns_state = {"log_evidence": jnp.array([[5.1, 6.2]])}
 
-        ns_state = {"log_evidence": jnp.array([[5.1, 6.2]])}
+    # ns_state is a plain dict, so log_Z is read from info.
+    info = {
+        "emax": jnp.array([[-10.0, -9.5]]),
+        "log_evidence": ns_state["log_evidence"],
+        "_batcher": descriptor,
+    }
 
-        # ns_state is a plain dict, so log_Z is read from info.
-        info = {
-            "emax": jnp.array([[-10.0, -9.5]]),
-            "log_evidence": ns_state["log_evidence"],
-            "_batcher": descriptor,
-        }
+    cb = ProgressCallback(info_interval=1)
 
-        cb = ProgressCallback(info_interval=1)
+    records = []
 
-        records = []
+    class _RecordHandler(logging.Handler):
+        def emit(self, record):
+            records.append(self.format(record))
 
-        class _RecordHandler(logging.Handler):
-            def emit(self, record):
-                records.append(self.format(record))
+    handler = _RecordHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    target_logger = logging.getLogger("jaxrens.cli.monitor")
+    target_logger.addHandler(handler)
+    old_level = target_logger.level
+    target_logger.setLevel(logging.DEBUG)
+    try:
+        cb.on_iteration(0, ns_state, info)
+    finally:
+        target_logger.removeHandler(handler)
+        target_logger.setLevel(old_level)
 
-        handler = _RecordHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        target_logger = logging.getLogger("jaxrens.cli.monitor")
-        target_logger.addHandler(handler)
-        old_level = target_logger.level
-        target_logger.setLevel(logging.DEBUG)
-        try:
-            cb.on_iteration(0, ns_state, info)
-        finally:
-            target_logger.removeHandler(handler)
-            target_logger.setLevel(old_level)
-
-        assert records
-        header = records[0].split("\n")[0]
-        # Batched runs show Emax and log_Z as [min..max] ranges.
-        assert "Emax=[-10..-9.5]" in header
-        assert "log_Z=[5.1000..6.2000]" in header
+    assert records
+    header = records[0].split("\n")[0]
+    # Batched runs show Emax and log_Z as [min..max] ranges.
+    assert "Emax=[-10..-9.5]" in header
+    assert "log_Z=[5.1000..6.2000]" in header
 
 
 class TestEnergyCheckCallbackPerReplica:

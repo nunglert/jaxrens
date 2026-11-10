@@ -12,11 +12,9 @@ import numpy as np
 import pytest
 
 from jaxrens.backends.toy import create_harmonic
-from jaxrens.cli.resolve import resolve
-from jaxrens.cli.schema import RootSpec
 from jaxrens.cli.schema.adaptation import ResolvedAdaptationPolicy
 from jaxrens.init.burn_in import initial_walk
-from jaxrens.sampling.batch_descriptor import ShardedSingleRun, SingleRun
+from jaxrens.sampling.batch_descriptor import ShardedSingleRun
 from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
@@ -173,89 +171,6 @@ def test_run_ns_sharded_divisibility_error():
             move_descriptors=setup["descriptors"],
             termination_criteria=[IterationTermination(1)],
         )
-
-
-def _minimal_root(tmp_path, *, shard_n_gpu, n_live=8, pressures=None):
-    """Validate a small LJ NPT config through RootSpec so resolve() is fast."""
-    cfg = {
-        "run": {
-            "n_live": n_live,
-            "max_iterations": 1,
-            "n_mcmc_steps": 1,
-            "seed": 0,
-        },
-        "backend": {
-            "type": "lj",
-            "epsilon": 1.0,
-            "sigma": 1.0,
-            "cutoff": 2.5,
-            "periodic": True,
-        },
-        "ensemble": {
-            "type": "npt",
-            "pressure": pressures if pressures is not None else 0.1,
-            "pressure_units": "eva3",
-        },
-        "moves": [
-            {"type": "random_walk", "step_size": 0.1},
-        ],
-        "termination": [{"type": "iteration", "max_iterations": 1}],
-        "init": {
-            "start_species": "18 4",
-            "random_initialise_pos": True,
-            "pos_randomization_mode": "grid",
-            "grid_distance": 1.0,
-            "random_initialise_cell": False,
-            "start_energy_ceiling_per_atom": 100.0,
-        },
-        "cell": {
-            "max_volume_per_atom": 30.0,
-            "min_volume_per_atom": 1.5,
-            "min_aspect_ratio": 0.6,
-            "flat_V_prior": False,
-        },
-        "output": {
-            "format": "extxyz",
-            "working_dir": str(tmp_path / "out"),
-            "out_file_prefix": "test",
-            "info_interval": 50,
-            "traj_interval": 50,
-            "snapshot_interval": 100000,
-            "checkpoint_interval": 100000,
-        },
-    }
-    if shard_n_gpu != 1:
-        cfg["run"]["shard_n_gpu"] = shard_n_gpu
-    return RootSpec.model_validate(cfg)
-
-
-def test_resolver_routes_shard_to_sharded_batcher(tmp_path):
-    """shard_n_gpu > 1 gives a ShardedSingleRun batcher."""
-    root = _minimal_root(tmp_path, shard_n_gpu=2)
-    resolved = resolve(root)
-    assert isinstance(resolved.batcher, ShardedSingleRun)
-    assert resolved.batcher.n_gpu == 2
-
-
-def test_resolver_default_keeps_single_run(tmp_path):
-    """The default shard_n_gpu=1 keeps the SingleRun batcher."""
-    root = _minimal_root(tmp_path, shard_n_gpu=1)
-    resolved = resolve(root)
-    assert isinstance(resolved.batcher, SingleRun)
-
-
-def test_resolver_rejects_shard_with_pressure_list(tmp_path):
-    """A sharded run cannot be combined with a list of pressures."""
-    root = _minimal_root(tmp_path, shard_n_gpu=2, pressures=[1.0, 2.0])
-    with pytest.raises(ValueError, match="shard_n_gpu"):
-        resolve(root)
-
-
-def test_resolver_rejects_indivisible_n_live(tmp_path):
-    """n_live not divisible by shard_n_gpu raises ValueError."""
-    root = _minimal_root(tmp_path, shard_n_gpu=3, n_live=8)
-    with pytest.raises(ValueError, match="divisible"):
-        resolve(root)
 
 
 @pytest.mark.parametrize(

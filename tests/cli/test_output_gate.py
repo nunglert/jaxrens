@@ -1,7 +1,8 @@
-"""Pre-run output-dir gate: refuses dirty dirs, --force wipes them.
+"""Tests for ``jaxrens.cli.output_gate``.
 
-Also covers ``discover_checkpoint`` (--resume auto-discovery) and the
-``snapshot_*`` helpers.
+The output-dir gate refuses a dirty ``working_dir`` and ``--force`` wipes
+it. ``discover_checkpoint`` picks the checkpoint for ``--resume``, and the
+snapshot helpers write, locate and read the config snapshot.
 """
 
 from __future__ import annotations
@@ -17,8 +18,9 @@ from jaxrens.cli.output_gate import (
     read_config_snapshot,
     snapshot_filename,
     snapshot_path_for_checkpoint,
+    write_config_snapshot,
 )
-
+from jaxrens.cli.schema import RootSpec
 
 PREFIX = "ns"
 
@@ -95,7 +97,7 @@ def test_gate_force_deletes_everything(tmp_path):
     enforce_clean_output_dir(tmp_path, PREFIX, force=True)
 
     for name in files:
-        assert not (tmp_path / name).exists(), f"{name} should have been deleted"
+        assert not (tmp_path / name).exists()
 
 
 def test_gate_ignores_foreign_prefix(tmp_path):
@@ -123,6 +125,7 @@ def test_gate_error_message_lists_files(tmp_path, capsys):
 
 
 def test_gate_error_truncates_long_listing(tmp_path, capsys):
+    """The listing shows the first 10 files, so 15 files leave "+5 more"."""
     for i in range(15):
         _touch(tmp_path, f"{PREFIX}.traj.snap.{i}.extxyz")
     with pytest.raises(SystemExit):
@@ -139,9 +142,11 @@ def test_gate_includes_config_snapshot(tmp_path):
     assert not (tmp_path / snapshot_filename(PREFIX)).exists()
 
 
-# ---------------------------------------------------------------------------
-# discover_checkpoint
-# ---------------------------------------------------------------------------
+def test_gate_skips_matching_directories(tmp_path):
+    (tmp_path / f"{PREFIX}.traj.frames").mkdir()
+    enforce_clean_output_dir(tmp_path, PREFIX, force=False)
+    enforce_clean_output_dir(tmp_path, PREFIX, force=True)
+    assert (tmp_path / f"{PREFIX}.traj.frames").is_dir()
 
 
 def test_discover_errors_when_no_checkpoint(tmp_path, capsys):
@@ -196,13 +201,10 @@ def test_discover_ignores_initial(tmp_path):
         discover_checkpoint(tmp_path, PREFIX)
 
 
-# ---------------------------------------------------------------------------
-# snapshot_path_for_checkpoint
-# ---------------------------------------------------------------------------
-
-
 def test_snapshot_path_for_final_checkpoint(tmp_path):
-    p = snapshot_path_for_checkpoint(tmp_path / f"{PREFIX}.final.checkpoint.h5")
+    p = snapshot_path_for_checkpoint(
+        tmp_path / f"{PREFIX}.final.checkpoint.h5"
+    )
     assert p == tmp_path / snapshot_filename(PREFIX)
 
 
@@ -215,15 +217,20 @@ def test_snapshot_path_for_unknown_returns_none(tmp_path):
     assert snapshot_path_for_checkpoint(tmp_path / "random.h5") is None
 
 
-# ---------------------------------------------------------------------------
-# read_config_snapshot
-# ---------------------------------------------------------------------------
+def test_snapshot_write_read_roundtrip(tmp_path):
+    """The snapshot holds the JSON-mode dump of the validated config.
 
-
-def test_snapshot_roundtrip(tmp_path):
-    import yaml
-    payload = {"run": {"n_live": 64, "seed": 1}, "moves": [{"type": "random_walk"}]}
-    path = tmp_path / snapshot_filename(PREFIX)
-    with open(path, "w") as fh:
-        yaml.safe_dump(payload, fh)
-    assert read_config_snapshot(path) == payload
+    ``working_dir`` is a ``Path`` in the model, so this also checks that
+    the dump is plain enough for ``yaml.safe_dump``.
+    """
+    root = RootSpec.model_validate(
+        {
+            "run": {"n_live": 8, "max_iterations": 5, "seed": 1},
+            "moves": [{"type": "random_walk", "step_size": 0.3}],
+            "backend": {"backend_type": "harmonic"},
+            "output": {"format": "none", "working_dir": str(tmp_path)},
+        }
+    )
+    path = write_config_snapshot(tmp_path, PREFIX, root)
+    assert path == tmp_path / snapshot_filename(PREFIX)
+    assert read_config_snapshot(path) == root.model_dump(mode="json")

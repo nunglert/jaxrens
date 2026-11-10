@@ -1,10 +1,8 @@
 """Tests for ``RootSpec.interval_units`` scaling in the resolver.
 
-Covers ``_scale_interval`` and ``_apply_interval_units`` directly, plus the
-end-to-end flow through ``resolve`` to verify the eight iteration-counted
-fields are correctly rewritten on the path into the runtime dataclasses
-(``OutputConfig``, ``NSConfig``, ``InterREConfig``, ``IterationTermination``,
-and the full-auto ``adjust_interval`` consumed by ``run_ns``).
+``_scale_interval`` and ``_apply_interval_units`` are tested directly, and
+``resolve`` is checked to pass the scaled values on to the runtime configs.
+In ``per_walker`` mode every interval is multiplied by n_live / n_cull.
 """
 
 from __future__ import annotations
@@ -14,14 +12,11 @@ import pytest
 from jaxrens.cli.resolve import _apply_interval_units, _scale_interval, resolve
 from jaxrens.cli.schema import RootSpec
 from jaxrens.cli.schema.termination import IterationTerminationSpec
-
-# ---------------------------------------------------------------------------
-# Fixture: a minimal RootSpec dict that exercises all 8 interval fields.
-# ---------------------------------------------------------------------------
+from jaxrens.sampling.termination import IterationTermination
 
 
 def _full_interval_dict(*, n_live: int = 10) -> dict:
-    """Minimal RootSpec dict with all 8 interval-counted fields set."""
+    """Minimal RootSpec dict with distinct values for the interval fields."""
     return {
         "run": {
             "n_live": n_live,
@@ -47,12 +42,9 @@ def _full_interval_dict(*, n_live: int = 10) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# _scale_interval — unit-level behaviour
-# ---------------------------------------------------------------------------
-
-
 class TestScaleInterval:
+    """Check rounding, clamping and None handling of one scaled value."""
+
     def test_none_passes_through(self):
         assert _scale_interval(None, factor=10) is None
 
@@ -72,12 +64,13 @@ class TestScaleInterval:
         assert _scale_interval(0, factor=10) == 1
 
 
-# ---------------------------------------------------------------------------
-# _apply_interval_units — RootSpec rewriting
-# ---------------------------------------------------------------------------
-
-
 class TestApplyIntervalUnits:
+    """Check which RootSpec fields are scaled, and by what factor.
+
+    The factor is n_live / n_cull in ``per_walker`` mode and 1 in
+    ``absolute`` mode, where values are still rounded to int.
+    """
+
     def test_default_absolute_passes_through(self):
         root = RootSpec.model_validate(_full_interval_dict(n_live=10))
         out = _apply_interval_units(root)
@@ -93,7 +86,7 @@ class TestApplyIntervalUnits:
         assert isinstance(out.termination[0], IterationTerminationSpec)
         assert out.termination[0].max_iterations == 4
 
-    def test_per_walker_scales_all_eight_fields(self):
+    def test_per_walker_scales_by_n_live(self):
         d = _full_interval_dict(n_live=10)
         d["interval_units"] = "per_walker"
         root = RootSpec.model_validate(d)
@@ -158,20 +151,45 @@ class TestApplyIntervalUnits:
         assert out.run.max_iterations == 50
 
     def test_per_walker_scales_temperature_lag_interval_and_interval(self):
-        """``temperature_lag_interval`` / ``temperature_interval`` scale with n_live."""
+        """With 500 walkers, 0.5 and 0.2 sweeps are 250 and 100 iterations."""
         d = _full_interval_dict(n_live=500)
         d["interval_units"] = "per_walker"
-        d["output"][
-            "temperature_lag_interval"
-        ] = 0.5  # 0.5 walker-sweeps → 250 iters
-        d["output"]["temperature_interval"] = 0.2  # → 100 iters
+        d["output"]["temperature_lag_interval"] = 0.5
+        d["output"]["temperature_interval"] = 0.2
         root = RootSpec.model_validate(d)
         out = _apply_interval_units(root)
         assert out.output.temperature_lag_interval == 250
         assert out.output.temperature_interval == 100
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "acc_rates_interval",
+            "max_neighbors_interval",
+            "collision_check_interval",
+            "flush_interval",
+        ],
+    )
+    def test_per_walker_scales_log_intervals(self, name):
+        d = _full_interval_dict(n_live=10)
+        d["interval_units"] = "per_walker"
+        d["output"][name] = 0.5
+        out = _apply_interval_units(RootSpec.model_validate(d))
+        assert getattr(out.output, name) == 5
+
+    def test_per_walker_leaves_other_termination_criteria(self):
+        d = _full_interval_dict(n_live=10)
+        d["interval_units"] = "per_walker"
+        d["termination"] = [
+            {"type": "iteration", "max_iterations": 4},
+            {"type": "prior_mass", "threshold": 1e-5},
+        ]
+        out = _apply_interval_units(RootSpec.model_validate(d))
+        assert out.termination[0].max_iterations == 40
+        assert out.termination[1].threshold == 1e-5
+
     def test_temperature_lag_interval_none_passes_through(self):
-        """``temperature_lag_interval: null`` survives scaling — disables the callback."""
+        """A null ``temperature_lag_interval`` (callback off) stays None."""
         d = _full_interval_dict(n_live=10)
         d["interval_units"] = "per_walker"
         d["output"]["temperature_lag_interval"] = None
@@ -179,27 +197,16 @@ class TestApplyIntervalUnits:
         out = _apply_interval_units(root)
         assert out.output.temperature_lag_interval is None
 
-    def test_per_walker_accepts_floats(self):
-        d = _full_interval_dict(n_live=500)
-        d["interval_units"] = "per_walker"
-        d["output"]["info_interval"] = 0.2  # 5 log lines per sweep
-        root = RootSpec.model_validate(d)
-        out = _apply_interval_units(root)
-        assert out.output.info_interval == 100
-
     def test_per_walker_max_iterations_none_preserved(self):
         d = _full_interval_dict(n_live=10)
         d["interval_units"] = "per_walker"
-        d["run"].pop("max_iterations")  # leave it at the default ``None``
-        # No termination block either, so the optional ``run.max_iterations``
-        # is the only iteration cap and must round-trip as None.
+        d["run"].pop("max_iterations")
         d.pop("termination", None)
         root = RootSpec.model_validate(d)
         out = _apply_interval_units(root)
         assert out.run.max_iterations is None
 
     def test_absolute_mode_floats_still_cast_to_int(self):
-        # Even in absolute mode, the resolver normalises to int via round().
         d = _full_interval_dict(n_live=10)
         d["output"]["info_interval"] = 100.7
         root = RootSpec.model_validate(d)
@@ -224,62 +231,37 @@ class TestApplyIntervalUnits:
         assert out.inter_re is None
 
 
-# ---------------------------------------------------------------------------
-# End-to-end via resolve — values reach the runtime dataclasses
-# ---------------------------------------------------------------------------
-
-
 class TestResolveIntervals:
+    """Check that ``resolve`` hands the scaled values to the runtime configs.
+
+    The fixture's ``inter_re`` block is dropped here because a pressure
+    replica exchange needs a list-valued ``ensemble.pressure`` at resolve
+    time.
+    """
+
     def test_per_walker_flows_through_resolve(self):
         d = _full_interval_dict(n_live=10)
         d["interval_units"] = "per_walker"
-        # The fixture's inter_re=pressure block is there to exercise the
-        # `_apply_interval_units` scaling of `inter_re.re_interval` (see
-        # tests above).  At resolve-time, however, inter_re=pressure
-        # demands a list-valued ensemble.pressure — drop the block here
-        # so the resolver takes the SingleRun path; the interval scaling
-        # we want to verify happens upstream of that branch.
         d.pop("inter_re", None)
         root = RootSpec.model_validate(d)
         resolved = resolve(root)
 
-        # Output dataclass receives absolute-iter ints.
         assert resolved.output.info_interval == 70
         assert resolved.output.snapshot_interval == 110
         assert resolved.output.checkpoint_interval == 130
 
-        # NSConfig.max_iterations scaled too.
         assert resolved.ns.max_iterations == 500
-
-        # The IterationTermination criterion appears in resolved.termination
-        # (it is appended to whatever the spec produced, plus any explicit
-        # iteration spec).  Confirm there is one whose limit matches the
-        # scaled value.
-        from jaxrens.sampling.termination import IterationTermination
 
         iter_terms = [
             t
             for t in resolved.termination
             if isinstance(t, IterationTermination)
         ]
-        assert iter_terms, "expected at least one IterationTermination"
-        # The explicit termination[0] from the fixture scales 4 → 40; the
-        # auto-appended IterationTermination from ns.max_iterations scales
-        # 50 → 500.  Both should be present.
+        # The explicit iteration criterion scales 4 -> 40; the one resolve
+        # appends for run.max_iterations scales 50 -> 500.
         max_iters = sorted(int(t.max_iterations) for t in iter_terms)
         assert max_iters == [40, 500]
 
-        # The full-auto adjust interval flows through ``adaptation_cfg``.
-        assert resolved.adaptation_cfg.adjust_interval == 20
-
-    def test_per_walker_n_cull_flows_through_resolve(self):
-        d = _full_interval_dict(n_live=100)
-        d["run"]["n_cull"] = 10
-        d["interval_units"] = "per_walker"
-        d.pop("inter_re", None)
-        resolved = resolve(RootSpec.model_validate(d))
-        assert resolved.output.info_interval == 70
-        assert resolved.ns.max_iterations == 500
         assert resolved.adaptation_cfg.adjust_interval == 20
 
     def test_absolute_default_unchanged(self):
