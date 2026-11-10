@@ -14,7 +14,7 @@ Usage::
         MoveKernel("galilean", galilean.build_kernel,
                    kernel_kwargs={"n_reflect": 5}, weight=1,
                    extra_state_fields={"direction": (jnp.ndarray,
-                       lambda pos, types: jnp.zeros_like(pos))}),
+                       lambda pos, types, cell: jnp.zeros_like(pos))}),
     ])
     state = init_fn(positions, types, energy, cell)
     state, info = step_fn(rng_key, state, likelihood_constraint, move_key)
@@ -216,9 +216,10 @@ def build_mwg(
             max_neighbors=int(max_neighbors),
         )
 
-        # Initialize move-specific fields
+        # Initialize move-specific fields.  Every initializer receives the
+        # cell; those that do not need it ignore it.
         for name, (_, initializer) in all_extra_fields.items():
-            kwargs[name] = initializer(positions, types)
+            kwargs[name] = initializer(positions, types, cell=kwargs["cell"])
 
         return MCStateClass(**kwargs)
 

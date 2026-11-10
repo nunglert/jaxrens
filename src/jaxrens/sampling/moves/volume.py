@@ -23,6 +23,7 @@ def build_kernel(
     min_vol_per_atom: float = 1.0,
     min_aspect: float = 0.5,
     flat_v_prior: bool = False,
+    restrict_c_in_plane: bool = False,
 ):
     """Build a volume move kernel.
 
@@ -33,6 +34,8 @@ def build_kernel(
         min_vol_per_atom: Lower bound on volume per atom.
         min_aspect: Minimum cell aspect ratio.
         flat_v_prior: If True, use flat volume prior (p_accept=1).
+        restrict_c_in_plane: Passed to the cell-geometry guard; see
+            :func:`jaxrens.utils.cell.check_cell_shape`.
 
     Returns:
         step function: (rng_key, state, Emax) -> (new_state, MoveInfo)
@@ -43,7 +46,11 @@ def build_kernel(
     # its result also gates the neighbor-bucket bookkeeping below and the
     # reject-reason ordering; see jaxrens.constraints.cell_geometry.
     cell_geometry = build_cell_geometry(
-        n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect
+        n_atoms,
+        max_vol_per_atom,
+        min_vol_per_atom,
+        min_aspect,
+        restrict_c_in_plane,
     )
 
     def step(rng_key, state, likelihood_constraint):

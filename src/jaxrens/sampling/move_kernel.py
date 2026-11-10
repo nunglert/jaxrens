@@ -29,11 +29,13 @@ class MoveKernel:
             before calling the move's step_fn.
         extra_state_fields: Move-specific fields to add to MCState.
             Keys are field names, values are (type, initializer_fn) tuples.
-            The initializer is called as initializer(positions, types) and
-            must return the initial value for that field.
+            The initializer is called as
+            ``initializer(positions, types, cell=cell)`` for each walker and
+            must return the initial value for that field; initializers that
+            do not need the cell simply ignore it.
             Example for Galilean::
 
-                {"direction": (jnp.ndarray, lambda pos, types: jnp.zeros_like(pos))}
+                {"direction": (jnp.ndarray, lambda pos, types, cell: jnp.zeros_like(pos))}
 
             The MWG factory unions extra_state_fields from all descriptors
             to build the MCState class dynamically.
