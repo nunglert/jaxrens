@@ -1,10 +1,9 @@
-"""Stored energies stay consistent with each run's ensemble after swaps.
+"""Tests that stored energies stay in each run's frame after swaps.
 
-After any number of swap cycles, every stored ``energy[r, k]`` must equal a
-fresh backend evaluation of that walker under run r's ensemble params.  This
-is the invariant the old semi-grand swap broke (energies written with
-the partner's μ while the run kept its own), checked here for every kernel
-against a real ``Hamiltonian(model, [EnsembleTerm()])``.
+After several swap cycles, every stored ``energy[r, k]`` must equal a fresh
+backend evaluation of that walker under run r's ensemble params. If it does
+not, the run's Emax contour is no longer well defined. The check uses a real
+``Hamiltonian(model, [EnsembleTerm()])`` and runs for every swap kernel.
 """
 
 from __future__ import annotations

@@ -1,9 +1,12 @@
-"""Test the replica-exchange driver and the EnsembleSwap kernel.
+"""Tests for the replica exchange driver and the EnsembleSwap kernel.
 
-Covers: get_swap_pairs, EnsembleSwap re-basing and acceptance (plain energy
-and pressure RE), replica_exchange_step, and JIT compatibility.  Semi-grand
-specifics live in test_semigrand.py, XRENS in test_xrens.py.
+The tests cover get_swap_pairs, the energy re-basing and acceptance of
+EnsembleSwap without ensemble params and with pressures, and
+replica_exchange_step, also under jit. Semi-grand RE is tested in
+test_semigrand.py and XRENS in test_xrens.py.
 """
+
+from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
@@ -14,15 +17,15 @@ from jaxrens.sampling.moves.replica_exchange import (
     SwapKernel,
     SwapWalker,
     get_swap_pairs,
+    make_swap_kernel,
     replica_exchange_step,
 )
-
-# ---------------------------------------------------------------------------
-# get_swap_pairs
-# ---------------------------------------------------------------------------
+from jaxrens.state.config import InterREConfig
 
 
 class TestGetSwapPairs:
+    """Check the even (0,1), (2,3), ... and odd (1,2), (3,4), ... pairs."""
+
     def test_even_phase_4_runs(self):
         pairs = get_swap_pairs(4, 0)
         expected = jnp.array([[0, 1], [2, 3]])
@@ -30,10 +33,7 @@ class TestGetSwapPairs:
 
     def test_odd_phase_4_runs(self):
         pairs = get_swap_pairs(4, 1)
-        expected = jnp.array([[1, 2], [3, 4]])
-        # With 4 runs, odd phase starts at 1 with step 2: indices 1, 3
-        # But run index 4 doesn't exist (n_runs=4 means indices 0..3)
-        # The function uses arange(phase, n_runs-1, 2) => arange(1, 3, 2) => [1]
+        # Runs are 0..3, so (3, 4) does not exist: arange(1, 3, 2) = [1].
         expected = jnp.array([[1, 2]])
         assert jnp.array_equal(pairs, expected)
 
@@ -54,7 +54,6 @@ class TestGetSwapPairs:
 
     def test_odd_phase_2_runs(self):
         pairs = get_swap_pairs(2, 1)
-        # arange(1, 1, 2) => empty
         assert pairs.shape[0] == 0
 
     def test_even_phase_3_runs(self):
@@ -76,11 +75,6 @@ class TestGetSwapPairs:
         assert pairs.shape == (3, 2)
         pairs = get_swap_pairs(6, 1)
         assert pairs.shape == (2, 2)
-
-
-# ---------------------------------------------------------------------------
-# EnsembleSwap.propose + the driver's acceptance rule, for one pair
-# ---------------------------------------------------------------------------
 
 
 def _walker(energy, volume=None, n_atoms=2):
@@ -112,7 +106,11 @@ def _accepts(stored, emax, volumes=None, pressures=None):
 
 
 class TestEnsembleSwapPlainEnergy:
-    """Without pressures or μ the energies move unchanged."""
+    """Check EnsembleSwap without ensemble params.
+
+    The energies move unchanged, and a swap is accepted only when each
+    incoming walker is strictly below the receiving run's Emax.
+    """
 
     def test_accept_when_energies_within_bounds(self):
         assert _accepts((1.0, 2.0), (3.0, 3.0))
@@ -147,8 +145,11 @@ class TestEnsembleSwapPlainEnergy:
 
 
 class TestEnsembleSwapPressure:
-    """Stored energies are enthalpies ``U + P_self·V``; the walker entering
-    run r carries ``U + P_r·V``."""
+    """Check the pressure re-basing of EnsembleSwap.
+
+    Stored energies are enthalpies ``U + P_self·V``; the walker entering
+    run r carries ``U + P_r·V``.
+    """
 
     @staticmethod
     def _stored(u, p, v):
@@ -187,9 +188,9 @@ class TestEnsembleSwapPressure:
         )
 
     def test_equal_pressures_si16_magnitudes_accept(self):
-        """Regression for the PV double-count seen at iter ~24 of
-        neuralil_si16_k125_autotune0_v3: equal U, V and P on both sides is a
-        physical no-op, so a loose Emax must accept."""
+        """Equal U, V and P on both sides, at Si16 magnitudes, is a physical
+        no-op, so a loose Emax accepts. A P·V term counted twice rejects it.
+        """
         p, v, u = 0.006242, 320.0, -83.0
         s = self._stored(u, p, v)
         assert _accepts((s, s), (u + 5.0, u + 5.0), (v, v), (p, p))
@@ -221,12 +222,11 @@ class TestEnsembleSwapPressure:
 
 
 class TestSwapKernelABC:
+    """Check the SwapKernel base class and the param keys of EnsembleSwap."""
+
     def test_cannot_instantiate_abc(self):
         with pytest.raises(TypeError):
             SwapKernel()
-
-    def test_ensemble_swap_is_subclass(self):
-        assert isinstance(EnsembleSwap(), SwapKernel)
 
     def test_param_keys(self):
         assert EnsembleSwap().param_keys == ("pressure", "chemical_potentials")
@@ -235,9 +235,20 @@ class TestSwapKernelABC:
         assert sg.optional_params == ("pressure",)
 
 
-# ---------------------------------------------------------------------------
-# replica_exchange_step
-# ---------------------------------------------------------------------------
+class TestMakeSwapKernel:
+    """Check the kernel make_swap_kernel builds for the pressure flavor and
+    the error for an unknown flavor. Semi-grand is in test_semigrand.py,
+    XRENS in test_xrens.py.
+    """
+
+    def test_pressure_builds_ensemble_swap_without_required_params(self):
+        kernel = make_swap_kernel(InterREConfig(flavor="pressure"))
+        assert isinstance(kernel, EnsembleSwap)
+        assert kernel.required_params == ()
+
+    def test_unknown_flavor_raises(self):
+        with pytest.raises(NotImplementedError, match="not yet implemented"):
+            make_swap_kernel(InterREConfig(flavor="foo"))
 
 
 def _make_re_data(n_runs, n_walkers, n_atoms=2, with_cells=True):
@@ -269,6 +280,10 @@ def _step(walkers, emax, run_params=None, n_swap_cycles=1, seed=0):
 
 
 class TestReplicaExchangeStep:
+    """Check the swap schedule, the counters and the write-back of
+    replica_exchange_step.
+    """
+
     def test_single_run_no_swap(self):
         walkers = _make_re_data(1, 4)
         new, info = _step(walkers, [0.0])
@@ -325,14 +340,6 @@ class TestReplicaExchangeStep:
             jnp.sort(walkers.energy.ravel()), jnp.sort(new.energy.ravel())
         )
 
-    def test_pressure_re_runs(self):
-        walkers = _make_re_data(3, 2)
-        new, info = _step(
-            walkers, [100.0] * 3, {"pressure": jnp.array([0.0, 1.0, 2.0])}
-        )
-        assert new.positions.shape == walkers.positions.shape
-        assert int(info["n_attempted"]) > 0
-
     def test_high_pressure_rejects_swaps(self):
         walkers = _make_re_data(2, 1)
         # Stored at P = 0, the receiving runs have P = 1e6: PV >> Emax.
@@ -354,12 +361,9 @@ class TestReplicaExchangeStep:
         assert jnp.allclose(new.energy, expected, atol=1e-5)
 
 
-# ---------------------------------------------------------------------------
-# JIT compatibility
-# ---------------------------------------------------------------------------
-
-
 class TestJITCompatibility:
+    """Check that get_swap_pairs and replica_exchange_step run under jit."""
+
     def test_get_swap_pairs_jit(self):
         pairs = jax.jit(get_swap_pairs, static_argnums=(0, 1))(4, 0)
         assert jnp.array_equal(pairs, jnp.array([[0, 1], [2, 3]]))

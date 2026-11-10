@@ -1,20 +1,11 @@
 """Tests for semi-grand (chemical-potential) replica exchange.
 
-Semi-grand RE is ``EnsembleSwap`` with required ``chemical_potentials``
-(see ``make_swap_kernel``).
-
-Coverage:
-- propose: hand-calculated grand-canonical energies match.
-- EnsembleSwap makes zero backend calls.
-- replica_exchange_step: JIT-compatible, n_energy_evals == 0, single run.
-- End-to-end: two-run NS with flavor='semi_grand', no errors, n_energy_evals==0.
-- make_swap_kernel: semi_grand without chemical_potentials raises.
-- Energy convention: a walker arriving in run R carries U + P_R·V - μ_R·N.
-- Accepted swaps move walkers between runs; each run keeps its μ.
-- CLI schema: semi_grand flavor validates chemical_potentials.
-- CLI schema: missing chemical_potentials raises.
-- CLI schema: row-length mismatch raises.
-- SingleRun: run_ns with semi_grand inter_re_config silently passes (manager no-op).
+Semi-grand RE is ``EnsembleSwap`` with ``chemical_potentials`` required
+(see ``make_swap_kernel``). Accepted swaps move walkers between runs, and
+each run keeps its own μ: a walker arriving in run r carries
+``U + P_r·V − μ_r·N``. The tests cover propose(), make_swap_kernel,
+replica_exchange_step with the semi-grand kernel, short NS runs on VmapRuns
+and PmapVmapRuns, and the semi_grand checks of InterRESpec.
 """
 
 from __future__ import annotations
@@ -22,21 +13,26 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import pytest
+from pydantic import ValidationError
 
+from jaxrens.backends.toy import create_harmonic
+from jaxrens.cli.schema.inter_re import InterRESpec
+from jaxrens.sampling.move_kernel import MoveKernel
+from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.moves.replica_exchange import (
     EnsembleSwap,
     SwapWalker,
     make_swap_kernel,
     replica_exchange_step,
 )
+from jaxrens.sampling.mwg import build_mwg
+from jaxrens.sampling.nested_sampling import run_ns_multi_gpu, run_ns_parallel
+from jaxrens.sampling.termination import IterationTermination
 from jaxrens.state.config import InterREConfig
-
-# ---------------------------------------------------------------------------
-# Helper: build minimal state dict
-# ---------------------------------------------------------------------------
 
 
 def _state(positions, types, energy, cell=None):
+    """One walker as passed to propose()."""
     return SwapWalker(positions, types, jnp.asarray(energy), cell)
 
 
@@ -46,8 +42,11 @@ def _semi_grand_kernel():
 
 
 def _propose(kernel, walker_a, walker_b, ens_a, ens_b, key, backend):
-    """``kernel.propose`` repackaged as ``*_a`` / ``*_b`` keys: ``*_a`` is the
-    walker entering run A (built from walker B), ``*_b`` the one entering B."""
+    """Return ``kernel.propose`` as a dict with ``*_a`` / ``*_b`` keys.
+
+    ``*_a`` is the walker entering run A (built from walker B), ``*_b`` the
+    one entering run B.
+    """
     into_a, into_b = kernel.propose(
         walker_a, walker_b, ens_a, ens_b, key, backend
     )
@@ -57,7 +56,7 @@ def _propose(kernel, walker_a, walker_b, ens_a, ens_b, key, backend):
         proposed[f"types_{suffix}"] = w.types
         proposed[f"energy_{suffix}"] = w.energy
         proposed[f"cell_{suffix}"] = w.cell
-    return proposed, kernel.n_energy_evals, 0
+    return proposed
 
 
 def _sg_step(
@@ -72,7 +71,7 @@ def _sg_step(
     pressures=None,
     n_swap_cycles=1,
 ):
-    """Old positional-array calling convention on top of the generic driver."""
+    """Run replica_exchange_step with semi-grand per-run params."""
     run_params = {"chemical_potentials": chemical_potentials}
     if pressures is not None:
         run_params["pressure"] = pressures
@@ -88,25 +87,21 @@ def _sg_step(
 
 
 def _ens(mu):
+    """Ensemble params with the chemical potentials of one run."""
     return {"chemical_potentials": jnp.array(mu, dtype=jnp.float32)}
-
-
-# ---------------------------------------------------------------------------
-# Sign convention and propose correctness
-# ---------------------------------------------------------------------------
 
 
 class TestSemiGrandProposeConvention:
     """Check that propose() exchanges the walkers and re-bases each energy
-    to the receiving run's μ: energy_a = U_B - μ_A · N_B (walker B in run A),
-    energy_b = U_A - μ_B · N_A (walker A in run B)."""
+    to the receiving run's μ.
+
+    energy_a = U_B − μ_A·N_B (walker B in run A) and
+    energy_b = U_A − μ_B·N_A (walker A in run B).
+    """
 
     def test_hand_calculated_energies_match(self):
-        """propose() must return energies matching the hand-derived formula.
-
-        Stored ``state.energy`` is ``Ω_self = U - μ_self · N`` (EnsembleBackend
-        convention).  The kernel must add ``μ_self · N`` back to recover U
-        before subtracting ``μ_partner · N``.
+        """The stored energy is ``U − μ_self·N``; propose() recovers U and
+        subtracts the receiving run's ``μ·N``.
 
         Setup:
           run A: μ_A = [0.0, 0.0], walker has types=[0, 0, 1], U_A = 3.0
@@ -137,26 +132,34 @@ class TestSemiGrandProposeConvention:
         ea = _ens(mu_a)
         eb = _ens(mu_b)
 
-        proposed, n_e, n_g = _propose(kernel, sa, sb, ea, eb, key, None)
+        proposed = _propose(kernel, sa, sb, ea, eb, key, None)
 
-        assert abs(float(proposed["energy_a"]) - 5.0) < 1e-5
-        assert abs(float(proposed["energy_b"]) - 1.0) < 1e-5
+        assert float(proposed["energy_a"]) == pytest.approx(5.0, abs=1e-5)
+        assert float(proposed["energy_b"]) == pytest.approx(1.0, abs=1e-5)
 
     def test_no_backend_calls(self):
-        """propose() must return (proposed, 0, 0) — zero energy/grad evals."""
-        kernel = _semi_grand_kernel()
-        key = jax.random.key(1)
+        """propose() never calls the backend, and the kernel reports zero
+        energy evaluations per swap."""
 
+        def _backend(*args, **kwargs):
+            raise AssertionError("semi-grand propose() called the backend")
+
+        kernel = _semi_grand_kernel()
         types_a = jnp.zeros(4, dtype=jnp.int32)
         types_b = jnp.ones(4, dtype=jnp.int32)
         sa = _state(jnp.zeros((4, 3)), types_a, jnp.array(1.0))
         sb = _state(jnp.zeros((4, 3)), types_b, jnp.array(2.0))
 
-        _, n_e, n_g = _propose(
-            kernel, sa, sb, _ens([0.0, 0.0]), _ens([1.0, 2.0]), key, None
+        _propose(
+            kernel,
+            sa,
+            sb,
+            _ens([0.0, 0.0]),
+            _ens([1.0, 2.0]),
+            jax.random.key(1),
+            _backend,
         )
-        assert n_e == 0, f"Expected 0 energy evals, got {n_e}"
-        assert n_g == 0, f"Expected 0 grad evals, got {n_g}"
+        assert kernel.n_energy_evals == 0
 
     def test_positions_and_types_swapped(self):
         """Side A receives walker B's configuration and side B walker A's."""
@@ -172,7 +175,7 @@ class TestSemiGrandProposeConvention:
         sa = _state(pos_a, types_a, jnp.array(1.0), cell_a)
         sb = _state(pos_b, types_b, jnp.array(2.0), cell_b)
 
-        proposed, _, _ = _propose(
+        proposed = _propose(
             kernel, sa, sb, _ens([0.0, 0.0]), _ens([0.5, 1.0]), key, None
         )
 
@@ -184,11 +187,7 @@ class TestSemiGrandProposeConvention:
         assert jnp.allclose(proposed["cell_b"], cell_a)
 
     def test_hand_calculated_energies_both_mu_nonzero(self):
-        """Self-subtract: μ_A ≠ 0 AND μ_B ≠ 0.
-
-        Production has ``state.energy = Ω_self = U - μ_self · N`` (EnsembleBackend
-        convention), so the kernel must add ``μ_self · N`` back to recover U
-        before subtracting ``μ_partner · N``.  This test pins both terms.
+        """μ_A ≠ 0, so recovering U from the stored energy matters.
 
         Setup:
           μ_A = [1.0, 2.0], μ_B = [0.0, 0.0]
@@ -215,12 +214,10 @@ class TestSemiGrandProposeConvention:
 
         sa = _state(jnp.zeros((3, 3)), types_a, jnp.array(stored_a))
         sb = _state(jnp.zeros((3, 3)), types_b, jnp.array(stored_b))
-        proposed, _, _ = _propose(
-            kernel, sa, sb, _ens(mu_a), _ens(mu_b), key, None
-        )
+        proposed = _propose(kernel, sa, sb, _ens(mu_a), _ens(mu_b), key, None)
 
-        assert abs(float(proposed["energy_a"]) - 0.0) < 1e-5
-        assert abs(float(proposed["energy_b"]) - 3.0) < 1e-5
+        assert float(proposed["energy_a"]) == pytest.approx(0.0, abs=1e-5)
+        assert float(proposed["energy_b"]) == pytest.approx(3.0, abs=1e-5)
 
     def test_symmetric_zero_mu(self):
         """With μ_A = μ_B = 0, each walker keeps Ω = U in the other run."""
@@ -234,12 +231,12 @@ class TestSemiGrandProposeConvention:
         sa = _state(jnp.zeros((3, 3)), types_a, u_a)
         sb = _state(jnp.zeros((3, 3)), types_b, u_b)
 
-        proposed, _, _ = _propose(
+        proposed = _propose(
             kernel, sa, sb, _ens([0.0, 0.0]), _ens([0.0, 0.0]), key, None
         )
 
-        assert abs(float(proposed["energy_a"]) - float(u_b)) < 1e-5
-        assert abs(float(proposed["energy_b"]) - float(u_a)) < 1e-5
+        assert float(proposed["energy_a"]) == pytest.approx(float(u_b))
+        assert float(proposed["energy_b"]) == pytest.approx(float(u_a))
 
     def test_pressure_rebased_with_cells(self):
         """μPT: the P·V term is also re-based to the receiving run.
@@ -259,7 +256,7 @@ class TestSemiGrandProposeConvention:
         ens_a = dict(_ens([0.0, 0.0]), pressure=jnp.array(1.0))
         ens_b = dict(_ens([0.0, 0.0]), pressure=jnp.array(3.0))
 
-        proposed, _, _ = _propose(
+        proposed = _propose(
             kernel, sa, sb, ens_a, ens_b, jax.random.key(0), None
         )
 
@@ -267,12 +264,9 @@ class TestSemiGrandProposeConvention:
         assert jnp.allclose(proposed["energy_b"], 5.0)
 
 
-# ---------------------------------------------------------------------------
-# make_swap_kernel guard
-# ---------------------------------------------------------------------------
-
-
 class TestMakeSwapKernelSemiGrand:
+    """Check the semi-grand kernel that make_swap_kernel builds."""
+
     def test_requires_chemical_potentials(self):
         cfg = InterREConfig(flavor="semi_grand", chemical_potentials=None)
         with pytest.raises(ValueError, match="chemical_potentials"):
@@ -287,13 +281,8 @@ class TestMakeSwapKernelSemiGrand:
         assert kernel.required_params == ("chemical_potentials",)
 
 
-# ---------------------------------------------------------------------------
-# _sg_step: JIT, n_energy_evals=0, single-run
-# ---------------------------------------------------------------------------
-
-
 class TestSemiGrandStepFunction:
-    """Tests for the full _sg_step function."""
+    """Check replica_exchange_step with the semi-grand kernel."""
 
     @staticmethod
     def _make_inputs(n_runs=2, n_walkers=5, n_atoms=4, n_species=2, seed=0):
@@ -303,14 +292,14 @@ class TestSemiGrandStepFunction:
             jax.random.normal(k1, (n_runs, n_walkers, n_atoms, 3)) * 0.1
         )
         types = jnp.zeros((n_runs, n_walkers, n_atoms), dtype=jnp.int32)
-        types = types.at[1, :, n_atoms // 2 :].set(1)  # run 1: half species 1
+        # Run 1 has half of its atoms in species 1.
+        types = types.at[1, :, n_atoms // 2 :].set(1)
         energies = jax.random.normal(k2, (n_runs, n_walkers)) * 2.0
         emax = jnp.max(energies, axis=1)  # (n_runs,)
         chem_pots = jnp.array([[0.0, 0.0], [0.5, 1.0]], dtype=jnp.float32)
         return positions, types, energies, emax, chem_pots
 
     def test_n_energy_evals_zero(self):
-        """n_energy_evals must always be 0 for semi-grand (no backend calls)."""
         positions, types, energies, emax, chem_pots = self._make_inputs()
         kernel = _semi_grand_kernel()
         key = jax.random.key(7)
@@ -326,12 +315,9 @@ class TestSemiGrandStepFunction:
             semi_grand_kernel=kernel,
             n_swap_cycles=1,
         )
-        assert (
-            int(swap_info["n_energy_evals"]) == 0
-        ), f"Expected 0 energy evals, got {swap_info['n_energy_evals']}"
+        assert int(swap_info["n_energy_evals"]) == 0
 
     def test_jit_compatible(self):
-        """_sg_step must run under jax.jit."""
         positions, types, energies, emax, chem_pots = self._make_inputs()
         kernel = _semi_grand_kernel()
 
@@ -360,8 +346,8 @@ class TestSemiGrandStepFunction:
         assert "n_energy_evals" in swap_info
 
     def test_single_run_no_swaps(self):
-        """n_runs=1 means no swap pairs possible → state unchanged."""
-        n_runs, n_walkers, n_atoms, n_species = 1, 5, 4, 2
+        """With one run there are no pairs, so nothing changes."""
+        n_runs, n_walkers, n_atoms = 1, 5, 4
         key = jax.random.key(0)
         positions = (
             jax.random.normal(key, (n_runs, n_walkers, n_atoms, 3)) * 0.1
@@ -398,7 +384,8 @@ class TestSemiGrandStepFunction:
         assert int(swap_info["n_energy_evals"]) == 0
 
     def test_attempted_swaps_positive(self):
-        """With 2 runs, at least 1 swap must be attempted per cycle."""
+        """With 2 runs each cycle attempts the one even pair, so 2 cycles
+        give 2 attempts."""
         positions, types, energies, emax, chem_pots = self._make_inputs(
             n_runs=2
         )
@@ -416,9 +403,7 @@ class TestSemiGrandStepFunction:
             semi_grand_kernel=kernel,
             n_swap_cycles=2,
         )
-        assert (
-            int(swap_info["n_attempted"]) > 0
-        ), f"Expected >0 attempted swaps, got {swap_info['n_attempted']}"
+        assert int(swap_info["n_attempted"]) == 2
 
     @staticmethod
     def _two_walkers(u_a, u_b, emax, cells=None, pressures=None):
@@ -519,13 +504,13 @@ class TestSemiGrandStepFunction:
         assert jnp.allclose(new_ene[:, 0], jnp.array([8.0, 2.0]))
 
     def test_identical_mu_zero_grand_potential_accepts(self):
-        """With μ_A = μ_B = 0, Ω = U, so swap accepts iff U < Emax."""
+        """With μ = 0 the stored energy is U, so U = 0.5 < Emax = 10 always
+        accepts."""
         n_runs, n_walkers, n_atoms = 2, 4, 3
         key = jax.random.key(11)
         positions = jnp.zeros((n_runs, n_walkers, n_atoms, 3))
         types = jnp.zeros((n_runs, n_walkers, n_atoms), dtype=jnp.int32)
 
-        # All energies safely below emax
         energies = jnp.ones((n_runs, n_walkers)) * 0.5
         emax = jnp.ones(n_runs) * 10.0
         chem_pots = jnp.zeros((n_runs, 2), dtype=jnp.float32)
@@ -542,215 +527,135 @@ class TestSemiGrandStepFunction:
             semi_grand_kernel=kernel,
             n_swap_cycles=1,
         )
-        # With μ=0 and U=0.5 < emax=10.0, all swaps must be accepted.
-        assert (
-            int(swap_info["n_accepted"]) > 0
-            or int(swap_info["n_attempted"]) == 0
-        ), "With μ=0 and energies << emax, swaps should be accepted"
+        assert int(swap_info["n_attempted"]) == 1
+        assert int(swap_info["n_accepted"]) == 1
 
 
-# ---------------------------------------------------------------------------
-# End-to-end: two-run NS with flavor='semi_grand'
-# ---------------------------------------------------------------------------
-
-
-class TestSemiGrandEndToEnd:
-    """Short NS run with two different μ vectors, assert semi-grand path works."""
-
-    @classmethod
-    def _run(cls, n_atoms=4, n_walkers=12, n_iters=10, seed=42):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.move_kernel import MoveKernel
-        from jaxrens.sampling.moves import random_walk
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import run_ns_parallel
-        from jaxrens.sampling.termination import IterationTermination
-
-        backend = create_harmonic(k=1.0)
-        descriptors = [
-            MoveKernel(
-                "rw",
-                random_walk.build_kernel,
-                step_size=0.3,
-                step_size_max=2.0,
-            )
-        ]
-        init_fn, step_fn, _ = build_mwg(backend, descriptors)
-
-        n_runs = 2
-        key = jax.random.key(seed)
-        keys = jax.random.split(key, n_runs + 1)
-        rng_keys = keys[:n_runs]
-        pos_key = keys[-1]
-
-        positions = jax.random.uniform(
-            pos_key, (n_runs, n_walkers, n_atoms, 3), minval=-1.0, maxval=1.0
+def _run_vmap_semi_grand(n_atoms=4, n_walkers=12, n_iters=10, seed=42):
+    """Run a two-run NS with flavor="semi_grand" and two μ vectors."""
+    backend = create_harmonic(k=1.0)
+    descriptors = [
+        MoveKernel(
+            "rw",
+            random_walk.build_kernel,
+            step_size=0.3,
+            step_size_max=2.0,
         )
-        types = jnp.zeros((n_atoms,), dtype=jnp.int32)
-        energies = jax.vmap(
-            lambda pos_run: jax.vmap(
-                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
-            )(pos_run)
-        )(positions)
+    ]
+    init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
-        # Two runs with different μ vectors (2 species, single-species system → μ[1] unused).
-        inter_re_cfg = InterREConfig(
-            flavor="semi_grand",
-            re_interval=1,
-            n_swap_cycles=1,
-            chemical_potentials=((0.0, 0.0), (0.5, 0.5)),
+    n_runs = 2
+    key = jax.random.key(seed)
+    keys = jax.random.split(key, n_runs + 1)
+    rng_keys = keys[:n_runs]
+    pos_key = keys[-1]
+
+    positions = jax.random.uniform(
+        pos_key, (n_runs, n_walkers, n_atoms, 3), minval=-1.0, maxval=1.0
+    )
+    types = jnp.zeros((n_atoms,), dtype=jnp.int32)
+    energies = jax.vmap(
+        lambda pos_run: jax.vmap(
+            lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+        )(pos_run)
+    )(positions)
+
+    # Only species 0 is present, so μ[1] has no effect.
+    inter_re_cfg = InterREConfig(
+        flavor="semi_grand",
+        re_interval=1,
+        n_swap_cycles=1,
+        chemical_potentials=((0.0, 0.0), (0.5, 0.5)),
+    )
+
+    return run_ns_parallel(
+        positions=positions,
+        types=types,
+        energies=energies,
+        cells=None,
+        init_fn=init_fn,
+        step_fn=step_fn,
+        rng_keys=rng_keys,
+        n_walkers=n_walkers,
+        max_iterations=n_iters,
+        n_mcmc_steps=3,
+        termination_criteria=[IterationTermination(n_iters)],
+        inter_re_config=inter_re_cfg,
+        backend=backend,
+    )
+
+
+def test_vmap_semi_grand_run():
+    result = _run_vmap_semi_grand()
+    assert result["log_evidence"].shape == (2,)
+    assert result["n_dead"].shape == (2,)
+    assert jnp.all(jnp.isfinite(result["log_evidence"]))
+
+
+def test_pmap_vmap_semi_grand_run():
+    """run_ns_multi_gpu with flavor="semi_grand" on n_gpu=1."""
+    n_gpu, n_per_gpu, n_walkers, n_atoms = 1, 2, 8, 4
+    n_total = n_gpu * n_per_gpu
+
+    backend = create_harmonic(k=1.0)
+    descriptors = [
+        MoveKernel(
+            "rw",
+            random_walk.build_kernel,
+            step_size=0.3,
+            step_size_max=2.0,
         )
+    ]
+    init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
-        re_stats_log = []
+    key = jax.random.key(99)
+    keys = jax.random.split(key, n_total + 1)
+    rng_keys = keys[:n_total]
+    pos_key = keys[-1]
 
-        class _StatCb:
-            def on_iteration(self, iteration, ns_state, info):
-                s = info.get("inter_re_stats")
-                if s is not None:
-                    re_stats_log.append(dict(s))
+    positions = jax.random.uniform(
+        pos_key, (n_total, n_walkers, n_atoms, 3), minval=-1.0, maxval=1.0
+    )
+    types = jnp.zeros((n_atoms,), dtype=jnp.int32)
+    energies = jax.vmap(
+        lambda pos_run: jax.vmap(
+            lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+        )(pos_run)
+    )(positions)
 
-        result = run_ns_parallel(
-            positions=positions,
-            types=types,
-            energies=energies,
-            cells=None,
-            init_fn=init_fn,
-            step_fn=step_fn,
-            rng_keys=rng_keys,
-            n_walkers=n_walkers,
-            max_iterations=n_iters,
-            n_mcmc_steps=3,
-            termination_criteria=[IterationTermination(n_iters)],
-            inter_re_config=inter_re_cfg,
-            backend=backend,
-            callbacks=[_StatCb()],
-        )
-        return result, re_stats_log
+    inter_re_cfg = InterREConfig(
+        flavor="semi_grand",
+        re_interval=1,
+        n_swap_cycles=1,
+        chemical_potentials=((0.0, 0.0), (0.5, 0.5)),
+    )
 
-    def test_no_errors_during_run(self):
-        """Semi-grand NS run must complete without exception."""
-        result, _ = self._run()
-        assert result is not None
+    result = run_ns_multi_gpu(
+        positions=positions,
+        types=types,
+        energies=energies,
+        cells=None,
+        init_fn=init_fn,
+        step_fn=step_fn,
+        rng_keys=rng_keys,
+        n_gpu=n_gpu,
+        n_per_gpu=n_per_gpu,
+        n_walkers=n_walkers,
+        max_iterations=8,
+        n_mcmc_steps=3,
+        termination_criteria=[IterationTermination(8)],
+        inter_re_config=inter_re_cfg,
+        backend=backend,
+    )
 
-    def test_result_shapes(self):
-        """Result arrays must have (n_runs, ...) shape."""
-        result, _ = self._run()
-        assert result["log_evidence"].shape == (2,)
-        assert result["n_dead"].shape == (2,)
-        assert jnp.all(jnp.isfinite(result["log_evidence"]))
-
-    def test_n_energy_evals_zero_end_to_end(self):
-        """The full step function must report n_energy_evals=0 (no backend calls)."""
-        n_runs, n_walkers, n_atoms, n_species = 2, 5, 4, 2
-        positions = jnp.zeros((n_runs, n_walkers, n_atoms, 3))
-        types = jnp.zeros((n_runs, n_walkers, n_atoms), dtype=jnp.int32)
-        energies = jnp.ones((n_runs, n_walkers)) * 0.5
-        emax = jnp.ones(n_runs) * 10.0
-        chem_pots = jnp.array([[0.0, 0.0], [1.0, 2.0]], dtype=jnp.float32)
-
-        kernel = _semi_grand_kernel()
-        _, _, _, _, swap_info = _sg_step(
-            rng_key=jax.random.key(0),
-            all_positions=positions,
-            all_types=types,
-            all_energies=energies,
-            all_cells=None,
-            all_emax=emax,
-            chemical_potentials=chem_pots,
-            semi_grand_kernel=kernel,
-            n_swap_cycles=1,
-        )
-        assert (
-            int(swap_info["n_energy_evals"]) == 0
-        ), f"Expected n_energy_evals=0, got {swap_info['n_energy_evals']}"
-
-
-# ---------------------------------------------------------------------------
-# PmapVmapRuns smoke test: n_gpu=1
-# ---------------------------------------------------------------------------
-
-
-class TestSemiGrandPmapVmapSmoke:
-    """Smoke test: run_ns_multi_gpu with flavor='semi_grand' and n_gpu=1."""
-
-    def test_pmap_vmap_runs_no_error(self):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.sampling.move_kernel import MoveKernel
-        from jaxrens.sampling.moves import random_walk
-        from jaxrens.sampling.mwg import build_mwg
-        from jaxrens.sampling.nested_sampling import run_ns_multi_gpu
-        from jaxrens.sampling.termination import IterationTermination
-
-        n_gpu, n_per_gpu, n_walkers, n_atoms = 1, 2, 8, 4
-        n_total = n_gpu * n_per_gpu
-
-        backend = create_harmonic(k=1.0)
-        descriptors = [
-            MoveKernel(
-                "rw",
-                random_walk.build_kernel,
-                step_size=0.3,
-                step_size_max=2.0,
-            )
-        ]
-        init_fn, step_fn, _ = build_mwg(backend, descriptors)
-
-        key = jax.random.key(99)
-        keys = jax.random.split(key, n_total + 1)
-        rng_keys = keys[:n_total]
-        pos_key = keys[-1]
-
-        positions = jax.random.uniform(
-            pos_key, (n_total, n_walkers, n_atoms, 3), minval=-1.0, maxval=1.0
-        )
-        types = jnp.zeros((n_atoms,), dtype=jnp.int32)
-        energies = jax.vmap(
-            lambda pos_run: jax.vmap(
-                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
-            )(pos_run)
-        )(positions)
-
-        inter_re_cfg = InterREConfig(
-            flavor="semi_grand",
-            re_interval=1,
-            n_swap_cycles=1,
-            chemical_potentials=((0.0, 0.0), (0.5, 0.5)),
-        )
-
-        result = run_ns_multi_gpu(
-            positions=positions,
-            types=types,
-            energies=energies,
-            cells=None,
-            init_fn=init_fn,
-            step_fn=step_fn,
-            rng_keys=rng_keys,
-            n_gpu=n_gpu,
-            n_per_gpu=n_per_gpu,
-            n_walkers=n_walkers,
-            max_iterations=8,
-            n_mcmc_steps=3,
-            termination_criteria=[IterationTermination(8)],
-            inter_re_config=inter_re_cfg,
-            backend=backend,
-        )
-
-        assert result is not None
-        assert result["log_evidence"].shape == (n_gpu, n_per_gpu)
-        assert jnp.all(jnp.isfinite(result["log_evidence"]))
-
-
-# ---------------------------------------------------------------------------
-# CLI schema validation
-# ---------------------------------------------------------------------------
+    assert result["log_evidence"].shape == (n_gpu, n_per_gpu)
+    assert jnp.all(jnp.isfinite(result["log_evidence"]))
 
 
 class TestInterRESpecSemiGrand:
-    """CLI schema validation for semi_grand flavor."""
+    """Check the semi_grand checks of the InterRESpec schema."""
 
     def test_semi_grand_valid_spec(self):
-        from jaxrens.cli.schema.inter_re import InterRESpec
-
         spec = InterRESpec(
             flavor="semi_grand",
             re_interval=1,
@@ -762,44 +667,25 @@ class TestInterRESpecSemiGrand:
         assert cfg.chemical_potentials == ((0.0, 0.0), (0.5, 1.0))
 
     def test_semi_grand_missing_chemical_potentials_raises(self):
-        from jaxrens.cli.schema.inter_re import InterRESpec
-
-        with pytest.raises((ValueError, Exception)):
+        with pytest.raises(
+            ValidationError, match="requires 'chemical_potentials'"
+        ):
             InterRESpec(flavor="semi_grand")
 
     def test_semi_grand_inconsistent_row_lengths_raises(self):
-        from jaxrens.cli.schema.inter_re import InterRESpec
-
-        with pytest.raises((ValueError, Exception)):
+        with pytest.raises(ValidationError, match="same length"):
             InterRESpec(
                 flavor="semi_grand",
-                chemical_potentials=[
-                    [0.0, 0.0],
-                    [0.5, 1.0, 2.0],
-                ],  # different lengths
+                chemical_potentials=[[0.0, 0.0], [0.5, 1.0, 2.0]],
             )
 
-    def test_semi_grand_flavor_valid(self):
-        """A semi_grand inter-RE spec is valid and constructs successfully."""
-        from jaxrens.cli.schema.inter_re import InterRESpec
-
-        spec = InterRESpec(
-            flavor="semi_grand",
-            chemical_potentials=[[0.0, 0.0], [1.0, 1.0]],
-        )
-        assert spec.flavor == "semi_grand"
-
-    def test_pressure_flavor_still_valid(self):
-        from jaxrens.cli.schema.inter_re import InterRESpec
-
+    def test_pressure_flavor_has_no_chemical_potentials(self):
         spec = InterRESpec(flavor="pressure", re_interval=2, n_swap_cycles=1)
         cfg = spec.to_inter_re_config()
         assert cfg.flavor == "pressure"
         assert cfg.chemical_potentials is None
 
     def test_to_inter_re_config_roundtrip(self):
-        from jaxrens.cli.schema.inter_re import InterRESpec
-
         spec = InterRESpec(
             flavor="semi_grand",
             re_interval=3,
