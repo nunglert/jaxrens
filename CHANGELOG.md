@@ -9,6 +9,67 @@ The version is derived from git tags by `setuptools-scm` (tag `v0.1.0` →
 version `0.1.0`). To cut a release: add a dated section below, merge to `main`,
 then `git tag -a vX.Y.Z`.
 
+## [0.8.0] — 2026-11-09
+
+### Fixed
+- **Semi-grand replica exchange stored energies with the wrong μ.** Affects
+  runs with `inter_re: {flavor: semi_grand}` and two or more replicas;
+  pressure RE is unchanged. An accepted swap kept both walkers in their
+  runs but overwrote their stored energies with `U − μ_partner · N`, while
+  each run went on using its own μ. A swapped walker then carried an energy
+  that did not match its run's contour, so later culls could remove the
+  wrong walker and the Emax sequence, and with it the evidence and every
+  thermodynamic quantity, was biased. Acceptance also compared each walker
+  with its own run's Emax instead of the Emax of the run it would enter.
+  The swap now works like pressure RE: the two walkers trade runs
+  (positions, types and cell), each energy is re-based to the receiving
+  run's μ (and, for μPT, its pressure), and each walker must fit below the
+  receiving run's Emax. Semi-grand RE results from earlier versions should
+  be rerun, and seeded runs are not reproducible against them.
+- **Replica-exchange docs.** In `user/concepts/replicas.md` the semi-grand
+  section describes the new exchange and why a single walker cannot take
+  another run's μ. The Pressure-RENS section no longer says that replicas
+  keep their configurations: the walkers move, as the code has always done.
+
+### Changed
+- **Replica-exchange code rewritten around one driver and one kernel
+  contract.** No config changes. Pressure RE makes the same swap decisions
+  as 0.7.0 for the same seed, and semi-grand RE the same as right after the
+  fix above (checked once against outputs recorded from the old
+  drivers). Breaking for Python-API users of
+  `jaxrens.sampling.moves.replica_exchange`:
+  - `PressureRENSSwap` and `SemiGrandSwap` are replaced by `EnsembleSwap`
+    (pressure RE is the case without μ); build kernels from an
+    `InterREConfig` with `make_swap_kernel`.
+  - `xrens_replica_exchange_step`, `semi_grand_replica_exchange_step` and
+    `perform_swap` are removed; `replica_exchange_step` now takes a
+    `SwapWalker` population, the per-run `run_params` dict and the kernel,
+    and returns `(walkers, swap_info)`.
+  - `SwapKernel.accept` is removed. `propose` returns the walkers that
+    would enter each run, with energies already in that run's frame, and
+    the driver accepts iff each is below the receiving run's Emax.
+- **Ensemble correction defined once.** `backends.ensemble.ensemble_energy`
+  (`P·V − μ·N`) is used by both `EnsembleTerm` and the swap re-basing
+  (`rebase_ensemble_energy`), so the two cannot drift apart.
+- **XRENS:** seeded runs are not reproducible against 0.7.0 (the walker
+  draw no longer shares a 3-way key split with the morph). The re-evaluated
+  energy now also gets the receiving run's `chemical_potentials` when the
+  run has them, and a non-periodic walker is evaluated with `cell=None`
+  instead of a zero cell.
+- **Swapped walkers take their per-walker state with them.** Besides
+  positions, types, cell and energy, an accepted inter-RE swap now also
+  moves the fields that describe the configuration: move-specific state
+  such as GMC's `direction`, and `max_neighbor_count` / `overflow`.
+  Previously these stayed in the slot, so a configuration arriving in a
+  run continued its GMC walk with the departed walker's direction. Run
+  state (ensemble params, adapted step sizes, acceptance counters) still
+  stays with the run; `state.mc_state.RUN_BOUND_FIELDS` lists it. Swap
+  decisions are unchanged, but seeded GMC runs with inter-RE are not
+  reproducible against 0.7.0.
+- **`run_ns_parallel` / `run_ns_multi_gpu`** no longer initialise the NS
+  state twice when `inter_re_config` is given: XRENS / semi-grand per-run
+  inputs are merged into `ensemble_params_per_run` before the first init.
+
 ## [0.7.0] — 2026-10-19
 
 ### Added

@@ -152,8 +152,8 @@ class InterREConfig:
     Attributes:
         flavor: Swap kernel flavor.  ``"pressure"`` (pressure-RENS, identity
             proposal), ``"xrens"`` (composition-morphing), or
-            ``"semi_grand"`` (chemical-potential assignment swap, zero backend
-            calls).
+            ``"semi_grand"`` (walker exchange between runs at fixed
+            chemical potentials, zero backend calls).
         re_interval: Fire a swap pass every this many NS iterations (1 = every iter).
         n_swap_cycles: Number of even+odd swap phases per fire.
         composition_targets: XRENS-only — per-run target compositions,

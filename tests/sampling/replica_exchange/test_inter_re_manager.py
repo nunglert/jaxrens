@@ -17,21 +17,27 @@ from jaxrens.backends.toy import create_harmonic
 from jaxrens.sampling.batch_descriptor import PmapVmapRuns, SingleRun, VmapRuns
 from jaxrens.sampling.inter_re_manager import InterREManager
 from jaxrens.sampling.move_kernel import MoveKernel
-from jaxrens.sampling.moves import random_walk
-from jaxrens.sampling.moves.replica_exchange import PressureRENSSwap
+from jaxrens.sampling.moves import galilean, random_walk
+from jaxrens.sampling.moves.replica_exchange import (
+    EnsembleSwap,
+    SwapWalker,
+    XRENSSwap,
+    replica_exchange_step,
+)
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, init_ns_parallel
 
-
-_EXPECTED_STATS_KEYS = frozenset({
-    "n_swap_pairs_attempted",
-    "n_swap_pairs_accepted",
-    "acceptance_rate",
-    "n_energy_evals",
-    "n_grad_evals",
-    "n_accepted_per_pair",
-    "n_attempted_per_pair",
-})
+_EXPECTED_STATS_KEYS = frozenset(
+    {
+        "n_swap_pairs_attempted",
+        "n_swap_pairs_accepted",
+        "acceptance_rate",
+        "n_energy_evals",
+        "n_grad_evals",
+        "n_accepted_per_pair",
+        "n_attempted_per_pair",
+    }
+)
 
 
 def _make_vmap_ns_state(n_runs=2, n_walkers=10, pressures=None, seed=42):
@@ -57,7 +63,9 @@ def _make_vmap_ns_state(n_runs=2, n_walkers=10, pressures=None, seed=42):
     )
     types = jnp.zeros((1,), dtype=jnp.int32)
     energies_all = jax.vmap(
-        lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+        lambda pos: jax.vmap(
+            lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+        )(pos)
     )(positions_all)
 
     if pressures is None:
@@ -66,7 +74,11 @@ def _make_vmap_ns_state(n_runs=2, n_walkers=10, pressures=None, seed=42):
         ensemble_params_per_run = [{"pressure": p} for p in pressures]
 
     ns_state = init_ns_parallel(
-        init_fn, positions_all, types, energies_all, None,
+        init_fn,
+        positions_all,
+        types,
+        energies_all,
+        None,
         rng_keys,
         step_sizes=jnp.array([0.2]),
         ensemble_params_per_run=ensemble_params_per_run,
@@ -85,16 +97,16 @@ def _make_vmap_ns_state(n_runs=2, n_walkers=10, pressures=None, seed=42):
 class TestFires:
     def test_fires_at_every_1(self):
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=2), None, re_interval=1
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=1
         )
-        assert not mgr.fires(0)        # iteration 0 never fires
+        assert not mgr.fires(0)  # iteration 0 never fires
         assert mgr.fires(1)
         assert mgr.fires(2)
         assert mgr.fires(100)
 
     def test_fires_at_every_5(self):
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=2), None, re_interval=5
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=5
         )
         assert not mgr.fires(0)
         assert not mgr.fires(1)
@@ -105,14 +117,14 @@ class TestFires:
 
     def test_fires_never_when_every_0(self):
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=2), None, re_interval=0
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=0
         )
         for i in range(10):
             assert not mgr.fires(i)
 
     def test_fires_never_when_every_large(self):
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=2), None, re_interval=1000
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=1000
         )
         for i in range(1, 999):
             assert not mgr.fires(i)
@@ -120,9 +132,7 @@ class TestFires:
 
     def test_fires_single_run_irrelevant(self):
         # SingleRun: is_active=False, but fires() itself is descriptor-agnostic.
-        mgr = InterREManager(
-            PressureRENSSwap(), SingleRun(), None, re_interval=1
-        )
+        mgr = InterREManager(EnsembleSwap(), SingleRun(), None, re_interval=1)
         # fires() returns True but is_active=False so _run_loop won't call apply.
         assert mgr.fires(1)
         assert not mgr.is_active
@@ -135,19 +145,25 @@ class TestFires:
 
 class TestIsActive:
     def test_single_run_not_active(self):
-        mgr = InterREManager(PressureRENSSwap(), SingleRun(), None, re_interval=1)
+        mgr = InterREManager(EnsembleSwap(), SingleRun(), None, re_interval=1)
         assert not mgr.is_active
 
     def test_vmap_active(self):
-        mgr = InterREManager(PressureRENSSwap(), VmapRuns(n_runs=2), None, re_interval=1)
+        mgr = InterREManager(
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=1
+        )
         assert mgr.is_active
 
     def test_vmap_not_active_when_every_0(self):
-        mgr = InterREManager(PressureRENSSwap(), VmapRuns(n_runs=2), None, re_interval=0)
+        mgr = InterREManager(
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=0
+        )
         assert not mgr.is_active
 
     def test_pmap_vmap_active(self):
-        mgr = InterREManager(PressureRENSSwap(), PmapVmapRuns(1, 2), None, re_interval=1)
+        mgr = InterREManager(
+            EnsembleSwap(), PmapVmapRuns(1, 2), None, re_interval=1
+        )
         assert mgr.is_active
 
 
@@ -159,11 +175,15 @@ class TestIsActive:
 class TestApplyNoOpSingleRun:
     def _make_single_ns_state(self):
         backend = create_harmonic(k=1.0)
-        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        descriptors = [
+            MoveKernel("rw", random_walk.build_kernel, step_size=0.2)
+        ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
         key = jax.random.key(0)
         pos_key, run_key = jax.random.split(key)
-        positions = jax.random.uniform(pos_key, (10, 1, 3), minval=-2.0, maxval=2.0)
+        positions = jax.random.uniform(
+            pos_key, (10, 1, 3), minval=-2.0, maxval=2.0
+        )
         types = jnp.zeros((1,), dtype=jnp.int32)
         energies = jax.vmap(
             lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
@@ -172,7 +192,7 @@ class TestApplyNoOpSingleRun:
 
     def test_single_run_state_unchanged(self):
         ns_state = self._make_single_ns_state()
-        mgr = InterREManager(PressureRENSSwap(), SingleRun(), None, re_interval=1)
+        mgr = InterREManager(EnsembleSwap(), SingleRun(), None, re_interval=1)
         key = jax.random.key(99)
 
         new_state, stats, new_key = mgr.apply(ns_state, key)
@@ -187,7 +207,7 @@ class TestApplyNoOpSingleRun:
 
     def test_single_run_stats_all_zero(self):
         ns_state = self._make_single_ns_state()
-        mgr = InterREManager(PressureRENSSwap(), SingleRun(), None, re_interval=1)
+        mgr = InterREManager(EnsembleSwap(), SingleRun(), None, re_interval=1)
         key = jax.random.key(0)
         _, stats, _ = mgr.apply(ns_state, key)
 
@@ -200,7 +220,7 @@ class TestApplyNoOpSingleRun:
 
     def test_single_run_key_advances(self):
         ns_state = self._make_single_ns_state()
-        mgr = InterREManager(PressureRENSSwap(), SingleRun(), None, re_interval=1)
+        mgr = InterREManager(EnsembleSwap(), SingleRun(), None, re_interval=1)
         key = jax.random.key(42)
         _, _, new_key = mgr.apply(ns_state, key)
         # Key should advance (not be identical)
@@ -216,7 +236,7 @@ class TestApplyVmapRuns:
     def test_stats_keys_present(self):
         ns_state, _, _ = _make_vmap_ns_state(n_runs=2)
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=2), None, re_interval=1
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=1
         )
         key = jax.random.key(7)
         _, stats, _ = mgr.apply(ns_state, key)
@@ -226,7 +246,7 @@ class TestApplyVmapRuns:
     def test_stats_non_negative(self):
         ns_state, _, _ = _make_vmap_ns_state(n_runs=2)
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=2), None, re_interval=1
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=1
         )
         key = jax.random.key(7)
         _, stats, _ = mgr.apply(ns_state, key)
@@ -238,7 +258,7 @@ class TestApplyVmapRuns:
     def test_stats_acceptance_rate_consistent(self):
         ns_state, _, _ = _make_vmap_ns_state(n_runs=2)
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=2), None, re_interval=1
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=1
         )
         key = jax.random.key(7)
         _, stats, _ = mgr.apply(ns_state, key)
@@ -251,7 +271,7 @@ class TestApplyVmapRuns:
     def test_key_advances(self):
         ns_state, _, _ = _make_vmap_ns_state(n_runs=2)
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=2), None, re_interval=1
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=1
         )
         key = jax.random.key(42)
         _, _, new_key = mgr.apply(ns_state, key)
@@ -260,20 +280,26 @@ class TestApplyVmapRuns:
     def test_state_returned_is_valid_pytree(self):
         ns_state, _, _ = _make_vmap_ns_state(n_runs=2)
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=2), None, re_interval=1
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=1
         )
         key = jax.random.key(7)
         new_state, _, _ = mgr.apply(ns_state, key)
 
         # Shapes should be preserved
-        assert new_state.population.positions.shape == ns_state.population.positions.shape
-        assert new_state.population.energy.shape == ns_state.population.energy.shape
+        assert (
+            new_state.population.positions.shape
+            == ns_state.population.positions.shape
+        )
+        assert (
+            new_state.population.energy.shape
+            == ns_state.population.energy.shape
+        )
 
     def test_pressure_rens_with_pressures(self):
         """VmapRuns with different pressures: swap uses enthalpy check."""
         ns_state, _, _ = _make_vmap_ns_state(n_runs=2, pressures=[0.01, 0.1])
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=2), None, re_interval=1
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=1
         )
         key = jax.random.key(77)
         new_state, stats, _ = mgr.apply(ns_state, key)
@@ -293,7 +319,9 @@ class TestApplyPmapVmapRuns:
         from jaxrens.sampling.nested_sampling import init_ns_multi_gpu
 
         backend = create_harmonic(k=1.0)
-        descriptors = [MoveKernel("rw", random_walk.build_kernel, step_size=0.2)]
+        descriptors = [
+            MoveKernel("rw", random_walk.build_kernel, step_size=0.2)
+        ]
         init_fn, step_fn, _ = build_mwg(backend, descriptors)
 
         n_gpu, n_per_gpu, n_walkers = 1, 2, 8
@@ -303,16 +331,27 @@ class TestApplyPmapVmapRuns:
         pos_key = keys[-1]
 
         positions = jax.random.uniform(
-            pos_key, (n_gpu * n_per_gpu, n_walkers, 1, 3), minval=-2.0, maxval=2.0
+            pos_key,
+            (n_gpu * n_per_gpu, n_walkers, 1, 3),
+            minval=-2.0,
+            maxval=2.0,
         )
         types = jnp.zeros((1,), dtype=jnp.int32)
         energies = jax.vmap(
-            lambda pos: jax.vmap(lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0])(pos)
+            lambda pos: jax.vmap(
+                lambda p: backend(p, types, jnp.zeros((3, 3)), 0)[0]
+            )(pos)
         )(positions)
 
         ns_state = init_ns_multi_gpu(
-            init_fn, positions, types, energies, None,
-            rng_keys, n_gpu=n_gpu, n_per_gpu=n_per_gpu,
+            init_fn,
+            positions,
+            types,
+            energies,
+            None,
+            rng_keys,
+            n_gpu=n_gpu,
+            n_per_gpu=n_per_gpu,
             step_sizes=jnp.array([0.2]),
         )
 
@@ -322,18 +361,21 @@ class TestApplyPmapVmapRuns:
             emax=descriptor.reduce_emax(ns_state.population.energy),
         )
         mgr = InterREManager(
-            PressureRENSSwap(), descriptor, backend, re_interval=1
+            EnsembleSwap(), descriptor, backend, re_interval=1
         )
 
         swap_key = jax.random.key(99)
         new_state, stats, _ = mgr.apply(ns_state, swap_key)
 
         assert _EXPECTED_STATS_KEYS == frozenset(stats.keys())
-        assert new_state.population.positions.shape == ns_state.population.positions.shape
+        assert (
+            new_state.population.positions.shape
+            == ns_state.population.positions.shape
+        )
 
     def test_pmap_vmap_is_active(self):
         descriptor = PmapVmapRuns(n_gpu=1, n_per_gpu=2)
-        mgr = InterREManager(PressureRENSSwap(), descriptor, None, re_interval=1)
+        mgr = InterREManager(EnsembleSwap(), descriptor, None, re_interval=1)
         assert mgr.is_active
 
 
@@ -352,7 +394,7 @@ class TestPerPairTracking:
     def test_shape_and_dtype(self, n_runs):
         ns_state, _, _ = _make_vmap_ns_state(n_runs=n_runs)
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=n_runs), None, re_interval=1
+            EnsembleSwap(), VmapRuns(n_runs=n_runs), None, re_interval=1
         )
         _, stats, _ = mgr.apply(ns_state, jax.random.key(7))
 
@@ -366,15 +408,22 @@ class TestPerPairTracking:
     def test_per_pair_sums_match_aggregate(self, n_runs, seed):
         ns_state, _, _ = _make_vmap_ns_state(n_runs=n_runs, seed=seed)
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=n_runs), None,
-            re_interval=1, n_swap_cycles=2,
+            EnsembleSwap(),
+            VmapRuns(n_runs=n_runs),
+            None,
+            re_interval=1,
+            n_swap_cycles=2,
         )
         _, stats, _ = mgr.apply(ns_state, jax.random.key(seed * 11))
 
-        assert int(stats["n_accepted_per_pair"].sum()) == \
-            stats["n_swap_pairs_accepted"]
-        assert int(stats["n_attempted_per_pair"].sum()) == \
-            stats["n_swap_pairs_attempted"]
+        assert (
+            int(stats["n_accepted_per_pair"].sum())
+            == stats["n_swap_pairs_accepted"]
+        )
+        assert (
+            int(stats["n_attempted_per_pair"].sum())
+            == stats["n_swap_pairs_attempted"]
+        )
 
     def test_per_pair_attempted_uniform_across_pairs(self):
         """With re_interval=1 and n_swap_cycles=1, every pair gets
@@ -385,12 +434,16 @@ class TestPerPairTracking:
         n_runs = 4
         ns_state, _, _ = _make_vmap_ns_state(n_runs=n_runs)
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=n_runs), None,
-            re_interval=1, n_swap_cycles=1,
+            EnsembleSwap(),
+            VmapRuns(n_runs=n_runs),
+            None,
+            re_interval=1,
+            n_swap_cycles=1,
         )
         _, stats, _ = mgr.apply(ns_state, jax.random.key(99))
 
         import numpy as np
+
         np.testing.assert_array_equal(
             stats["n_attempted_per_pair"],
             np.array([1, 1, 1], dtype=np.int32),
@@ -406,12 +459,17 @@ class TestPerPairTracking:
         # (large enthalpy gap → low acceptance).
         n_runs = 3
         ns_state, _, _ = _make_vmap_ns_state(
-            n_runs=n_runs, n_walkers=20,
-            pressures=[0.0, 1e-3, 10.0], seed=11,
+            n_runs=n_runs,
+            n_walkers=20,
+            pressures=[0.0, 1e-3, 10.0],
+            seed=11,
         )
         mgr = InterREManager(
-            PressureRENSSwap(), VmapRuns(n_runs=n_runs), None,
-            re_interval=1, n_swap_cycles=20,  # many cycles to amplify the asymmetry
+            EnsembleSwap(),
+            VmapRuns(n_runs=n_runs),
+            None,
+            re_interval=1,
+            n_swap_cycles=20,  # many cycles to amplify the asymmetry
         )
         _, stats, _ = mgr.apply(ns_state, jax.random.key(123))
 
@@ -427,69 +485,190 @@ class TestPerPairTracking:
 
     def test_per_pair_xrens_shape(self):
         """XRENS swap step also surfaces per-pair arrays of the right shape."""
-        from jaxrens.sampling.moves.replica_exchange import xrens_replica_exchange_step, XRENSSwap
-
         n_runs, n_walkers, n_atoms = 3, 4, 4
         rng = jax.random.key(0)
         all_positions = jax.random.uniform(
-            rng, (n_runs, n_walkers, n_atoms, 3), minval=-1.0, maxval=1.0,
+            rng,
+            (n_runs, n_walkers, n_atoms, 3),
+            minval=-1.0,
+            maxval=1.0,
         )
         all_types = jnp.zeros((n_runs, n_walkers, n_atoms), dtype=jnp.int32)
         backend = create_harmonic(k=1.0)
         all_energies = jax.vmap(
             lambda pos_R: jax.vmap(
-                lambda pos_K: backend(pos_K, all_types[0, 0], jnp.zeros((3, 3)), 0)[0]
+                lambda pos_K: backend(
+                    pos_K, all_types[0, 0], jnp.zeros((3, 3)), 0
+                )[0]
             )(pos_R)
         )(all_positions)
         all_emax = jnp.full((n_runs,), 1e6)
         composition_targets = jnp.tile(
-            jnp.array([n_atoms], dtype=jnp.int32)[None, :], (n_runs, 1),
+            jnp.array([n_atoms], dtype=jnp.int32)[None, :],
+            (n_runs, 1),
         )
-        _, _, _, _, swap_info = xrens_replica_exchange_step(
+        _, swap_info = replica_exchange_step(
             jax.random.key(7),
-            all_positions, all_types, all_energies, None, all_emax,
-            composition_targets,
-            backend, XRENSSwap(n_species=1),
+            SwapWalker(all_positions, all_types, all_energies, None),
+            all_emax,
+            {"target_composition": composition_targets},
+            XRENSSwap(n_species=1),
+            backend=backend,
         )
         assert swap_info["n_accepted_per_pair"].shape == (n_runs - 1,)
         assert swap_info["n_attempted_per_pair"].shape == (n_runs - 1,)
         # Aggregate consistency.
-        assert int(swap_info["n_accepted_per_pair"].sum()) == \
-            int(swap_info["n_accepted"])
-        assert int(swap_info["n_attempted_per_pair"].sum()) == \
-            int(swap_info["n_attempted"])
+        assert int(swap_info["n_accepted_per_pair"].sum()) == int(
+            swap_info["n_accepted"]
+        )
+        assert int(swap_info["n_attempted_per_pair"].sum()) == int(
+            swap_info["n_attempted"]
+        )
 
     def test_per_pair_semi_grand_shape(self):
         """Semi-grand swap step also surfaces per-pair arrays."""
-        from jaxrens.sampling.moves.replica_exchange import (
-            semi_grand_replica_exchange_step, SemiGrandSwap,
-        )
-
         n_runs, n_walkers, n_atoms, n_species = 3, 4, 4, 2
         rng = jax.random.key(0)
         all_positions = jax.random.uniform(
-            rng, (n_runs, n_walkers, n_atoms, 3), minval=-1.0, maxval=1.0,
+            rng,
+            (n_runs, n_walkers, n_atoms, 3),
+            minval=-1.0,
+            maxval=1.0,
         )
         all_types = jnp.zeros((n_runs, n_walkers, n_atoms), dtype=jnp.int32)
         backend = create_harmonic(k=1.0)
         all_energies = jax.vmap(
             lambda pos_R: jax.vmap(
-                lambda pos_K: backend(pos_K, all_types[0, 0], jnp.zeros((3, 3)), 0)[0]
+                lambda pos_K: backend(
+                    pos_K, all_types[0, 0], jnp.zeros((3, 3)), 0
+                )[0]
             )(pos_R)
         )(all_positions)
         all_emax = jnp.full((n_runs,), 1e6)
         chemical_potentials = jnp.zeros((n_runs, n_species))
-        _, _, _, _, swap_info = semi_grand_replica_exchange_step(
+        _, swap_info = replica_exchange_step(
             jax.random.key(7),
-            all_positions, all_types, all_energies, None, all_emax,
-            chemical_potentials,
-            SemiGrandSwap(n_species=n_species),
+            SwapWalker(all_positions, all_types, all_energies, None),
+            all_emax,
+            {"chemical_potentials": chemical_potentials},
+            EnsembleSwap(required_params=("chemical_potentials",)),
         )
         assert swap_info["n_accepted_per_pair"].shape == (n_runs - 1,)
         assert swap_info["n_attempted_per_pair"].shape == (n_runs - 1,)
-        assert int(swap_info["n_accepted_per_pair"].sum()) == \
-            int(swap_info["n_accepted"])
-        assert int(swap_info["n_attempted_per_pair"].sum()) == \
-            int(swap_info["n_attempted"])
+        assert int(swap_info["n_accepted_per_pair"].sum()) == int(
+            swap_info["n_accepted"]
+        )
+        assert int(swap_info["n_attempted_per_pair"].sum()) == int(
+            swap_info["n_attempted"]
+        )
 
 
+# ---------------------------------------------------------------------------
+# Which MCState fields move with a swapped configuration
+# ---------------------------------------------------------------------------
+
+
+class TestSwapCarriesWalkerState:
+    """Configuration-bound fields (move extras such as GMC's direction, the
+    neighbour bookkeeping) follow the configuration; run-bound fields
+    (ensemble params, step sizes, acceptance counters) stay with the slot."""
+
+    @staticmethod
+    def _two_run_state():
+        backend = create_harmonic(k=1.0)
+        descriptors = [
+            MoveKernel(
+                "gmc",
+                galilean.build_kernel,
+                step_size=0.2,
+                extra_state_fields={
+                    "direction": (
+                        jnp.ndarray,
+                        lambda pos, types: jnp.zeros_like(pos),
+                    )
+                },
+            )
+        ]
+        init_fn, _, _ = build_mwg(backend, descriptors)
+        n_runs, n_walkers = 2, 1
+        positions = jnp.stack(
+            [jnp.zeros((n_walkers, 2, 3)), jnp.ones((n_walkers, 2, 3))]
+        )
+        types = jnp.zeros((2,), dtype=jnp.int32)
+        energies = jnp.array([[0.0], [1.0]])
+        ns_state = init_ns_parallel(
+            init_fn,
+            positions,
+            types,
+            energies,
+            None,
+            jax.random.split(jax.random.key(0), n_runs),
+            step_sizes=jnp.array([0.2]),
+            ensemble_params_per_run=[
+                {"pressure": jnp.array(0.0)},
+                {"pressure": jnp.array(0.0)},
+            ],
+        )
+        pop = ns_state.population
+        # Tag every per-walker field with its run index so we can see where
+        # each ends up after the swap.
+        run_tag = jnp.arange(n_runs)
+        pop = pop.set(
+            direction=jnp.broadcast_to(
+                run_tag[:, None, None, None] + 10.0, pop.direction.shape
+            ),
+            max_neighbor_count=jnp.broadcast_to(
+                run_tag[:, None] + 20, pop.max_neighbor_count.shape
+            ).astype(pop.max_neighbor_count.dtype),
+            overflow=jnp.array([[True], [False]]),
+            step_sizes=jnp.broadcast_to(
+                run_tag[:, None, None] + 0.5, pop.step_sizes.shape
+            ),
+            n_accepted=jnp.broadcast_to(
+                run_tag[:, None, None] + 30, pop.n_accepted.shape
+            ).astype(pop.n_accepted.dtype),
+        )
+        return ns_state.set(population=pop, emax=jnp.array([1e6, 1e6]))
+
+    def test_accepted_swap_moves_configuration_state(self):
+        ns_state = self._two_run_state()
+        old = ns_state.population
+        mgr = InterREManager(
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=1
+        )
+        new_state, stats, _ = mgr.apply(ns_state, jax.random.key(1))
+        new = new_state.population
+        assert stats["n_swap_pairs_accepted"] == 1
+
+        # Moved with the configuration.
+        for name in (
+            "positions",
+            "direction",
+            "max_neighbor_count",
+            "overflow",
+        ):
+            got, want = getattr(new, name), getattr(old, name)
+            assert jnp.array_equal(got[0], want[1]), name
+            assert jnp.array_equal(got[1], want[0]), name
+
+        # Stayed with the run.
+        for name in ("step_sizes", "n_accepted"):
+            assert jnp.array_equal(
+                getattr(new, name), getattr(old, name)
+            ), name
+        assert jnp.array_equal(
+            new.ensemble_params["pressure"], old.ensemble_params["pressure"]
+        )
+
+    def test_walker_bound_fields_classification(self):
+        from jaxrens.state.mc_state import (
+            RUN_BOUND_FIELDS,
+            walker_bound_fields,
+        )
+
+        pop = self._two_run_state().population
+        fields = walker_bound_fields(pop)
+        assert "direction" in fields
+        assert {"positions", "max_neighbor_count", "overflow"} <= set(fields)
+        assert not set(fields) & RUN_BOUND_FIELDS
+        assert "max_neighbors" not in fields  # static

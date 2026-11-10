@@ -31,6 +31,62 @@ from jaxrens.backends.hamiltonian import EnergyTerm, Hamiltonian
 from jaxrens.utils.cell import get_volume
 
 
+def ensemble_energy(
+    cell: jnp.ndarray | None,
+    species: jnp.ndarray,
+    pressure: Any = None,
+    chemical_potentials: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """``P·V − μ·N`` for one configuration.
+
+    The single definition of the ensemble correction: :class:`EnsembleTerm`
+    adds it to the model energy, and replica exchange uses it (via
+    :func:`rebase_ensemble_energy`) to move a stored energy from one run's
+    ensemble to another's.  A missing ``pressure`` (or ``cell``) drops the
+    ``P·V`` term, a missing ``chemical_potentials`` the ``μ·N`` term.
+    """
+    E = jnp.zeros((), dtype=jnp.float32)
+    if pressure is not None and cell is not None:
+        E = pressure * get_volume(cell)
+
+    if chemical_potentials is not None:
+        n_species = chemical_potentials.shape[0]
+        if n_species > 0:
+            counts = jnp.zeros(n_species, dtype=species.dtype)
+            counts = counts.at[species].add(1)
+            E = E - jnp.dot(chemical_potentials, counts.astype(jnp.float32))
+
+    return E
+
+
+def rebase_ensemble_energy(
+    energy: jnp.ndarray,
+    cell: jnp.ndarray | None,
+    species: jnp.ndarray,
+    params_from: dict[str, Any],
+    params_to: dict[str, Any],
+) -> jnp.ndarray:
+    """Re-express a stored energy under another run's ensemble params.
+
+    ``energy`` is ``U + ensemble_energy(params_from)``; the result is
+    ``U + ensemble_energy(params_to)``.  ``U`` is recovered first and the
+    new terms added after, so for pressure-only params this is exactly
+    ``(E − P_from·V) + P_to·V``.
+    """
+    u = energy - ensemble_energy(
+        cell,
+        species,
+        params_from.get("pressure"),
+        params_from.get("chemical_potentials"),
+    )
+    return u + ensemble_energy(
+        cell,
+        species,
+        params_to.get("pressure"),
+        params_to.get("chemical_potentials"),
+    )
+
+
 class EnsembleTerm(EnergyTerm):
     """``P·V − μ·N`` ensemble correction.
 
@@ -63,17 +119,7 @@ class EnsembleTerm(EnergyTerm):
         if ensemble_params is not None:
             pressure = ensemble_params.get("pressure", pressure)
             mu = ensemble_params.get("chemical_potentials", mu)
-
-        E = pressure * get_volume(cell)
-
-        if mu is not None:
-            n_species = mu.shape[0]
-            if n_species > 0:
-                counts = jnp.zeros(n_species, dtype=species.dtype)
-                counts = counts.at[species].add(1)
-                E = E - jnp.dot(mu, counts.astype(jnp.float32))
-
-        return E
+        return ensemble_energy(cell, species, pressure, mu)
 
     def energy_and_forces(
         self,

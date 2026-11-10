@@ -146,7 +146,12 @@ times.
 
 Every `inter_re.re_interval` iterations, the manager runs `n_swap_cycles`
 even/odd swap passes between adjacent replicas in the pressure (or
-composition / μ) ladder. Three flavors exist:
+composition / μ) ladder. Three flavors exist (`inter_re.flavor`), backed
+by two swap kernels: `pressure` and `semi_grand` both use `EnsembleSwap`
+(pressure RE is the case without μ), `xrens` uses `XRENSSwap`. Every
+kernel builds the walkers that would *enter* each replica, with their
+energy in that replica's frame, and the driver accepts a swap iff both
+fit below the Emax of the replica they enter.
 
 ### How the InterREManager dispatches swaps
 
@@ -154,8 +159,8 @@ The manager is constructed once before the NS loop starts; its
 JIT-compiled swap step is cached and reused. On each NS iteration
 `_run_loop` calls `fires(i)`, and on a fire calls
 `apply(state, key)`, which dispatches on the
-{class}`~jaxrens.sampling.batch_descriptor.BatchDescriptor` and on
-the swap-kernel flavor:
+{class}`~jaxrens.sampling.batch_descriptor.BatchDescriptor`; the only
+flavor-specific step is the kernel's `propose`:
 
 ```{mermaid}
 flowchart TB
@@ -164,27 +169,24 @@ flowchart TB
     FIRES -- no --> CONT["continue NS step"]
     FIRES -- yes --> APPLY["manager.apply(state, key)"]
 
-    APPLY --> EXTR["_extract_swap_inputs(state):<br/>positions, types, energies, cells, emax,<br/>+ pressures / composition_targets / μ<br/>(from pop.ensemble_params)"]
+    APPLY --> EXTR["_extract_swap_inputs(state):<br/>SwapWalker(positions, types, energy, cell), emax,<br/>+ kernel.param_keys: pressure / μ / target_composition<br/>(from pop.ensemble_params)"]
     EXTR --> DESC{"BatchDescriptor"}
 
     DESC -- SingleRun --> NOOP["no-op<br/>(empty stats)"]
-    DESC -- VmapRuns --> VMAP["_jit_vmap_swap<br/>(R, K, …) directly"]
+    DESC -- VmapRuns --> VMAP["jit(replica_exchange_step)<br/>(R, K, …) directly"]
     DESC -- PmapVmapRuns --> AGG["shard_map on batcher.mesh ('gpu')<br/>lax.all_gather: (P, K, …) → (G, P, K, …)<br/>on every device"]
     AGG --> FLAT["reshape (G·P, K, …)<br/>same RNG ⇒ identical decisions"]
-    FLAT --> SWAP["_jit_pmap_swap<br/>(stats out_specs=P(), replicated)"]
+    FLAT --> CYC
 
-    VMAP --> KFLAV{"swap kernel"}
-    SWAP --> KFLAV
+    VMAP --> CYC["replica_exchange_step:<br/>loop n_swap_cycles ×<br/>(even pass, odd pass)"]
+    CYC --> KFLAV{"kernel.propose<br/>(walkers entering each run,<br/>energy in that run's frame)"}
 
-    KFLAV -- "PressureRENS" --> PR["replica_exchange_step<br/>swap thermo context only<br/>(0 backend calls)"]
-    KFLAV -- "XRENSSwap" --> XR["xrens_replica_exchange_step<br/>swap species labels<br/>(re-evaluates U)"]
-    KFLAV -- "SemiGrandSwap" --> SG["semi_grand_replica_exchange_step<br/>swap N at fixed μ<br/>(0 backend calls)"]
+    KFLAV -- "EnsembleSwap<br/>(pressure, semi_grand)" --> PR["walkers trade runs,<br/>energy re-based to P, μ<br/>(0 backend calls)"]
+    KFLAV -- "XRENSSwap" --> XR["morph types to target,<br/>re-evaluate U<br/>(2 backend calls)"]
 
-    PR --> CYC["loop n_swap_cycles ×<br/>(even pass, odd pass)"]
-    XR --> CYC
-    SG --> CYC
-
-    CYC --> SHARDQ{"PmapVmapRuns?"}
+    PR --> ACC["accept iff each incoming<br/>energy &lt; receiving Emax"]
+    XR --> ACC
+    ACC --> SHARDQ{"PmapVmapRuns?"}
     SHARDQ -- yes --> SHARD["slice this device's shard<br/>via lax.axis_index('gpu')"]
     SHARDQ -- no --> WRITE
     SHARD --> WRITE["population.set(positions=…, types=…,<br/>energy=…, cell=…)"]
@@ -197,20 +199,26 @@ flowchart TB
     classDef io fill:#f5f5f5,stroke:#444,color:#222
 
     class FIRES,DESC,KFLAV,SHARDQ decision
-    class VMAP,AGG,FLAT,SWAP,SHARD,CYC path
-    class PR,XR,SG kernel
+    class VMAP,AGG,FLAT,SHARD,CYC,ACC path
+    class PR,XR kernel
     class LOOP,APPLY,EXTR,WRITE,RET,CONT,NOOP io
 ```
 
 A few invariants worth pinning down:
 
-- **Cached compilation.** `_build_jit_fns` runs once in
-  `__init__` and stores `_jit_vmap_swap` / `_jit_pmap_swap`.
-  Subsequent `apply` calls hit the cache — no re-tracing per
-  iteration. Despite its name, `_jit_pmap_swap` is a
+- **Cached compilation.** `_build_jit_fn` runs once in
+  `__init__` and stores `_jit_swap`. Subsequent `apply` calls hit
+  the cache — no re-tracing per iteration. For `PmapVmapRuns` it is a
   `jax.jit(jax.shard_map(...))` over the batcher's cached `"gpu"`
   mesh (`batcher.mesh`), the same mesh the NS step uses. See
   {ref}`the shard_map notes <multi-device-shard-map>`.
+- **What travels with a swapped walker.** The configuration
+  (positions, types, cell, energy re-based to the new run) and every
+  other per-walker field that describes it: move-specific state such
+  as GMC's `direction`, and the neighbour bookkeeping
+  (`max_neighbor_count`, `overflow`). The run's own state stays in
+  the slot: ensemble params, adapted step sizes and acceptance
+  counters (`state/mc_state.py::RUN_BOUND_FIELDS`).
 - **Identical swap decisions across devices.** For
   `PmapVmapRuns`, the same scalar `swap_key` is broadcast to all
   devices before the `shard_map` call. After the `all_gather` every
@@ -227,17 +235,19 @@ A few invariants worth pinning down:
   no-op and the `shard_map` collapses to `vmap`. The same code path runs
   unconditionally so multi-GPU correctness is exercised by the
   single-GPU test suite.
-- **Kernel choice is set at construction.** `_is_xrens` /
-  `_is_semi_grand` are checked once and select which
-  `replica_exchange_step` variant to JIT; they are not re-checked
-  per call.
+- **Kernels declare what they need.** A kernel lists the per-replica
+  ensemble params it reads (`required_params` / `optional_params`);
+  the manager slices exactly those out of `pop.ensemble_params` and
+  raises if a required one is missing. There is no per-flavor branch
+  in the manager or the driver.
 
 
 ### Pressure-RENS
 
-The two replicas keep their configurations; only the *thermodynamic
-context* is swapped. Configuration $r_i$ from replica $i$ is
-evaluated under replica $j$'s ensemble:
+The two selected walkers trade replicas: configuration $r_i$ moves
+from replica $i$ to replica $j$ and is evaluated under replica $j$'s
+ensemble, and symmetrically for $r_j$. The pressures stay with their
+replicas:
 
 $$
 \alpha_{ij} = \mathbf{1}\bigl[H_j(r_i) < E_{\max, j}\bigr] \cdot
@@ -267,46 +277,57 @@ $$
 $$
 
 so the configuration arriving at replica $i$ has run-$i$'s target
-composition but is built from run-$j$'s positions and cell. The
-morphed potential energies $\tilde U_i = U(\tilde r_i)$ and
-$\tilde U_j = U(\tilde r_j)$ are recomputed by the backend
-(2 evaluations per attempted pair). Acceptance follows the same
-cross-bound enthalpy form as Pressure-RENS, applied to the new
-energies:
+composition but is built from run-$j$'s positions and cell. Its
+energy is re-evaluated by the backend under replica $i$'s ensemble
+params (2 evaluations per attempted pair),
+$\tilde H_i = U(\tilde r_i) + P_i\, V(h_j)$ (minus
+$\boldsymbol\mu_i \cdot \mathbf N$ if replica $i$ carries chemical
+potentials), and each morphed walker must fit the contour of the
+replica it enters:
 
 $$
-\alpha_{ij} = \mathbf 1\!\bigl[\tilde U_i + P_j\, V(h_j) < E_{\max,j}\bigr]\,
-              \mathbf 1\!\bigl[\tilde U_j + P_i\, V(h_i) < E_{\max,i}\bigr].
+\alpha_{ij} = \mathbf 1\!\bigl[\tilde H_i < E_{\max,i}\bigr]\,
+              \mathbf 1\!\bigl[\tilde H_j < E_{\max,j}\bigr].
 $$
-
-In NVT the $PV$ term drops and the criterion reduces to
-$\tilde U_i < E_{\max,j} \,\wedge\, \tilde U_j < E_{\max,i}$.
 
 ### Semi-grand swap
 
 Each replica $i$ carries a per-species chemical-potential vector
-$\boldsymbol\mu_i \in \mathbb R^{S}$. Walkers, cells, and species
-stay put — only the $\boldsymbol\mu$ assignment is exchanged. Let
-$\mathbf N(\sigma)_s = \#\{a : \sigma_a = s\}$ be the species-count
-vector of walker $\sigma$. The grand-canonical energy under the
-*new* chemical-potential vector after the swap is
+$\boldsymbol\mu_i \in \mathbb R^{S}$, fixed for the whole run. As in
+Pressure-RENS, the two selected walkers trade replicas (positions,
+species and cell) and the $\boldsymbol\mu$ vectors stay where they
+are. Let $\mathbf N(\sigma)_s = \#\{a : \sigma_a = s\}$ be the
+species-count vector of walker $\sigma$. A walker that arrives in
+replica $j$ is scored with replica $j$'s grand-canonical energy
 
 $$
-\Omega_i^{\text{new}} = U_i \;-\; \boldsymbol\mu_j \cdot \mathbf N(\sigma_i),
-\qquad
-\Omega_j^{\text{new}} = U_j \;-\; \boldsymbol\mu_i \cdot \mathbf N(\sigma_j),
+\Omega_j(r_i) = U_i + P_j\, V(h_i) - \boldsymbol\mu_j \cdot \mathbf N(\sigma_i),
 $$
 
-and because nothing moves, each replica simply checks its own NS
-threshold:
+and the swap is accepted when each walker fits the contour of the
+replica it enters:
 
 $$
-\alpha_{ij} = \mathbf 1\!\bigl[\Omega_i^{\text{new}} < E_{\max,i}\bigr]\,
-              \mathbf 1\!\bigl[\Omega_j^{\text{new}} < E_{\max,j}\bigr].
+\alpha_{ij} = \mathbf 1\!\bigl[\Omega_j(r_i) < E_{\max,j}\bigr]\,
+              \mathbf 1\!\bigl[\Omega_i(r_j) < E_{\max,i}\bigr].
 $$
 
-Zero backend calls — the $U_i$'s are already stored, so the
-update is a pair of $S$-dimensional dot products.
+On acceptance $\Omega_j(r_i)$ becomes the stored energy of the walker
+in replica $j$, so every stored energy in a replica uses that
+replica's $\boldsymbol\mu$ (and $P$). In μVT the $PV$ term drops.
+
+Exchanging the $\boldsymbol\mu$ of a single walker instead of moving
+it does not work here: a replica is a population sharing one contour
+$E_{\max}$, and that contour is defined only if all its walkers are
+scored with the same $\boldsymbol\mu$.
+
+Zero backend calls: $U_i$ is recovered from the stored energy, so the
+update costs two $S$-dimensional dot products (plus the $PV$ terms).
+This is the same kernel as Pressure-RENS (`EnsembleSwap`): both
+re-base the stored energy with
+{func}`~jaxrens.backends.ensemble.rebase_ensemble_energy`, which uses
+the same $P V - \boldsymbol\mu \cdot \mathbf N$ definition as
+`EnsembleTerm`.
 
 
 ## Where this lives in the code
@@ -316,5 +337,6 @@ update is a pair of $S$-dimensional dot products.
 | Topology derivation | `cli/resolve.py::_derive_replica_axes` |
 | Multi-run dispatch | {func}`jaxrens.sampling.nested_sampling.run_ns_multi_gpu` |
 | Swap manager | `sampling/inter_re_manager.py::InterREManager` |
-| Swap kernels (3 flavors) | `sampling/moves/replica_exchange.py` |
+| Swap driver + kernels (`EnsembleSwap`, `XRENSSwap`) | `sampling/moves/replica_exchange.py` |
+| Ensemble energy / re-basing (`P·V − μ·N`) | `backends/ensemble.py::ensemble_energy`, `rebase_ensemble_energy` |
 | Even/odd pair helper | `sampling/moves/replica_exchange.py::get_swap_pairs` |
