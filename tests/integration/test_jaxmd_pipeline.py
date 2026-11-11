@@ -1,30 +1,29 @@
-"""End-to-end integration: Si NPT-NS through the jax-md Tersoff backend.
+"""End-to-end NPT nested sampling of Si with the jax-md Tersoff backend.
 
-Mirrors :mod:`tests.integration.test_nequix_pipeline` but with jax-md's
-Tersoff '88 Si potential.  Exercises:
-
-* Backend build — ``create_jaxmd(potential='tersoff', ...)``.
-* Resolver's pre-NS energy eval (no ``max_neighbors_for`` path — all-pairs).
-* Symbol-map plumbing via the backend's ``atomic_numbers`` property.
-* Cohort or multi-GPU dispatcher, depending on pressure-list length.
-* Streamed I/O — per-replica ``.energies`` / ``.traj.extxyz``, plus
-  HDF5 checkpoints.
-
-Skipped when ``jax_md`` is not importable.
-Sized for the integration tier — small ``n_live`` and ``max_iterations``,
-keeps wall time bounded.
+Each test builds a config from YAML, resolves it, runs it through
+``run_multi_gpu_from_config`` and checks the per-replica energy logs and
+trajectories and the final HDF5 checkpoint. The backend computes all
+pairs, so no ``max_neighbors`` estimate is involved. Both tests skip when
+``jax_md`` is not installed.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import ase.io
 import numpy as np
 import pytest
 import yaml
 
-from . import multi_gpu_n_devices
+from jaxrens.cli.resolve import resolve
+from jaxrens.cli.run import run_multi_gpu_from_config
+from jaxrens.cli.schema import RootSpec
+from jaxrens.io.checkpoint import load_checkpoint
+from jaxrens.io.energy_log import EnergyLogger
+from jaxrens.sampling.batch_descriptor import PmapVmapRuns
 
+from . import multi_gpu_n_devices
 
 _CONFIG_YAML = """
 run:
@@ -81,7 +80,6 @@ init:
     emax_offset_per_atom: 1.0
 
 cell:
-  # V/atom large enough to give the all-pairs calculation breathing room.
   max_volume_per_atom: 60.0
   min_volume_per_atom: 12.0
   min_aspect_ratio: 0.5
@@ -102,70 +100,58 @@ output:
 @pytest.mark.jaxmd
 @pytest.mark.heavy
 def test_jaxmd_full_pipeline(tmp_path: Path) -> None:
-    """Two-pressure jax-md Tersoff NS smoke test.
+    """Run two pressure replicas, which go through the multi-GPU dispatcher.
 
-    Routes through the multi-GPU dispatcher (two pressures → two
-    replicas).  On a single-GPU box this becomes ``n_gpu=1, n_per_gpu=2``;
-    on a 2-GPU box it becomes ``n_gpu=2, n_per_gpu=1``.  Either is fine —
-    the test inspects per-replica outputs and the global checkpoint.
+    With one GPU this is ``n_gpu=1, n_per_gpu=2``; with two it is
+    ``n_gpu=2, n_per_gpu=1``. The checks hold for both layouts.
     """
     pytest.importorskip("jax_md")
-
-    from jaxrens.cli.resolve import (
-        resolve,
-    )
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
-    from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootSpec
 
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["output"]["working_dir"] = str(tmp_path / "out")
 
     root = RootSpec.model_validate(raw)
     resolved = resolve(root)
-    assert isinstance(resolved.batcher, PmapVmapRuns), (
-        "Two-pressure config should route through the multi-GPU dispatcher."
-    )
+    assert isinstance(resolved.batcher, PmapVmapRuns)
 
-    run_multi_gpu_from_config(resolved)
+    result = run_multi_gpu_from_config(resolved)
+    assert np.all(np.asarray(result["n_dead"]) == 5)
 
     out = tmp_path / "out"
     n_total = resolved.ns.n_gpu * resolved.ns.n_per_gpu
-    assert n_total == 2, f"expected 2 replicas, got {n_total}"
-
-    from jaxrens.io.energy_log import EnergyLogger
+    assert n_total == 2
 
     for r in range(n_total):
         energies_path = out / f"jaxmd_smoke.run{r:02d}.energies"
         traj_path = out / f"jaxmd_smoke.run{r:02d}.traj.extxyz"
-        assert energies_path.exists(), (
-            f"missing per-replica energy log: {energies_path}"
-        )
-        assert traj_path.exists(), (
-            f"missing per-replica trajectory: {traj_path}"
-        )
+        assert energies_path.exists()
+        assert traj_path.exists()
         log = EnergyLogger.read(energies_path)
-        assert log.energies.shape == (5,), (
-            f"{energies_path.name}: expected 5 data entries, "
-            f"got {log.energies.shape}"
-        )
+        assert log.energies.shape == (5,)
+
+    # start_species "14 8" must reach the trajectory as 8 Si atoms through
+    # the backend's atomic_numbers table.
+    frames = ase.io.read(out / "jaxmd_smoke.run00.traj.extxyz", index=":")
+    assert len(frames) > 0
+    assert all(f.get_chemical_symbols() == ["Si"] * 8 for f in frames)
 
     final_ckpt = out / "jaxmd_smoke.final.checkpoint.h5"
-    assert final_ckpt.exists(), f"missing final checkpoint: {final_ckpt}"
-
-    from jaxrens.io.checkpoint import load_checkpoint
+    assert final_ckpt.exists()
 
     state = load_checkpoint(final_ckpt)
     log_z = np.asarray(state["log_evidence"])
-    assert log_z.shape == (resolved.ns.n_gpu, resolved.ns.n_per_gpu), (
-        f"expected (G, P)=({resolved.ns.n_gpu}, {resolved.ns.n_per_gpu}), "
-        f"got {log_z.shape}"
-    )
-    assert np.all(np.isfinite(log_z)), f"log_evidence not finite: {log_z}"
+    assert log_z.shape == (resolved.ns.n_gpu, resolved.ns.n_per_gpu)
+    assert np.all(np.isfinite(log_z))
+    np.testing.assert_array_equal(result["log_evidence"], log_z)
 
+    # (n_gpu, n_per_gpu, n_live, n_atoms, 3)
     saved_positions = np.asarray(state["positions"])
     assert saved_positions.shape == (
-        resolved.ns.n_gpu, resolved.ns.n_per_gpu, 4, 8, 3,
+        resolved.ns.n_gpu,
+        resolved.ns.n_per_gpu,
+        4,
+        8,
+        3,
     )
 
 
@@ -174,29 +160,19 @@ def test_jaxmd_full_pipeline(tmp_path: Path) -> None:
 @pytest.mark.gpu
 @pytest.mark.heavy
 def test_jaxmd_multi_gpu_pipeline(tmp_path: Path) -> None:
-    """jax-md Tersoff NPT-NS with pressure replicas distributed 2-per-GPU.
+    """Run two pressure replicas per GPU with pressure replica exchange.
 
-    Exercises the full ``pmap(vmap(vmap))`` hierarchy across multiple
-    devices.  Runs on either 2 or 4 local devices.
+    This goes through the full ``pmap(vmap(vmap))`` hierarchy on 2 or 4
+    devices.
     """
     pytest.importorskip("jax_md")
-
-    from jaxrens.cli.resolve import (
-        resolve,
-    )
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
-    from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootSpec
 
     n_gpu = multi_gpu_n_devices()
     n_total = n_gpu * 2
 
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["output"]["working_dir"] = str(tmp_path / "out")
-    # Generate enough pressures for n_per_gpu=2 on n_gpu devices.
-    raw["ensemble"]["pressure"] = [
-        float(i) * 0.25 for i in range(n_total)
-    ]
+    raw["ensemble"]["pressure"] = [float(i) * 0.25 for i in range(n_total)]
     raw["output"]["out_file_prefix"] = "jaxmd_mgpu"
     raw["inter_re"] = {
         "flavor": "pressure",
@@ -210,13 +186,10 @@ def test_jaxmd_multi_gpu_pipeline(tmp_path: Path) -> None:
     assert resolved.ns.n_gpu == n_gpu
     assert resolved.ns.n_per_gpu == 2
 
-    run_multi_gpu_from_config(resolved)
+    result = run_multi_gpu_from_config(resolved)
+    assert np.all(np.asarray(result["n_dead"]) == 5)
 
     out = tmp_path / "out"
-    n_total = resolved.ns.n_gpu * resolved.ns.n_per_gpu
-
-    from jaxrens.io.energy_log import EnergyLogger
-
     for r in range(n_total):
         energies_path = out / f"jaxmd_mgpu.run{r:02d}.energies"
         traj_path = out / f"jaxmd_mgpu.run{r:02d}.traj.extxyz"
@@ -228,12 +201,11 @@ def test_jaxmd_multi_gpu_pipeline(tmp_path: Path) -> None:
     final_ckpt = out / "jaxmd_mgpu.final.checkpoint.h5"
     assert final_ckpt.exists()
 
-    from jaxrens.io.checkpoint import load_checkpoint
-
     state = load_checkpoint(final_ckpt)
     log_z = np.asarray(state["log_evidence"])
     assert log_z.shape == (n_gpu, 2)
     assert np.all(np.isfinite(log_z))
+    np.testing.assert_array_equal(result["log_evidence"], log_z)
 
     saved_positions = np.asarray(state["positions"])
     assert saved_positions.shape == (n_gpu, 2, 4, 8, 3)

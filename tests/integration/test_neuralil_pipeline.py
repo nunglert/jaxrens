@@ -1,36 +1,30 @@
-"""End-to-end integration: tiny carbon NS through the NeuralIL backend.
+"""End-to-end NPT nested sampling of H with the NeuralIL backend.
 
-Mirrors :mod:`tests.integration.test_lj_pipeline` and :mod:`test_mace_pipeline`
-but for NeuralIL.  The point is to exercise the *NeuralIL wiring* — backend
-build, model-pickle load, the resolver's pre-NS energy eval, the bucketed
-``max_neighbors_list`` ladder, and a few MCMC steps with
-``value_and_grad(NeuralIL)`` — not to validate any scientific result.
-
-Skipped when:
-
-* ``neuralil`` is not importable.
-* The ``tests/_assets/models/neuralil_tiny`` model pickle is missing.
-
-Sized for the integration tier: two-pressure multi-run (``[0.0, 1.0]`` GPa)
-routed through ``run_multi_gpu_from_config``; CPU-runnable (pmap-on-one-device
-+ vmap), no GPU gate.
-
-Note: ``NeuralILBackendSpec.build_backend()`` always uses
-``supercell_trafo=(1, 1, 1)``; we size the cell ≥ ``2 * r_cut`` so the
-default-supercell neighbor search is sound.  The model's species table is
-``['C', 'H', 'N', 'O']``; with ``NeuralILBackend`` now exposing
-``atomic_numbers``, ``start_species: "1 8"`` (8 atoms of Z=1) maps to type
-index 1 = 'H' — chemically meaningful, but the test only asserts on shapes,
-not chemistry.
+The tests run a tiny config (8 atoms, 5 iterations) through ``resolve``
+and the CLI runners with the model pickle in
+``tests/_assets/models/neuralil_tiny``. This covers the model load, the
+``max_neighbors_list`` bucket ladder and ``value_and_grad`` of NeuralIL
+in the galilean move. The results are not checked for physical accuracy.
+The model's species table is ``['C', 'H', 'N', 'O']``, so
+``start_species: "1 8"`` maps to type index 1. The tests skip when
+``neuralil`` is not installed.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import ase.io
 import numpy as np
 import pytest
 import yaml
+
+from jaxrens.cli.resolve import resolve
+from jaxrens.cli.run import run_multi_gpu_from_config, run_sharded_from_config
+from jaxrens.cli.schema import RootSpec
+from jaxrens.io.checkpoint import load_checkpoint
+from jaxrens.io.energy_log import EnergyLogger
+from jaxrens.sampling.batch_descriptor import PmapVmapRuns, ShardedSingleRun
 
 from . import multi_gpu_n_devices
 
@@ -54,8 +48,8 @@ run:
 backend:
   type: neuralil
   checkpoint_path: PLACEHOLDER
-  # Cell is large enough vs. r_cut=3.5 Å that the default
-  # supercell_trafo=(1,1,1) used by NeuralILBackendSpec is sufficient.
+  # No supercell_trafo: the cell is large enough next to r_cut = 3.5 Å
+  # for the default (1, 1, 1).
   periodic: true
   max_neighbors_list: [30, 50, 80]
   max_neighbors_offset: 4
@@ -74,12 +68,12 @@ moves:
     step_size: 0.05
     weight: 1.0
 
-# Only IterationTermination — keeps n_dead deterministic for the assertions.
+# Iteration count only, so n_dead is fixed for the assertions.
 termination:
   - type: iteration
     max_iterations: 5
 
-# Adaptation must not fire mid-run; set adjust interval > max.
+# adjust_interval > max_iterations, so the step-size bisection never runs.
 adaptation:
   full_auto: true
   adjust_interval: 100
@@ -90,7 +84,7 @@ adaptation:
     step_size_max: 0.3
 
 init:
-  start_species: "1 8"      # 8 atoms (Z=1 → 'H' in NeuralIL's table)
+  start_species: "1 8"      # 8 H atoms; H is index 1 in the model's table
   random_initialise_pos: true
   pos_randomization_mode: grid
   grid_distance: 1.5
@@ -103,9 +97,8 @@ init:
     emax_offset_per_atom: 1.0
 
 cell:
-  # V/atom large enough to easily satisfy 2*r_cut PBC requirement at the
-  # default supercell_trafo=(1,1,1) (cubic side > 7 Å for 8 atoms means
-  # min_volume_per_atom > 7^3 / 8 ≈ 43).
+  # The cell edge must exceed 2 * r_cut = 7 Å with supercell (1, 1, 1):
+  # for 8 atoms in a cube that needs V/atom > 7^3 / 8 ≈ 43.
   max_volume_per_atom: 200.0
   min_volume_per_atom: 50.0
   min_aspect_ratio: 0.5
@@ -126,27 +119,11 @@ output:
 @pytest.mark.neuralil
 @pytest.mark.heavy
 def test_neuralil_full_pipeline(tmp_path: Path) -> None:
-    """Two-pressure NeuralIL NS run.  Exercises:
+    """Run two pressure replicas, which go through the multi-GPU dispatcher.
 
-    * Resolver — config → ``ResolvedConfig`` (two-pressure path).
-    * Backend build — ``create_neuralil`` loading the
-      ``neuralil_tiny/model.pkl`` bundle.
-    * Initial walker sampling + ``_finalise_initial_energies_and_counts``
-      (no-``max_neighbors_for`` path for NeuralIL).
-    * Bucketed kernel dispatch — ``max_neighbors_list`` ladder.
-    * ``init_ns_multi_gpu`` building a ``(G, P, ...)`` NSState.
-    * Batched burn-in (1 walk, 2 MCMC steps).
-    * NS loop with galilean (``value_and_grad(NeuralIL)``) + volume moves
-      under pmap-vmap dispatch (single device, ``n_gpu=1, n_per_gpu=2``).
-    * Streamed I/O — per-replica ``.energies`` / ``.traj.extxyz``, plus
-      global HDF5 checkpoints.
+    On one device the layout is ``(G, P) = (1, 2)``.
     """
     pytest.importorskip("neuralil")
-
-    from jaxrens.cli.resolve import resolve
-    from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootSpec
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
 
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["backend"]["checkpoint_path"] = str(_MODEL_PKL)
@@ -154,51 +131,36 @@ def test_neuralil_full_pipeline(tmp_path: Path) -> None:
 
     root = RootSpec.model_validate(raw)
     resolved = resolve(root)
+    assert isinstance(resolved.batcher, PmapVmapRuns)
 
-    # Two-pressure list → multi-run dispatcher.
-    assert isinstance(
-        resolved.batcher, PmapVmapRuns
-    ), "Two-pressure config should route through the multi-GPU dispatcher."
+    result = run_multi_gpu_from_config(resolved)
+    assert np.all(np.asarray(result["n_dead"]) == 5)
 
-    run_multi_gpu_from_config(resolved)
-
-    # ---- On-disk artefacts ---------------------------------------------------
     out = tmp_path / "out"
     n_total = resolved.ns.n_gpu * resolved.ns.n_per_gpu
-    assert n_total == 2, f"expected 2 replicas, got {n_total}"
-
-    from jaxrens.io.energy_log import EnergyLogger
+    assert n_total == 2
 
     for r in range(n_total):
         energies_path = out / f"neuralil_smoke.run{r:02d}.energies"
         traj_path = out / f"neuralil_smoke.run{r:02d}.traj.extxyz"
-        assert (
-            energies_path.exists()
-        ), f"missing per-replica energy log: {energies_path}"
-        assert (
-            traj_path.exists()
-        ), f"missing per-replica trajectory: {traj_path}"
+        assert energies_path.exists()
+        assert traj_path.exists()
         log = EnergyLogger.read(energies_path)
-        assert log.energies.shape == (5,), (
-            f"{energies_path.name}: expected 5 data entries, "
-            f"got {log.energies.shape}"
-        )
+        assert log.energies.shape == (5,)
+        frames = ase.io.read(traj_path, index=":")
+        assert [f.info["iter"] for f in frames] == [0, 1, 2, 3, 4]
+        assert all(f.get_chemical_symbols() == ["H"] * 8 for f in frames)
 
     final_ckpt = out / "neuralil_smoke.final.checkpoint.h5"
-    assert final_ckpt.exists(), f"missing final checkpoint: {final_ckpt}"
-
-    # ---- Final checkpoint round-trip ----------------------------------------
-    from jaxrens.io.checkpoint import load_checkpoint
+    assert final_ckpt.exists()
 
     state = load_checkpoint(final_ckpt)
     log_z = np.asarray(state["log_evidence"])
-    assert log_z.shape == (resolved.ns.n_gpu, resolved.ns.n_per_gpu), (
-        f"expected (G, P)=({resolved.ns.n_gpu}, {resolved.ns.n_per_gpu}), "
-        f"got {log_z.shape}"
-    )
-    assert np.all(np.isfinite(log_z)), f"log_evidence not finite: {log_z}"
+    assert log_z.shape == (resolved.ns.n_gpu, resolved.ns.n_per_gpu)
+    assert np.all(np.isfinite(log_z))
+    np.testing.assert_array_equal(result["log_evidence"], log_z)
 
-    # Live walkers retained their (G, P, n_walkers, n_atoms, 3) layout.
+    # (n_gpu, n_per_gpu, n_live, n_atoms, 3)
     saved_positions = np.asarray(state["positions"])
     assert saved_positions.shape == (
         resolved.ns.n_gpu,
@@ -207,12 +169,6 @@ def test_neuralil_full_pipeline(tmp_path: Path) -> None:
         8,
         3,
     )
-
-
-# ---------------------------------------------------------------------------
-# Multi-GPU variant — pressure replicas distributed 2-per-device on
-# whatever JAX exposes (either 2 or 4 local devices).
-# ---------------------------------------------------------------------------
 
 
 _NEURALIL_MULTI_GPU_CONFIG_YAML = """
@@ -235,8 +191,8 @@ ensemble:
   pressure: [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75]
   pressure_units: gpa
 
-# RE every 2 iters → 2 swap rounds during the run, exercising the
-# cross-device gather + accept/reject path.
+# RE every 2 iterations gives 2 swap rounds in 5 iterations, across
+# devices.
 inter_re:
   flavor: pressure
   re_interval: 2
@@ -300,21 +256,12 @@ output:
 @pytest.mark.gpu
 @pytest.mark.heavy
 def test_neuralil_multi_gpu_pipeline(tmp_path: Path) -> None:
-    """NeuralIL NPT NS with pressure replicas distributed 2-per-GPU.
+    """Run two pressure replicas per GPU with pressure replica exchange.
 
-    Same code path as :func:`test_neuralil_full_pipeline` but with
-    multiple real devices and an inner vmap of width 2.  Exercises the
-    full pmap(vmap(vmap)) hierarchy with the NeuralIL backend whose
-    dynamics model is now built once at construction time
-    (post-cache-refactor) and dispatched across devices via the
-    resolver's ``base_backend``.  Runs on either 2 or 4 local devices.
+    This goes through the full ``pmap(vmap(vmap))`` hierarchy on 2 or 4
+    devices, with the resolver's ``base_backend`` shared by all of them.
     """
     pytest.importorskip("neuralil")
-
-    from jaxrens.cli.resolve import resolve
-    from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootSpec
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
 
     n_gpu = multi_gpu_n_devices()
     n_total = n_gpu * 2
@@ -330,13 +277,10 @@ def test_neuralil_multi_gpu_pipeline(tmp_path: Path) -> None:
     assert resolved.ns.n_gpu == n_gpu
     assert resolved.ns.n_per_gpu == 2
 
-    run_multi_gpu_from_config(resolved)
+    result = run_multi_gpu_from_config(resolved)
+    assert np.all(np.asarray(result["n_dead"]) == 5)
 
     out = tmp_path / "out"
-    n_total = resolved.ns.n_gpu * resolved.ns.n_per_gpu
-
-    from jaxrens.io.energy_log import EnergyLogger
-
     for r in range(n_total):
         energies_path = out / f"neuralil_mgpu.run{r:02d}.energies"
         traj_path = out / f"neuralil_mgpu.run{r:02d}.traj.extxyz"
@@ -348,24 +292,14 @@ def test_neuralil_multi_gpu_pipeline(tmp_path: Path) -> None:
     final_ckpt = out / "neuralil_mgpu.final.checkpoint.h5"
     assert final_ckpt.exists()
 
-    from jaxrens.io.checkpoint import load_checkpoint
-
     state = load_checkpoint(final_ckpt)
     log_z = np.asarray(state["log_evidence"])
     assert log_z.shape == (n_gpu, 2)
     assert np.all(np.isfinite(log_z))
+    np.testing.assert_array_equal(result["log_evidence"], log_z)
 
     saved_positions = np.asarray(state["positions"])
     assert saved_positions.shape == (n_gpu, 2, 4, 8, 3)
-
-
-# ---------------------------------------------------------------------------
-# Sharded single-run variant — ONE NS run whose live population is sharded
-# across all local GPUs (ShardedSingleRun / run_sharded_from_config).  This is
-# a different code path from the pmap-vmap multi-run tests above: there is a
-# single pressure, a single set of output files, and the dead-point /
-# snapshot writers run on a per-iteration WalkerState gathered off the mesh.
-# ---------------------------------------------------------------------------
 
 
 _NEURALIL_SHARDED_CONFIG_YAML = """
@@ -384,9 +318,8 @@ backend:
   max_neighbors_list: [30, 50, 80]
   max_neighbors_offset: 4
 
-# Single pressure → still a single NS run; sharding distributes its live
-# population across GPUs (a pressure LIST would route to the multi-run path
-# and the resolver rejects combining it with shard_n_gpu).
+# A single pressure gives one NS run whose live population is split
+# across GPUs. The resolver rejects a pressure list with shard_n_gpu.
 ensemble:
   type: npt
   pressure: 0.0
@@ -450,28 +383,15 @@ output:
 @pytest.mark.gpu
 @pytest.mark.heavy
 def test_neuralil_sharded_multi_gpu_pipeline(tmp_path: Path) -> None:
-    """Single NeuralIL NPT NS run sharded across all local GPUs.
+    """Run one NS run with its live population sharded across all GPUs.
 
-    Exercises the ``ShardedSingleRun`` path end-to-end through
-    ``run_sharded_from_config``:
-
-    * Resolver routes ``run.shard_n_gpu > 1`` to ``ShardedSingleRun(n_gpu)``.
-    * ``init_ns_sharded`` shards the K=8 population to ``(G, K/G, ...)``.
-    * The NS loop runs ``ns_step_sharded`` (galilean ``value_and_grad`` +
-      volume moves) with the cross-shard ``lax.psum`` invariants.
-    * **The per-iteration dead point is gathered off the mesh and written**
-      via the single-run ``TrajectoryCallback`` — this is the path that
-      regressed when ``info["dead_walker"]`` kept its leading shard axis, so
-      the trajectory-frame assertions below are the regression guard.
-    * Streamed I/O is single-run-shaped: one ``.energies`` and one
-      ``.traj.extxyz`` (no ``.runNN`` suffix), plus a gathered checkpoint.
+    With ``run.shard_n_gpu > 1`` and a single pressure the resolver picks
+    ``ShardedSingleRun``, and ``run_sharded_from_config`` runs the loop.
+    The outputs have the single-run layout: one ``.energies`` and one
+    ``.traj.extxyz`` without a ``.runNN`` suffix, and a checkpoint
+    gathered back to ``(K, ...)`` shapes.
     """
     pytest.importorskip("neuralil")
-
-    from jaxrens.cli.resolve import resolve
-    from jaxrens.cli.run import run_sharded_from_config
-    from jaxrens.cli.schema import RootSpec
-    from jaxrens.sampling.batch_descriptor import ShardedSingleRun
 
     n_gpu = multi_gpu_n_devices()
 
@@ -482,56 +402,36 @@ def test_neuralil_sharded_multi_gpu_pipeline(tmp_path: Path) -> None:
 
     root = RootSpec.model_validate(raw)
     resolved = resolve(root)
-
-    assert isinstance(resolved.batcher, ShardedSingleRun), (
-        "shard_n_gpu > 1 with a single pressure should route through the "
-        "sharded single-run dispatcher."
-    )
+    assert isinstance(resolved.batcher, ShardedSingleRun)
     assert resolved.batcher.n_gpu == n_gpu
 
     run_sharded_from_config(resolved)
 
-    # ---- On-disk artefacts: single-run-shaped (no per-replica suffix) -------
     out = tmp_path / "out"
-    from jaxrens.io.energy_log import EnergyLogger
-
     energies_path = out / "neuralil_sharded.energies"
     traj_path = out / "neuralil_sharded.traj.extxyz"
-    assert energies_path.exists(), f"missing energy log: {energies_path}"
-    assert traj_path.exists(), f"missing trajectory: {traj_path}"
+    assert energies_path.exists()
+    assert traj_path.exists()
 
     log = EnergyLogger.read(energies_path)
-    assert log.energies.shape == (
-        5,
-    ), f"expected 5 dead-point energies, got {log.energies.shape}"
+    assert log.energies.shape == (5,)
 
-    # Dead-point trajectory: one frame per iteration, each the full 8-atom
-    # gathered walker.  Before the sharded dead_walker fix this write crashed
-    # (the WalkerState reached the writer with a leading shard axis), so these
-    # assertions guard that regression.
-    from ase.io import read as ase_read
-
-    frames = ase_read(str(traj_path), index=":")
-    assert len(frames) == 5, f"expected 5 trajectory frames, got {len(frames)}"
+    # One frame per iteration, each the full 8-atom dead walker. The dead
+    # walker is gathered off the mesh; if it kept its leading shard axis,
+    # the trajectory writer would crash here.
+    frames = ase.io.read(str(traj_path), index=":")
+    assert len(frames) == 5
     for fr in frames:
-        assert len(fr) == 8, f"expected 8 atoms per frame, got {len(fr)}"
+        assert len(fr) == 8
 
-    # ---- Final checkpoint: gathered to single-run (K, ...) shapes -----------
     final_ckpt = out / "neuralil_sharded.final.checkpoint.h5"
-    assert final_ckpt.exists(), f"missing final checkpoint: {final_ckpt}"
-
-    from jaxrens.io.checkpoint import load_checkpoint
+    assert final_ckpt.exists()
 
     state = load_checkpoint(final_ckpt)
     log_z = np.asarray(state["log_evidence"])
-    assert (
-        log_z.size == 1
-    ), f"expected scalar log_evidence, got shape {log_z.shape}"
-    assert np.all(np.isfinite(log_z)), f"log_evidence not finite: {log_z}"
+    assert log_z.size == 1
+    assert np.all(np.isfinite(log_z))
 
+    # Gathered to (K=8, n_atoms=8, 3).
     saved_positions = np.asarray(state["positions"])
-    assert saved_positions.shape == (
-        8,
-        8,
-        3,
-    ), f"expected gathered (K=8, n_atoms=8, 3), got {saved_positions.shape}"
+    assert saved_positions.shape == (8, 8, 3)

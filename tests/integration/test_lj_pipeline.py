@@ -1,35 +1,30 @@
-"""End-to-end smoke: LJ multi-pressure NS through every major stage.
+"""End-to-end NPT nested sampling of Lennard-Jones argon.
 
-Single comprehensive test that exercises:
-
-* **Resolver** — load YAML → ``ResolvedConfig``, build LJ backend,
-  per-replica EnsembleBackend wrapping, initial walker sampling, cell
-  shape walk, initial-energy evaluation.
-* **Init** — ``init_ns_multi_gpu`` building a ``(G, P, ...)`` NSState.
-* **Burn-in** — ``initial_walk(batched=True)`` with adaptation.
-* **NS loop** — ``_run_loop`` driven by termination criteria; the
-  ``while True`` form (no static iteration cap).
-* **Inter-replica exchange** — pressure-RENS swaps every few iterations.
-* **Step-size adaptation** — ``full_auto`` bisection during the loop.
-* **Streamed I/O** — ``EnergyLogger`` (``.energies``), trajectory writer
-  (``.traj.extxyz``), and HDF5 checkpoint (``.checkpoint.h5`` /
-  ``.final.checkpoint.h5``).
-
-Sized to finish in a few seconds on CPU.  Intentionally minimal:
-``n_live=16``, ``max_iterations=30``, 8 LJ atoms, 2 replicas — just
-enough to fire each stage at least once.
+The tests build a config from YAML, resolve it and run it through the CLI
+entry points: initial walkers and cells, burn-in, the NS loop with
+pressure replica exchange and ``full_auto`` step-size adaptation, and the
+streamed outputs (``.energies``, ``.traj.extxyz``, HDF5 checkpoints). The
+runs are small (8 atoms, ``n_live=16``, 30 iterations).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import ase.io
 import numpy as np
 import pytest
 import yaml
 
-from . import multi_gpu_n_devices
+from jaxrens.cli.cli import _run_single
+from jaxrens.cli.resolve import resolve
+from jaxrens.cli.run import run_multi_gpu_from_config
+from jaxrens.cli.schema import RootSpec
+from jaxrens.io.checkpoint import load_checkpoint
+from jaxrens.io.energy_log import EnergyLogger
+from jaxrens.sampling.batch_descriptor import PmapVmapRuns, SingleRun
 
+from . import multi_gpu_n_devices
 
 _CONFIG_YAML = """
 run:
@@ -51,7 +46,7 @@ ensemble:
   pressure: [0.1, 1.0]
   pressure_units: eva3
 
-# Two replicas + RE every 10 iters → at least 2 swap attempts during the run.
+# Two replicas with RE every 10 iterations: swaps are attempted twice.
 inter_re:
   flavor: pressure
   re_interval: 10
@@ -66,14 +61,13 @@ moves:
     step_size: 0.2
     weight: 1.0
 
-# Single termination criterion = the IterationTermination derived from
-# run.max_iterations (no prior_mass to keep the run length deterministic
-# for the assertions below).
+# Iteration count only, no prior_mass, so the run length the assertions
+# below rely on is fixed.
 termination:
   - type: iteration
     max_iterations: 30
 
-# full_auto with adjust_interval=10 → bisection fires at iter 10 / 20.
+# full_auto with adjust_interval=10: bisection runs at iterations 10 and 20.
 adaptation:
   full_auto: true
   adjust_interval: 10
@@ -97,8 +91,8 @@ init:
     emax_offset_per_atom: 1.0
 
 cell:
-  # Loose bounds so the volume sampler + cell_shape_walk can't produce a
-  # degenerate small/anisotropic cell that breaks grid positioning.
+  # Loose enough that the volume sampler and cell_shape_walk don't produce
+  # a cell too small or too skewed for grid positioning.
   max_volume_per_atom: 30.0
   min_volume_per_atom: 1.5
   min_aspect_ratio: 0.6
@@ -117,145 +111,99 @@ output:
 
 
 def test_lj_full_pipeline(tmp_path: Path) -> None:
-    """Run a 30-iter LJ NPT NS with two pressure replicas and verify each
-    stage produced its expected on-disk artefact.
+    """Run two pressure replicas with RE and check the result and outputs.
 
-    Asserts on:
-
-    * Result dict shape and finiteness.
-    * ``.energies``, ``.traj.extxyz``, periodic checkpoint, and final
-      checkpoint files exist per replica / globally.
-    * The streamed ``.energies`` file matches ``max_iterations`` in length.
-    * HDF5 checkpoint loads back without errors and ``log_evidence`` is
-      finite with the expected ``(G, P) = (1, 2)`` shape under the
-      single-device CI runner.
+    On one device the layout is ``(G, P) = (1, 2)``.
     """
-    from jaxrens.cli.resolve import (
-        resolve,
-    )
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
-    from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootSpec
-
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["output"]["working_dir"] = str(tmp_path / "out")
 
     root = RootSpec.model_validate(raw)
     resolved = resolve(root)
-    assert isinstance(resolved.batcher, PmapVmapRuns), (
-        "Two-pressure config should route through the multi-GPU dispatcher."
-    )
+    assert isinstance(resolved.batcher, PmapVmapRuns)
 
     result = run_multi_gpu_from_config(resolved)
 
-    # ---- Result-dict sanity --------------------------------------------------
     log_z = np.asarray(result["log_evidence"])
-    assert log_z.shape == (resolved.ns.n_gpu, resolved.ns.n_per_gpu), (
-        f"log_evidence shape {log_z.shape} != "
-        f"({resolved.ns.n_gpu}, {resolved.ns.n_per_gpu})"
-    )
-    assert np.all(np.isfinite(log_z)), f"log_evidence contains non-finite values: {log_z}"
+    assert log_z.shape == (resolved.ns.n_gpu, resolved.ns.n_per_gpu)
+    assert np.all(np.isfinite(log_z))
 
     n_dead = np.asarray(result["n_dead"])
-    assert np.all(n_dead == 30), (
-        f"Expected n_dead == max_iterations == 30 per replica, got {n_dead}"
-    )
+    assert np.all(n_dead == 30)
 
-    # Live walkers retained their shape after the run.
     positions = np.asarray(result["positions"])
     n_atoms = 8
     assert positions.shape == (
-        resolved.ns.n_gpu, resolved.ns.n_per_gpu, 16, n_atoms, 3,
+        resolved.ns.n_gpu,
+        resolved.ns.n_per_gpu,
+        16,
+        n_atoms,
+        3,
     )
 
-    # ---- On-disk artefacts ---------------------------------------------------
     out = tmp_path / "out"
     n_total = resolved.ns.n_gpu * resolved.ns.n_per_gpu
     for r in range(n_total):
         energies_path = out / f"smoke.run{r:02d}.energies"
         traj_path = out / f"smoke.run{r:02d}.traj.extxyz"
-        assert energies_path.exists(), f"missing per-replica energy log: {energies_path}"
-        assert traj_path.exists(), f"missing per-replica trajectory: {traj_path}"
-        # EnergyLogger writes a header + one data line per iteration; read via
-        # the canonical parser to avoid coupling to format details.
-        from jaxrens.io.energy_log import EnergyLogger
+        assert energies_path.exists()
+        assert traj_path.exists()
         log = EnergyLogger.read(energies_path)
-        assert log.energies.shape == (30,), (
-            f"{energies_path.name}: expected 30 data entries (one per iteration), "
-            f"got {log.energies.shape}"
-        )
+        assert log.energies.shape == (30,)
+        # traj_interval=5 over 30 iterations, tagged with the 0-based
+        # iteration index.
+        frames = ase.io.read(traj_path, index=":")
+        assert [f.info["iter"] for f in frames] == [0, 5, 10, 15, 20, 25]
+        assert all(f.get_chemical_symbols() == ["Ar"] * 8 for f in frames)
 
-    # Initial / periodic / final checkpoints all on disk.
-    for suffix in ("initial.checkpoint.h5", "checkpoint.h5", "final.checkpoint.h5"):
-        path = out / f"smoke.{suffix}"
-        assert path.exists(), f"missing {path}"
-
-    # ---- Final checkpoint round-trip ----------------------------------------
-    from jaxrens.io.checkpoint import load_checkpoint
+    for suffix in (
+        "initial.checkpoint.h5",
+        "checkpoint.h5",
+        "final.checkpoint.h5",
+    ):
+        assert (out / f"smoke.{suffix}").exists()
 
     state = load_checkpoint(out / "smoke.final.checkpoint.h5")
-    assert np.all(np.isfinite(np.asarray(state["log_evidence"])))
-    # Live walkers are saved in the checkpoint with batched leading axes.
-    saved_positions = np.asarray(state["positions"])
-    assert saved_positions.shape[-2:] == (n_atoms, 3)
-    # Dead arrays were intentionally dropped from HDF5 in the recent refactor;
-    # the canonical record lives in .energies / .traj.  Either absent
-    # (load_checkpoint returns None) or present-but-empty is acceptable.
-    de = state.get("dead_energies")
-    if de is not None:
-        assert np.asarray(de).size == 0 or np.asarray(de).shape[-1] in (0, 30)
+    np.testing.assert_array_equal(state["log_evidence"], log_z)
+    assert np.asarray(state["n_dead"]).tolist() == [[30, 30]]
+    assert np.asarray(state["positions"]).shape == positions.shape
+    # The checkpoint does not store dead points; .energies and .traj hold
+    # them.
+    assert state["dead_energies"] is None
 
 
 @pytest.mark.parametrize("missing", ["pressures", "inter_re"])
 def test_lj_pipeline_smoke_variants(tmp_path: Path, missing: str) -> None:
-    """Variant smokes: scalar-pressure single-run path, and multi-pressure
-    without inter_re (cohort path).  Both go through different dispatchers
-    and cover the non-RENS code paths.
+    """Run the config without RE, once with a scalar pressure, once with two.
 
-    Skipped when the variant doesn't actually pivot to a different
-    dispatcher — e.g. ``missing="inter_re"`` still hits the multi-replica
-    multi-GPU path; ``missing="pressures"`` collapses to single-run.
+    A scalar pressure gives a single run; two pressures without
+    ``inter_re`` still go through the multi-replica runner.
     """
-    from jaxrens.cli.resolve import (
-        resolve,
-    )
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
-    from jaxrens.cli.run import run_from_config, run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootSpec
-
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["output"]["working_dir"] = str(tmp_path / "out")
     raw["output"]["out_file_prefix"] = f"smoke_{missing}"
 
+    raw.pop("inter_re")
     if missing == "pressures":
-        raw["ensemble"]["pressure"] = 0.5  # scalar → single-run cohort
-        raw.pop("inter_re", None)
-    elif missing == "inter_re":
-        raw.pop("inter_re", None)  # multi-run path without RENS
+        raw["ensemble"]["pressure"] = 0.5
 
     root = RootSpec.model_validate(raw)
     resolved = resolve(root)
-
-    if isinstance(resolved.batcher, PmapVmapRuns):
-        # Without inter_re, the resolver may still build a multi-replica
-        # ResolvedConfig if the pressure list is multi-element; exercise
-        # that path.
-        run_multi_gpu_from_config(resolved)
-    else:
-        # SingleRun (n_total=1 for scalar pressure).
-        from jaxrens.cli.cli import _run_single
-        _run_single(resolved)
-
-    # Per-config artefact paths use the parametrized prefix.
     out = tmp_path / "out"
-    final_ckpts = list(out.glob(f"smoke_{missing}*final.checkpoint.h5"))
-    assert final_ckpts, f"no final checkpoint produced for variant {missing!r}"
 
-
-# ---------------------------------------------------------------------------
-# Multi-GPU variant — pressure replicas distributed 2-per-device on
-# whatever JAX exposes (either 2 or 4 local devices).
-# ---------------------------------------------------------------------------
+    if missing == "pressures":
+        assert isinstance(resolved.batcher, SingleRun)
+        _run_single(resolved)
+        assert (out / "smoke_pressures.final.checkpoint.h5").exists()
+    else:
+        assert isinstance(resolved.batcher, PmapVmapRuns)
+        assert resolved.inter_re_config is None
+        run_multi_gpu_from_config(resolved)
+        for r in range(2):
+            log = EnergyLogger.read(
+                out / f"smoke_inter_re.run{r:02d}.energies"
+            )
+            assert log.energies.shape == (30,)
 
 
 _LJ_MULTI_GPU_CONFIG_YAML = """
@@ -341,22 +289,12 @@ output:
 @pytest.mark.lj
 @pytest.mark.heavy
 def test_lj_multi_gpu_pipeline(tmp_path: Path) -> None:
-    """LJ NPT NS with pressure replicas distributed 2-per-GPU.
+    """Run two pressure replicas per GPU with RE and adaptation.
 
-    Same code path as :func:`test_lj_full_pipeline` but with multiple
-    real devices and an inner vmap of width 2, exercising the full
-    pmap(vmap(vmap)) hierarchy rather than the degenerate
-    ``n_per_gpu=1`` case.  Hits cross-device pmap communication for
-    pressure-RENS swaps and ``full_auto`` bisection adaptation.  Runs on
-    either 2 or 4 local devices.
+    Unlike :func:`test_lj_full_pipeline` on one device, the inner vmap has
+    width 2 and the RE swaps cross devices through ``pmap``. Needs 2 or 4
+    local devices.
     """
-    from jaxrens.cli.resolve import (
-        resolve,
-    )
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
-    from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootSpec
-
     n_gpu = multi_gpu_n_devices()
     n_total = n_gpu * 2
 
@@ -367,12 +305,8 @@ def test_lj_multi_gpu_pipeline(tmp_path: Path) -> None:
     root = RootSpec.model_validate(raw)
     resolved = resolve(root)
     assert isinstance(resolved.batcher, PmapVmapRuns)
-    assert resolved.ns.n_gpu == n_gpu, (
-        f"expected n_gpu={n_gpu}, got {resolved.ns.n_gpu}"
-    )
-    assert resolved.ns.n_per_gpu == 2, (
-        f"expected n_per_gpu=2, got {resolved.ns.n_per_gpu}"
-    )
+    assert resolved.ns.n_gpu == n_gpu
+    assert resolved.ns.n_per_gpu == 2
 
     result = run_multi_gpu_from_config(resolved)
 
@@ -384,9 +318,6 @@ def test_lj_multi_gpu_pipeline(tmp_path: Path) -> None:
     assert np.all(n_dead == 30)
 
     out = tmp_path / "out"
-    n_total = resolved.ns.n_gpu * resolved.ns.n_per_gpu
-    from jaxrens.io.energy_log import EnergyLogger
-
     for r in range(n_total):
         energies_path = out / f"smoke_mgpu.run{r:02d}.energies"
         traj_path = out / f"smoke_mgpu.run{r:02d}.traj.extxyz"
