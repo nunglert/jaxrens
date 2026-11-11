@@ -1319,3 +1319,63 @@ class TestStackingShiftSpec:
         a = 3 * A1
         with pytest.raises(RuntimeError, match="Wigner-Seitz"):
             resolve(self._root(tmp_path, cpar=(a + 0.5 * A2)[:2]))
+
+
+class TestSheetIdInReplicaExchange:
+    def test_sheet_id_follows_its_configuration(self):
+        """sheet_id describes the configuration, so a replica-exchange swap
+        must move it with the positions to the other run."""
+        from jaxrens.sampling.batch_descriptor import VmapRuns
+        from jaxrens.sampling.inter_re_manager import InterREManager
+        from jaxrens.sampling.moves.replica_exchange import EnsembleSwap
+        from jaxrens.sampling.nested_sampling import init_ns_parallel
+
+        pos, typ, cell = _graphite([3.35, 3.35], li_per_gallery=(3,))
+        desc = MoveKernel(
+            name="layer_slide_C",
+            build_kernel=build_layer_slide_kernel,
+            kernel_kwargs=dict(
+                species=(C,),
+                host_codes=(C,),
+                n_sheets=2,
+                in_plane_repeats=(3, 3),
+                subdivisions=3,
+                slide_host=True,
+            ),
+            extra_state_fields={
+                "sheet_id": (jnp.ndarray, make_sheet_id_initializer((C,)))
+            },
+        )
+        init_fn, _, _ = build_mwg(create_harmonic(), [desc])
+        # Run 1 holds the same crystal shifted up by half a cell, so its
+        # sheets are numbered the other way round.
+        shifted = pos + [0.0, 0.0, 0.5 * cell[2, 2]]
+        positions = jnp.asarray(np.stack([pos[None], shifted[None]]))
+        cells = jnp.asarray(np.broadcast_to(cell, (2, 1, 3, 3)))
+        ns_state = init_ns_parallel(
+            init_fn,
+            positions,
+            jnp.asarray(typ),
+            jnp.array([[0.0], [1.0]]),
+            cells,
+            jax.random.split(jax.random.key(0), 2),
+            step_sizes=jnp.array([0.02]),
+            ensemble_params_per_run=[
+                {"pressure": jnp.array(0.0)},
+                {"pressure": jnp.array(0.0)},
+            ],
+        )
+        ns_state = ns_state.set(emax=jnp.array([1e6, 1e6]))
+        old = ns_state.population
+        assert not jnp.array_equal(old.sheet_id[0], old.sheet_id[1])
+
+        mgr = InterREManager(
+            EnsembleSwap(), VmapRuns(n_runs=2), None, re_interval=1
+        )
+        new_state, stats, _ = mgr.apply(ns_state, jax.random.key(1))
+        new = new_state.population
+        assert stats["n_swap_pairs_accepted"] == 1
+        for name in ("positions", "sheet_id"):
+            got, want = getattr(new, name), getattr(old, name)
+            assert jnp.array_equal(got[0], want[1]), name
+            assert jnp.array_equal(got[1], want[0]), name
