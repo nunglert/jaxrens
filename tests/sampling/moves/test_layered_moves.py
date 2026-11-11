@@ -782,6 +782,39 @@ class TestLayerSlideKernel:
         # (1, 1) on the k = 3 grid is (a1 + a2) / 3: AA -> AB.
         assert counts[1, 1] > 0 and counts[2, 2] > 0
 
+    def test_continuous_slide_is_a_small_in_plane_gaussian(self):
+        sigma = 0.05
+        step, state, cell = _slide_setup((C,), True, k=0, sigma=sigma)
+        new, info = _propose(step, state, 2000, seed=9)
+        assert bool(jnp.all(info.accepted))
+        d = np.asarray(new.positions - state.positions)
+        moved = _moved(state, new)
+        sid = np.asarray(state.sheet_id)
+        ts = []
+        for dk, mk in zip(d, moved):
+            assert mk.sum() == 18 and len(set(sid[mk])) == 1
+            t = dk[mk]
+            np.testing.assert_allclose(
+                t, np.broadcast_to(t[0], t.shape), atol=1e-6
+            )
+            ts.append(t[0])
+        ts = np.array(ts)
+        np.testing.assert_allclose(ts[:, 2], 0.0, atol=1e-6)  # in plane
+        # Centred Gaussian of width sigma in each in-plane direction: no
+        # grid jump.
+        np.testing.assert_allclose(
+            ts[:, :2].mean(axis=0), 0.0, atol=4 * sigma / np.sqrt(2000)
+        )
+        np.testing.assert_allclose(ts[:, :2].std(axis=0), sigma, rtol=0.1)
+        assert np.abs(ts[:, :2]).max() < 6 * sigma
+
+    def test_continuous_slide_of_a_gallery(self):
+        step, state, _ = _slide_setup((LI,), False, k=0, li=(3, 3), sigma=0.05)
+        new, info = _propose(step, state, 100, seed=10)
+        typ = np.asarray(state.types)
+        for mk in _moved(state, new):
+            assert mk.sum() == 3 and np.all(typ[mk] == LI)
+
     def test_reverse_translation_returns_to_start(self):
         step, state, cell = _slide_setup((C,), True, k=3)
         new, _ = _propose(step, state, 20, seed=3)
@@ -870,9 +903,22 @@ class TestLayerSlideSpec:
         )
         assert desc.kernel_kwargs["host_codes"] == (0, 3)
 
-    def test_subdivisions_must_be_positive(self):
+    def test_subdivisions_must_not_be_negative(self):
         with pytest.raises(pydantic.ValidationError):
-            LayerSlideMoveSpec(species="C", subdivisions=0)
+            LayerSlideMoveSpec(species="C", subdivisions=-1)
+
+    def test_continuous_mode(self):
+        spec = LayerSlideMoveSpec(species="C", subdivisions=0)
+        assert spec._effective_name() == "layer_slide_C_continuous"
+        assert (
+            LayerSlideMoveSpec(species="Li", subdivisions=0)._effective_name()
+            == "layer_slide_Li_continuous"
+        )
+        desc = spec.to_descriptor(
+            symbol_map=self._SYMBOLS, sheets=SheetInfo(2, 18)
+        )
+        assert desc.kernel_kwargs["subdivisions"] == 0
+        assert desc.kernel_kwargs["slide_host"] is True
 
     def test_descriptor(self):
         desc = LayerSlideMoveSpec(species="C", subdivisions=3).to_descriptor(
@@ -1212,6 +1258,47 @@ class TestStackingShiftPrior:
         )
         counts = np.bincount(sextant, minlength=6)
         assert stats.chisquare(counts).pvalue > 1e-3
+
+
+class TestStackingShiftContinuous:
+    def test_continuous_tilt_is_a_small_in_plane_gaussian(self):
+        sigma = 0.05
+        step, state = _shift_setup(k=0, sigma=sigma)
+        new, info = _propose(step, state, 2000, seed=11)
+        assert bool(jnp.all(info.accepted))
+        t = np.asarray(new.cell[:, 2] - state.cell[2])
+        np.testing.assert_allclose(t[:, 2], 0.0, atol=1e-6)  # in plane
+        np.testing.assert_allclose(
+            t[:, :2].mean(axis=0), 0.0, atol=4 * sigma / np.sqrt(2000)
+        )
+        np.testing.assert_allclose(t[:, :2].std(axis=0), sigma, rtol=0.1)
+        vol = abs(np.linalg.det(np.asarray(state.cell)))
+        np.testing.assert_allclose(
+            np.abs(np.linalg.det(np.asarray(new.cell))), vol, rtol=1e-5
+        )
+        # The tilt is in plane: every height is unchanged.
+        s3 = np.asarray(fractional_heights(state.positions, state.cell))
+        for pos, cell in zip(
+            np.asarray(new.positions)[:20], np.asarray(new.cell)[:20]
+        ):
+            s3n = np.asarray(fractional_heights(jnp.asarray(pos), cell))
+            d = (s3n - s3 + 0.5) % 1.0 - 0.5
+            np.testing.assert_allclose(d, 0.0, atol=1e-5)
+
+    def test_spec(self):
+        from jaxrens.cli.schema.cell import CellSpec
+
+        spec = StackingShiftMoveSpec(subdivisions=0)
+        assert spec._effective_name() == "stacking_shift_continuous"
+        desc = spec.to_descriptor(
+            n_atoms=39,
+            cell_cfg=CellSpec(restrict_c_in_plane=True, min_aspect_ratio=0.5),
+            symbol_map={0: "C", 1: "Li"},
+            sheets=SheetInfo(2, 18),
+        )
+        assert desc.kernel_kwargs["subdivisions"] == 0
+        with pytest.raises(pydantic.ValidationError):
+            StackingShiftMoveSpec(subdivisions=-1)
 
 
 class TestStackingShiftSpec:
