@@ -183,9 +183,8 @@ def check_sheets(
     positions = np.asarray(positions)
     n_atoms = positions.shape[-2]
     positions = positions.reshape(-1, n_atoms, 3)
-    types = np.broadcast_to(np.asarray(types), positions.shape[:-1]).reshape(
-        -1, n_atoms
-    )
+    types = np.asarray(types).reshape(-1, n_atoms)
+    types = np.broadcast_to(types, positions.shape[:-1])
     if cells is None:
         cells = np.zeros((3, 3))
     cells = np.asarray(cells).reshape(-1, 3, 3)
