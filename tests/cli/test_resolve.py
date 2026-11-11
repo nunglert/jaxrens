@@ -1432,6 +1432,33 @@ class TestRestartInit:
             resolve(root)
 
 
+@pytest.mark.multi_gpu
+def test_multi_replica_restart_retiles_single_gpu_checkpoint(tmp_path):
+    """Restart a checkpoint saved with n_gpu=1 on a host with 2 or 4 devices.
+
+    The 4 replicas are re-tiled as ``(n_gpu, 4 // n_gpu)``; replica order
+    must survive, so the restart bundles flatten back to the saved n_dead.
+    On one GPU, run it on CPU with
+    ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=2``.
+    """
+    n_gpu = len(jax.local_devices())
+    if n_gpu not in (2, 4):
+        pytest.fail(f"needs 2 or 4 local devices, got {n_gpu}")
+    n_per_gpu = 4 // n_gpu
+
+    n_dead = (3, 7, 5, 2)
+    p, positions = _write_batched_checkpoint(tmp_path, n_dead=n_dead)
+    resolved = resolve(_restart_root(p, [0.01, 0.02, 0.03, 0.04]))
+
+    assert resolved.batcher == PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+    np.testing.assert_allclose(
+        np.asarray(resolved.init.initial_positions), positions
+    )
+    bundles = resolved.init.restart_state
+    assert [len(row) for row in bundles] == [n_per_gpu] * n_gpu
+    assert [b.n_dead for row in bundles for b in row] == list(n_dead)
+
+
 class _FakeZTableBackend:
     """Stand-in for MACE: exposes ``atomic_numbers`` and a dummy __call__.
 
