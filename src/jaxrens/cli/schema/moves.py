@@ -1160,7 +1160,10 @@ class LayerSlideMoveSpec(LayeredMoveSpec):
     uniform on the grid without ``(0, 0)`` and ``k = subdivisions``, plus
     in-plane Gaussian noise of ``step_size``.  ``k = 1`` gives host lattice
     vectors (intercalant hollow to hollow); ``k = 3`` adds the third-cell
-    shifts between AA, AB and AC stacking.
+    shifts between AA, AB and AC stacking.  ``k = 0`` drops the jump: a
+    continuous Gaussian slide of ``step_size``, adapted like a local move,
+    that lets a sheet settle near its current registry.  Continuous moves are
+    auto-named ``layer_slide_<symbols>_continuous``.
 
     ::
 
@@ -1184,10 +1187,11 @@ class LayerSlideMoveSpec(LayeredMoveSpec):
     )
     subdivisions: int = Field(
         default=1,
-        ge=1,
+        ge=0,
         description=(
             "Grid steps per host lattice vector: 1 for host lattice "
-            "translations, 3 to include the AA/AB/AC stacking shifts."
+            "translations, 3 to include the AA/AB/AC stacking shifts, 0 for "
+            "a continuous slide (Gaussian of ``step_size`` only)."
         ),
     )
 
@@ -1221,7 +1225,10 @@ class LayerSlideMoveSpec(LayeredMoveSpec):
     def _effective_name(self) -> str:
         if self.name is not None:
             return self.name
-        return "layer_slide_" + "_".join(self.species)
+        name = "layer_slide_" + "_".join(self.species)
+        if self.subdivisions == 0:
+            name += "_continuous"
+        return name
 
     def _kernel_kwargs(
         self,
@@ -1257,7 +1264,9 @@ class StackingShiftMoveSpec(LayeredMoveSpec):
     ``{-1, 0, 1}^2`` without ``(0, 0)``, ``k = subdivisions``, plus in-plane
     noise of ``step_size``.  ``k = 1`` changes the in-plane offset of the
     intercalants between galleries (alpha-alpha / alpha-beta); ``k = 3``
-    changes the sheet stacking (AA / AB / AC).
+    changes the sheet stacking (AA / AB / AC).  ``k = 0`` drops the jump: a
+    continuous Gaussian tilt of ``step_size``, adapted like a local move,
+    auto-named ``stacking_shift_continuous``.
 
     Requires ``cell.restrict_c_in_plane: true``: otherwise the equivalent
     cells ``c + p a + q b`` weigh the registries unequally in the prior.
@@ -1277,11 +1286,13 @@ class StackingShiftMoveSpec(LayeredMoveSpec):
     )
     subdivisions: int = Field(
         default=1,
-        ge=1,
+        ge=0,
         description=(
             "Grid steps per host lattice vector: 1 for host lattice "
-            "translations, 3 to include the AA/AB/AC stacking shifts.  "
-            "Auto-named ``stacking_shift_<subdivisions>``."
+            "translations, 3 to include the AA/AB/AC stacking shifts, 0 for "
+            "a continuous tilt (Gaussian of ``step_size`` only).  "
+            "Auto-named ``stacking_shift_<subdivisions>``, or "
+            "``stacking_shift_continuous`` for 0."
         ),
     )
 
@@ -1291,6 +1302,8 @@ class StackingShiftMoveSpec(LayeredMoveSpec):
     def _effective_name(self) -> str:
         if self.name is not None:
             return self.name
+        if self.subdivisions == 0:
+            return "stacking_shift_continuous"
         return f"stacking_shift_{self.subdivisions}"
 
     def _kernel_kwargs(

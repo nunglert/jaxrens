@@ -353,7 +353,10 @@ def build_layer_slide_kernel(
 
     with ``(i, j)`` uniform on ``{0..m_a k - 1} x {0..m_b k - 1}`` without
     ``(0, 0)``, ``k = subdivisions``, and ``u, v`` an orthonormal basis of
-    the sheet plane.  The translation is in plane, so no height changes:
+    the sheet plane.  With ``subdivisions = 0`` there is no grid jump: the
+    translation is only the in-plane Gaussian, a continuous slide whose
+    width is adapted like any other step size.  The translation is in plane,
+    so no height changes:
     the sheet (fixed by ``sheet_id``) or the gallery's content is the same
     before and after, and the proposal is symmetric.  An empty gallery
     rejects the proposal (reason 3).
@@ -365,7 +368,8 @@ def build_layer_slide_kernel(
         host_codes: Type codes of the sheet atoms (used by ``sheet_id``).
         n_sheets: Number of sheets, from ``check_sheets``.
         in_plane_repeats: ``(m_a, m_b)``, host primitive cells along a, b.
-        subdivisions: Grid steps ``k`` per host lattice vector.
+        subdivisions: Grid steps ``k`` per host lattice vector; 0 for a
+            continuous slide (Gaussian only).
         slide_host: Slide a sheet (True) or a gallery's atoms (False).
 
     Returns:
@@ -374,7 +378,8 @@ def build_layer_slide_kernel(
     """
     del host_codes  # carried for the descriptor; sheet_id already uses it
     m_a, m_b = in_plane_repeats
-    n_a, n_b = m_a * subdivisions, m_b * subdivisions
+    continuous = subdivisions == 0
+    n_a, n_b = max(m_a * subdivisions, 1), max(m_b * subdivisions, 1)
     n_grid = n_a * n_b
 
     def step(rng_key, state, likelihood_constraint):
@@ -395,17 +400,15 @@ def build_layer_slide_kernel(
             )
             valid = jnp.any(members)
 
-        t_idx = jax.random.randint(k_t, (), 1, n_grid)
-        i, j = t_idx // n_b, t_idx % n_b
         n_hat, _ = _normal_and_height(cell)
         u = cell[0] / jnp.linalg.norm(cell[0])
         v = jnp.cross(n_hat, u)
         eps = jax.random.normal(k_noise, (2,))
-        t = (
-            i * cell[0] / n_a
-            + j * cell[1] / n_b
-            + state.step_size * (eps[0] * u + eps[1] * v)
-        )
+        t = state.step_size * (eps[0] * u + eps[1] * v)
+        if not continuous:
+            t_idx = jax.random.randint(k_t, (), 1, n_grid)
+            i, j = t_idx // n_b, t_idx % n_b
+            t = t + i * cell[0] / n_a + j * cell[1] / n_b
         new_positions = positions + members[:, None] * t
 
         result = backend(
@@ -465,9 +468,10 @@ def build_stacking_shift_kernel(
     3. Tilt the cell, ``c' = c + t``, keeping the atoms fixed in Cartesian
        space, with ``t = i a / (m_a k) + j b / (m_b k)`` plus in-plane
        Gaussian noise of ``step_size``, ``(i, j)`` uniform in
-       ``{-1, 0, 1}^2`` without ``(0, 0)``.  The periodic images above the
-       boundary shift by ``t`` relative to the atoms below it, so only the
-       registry across gallery ``g`` changes.
+       ``{-1, 0, 1}^2`` without ``(0, 0)``.  With ``subdivisions = 0``
+       there is no grid jump, only the Gaussian: a continuous tilt.  The
+       periodic images above the boundary shift by ``t`` relative to the
+       atoms below it, so only the registry across gallery ``g`` changes.
 
     The volume and every height are unchanged (``t`` is in plane), so the
     reverse move sees the same galleries and cut, and undoes the tilt with
@@ -481,7 +485,8 @@ def build_stacking_shift_kernel(
         n_sheets: Number of sheets, from ``check_sheets``.
         in_plane_repeats: ``(m_a, m_b)``, host primitive cells along a, b.
         subdivisions: Grid steps ``k`` per host lattice vector: 1 for host
-            lattice vectors, 3 for the AA/AB/AC shifts.
+            lattice vectors, 3 for the AA/AB/AC shifts, 0 for a continuous
+            tilt (Gaussian only).
         n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect,
             restrict_c_in_plane: Cell-geometry guard, as for the other cell
             moves.
@@ -492,7 +497,8 @@ def build_stacking_shift_kernel(
     """
     del host_codes  # carried for the descriptor; sheet_id already uses it
     m_a, m_b = in_plane_repeats
-    n_a, n_b = m_a * subdivisions, m_b * subdivisions
+    continuous = subdivisions == 0
+    n_a, n_b = max(m_a * subdivisions, 1), max(m_b * subdivisions, 1)
     shifts = jnp.asarray(_SHIFTS)
     cell_geometry = build_cell_geometry(
         n_atoms,
@@ -515,15 +521,13 @@ def build_stacking_shift_kernel(
         shift = jnp.floor(positions @ n_hat / h - cut)
         wrapped = positions - shift[:, None] * cell[2]
 
-        i, j = shifts[jax.random.randint(k_t, (), 0, shifts.shape[0])]
         u = cell[0] / jnp.linalg.norm(cell[0])
         v = jnp.cross(n_hat, u)
         eps = jax.random.normal(k_noise, (2,))
-        t = (
-            i * cell[0] / n_a
-            + j * cell[1] / n_b
-            + state.step_size * (eps[0] * u + eps[1] * v)
-        )
+        t = state.step_size * (eps[0] * u + eps[1] * v)
+        if not continuous:
+            i, j = shifts[jax.random.randint(k_t, (), 0, shifts.shape[0])]
+            t = t + i * cell[0] / n_a + j * cell[1] / n_b
         new_cell = cell.at[2].add(t)
 
         result = backend(
