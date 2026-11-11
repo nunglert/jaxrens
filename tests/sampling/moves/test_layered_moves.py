@@ -195,6 +195,10 @@ class TestCheckSheets:
         stacked = np.broadcast_to(pos, (2, 3, *pos.shape))
         cells = np.broadcast_to(cell, (2, 3, 3, 3))
         assert check_sheets(stacked, typ, cells, (C,)) == SheetInfo(2, 18)
+        # Types with the same leading axes, as the multi-replica resolver
+        # passes them.
+        types = np.broadcast_to(typ, (2, 3, len(typ)))
+        assert check_sheets(stacked, types, cells, (C,)) == SheetInfo(2, 18)
 
     def test_non_periodic_cell(self):
         pos, typ, cell = _graphite([3.35, 3.35])
