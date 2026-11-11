@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import ase
 import ase.io
@@ -37,6 +38,7 @@ from jaxrens.cli.resolve import (
     ResolvedConfig,
     _finalise_initial_energies_and_counts,
     _resolve_init,
+    _warn_if_pressure_without_volume,
     resolve,
 )
 from jaxrens.cli.schema import RootSpec
@@ -1732,3 +1734,50 @@ class TestFinaliseInitialBucketChoice:
             == [27] * 4
         )
         assert backend.calls == [35]
+
+
+_ZERO_CELLS = np.zeros((3, 3, 3))
+_REAL_CELLS = np.broadcast_to(np.eye(3) * 5.0, (3, 3, 3))
+_REPLICA_CELLS = np.broadcast_to(np.eye(3) * 5.0, (2, 2, 3, 3)).copy()
+_REPLICA_CELLS[1, 0] = 0.0
+
+
+@pytest.mark.parametrize(
+    "params,cells,expected",
+    [
+        (({"pressure": 0.1},), _ZERO_CELLS, "3 of 3"),
+        (({"pressure": 0.1},), None, "have no cell"),
+        (({"pressure": 0.1},), _REAL_CELLS, None),
+        (({"pressure": 0.0},), _ZERO_CELLS, None),
+        (({},), _ZERO_CELLS, None),
+        (({"pressure": 0.0}, {"pressure": 0.1}), _REPLICA_CELLS, "1 of 4"),
+    ],
+    ids=[
+        "zero_cells",
+        "no_cells",
+        "real_cells",
+        "zero_pressure",
+        "nvt",
+        "one_zero_cell_of_two_replicas",
+    ],
+)
+def test_warn_if_pressure_without_volume(params, cells, expected, caplog):
+    """A nonzero pressure with missing or zero-volume cells logs a warning,
+    since P*V is 0 and the pressure has no effect. Real cells, P = 0 and
+    NVT log nothing.
+    """
+    resolved = SimpleNamespace(
+        ensemble_params_per_run=params,
+        init=SimpleNamespace(
+            initial_cells=None if cells is None else jnp.asarray(cells)
+        ),
+    )
+    with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+        _warn_if_pressure_without_volume(resolved)
+
+    messages = [r.message for r in caplog.records]
+    if expected is None:
+        assert messages == []
+    else:
+        assert len(messages) == 1
+        assert expected in messages[0]
