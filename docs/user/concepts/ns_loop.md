@@ -27,13 +27,13 @@ collapses every equi-likelihood shell into a scalar *prior mass*
 $X \in [0, 1]$. Sort the $X$'s by decreasing likelihood and the
 integral becomes 1-D.
 
-At iteration $i$, NS maintains $N$ live walkers all drawn from the
+At iteration $i$, NS maintains $K$ live walkers all drawn from the
 prior restricted to $L > L_i^\star$. The worst walker is retired —
 it becomes a *dead point* with likelihood $L_i^\star$ — and replaced
 by a new one drawn from the same constrained prior. In expectation,
 
 $$
-X_i \approx \exp(-i/N),
+X_i \approx \exp(-i/K),
 $$
 
 and the trapezoid-rule approximation gives the evidence estimate
@@ -187,8 +187,8 @@ walker distribution concentrates toward the ground state of $H$.
 - **n_cull > 1**: retire the `n_cull` worst walkers per iteration, each
   refilled from a distinct random survivor; every culled walker is a dead
   point.  One iteration contracts the prior mass by
-  $(N + 1 - n_\mathrm{cull})/(N + 1)$, and within an iteration dead point
-  $j$ (descending energy) carries the shrinkage $(N - j)/(N + 1 - j)$ —
+  $(K + 1 - n_\mathrm{cull})/(K + 1)$, and within an iteration dead point
+  $j$ (descending energy) carries the shrinkage $(K - j)/(K + 1 - j)$ —
   pymatnest's convention, implemented once in {mod}`jaxrens.prior_mass`.
   See {attr}`jaxrens.state.config.NSConfig.n_cull`.
 - **n_extra**: reseed MCMC chains starting from additional random

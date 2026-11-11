@@ -32,46 +32,21 @@ modules sized by lines of code — sets the stage:
 
 .. currentmodule:: jaxrens
 
-.. important::
+.. note::
 
-   There is no curated top-level API right now: ``import jaxrens`` exposes
-   only ``__version__``.  Import public symbols from their subpackage —
-   ``from jaxrens.sampling.nested_sampling import run_ns`` — and browse the
-   :ref:`Subpackages <subpackages>` tree below to find them.
-
-.. dropdown:: Maintainer note — reinstating the top-level API
-   :class-title: sd-fs-6
-
-   The curated top-level API (``from jaxrens import run_ns``,
-   ``jaxrens.free_energy``, …) is disabled; see the commented lazy-export
-   block in ``src/jaxrens/__init__.py``.  Keeping it off is deliberate:
-   ``import jaxrens`` must not import JAX (see :doc:`../dev/contributing`),
-   and a lazy re-export surface is easy to break that rule with.
-
-   When it was enabled this page listed these symbols grouped by theme:
-
-   * *High-level entry points:* ``run_ns``, ``run_from_config``,
-     ``init_ns``, ``ns_step``, ``build_mwg``, ``load_backend``
-   * *State and configuration:* ``MoveKernel``, ``MCState``,
-     ``make_mc_state_class``, ``NSConfig``, ``MoveConfig``,
-     ``BackendConfig``, ``OutputConfig``
-   * *Backend interfaces:* ``EnergyBackend``, ``EnsembleBackend``,
-     ``make_ensemble_params``
-   * *Post-processing:* ``calc_log_weights``, ``calc_log_weights_live``,
-     ``log_evidence``, ``partition_function``, ``heat_capacity``,
-     ``expectation``, ``free_energy``
-
-   To reinstate, uncomment the lazy-export block in
-   ``src/jaxrens/__init__.py`` and restore the four ``autosummary``
-   sections here (recoverable from git history).
+   ``import jaxrens`` exposes only ``__version__`` (and does not import
+   JAX, see :doc:`../dev/contributing`).  Import public symbols from their
+   subpackage — ``from jaxrens.sampling.nested_sampling import run_ns`` —
+   and browse the :ref:`package tree <subpackages>` below to find them.
 
 .. _subpackages:
 
-Subpackages
------------
+Subpackages and modules
+-----------------------
 
 For the internal organization (move kernels, adaptation, init
-helpers, I/O writers), browse the subpackages directly:
+helpers, constraints, I/O writers), browse the subpackages and
+top-level modules directly:
 
 .. autosummary::
    :toctree: api/
@@ -81,6 +56,10 @@ helpers, I/O writers), browse the subpackages directly:
    sampling
    state
    init
+   constraints
    io
    postprocess
    cli
+   utils
+   prior_mass
+   unvalidated

@@ -32,9 +32,9 @@ flowchart LR
         direction LR
         subgraph mc_config["configuration"]
             direction TB
-            POS["positions: (K, A, 3)"]
+            POS["positions: (K, N, 3)"]
             CELL["cell: (K, 3, 3)"]
-            TYP["types: (K, A)"]
+            TYP["types: (K, N)"]
             EN["energy: (K,)"]
         end
         subgraph mc_mcmc["MCMC stats"]
@@ -116,7 +116,7 @@ so callbacks can branch on it.
 ```
 
 - **`SingleRun`** — one process, one GPU, one NS instance.
-  `K = n_walkers`, `A = n_atoms`.
+  `K = n_walkers`, `N = n_atoms`.
 - **`VmapRuns`** — one GPU, `R = n_runs` parallel NS instances.
   Used on CPU nodes or when `len(jax.local_devices()) == 1`.
 - **`PmapVmapRuns`** — `G × P` replicas distributed across `G` GPUs
@@ -124,7 +124,7 @@ so callbacks can branch on it.
   `jax.jit(shard_map(vmap(...)))` over a `"gpu"`-named device mesh.
 - **`ShardedSingleRun`** — *one* NS run whose `K` walkers are split
   into `G` chunks of `K / G`, one per GPU (`run.shard_n_gpu > 1`).
-  Population leaves are `(G, K / G, A, 3)`; the leading axis is a
+  Population leaves are `(G, K / G, N, 3)`; the leading axis is a
   *sharding* axis, not a replica axis, so `n_runs == 1`. The step is
   `ns_step_sharded`, which uses `all_gather` / `psum` collectives over
   a `"shard"`-named mesh to act on the global population. This is for

@@ -1624,7 +1624,7 @@ def init_ns_multi_gpu(
             return arr.reshape((n_total,) + arr.shape[2:])
         return arr
 
-    positions_flat = _flatten_leading(positions)  # (G*P, K, A, 3)
+    positions_flat = _flatten_leading(positions)  # (G*P, K, N, 3)
     energies_flat = _flatten_leading(energies)  # (G*P, K)
     cells_flat = _flatten_leading(cells) if cells is not None else None
     mnc_flat = (
@@ -1929,13 +1929,13 @@ def run_ns_multi_gpu(
     n_total = n_gpu * n_per_gpu
 
     # Infer n_walkers from the position array.
-    # Positions may be (G*P, K, A, 3) or (G, P, K, A, 3).
+    # Positions may be (G*P, K, N, 3) or (G, P, K, N, 3).
     if n_walkers is None:
         if positions.ndim == 5:
-            # (G, P, K, A, 3) form
+            # (G, P, K, N, 3) form
             n_walkers = positions.shape[2]
         else:
-            # (G*P, K, A, 3) form
+            # (G*P, K, N, 3) form
             n_walkers = positions.shape[1]
 
     if termination_criteria is None:

@@ -761,8 +761,8 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
     # before invoking this function.
 
     n_live = ns.n_live
-    positions = resolved.init.initial_positions  # (n_total, K, A, 3)
-    types = resolved.init.initial_types  # (A,)
+    positions = resolved.init.initial_positions  # (n_total, K, N, 3)
+    types = resolved.init.initial_types  # (N,)
     cells = resolved.init.initial_cells  # (n_total, K, 3, 3) | None
     energies = resolved.init.initial_energies  # (n_total, K)
 
@@ -1219,7 +1219,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
     working_dir = resolved.output.working_dir
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    positions = resolved.init.initial_positions  # (K, A, 3)
+    positions = resolved.init.initial_positions  # (K, N, 3)
     types = resolved.init.initial_types
     cells = resolved.init.initial_cells
     energies = resolved.init.initial_energies
