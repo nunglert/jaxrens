@@ -54,6 +54,11 @@ def _process_rate_jax(
     Given an acceptance rate and the target window [min_rate, max_rate],
     decide whether the step size has converged and compute the next value.
 
+    The window is closed: a rate equal to either bound is inside it.  Trial
+    rates are multiples of ``1 / n_samples``, so the bounds are hit often,
+    and both are treated alike.  ``[0, 1]`` therefore never moves the step
+    size.
+
     Uses rate_prev < 0 as sentinel for "no previous rate".
 
     Returns:
@@ -62,11 +67,11 @@ def _process_rate_jax(
           - converged: bool scalar, True iff within window or bracketed
           - cap_hit: bool scalar, True iff the proposed adjusted ss hit max_step_size
           - floor_hit: bool scalar, True iff the proposed adjusted ss hit the FLOOR_THRESHOLD floor
-          - too_high: bool scalar, True iff rate >= max_rate (used to track bracket formation)
+          - too_high: bool scalar, True iff rate > max_rate (used to track bracket formation)
           - too_low: bool scalar, True iff rate < min_rate (used to track bracket formation)
     """
     target = 0.5 * (min_rate + max_rate)
-    in_window = (rate > min_rate) & (rate < max_rate)
+    in_window = (rate >= min_rate) & (rate <= max_rate)
 
     # Bracket detection: previous and current straddle the target window
     has_prev = rate_prev >= 0.0
@@ -79,7 +84,7 @@ def _process_rate_jax(
     bracket_ss = jnp.where(prev_closer, step_size_prev, step_size)
 
     # Direction: scale up if rate too high, down if too low
-    too_high = rate >= max_rate
+    too_high = rate > max_rate
     too_low = rate < min_rate
     scale = jnp.where(
         too_low,

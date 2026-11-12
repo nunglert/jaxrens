@@ -139,6 +139,32 @@ class TestProcessRateJax:
         )
         assert converged
 
+    @pytest.mark.parametrize("rate", [0.2, 0.7])
+    def test_rate_on_a_bound_is_inside(self, rate):
+        """The window is closed: either bound keeps the step size."""
+        ss, converged, _, _, too_high, too_low = _process_rate_jax(
+            jnp.array(rate), jnp.array(0.1),
+            jnp.array(0.1), jnp.array(-1.0),
+            0.2, 0.7, 1.5, 10.0,
+        )
+        assert converged
+        assert float(ss) == pytest.approx(0.1)
+        assert not too_high
+        assert not too_low
+
+    @pytest.mark.parametrize("rate", [0.0, 1.0])
+    def test_full_window_never_moves(self, rate):
+        """``[0, 1]`` keeps the step size even at rate 0 or 1."""
+        ss, converged, cap_hit, floor_hit, _, _ = _process_rate_jax(
+            jnp.array(rate), jnp.array(0.1),
+            jnp.array(0.1), jnp.array(-1.0),
+            0.0, 1.0, 1.5, 10.0,
+        )
+        assert converged
+        assert float(ss) == pytest.approx(0.1)
+        assert not cap_hit
+        assert not floor_hit
+
     def test_jit_compatible(self):
         jit_fn = jax.jit(_process_rate_jax, static_argnums=(4, 5, 6, 7))
         ss, converged, cap_hit, floor_hit, too_high, too_low = jit_fn(
