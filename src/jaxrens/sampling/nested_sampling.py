@@ -78,6 +78,34 @@ def _choose_starting_bucket(
     return _pick_next_bucket(peak, 0, ladder, offset)
 
 
+def initial_step_sizes(
+    n_moves: int,
+    initial_step_size: float | None = None,
+    move_descriptors: list | tuple | None = None,
+) -> jnp.ndarray:
+    """Per-move starting step sizes, shape ``(n_moves,)``.
+
+    An explicit ``initial_step_size`` is broadcast to every move.  Without
+    it each move starts from its own descriptor ``step_size``, as set per
+    move in the config; with neither, every move starts from 0.1.
+
+    Raises:
+        ValueError: If the descriptors do not match ``n_moves``.
+    """
+    if initial_step_size is not None:
+        return jnp.full(n_moves, initial_step_size, dtype=jnp.float32)
+    if move_descriptors:
+        if len(move_descriptors) != n_moves:
+            raise ValueError(
+                f"{len(move_descriptors)} move descriptors for {n_moves} "
+                "moves: the starting step sizes would not line up."
+            )
+        return jnp.asarray(
+            [d.step_size for d in move_descriptors], dtype=jnp.float32
+        )
+    return jnp.full(n_moves, 0.1, dtype=jnp.float32)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1076,7 +1104,7 @@ def run_ns(
     n_extra: int = 0,
     n_cull: int = 1,
     convergence_threshold: float = 0.1,
-    initial_step_size: float = 0.1,
+    initial_step_size: float | None = None,
     target_acceptance: float = 0.5,
     callbacks: list[Any] | None = None,
     termination_criteria: list[TerminationCriterion] | None = None,
@@ -1148,7 +1176,9 @@ def run_ns(
         energies,
         cells,
         rng_key,
-        step_sizes=jnp.full(n_moves, initial_step_size),
+        step_sizes=initial_step_sizes(
+            n_moves, initial_step_size, move_descriptors
+        ),
         ensemble_params=ensemble_params,
         restart_state=restart_state,
         max_neighbors=starting_bucket,
@@ -1352,7 +1382,7 @@ def run_ns_parallel(
     n_extra: int = 0,
     n_cull: int = 1,
     convergence_threshold: float = 0.1,
-    initial_step_size: float = 0.1,
+    initial_step_size: float | None = None,
     target_acceptance: float = 0.5,
     termination_criteria: list[TerminationCriterion] | None = None,
     ensemble_params_per_run: list[dict] | None = None,
@@ -1392,7 +1422,8 @@ def run_ns_parallel(
         n_extra: Extra walkers to walk per iteration (static).
         n_cull: Walkers culled per iteration (static).
         convergence_threshold: For PriorMassTermination.
-        initial_step_size: Starting step size.
+        initial_step_size: Starting step size for every move.  ``None``
+            (default) starts each move from its descriptor ``step_size``.
         target_acceptance: Target acceptance rate (unused directly; kept for
             interface parity with run_ns).
         termination_criteria: Optional. If None, uses defaults.
@@ -1458,7 +1489,9 @@ def run_ns_parallel(
         energies,
         cells,
         rng_keys,
-        step_sizes=jnp.full(n_moves, initial_step_size),
+        step_sizes=initial_step_sizes(
+            n_moves, initial_step_size, move_descriptors
+        ),
         ensemble_params_per_run=ensemble_params_per_run,
         restart_states=restart_states,
         max_neighbors=starting_bucket,
@@ -1829,7 +1862,7 @@ def run_ns_multi_gpu(
     n_extra: int = 0,
     n_cull: int = 1,
     convergence_threshold: float = 0.1,
-    initial_step_size: float = 0.1,
+    initial_step_size: float | None = None,
     target_acceptance: float = 0.5,
     callbacks: list[Any] | None = None,
     termination_criteria: list[TerminationCriterion] | None = None,
@@ -1872,7 +1905,8 @@ def run_ns_multi_gpu(
         n_extra: Extra walkers to walk per iteration (static).
         n_cull: Walkers culled per iteration (static).
         convergence_threshold: For ``PriorMassTermination``.
-        initial_step_size: Starting step size.
+        initial_step_size: Starting step size for every move.  ``None``
+            (default) starts each move from its descriptor ``step_size``.
         target_acceptance: Kept for interface parity; unused directly.
         callbacks: List of callback objects with optional ``on_iteration`` /
             ``on_finish`` methods.  Callbacks receive the ``(G, P, ...)``-shaped
@@ -2004,7 +2038,9 @@ def run_ns_multi_gpu(
         rng_keys_flat,
         n_gpu,
         n_per_gpu,
-        step_sizes=jnp.full(n_moves, initial_step_size),
+        step_sizes=initial_step_sizes(
+            n_moves, initial_step_size, move_descriptors
+        ),
         ensemble_params_per_run=ensemble_params_per_run,
         restart_states=restart_states,
         max_neighbors=starting_bucket,
@@ -2151,7 +2187,7 @@ def run_ns_sharded(
     n_extra: int = 0,
     n_cull: int = 1,
     convergence_threshold: float = 0.1,
-    initial_step_size: float = 0.1,
+    initial_step_size: float | None = None,
     target_acceptance: float = 0.5,
     callbacks: list[Any] | None = None,
     termination_criteria: list[TerminationCriterion] | None = None,
@@ -2266,7 +2302,9 @@ def run_ns_sharded(
         cells,
         rng_key,
         n_gpu=n_gpu,
-        step_sizes=jnp.full(n_moves, initial_step_size),
+        step_sizes=initial_step_sizes(
+            n_moves, initial_step_size, move_descriptors
+        ),
         ensemble_params=ensemble_params,
         restart_state=restart_state,
         max_neighbors=starting_bucket,

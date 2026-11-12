@@ -39,6 +39,7 @@ from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import (
     init_ns_multi_gpu,
     init_ns_parallel,
+    initial_step_sizes,
     run_ns,
     run_ns_multi_gpu,
     run_ns_sharded,
@@ -657,7 +658,11 @@ def run_from_config(
         n_extra=ns_config.n_extra,
         n_cull=ns_config.n_cull,
         convergence_threshold=ns_config.convergence_threshold,
-        initial_step_size=first_mc.step_size,
+        # With descriptors each move starts from its own step_size; the
+        # legacy MoveConfig path has none, so it keeps the first move's.
+        initial_step_size=(
+            None if move_descriptors is not None else first_mc.step_size
+        ),
         target_acceptance=first_mc.target_acceptance,
         callbacks=callbacks,
         ensemble_params=ensemble_params,
@@ -810,8 +815,9 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
 
         key, key_init, key_burn = jax.random.split(key, 3)
         rng_keys = jax.random.split(key_init, n_total)
-        step_sizes = jnp.full(
-            len(resolved.move_descriptors), resolved.moves[0].step_size
+        step_sizes = initial_step_sizes(
+            len(resolved.move_descriptors),
+            move_descriptors=resolved.move_descriptors,
         )
 
         logger.debug("[stage] init_ns_multi_gpu (burn-in NSState): starting")
@@ -1152,7 +1158,6 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
         n_extra=ns.n_extra,
         n_cull=ns.n_cull,
         convergence_threshold=ns.convergence_threshold,
-        initial_step_size=first_mc.step_size,
         target_acceptance=first_mc.target_acceptance,
         callbacks=callbacks,
         termination_criteria=list(resolved.termination),
@@ -1252,9 +1257,9 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
         )
 
         key, key_init, key_burn = jax.random.split(key, 3)
-        step_sizes = jnp.full(
+        step_sizes = initial_step_sizes(
             len(resolved.move_descriptors),
-            resolved.moves[0].step_size,
+            move_descriptors=resolved.move_descriptors,
         )
         ns_state_burn = init_ns_sharded(
             init_fn,
@@ -1539,7 +1544,6 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
         n_extra=ns.n_extra,
         n_cull=ns.n_cull,
         convergence_threshold=ns.convergence_threshold,
-        initial_step_size=first_mc.step_size,
         target_acceptance=first_mc.target_acceptance,
         callbacks=callbacks,
         termination_criteria=list(resolved.termination),
