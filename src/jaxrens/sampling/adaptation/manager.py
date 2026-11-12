@@ -63,6 +63,30 @@ _DIAG_KEYS = (
 )
 
 
+def _not_adapted_result(ss_move: jnp.ndarray) -> tuple:
+    """Per-move result for a move the adaptation leaves alone.
+
+    Same layout and dtypes as ``adjust_step_size`` returns, shaped like
+    ``ss_move`` (the batcher prefix): the step size unchanged, no trial
+    rounds, ``converged`` True, and a NaN rate (nothing was measured, so 0
+    would read as a dead move in the logs and plots).
+    """
+    shape = jnp.shape(ss_move)
+    zeros = jnp.zeros(shape, dtype=jnp.int32)
+    return (
+        ss_move,
+        jnp.full(shape, jnp.nan, dtype=jnp.float32),  # rate
+        jnp.zeros((*shape, 4), dtype=jnp.int32),  # counts
+        zeros,  # n_rounds
+        jnp.ones(shape, dtype=bool),  # converged
+        zeros,  # cap_hits
+        zeros,  # floor_hits
+        jnp.zeros(shape, dtype=bool),  # bracket_detected
+        zeros,  # trial_n_evaluations
+        zeros,  # trial_n_grad_evaluations
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public builder
 # ---------------------------------------------------------------------------
@@ -87,8 +111,13 @@ def build_adapt_step(
     """Build the per-iteration adapt step.
 
     Returns ``None`` when adaptation is inactive — when ``per_move_fns``
-    or ``move_descriptors`` is empty, or ``adjust_interval <= 0``.
-    Callers detect inactivity via ``if adapt_step is None``.
+    or ``move_descriptors`` is empty, when no move is ``adaptive``, or
+    ``adjust_interval <= 0``.  Callers detect inactivity via
+    ``if adapt_step is None``.
+
+    Moves with ``adaptive=False`` run no trial rounds: their step size is
+    left as it is and their diagnostics are filled by
+    :func:`_not_adapted_result`.
 
     Otherwise returns ``adapt_step(ns_state, emax, rng_key)`` which:
 
@@ -112,7 +141,8 @@ def build_adapt_step(
         batcher: ``BatchDescriptor`` (``SingleRun`` / ``VmapRuns`` /
             ``PmapVmapRuns`` / ``ShardedSingleRun``).
         adjust_n_samples: Walkers per bisection trial round (static).
-        adjust_factor: Multiplicative step-size factor (static).
+        adjust_factor: Multiplicative step-size factor (static), used for
+            the moves whose descriptor sets no ``adjust_factor``.
         adjust_max_rounds: Max bisection rounds (static).
         adjust_interval: Iterations between fires.  ``<= 0`` → inactive.
         trial_batch_size: Optional chunk for the per-round trial vmap
@@ -131,6 +161,8 @@ def build_adapt_step(
     PmapVmapRuns.
     """
     if not per_move_fns or not move_descriptors or adjust_interval <= 0:
+        return None
+    if not any(d.adaptive for d in move_descriptors):
         return None
 
     descriptors = list(move_descriptors)
@@ -151,14 +183,22 @@ def build_adapt_step(
     # === Per-move JIT callables (one per move type) =======================
     builder = _build_sharded_per_move if is_sharded else _build_per_move
     per_move_jit = [
-        builder(
-            desc,
-            fn,
-            batcher,
-            adjust_n_samples,
-            adjust_factor,
-            adjust_max_rounds,
-            trial_batch_size,
+        (
+            builder(
+                desc,
+                fn,
+                batcher,
+                adjust_n_samples,
+                (
+                    desc.adjust_factor
+                    if desc.adjust_factor is not None
+                    else adjust_factor
+                ),
+                adjust_max_rounds,
+                trial_batch_size,
+            )
+            if desc.adaptive
+            else None
         )
         for desc, fn in zip(descriptors, move_fns)
     ]
@@ -176,6 +216,9 @@ def build_adapt_step(
             adapt_key = pairs[..., 0]
             key_adjust = pairs[..., 1]
             ss_move = ss[..., move_idx]
+            if per_move_jit[move_idx] is None:
+                per_move_results.append(_not_adapted_result(ss_move)[1:])
+                continue
             result = per_move_jit[move_idx](pop, ss_move, emax, key_adjust)
             new_ss = result[0]
             ss = ss.at[..., move_idx].set(new_ss)

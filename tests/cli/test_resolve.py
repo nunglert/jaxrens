@@ -1808,3 +1808,66 @@ def test_warn_if_pressure_without_volume(params, cells, expected, caplog):
     else:
         assert len(messages) == 1
         assert expected in messages[0]
+
+
+def _per_move_root(per_move):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(adaptation=SimpleNamespace(per_move=per_move))
+
+
+def _named(name, adaptive=True):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(name=name, adaptive=adaptive)
+
+
+def test_per_move_entry_of_a_non_adaptive_move_warns(caplog):
+    """A ``per_move`` entry for a move that is never adapted is reported."""
+    import logging
+
+    from jaxrens.cli.resolve import _check_per_move
+
+    root = _per_move_root({"hop": {}, "rw": {}})
+    descriptors = [
+        _named("hop", adaptive=False),
+        _named("rw"),
+        _named("slide", adaptive=False),
+    ]
+    with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+        _check_per_move(root, descriptors)
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 1
+    assert "adaptation.per_move.hop has no effect" in messages[0]
+
+
+def test_per_move_key_matching_no_move_is_an_error():
+    from jaxrens.cli.resolve import _check_per_move
+
+    root = _per_move_root({"rw": {}, "gmc_Lii": {}})
+    with pytest.raises(ValueError, match=r"\['gmc_Lii'\], which match no"):
+        _check_per_move(root, [_named("rw"), _named("gmc_Li")])
+
+
+def test_per_move_adjust_factor_reaches_the_descriptor(tmp_path):
+    """``per_move.<name>.adjust_factor`` overrides the run-wide one."""
+    cfg = {
+        "run": {"n_live": 8, "max_iterations": 5, "n_mcmc_steps": 2},
+        "moves": [
+            {"type": "random_walk", "name": "rw_a", "step_size": 0.1},
+            {"type": "random_walk", "name": "rw_b", "step_size": 0.1},
+        ],
+        "backend": {"type": "harmonic"},
+        "adaptation": {
+            "defaults": {"adjust_factor": 1.5},
+            "per_move": {"rw_b": {"adjust_factor": 2.0}},
+        },
+        "output": {
+            "format": "none",
+            "working_dir": str(tmp_path),
+            "info_interval": 999,
+        },
+    }
+    resolved = resolve(RootSpec.model_validate(cfg))
+    factors = {d.name: d.adjust_factor for d in resolved.move_descriptors}
+    assert factors == {"rw_a": 1.5, "rw_b": 2.0}

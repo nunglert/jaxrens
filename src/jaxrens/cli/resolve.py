@@ -481,6 +481,37 @@ def _validate_input_cell(
     )
 
 
+def _check_per_move(root: RootSpec, move_descriptors) -> None:
+    """Check ``adaptation.per_move`` against the moves of the run.
+
+    A key that names no move is an error: it would otherwise be silently
+    ignored (a typo, or a move renamed or removed).  An entry for a move
+    that is never adapted (``adaptive=False``, a jump on a grid) has no
+    effect and is reported with a warning.
+
+    Raises:
+        ValueError: If a ``per_move`` key matches no move name.
+    """
+    per_move = root.adaptation.per_move
+    names = [d.name for d in move_descriptors]
+    unknown = sorted(set(per_move) - set(names))
+    if unknown:
+        raise ValueError(
+            f"adaptation.per_move has entries for {unknown}, which match no "
+            f"move. The move names of this run are {names} (a move's "
+            "name: if set, otherwise its automatic name)."
+        )
+    for d in move_descriptors:
+        if not d.adaptive and d.name in per_move:
+            logger.warning(
+                "adaptation.per_move.%s has no effect: %s is not adapted "
+                "(its acceptance is set by a discrete jump), so it keeps "
+                "step_size as configured.",
+                d.name,
+                d.name,
+            )
+
+
 def _warn_if_lj_cutoff_unsafe(
     backend_spec: Any,
     cell_cfg: CellSpec,
@@ -1506,10 +1537,12 @@ def _resolve_single_replica(
             ),
             min_rate=policy.min_rate,
             max_rate=policy.max_rate,
+            adjust_factor=policy.adjust_factor,
             step_size_max=policy.step_size_max,
         )
         for m, policy in zip(root.moves, adaptation_policies)
     )
+    _check_per_move(root, move_descriptors)
 
     constraint_descriptors = _resolve_constraints(root, resolved_init)
 
@@ -2039,10 +2072,12 @@ def _resolve_multi_replica(
             ),
             min_rate=policy.min_rate,
             max_rate=policy.max_rate,
+            adjust_factor=policy.adjust_factor,
             step_size_max=policy.step_size_max,
         )
         for m, policy in zip(root.moves, adaptation_policies)
     )
+    _check_per_move(root, move_descriptors)
 
     constraint_descriptors = _resolve_constraints(root, stacked_init)
 
