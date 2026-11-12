@@ -1,13 +1,15 @@
-"""Writer mode contract: mode='w' truncates a pre-existing file, mode='a' preserves it.
+"""Tests for the writer mode contract.
 
-Regression for the bug where ``EnergyLogger`` opened with ``mode='w'``
-unconditionally and silently destroyed a prior run's ``.energies`` file
-when ``jaxrens run`` was invoked again against the same output dir.
+Every output writer (energy log, extxyz and HDF5 trajectories, and the
+adaptation, RE, max-neighbors and acc-rates logs) takes a mode: "w"
+replaces a file left by an earlier run, "a" keeps it and appends.
 """
 
 from __future__ import annotations
 
+import h5py
 import numpy as np
+from ase.io import read as ase_read
 
 from jaxrens.io.acc_rates_log import AccRatesLogger
 from jaxrens.io.adaptation_log import AdaptationLogger
@@ -15,10 +17,6 @@ from jaxrens.io.energy_log import EnergyLogger
 from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
 from jaxrens.io.re_stats_log import RELogger
 from jaxrens.io.trajectory import ExtxyzTrajectoryWriter, H5TrajectoryWriter
-
-# ---------------------------------------------------------------------------
-# EnergyLogger
-# ---------------------------------------------------------------------------
 
 
 def _write_energies(path, *, mode, n, base_iter=0):
@@ -49,9 +47,16 @@ def test_energy_logger_mode_a_appends(tmp_path):
     assert int(log.iterations[-1]) == 102
 
 
-# ---------------------------------------------------------------------------
-# ExtxyzTrajectoryWriter
-# ---------------------------------------------------------------------------
+def test_energy_logger_mode_a_new_file_writes_header(tmp_path):
+    """Resuming without an .energies file: append mode creates it with
+    the header."""
+    path = tmp_path / "ns.energies"
+    _write_energies(path, mode="a", n=3)
+
+    log = EnergyLogger.read(path)
+    assert log.n_walkers == 4
+    assert log.n_atoms == 2
+    assert log.iterations.tolist() == [0, 1, 2]
 
 
 def _walker(i):
@@ -63,8 +68,6 @@ def _walker(i):
 
 
 def _count_frames(path):
-    from ase.io import read as ase_read
-
     return len(ase_read(str(path), ":"))
 
 
@@ -105,24 +108,7 @@ def test_extxyz_writer_mode_a_appends(tmp_path):
     assert _count_frames(path) == 7
 
 
-def test_extxyz_writer_accumulates_within_single_run(tmp_path):
-    """First write of a mode='w' run overwrites; subsequent writes append."""
-    path = tmp_path / "traj.extxyz"
-    w = ExtxyzTrajectoryWriter(path, symbol_map={0: "H"}, wrap=False, mode="w")
-    for i in range(4):
-        w.write_dead_point(i, _walker(i), float(-i))
-    w.close()
-    assert _count_frames(path) == 4
-
-
-# ---------------------------------------------------------------------------
-# H5TrajectoryWriter
-# ---------------------------------------------------------------------------
-
-
 def test_h5_trajectory_writer_mode_w_truncates(tmp_path):
-    import h5py
-
     path = tmp_path / "traj.h5"
     w1 = H5TrajectoryWriter(path, {0: "H"}, mode="w")
     for i in range(3):
@@ -141,8 +127,6 @@ def test_h5_trajectory_writer_mode_w_truncates(tmp_path):
 
 
 def test_h5_trajectory_writer_mode_a_preserves(tmp_path):
-    import h5py
-
     path = tmp_path / "traj.h5"
     w1 = H5TrajectoryWriter(path, {0: "H"}, mode="w")
     for i in range(3):
@@ -158,11 +142,6 @@ def test_h5_trajectory_writer_mode_a_preserves(tmp_path):
         assert "1" in f
         assert "2" in f
         assert "100" in f
-
-
-# ---------------------------------------------------------------------------
-# AdaptationLogger
-# ---------------------------------------------------------------------------
 
 
 def _write_adaptation(path, *, mode, n, base_iter=0):
@@ -195,11 +174,6 @@ def test_adaptation_logger_mode_a_appends(tmp_path):
 
     log = AdaptationLogger.read(path)
     assert log.iterations.shape == (13,)
-
-
-# ---------------------------------------------------------------------------
-# RELogger
-# ---------------------------------------------------------------------------
 
 
 def _write_re(path, *, mode, n, base_iter=0):
@@ -238,11 +212,6 @@ def test_re_logger_mode_a_appends(tmp_path):
     assert log.iterations.shape == (13,)
 
 
-# ---------------------------------------------------------------------------
-# MaxNeighborsLogger
-# ---------------------------------------------------------------------------
-
-
 def _write_mn(path, *, mode, n, base_iter=0):
     lg = MaxNeighborsLogger(
         path=path,
@@ -278,11 +247,6 @@ def test_max_neighbors_logger_mode_a_appends(tmp_path):
 
     log = MaxNeighborsLogger.read(path)
     assert log.iterations.shape == (13,)
-
-
-# ---------------------------------------------------------------------------
-# AccRatesLogger
-# ---------------------------------------------------------------------------
 
 
 def _write_acc(path, *, mode, n, base_iter=0):

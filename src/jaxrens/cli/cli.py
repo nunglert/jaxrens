@@ -122,6 +122,10 @@ class _VersionAction(argparse.Action):
 _BRACKET_RE = re.compile(r"^(\w+)\[(\d+)\]$")
 
 
+class SetOverrideError(ValueError):
+    """A ``--set`` override that cannot be parsed or applied."""
+
+
 def _parse_set_override(spec: str) -> tuple[list[str | int], Any]:
     """Parse ``key.path=value`` into a key-path list and a typed value.
 
@@ -135,7 +139,7 @@ def _parse_set_override(spec: str) -> tuple[list[str | int], Any]:
         *value* is the YAML-parsed scalar.
     """
     if "=" not in spec:
-        raise ValueError(
+        raise SetOverrideError(
             f"--set expects KEY=VALUE, got {spec!r} with no '='. "
             f"Use dotted keys to reach nested config, with bracket "
             f"notation for list entries, e.g. --set run.n_live=128 or "
@@ -177,13 +181,25 @@ def _deep_set(d: dict[str, Any], path: list[str | int], value: Any) -> None:
 def _apply_overrides(
     raw: dict[str, Any], overrides: list[str]
 ) -> dict[str, Any]:
-    """Return a copy of *raw* with all ``--set`` overrides applied."""
+    """Return a copy of *raw* with all ``--set`` overrides applied.
+
+    Raises:
+        SetOverrideError: When a spec has no ``=`` or its key path does not
+            exist in the config (missing list index, or a key below a
+            scalar).
+    """
     import copy
 
     d = copy.deepcopy(raw)
     for spec in overrides:
         path, value = _parse_set_override(spec)
-        _deep_set(d, path, value)
+        try:
+            _deep_set(d, path, value)
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise SetOverrideError(
+                f"--set {spec!r}: the key path does not exist in the config "
+                f"({type(exc).__name__}: {exc})."
+            ) from exc
     return d
 
 
@@ -1049,6 +1065,9 @@ def main(argv: list[str] | None = None) -> None:
     except ValidationError as exc:
         cfg = getattr(args, "config", "<unknown>")
         _err(_format_validation_error(exc, cfg))
+        sys.exit(2)
+    except SetOverrideError as exc:
+        _err(f"jaxrens: {exc}")
         sys.exit(2)
     except FileNotFoundError as exc:
         _err(f"jaxrens: {exc}")

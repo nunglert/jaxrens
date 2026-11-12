@@ -3,32 +3,35 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")  # headless, must be before any other matplotlib import
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from jaxrens.cli.analyze import (
     _default_output,
     _prefix_from_checkpoint,
+    _write_csv,
     analyze_file,
 )
 from jaxrens.cli.cli import main
+from jaxrens.io.checkpoint import save_checkpoint
+from jaxrens.io.energy_log import EnergyLogger
+from jaxrens.postprocess.monitor import Monitor
 
 _LJ8_NPT_OUTPUT = (
     Path(__file__).parent.parent / "_assets" / "data" / "lj8_npt" / "output"
 )
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint-filename parsing
-# ---------------------------------------------------------------------------
-
-
 class TestPrefixFromCheckpoint:
+    """Check that the output prefix is read from the checkpoint name."""
+
     @pytest.mark.parametrize(
         "name, expected",
         [
@@ -46,48 +49,39 @@ class TestPrefixFromCheckpoint:
             _prefix_from_checkpoint(tmp_path / "ns.energies")
 
 
-class TestDefaultOutput:
-    @pytest.mark.parametrize("suffix", ["csv", "json", "png"])
-    def test_names_by_prefix_observable_and_suffix(self, tmp_path, suffix):
-        out = _default_output(
-            tmp_path / "lj8.final.checkpoint.h5", "lj8", "heat_capacity", suffix
-        )
-        assert out.name == f"lj8.heat_capacity.{suffix}"
-        assert out.parent == tmp_path
+@pytest.mark.parametrize("suffix", ["csv", "json", "png"])
+def test_default_output_names_by_prefix_observable_and_suffix(
+    tmp_path, suffix
+):
+    out = _default_output(
+        tmp_path / "lj8.final.checkpoint.h5", "lj8", "heat_capacity", suffix
+    )
+    assert out.name == f"lj8.heat_capacity.{suffix}"
+    assert out.parent == tmp_path
 
 
-class TestWriteCsvGuard:
-    """``_write_csv`` refuses a non-scalar observable rather than mangling it
-    into a shape CSV cannot represent -- ``--format json`` is the escape
-    hatch, exercised in ``TestAnalyzeFileEndToEnd`` below.
+def test_write_csv_rejects_non_scalar_values(tmp_path):
+    """CSV holds one value per temperature; other shapes need JSON."""
+    T = np.linspace(0.0, 1.0, 4)
+    values = np.zeros((4, 2))
+    with pytest.raises(ValueError, match="not one scalar per"):
+        _write_csv(tmp_path / "out.csv", T, "Cv", values)
+
+
+def _write_run_dir(
+    tmp_path,
+    prefix="ns",
+    n_live=10,
+    n_dead=20,
+    seed=0,
+    checkpoint="final.checkpoint.h5",
+):
+    """Write a checkpoint and a matching ``.energies`` log.
+
+    This is the smallest run directory ``Monitor.from_directory`` can load.
+    ``checkpoint`` is the suffix after ``<prefix>.``. With the same seed,
+    the dead energies do not depend on ``n_live``.
     """
-
-    def test_non_scalar_values_raise(self, tmp_path):
-        from jaxrens.cli.analyze import _write_csv
-
-        T = np.linspace(0.0, 1.0, 4)
-        values = np.zeros((4, 2))  # two components per T -- not scalar
-        with pytest.raises(ValueError, match="not one scalar per"):
-            _write_csv(tmp_path / "out.csv", T, "Cv", values)
-
-
-# ---------------------------------------------------------------------------
-# End-to-end: synthetic run directory + analyze_file
-# ---------------------------------------------------------------------------
-
-
-def _write_run_dir(tmp_path, prefix="ns", n_live=10, n_dead=20, seed=0):
-    """Synthesise a minimal run directory analyze_file can load.
-
-    Mirrors the pattern in ``tests/postprocess/test_monitor.py``'s
-    ``TestMonitorFromDirectory``: a checkpoint via ``save_checkpoint`` plus
-    a matching ``.energies`` log via ``EnergyLogger``.
-    """
-    import jax.numpy as jnp
-
-    from jaxrens.io.checkpoint import save_checkpoint
-    from jaxrens.io.energy_log import EnergyLogger
-
     rng = np.random.default_rng(seed)
     dead_e = np.sort(rng.uniform(0.0, 5.0, n_dead))
     live_e = rng.uniform(4.0, 6.0, n_live)
@@ -113,7 +107,7 @@ def _write_run_dir(tmp_path, prefix="ns", n_live=10, n_dead=20, seed=0):
         "n_dead": n_dead,
         "n_walkers": n_live,
     }
-    ckpt_path = tmp_path / f"{prefix}.final.checkpoint.h5"
+    ckpt_path = tmp_path / f"{prefix}.{checkpoint}"
     save_checkpoint(ckpt_path, ns_state, symbol_map={0: "Ar"})
 
     energy_logger = EnergyLogger(
@@ -128,6 +122,12 @@ def _write_run_dir(tmp_path, prefix="ns", n_live=10, n_dead=20, seed=0):
 
 
 class TestAnalyzeFileEndToEnd:
+    """Check ``analyze_file`` on a synthetic run directory.
+
+    The tests cover the CSV and JSON output for each observable, the
+    optional PNG, explicit output paths and the input errors.
+    """
+
     @pytest.mark.parametrize(
         "observable, column",
         [
@@ -163,9 +163,7 @@ class TestAnalyzeFileEndToEnd:
         # T column matches the requested linspace, to the 8-sig-fig
         # precision the writer keeps.
         t_col = [float(row[0]) for row in rows[1:]]
-        np.testing.assert_allclose(
-            t_col, np.linspace(0.5, 5.0, 10), rtol=1e-7
-        )
+        np.testing.assert_allclose(t_col, np.linspace(0.5, 5.0, 10), rtol=1e-7)
 
     @pytest.mark.parametrize(
         "observable, column",
@@ -176,8 +174,6 @@ class TestAnalyzeFileEndToEnd:
         ],
     )
     def test_each_observable_writes_json(self, tmp_path, observable, column):
-        import json
-
         ckpt_path = _write_run_dir(tmp_path, prefix="ns")
         json_path, png_path = analyze_file(
             ckpt_path,
@@ -202,6 +198,11 @@ class TestAnalyzeFileEndToEnd:
             payload["T"], np.linspace(0.5, 5.0, 10), rtol=1e-10
         )
         assert all(np.isfinite(v) for v in payload[column])
+        monitor = Monitor.from_directory(tmp_path, prefix="ns")
+        expected = getattr(monitor, observable)(
+            np.linspace(0.5, 5.0, 10), k_B=1.0
+        )
+        np.testing.assert_allclose(payload[column], expected, rtol=1e-12)
 
     def test_unknown_format_raises(self, tmp_path):
         ckpt_path = _write_run_dir(tmp_path, prefix="ns")
@@ -244,42 +245,40 @@ class TestAnalyzeFileEndToEnd:
         assert png_path == plot_path
         assert png_path.exists()
 
-    def test_prefers_final_checkpoint(self, tmp_path):
-        """Both a periodic and a final checkpoint exist; final wins."""
-        import jax.numpy as jnp
+    @pytest.mark.parametrize(
+        "checkpoint, n_live",
+        [("final.checkpoint.h5", 10), ("checkpoint.h5", 15)],
+    )
+    def test_uses_the_named_checkpoint(self, tmp_path, checkpoint, n_live):
+        """With both checkpoints present, the one passed in is analyzed.
 
-        from jaxrens.io.checkpoint import save_checkpoint
-
-        _write_run_dir(tmp_path, prefix="ns")
-        # A stale periodic checkpoint with a different n_walkers -- if
-        # analyze_file picked this one up instead, n_live below would be 3.
-        stale_state = {
-            "positions": jnp.zeros((3, 4, 3)),
-            "types": jnp.zeros(3, dtype=int),
-            "energies": jnp.zeros(3),
-            "cells": None,
-            "dead_energies": jnp.full(1000, np.inf),
-            "dead_positions": jnp.zeros((1000, 4, 3)),
-            "dead_volumes": None,
-            "live_volumes": None,
-            "log_evidence": 0.0,
-            "iteration": 0,
-            "emax": 0.0,
-            "n_dead": 0,
-            "n_walkers": 3,
+        The two checkpoints differ in n_live, so their Cv curves differ.
+        """
+        _write_run_dir(tmp_path, n_live=10)
+        _write_run_dir(tmp_path, n_live=15, checkpoint="checkpoint.h5")
+        json_path, _ = analyze_file(
+            tmp_path / f"ns.{checkpoint}",
+            t_min=0.5,
+            t_max=5.0,
+            n_t=10,
+            fmt="json",
+        )
+        payload = json.loads(json_path.read_text())
+        T = np.linspace(0.5, 5.0, 10)
+        values = {
+            prefer_final: Monitor.from_directory(
+                tmp_path, prefix="ns", prefer_final=prefer_final
+            ).heat_capacity(T, k_B=1.0)
+            for prefer_final in (True, False)
         }
-        save_checkpoint(tmp_path / "ns.checkpoint.h5", stale_state)
-
-        ckpt_path = tmp_path / "ns.final.checkpoint.h5"
-        csv_path, _ = analyze_file(ckpt_path, t_min=0.5, t_max=5.0)
-        assert csv_path.exists()
+        assert not np.allclose(values[True], values[False])
+        expected = values[checkpoint.startswith("final")]
+        np.testing.assert_allclose(payload["Cv"], expected, rtol=1e-12)
 
     def test_unknown_observable_raises(self, tmp_path):
         ckpt_path = _write_run_dir(tmp_path, prefix="ns")
         with pytest.raises(ValueError, match="Unknown observable"):
-            analyze_file(
-                ckpt_path, observable="bogus", t_min=0.5, t_max=5.0
-            )
+            analyze_file(ckpt_path, observable="bogus", t_min=0.5, t_max=5.0)
 
     def test_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
@@ -296,32 +295,22 @@ class TestAnalyzeFileEndToEnd:
             analyze_file(bogus, t_min=0.5, t_max=5.0)
 
 
-# ---------------------------------------------------------------------------
-# Smoke test against the committed lj8_npt example output
-# ---------------------------------------------------------------------------
-
-
-class TestAnalyzeSmokeRealRun:
-    """Same fixture as ``TestSmokeRealRun`` in test_monitor.py."""
-
-    def test_heat_capacity_on_real_run(self, tmp_path):
-        ckpt = _LJ8_NPT_OUTPUT / "lj8_npt.final.checkpoint.h5"
-        csv_path, _ = analyze_file(
-            ckpt,
-            t_min=0.1,
-            t_max=5.0,
-            output_path=tmp_path / "cv.csv",
-        )
-        assert csv_path.exists()
-        assert csv_path.stat().st_size > 0
-
-
-# ---------------------------------------------------------------------------
-# CLI subcommand: main(["analyze", ...])
-# ---------------------------------------------------------------------------
+def test_heat_capacity_on_real_run(tmp_path):
+    """Smoke run on the committed lj8_npt example output."""
+    ckpt = _LJ8_NPT_OUTPUT / "lj8_npt.final.checkpoint.h5"
+    csv_path, _ = analyze_file(
+        ckpt,
+        t_min=0.1,
+        t_max=5.0,
+        output_path=tmp_path / "cv.csv",
+    )
+    assert csv_path.exists()
+    assert csv_path.stat().st_size > 0
 
 
 class TestAnalyzeCLI:
+    """Check ``jaxrens analyze`` through ``main``: flags and exit codes."""
+
     def test_writes_csv_and_prints_path(self, tmp_path, capsys):
         ckpt_path = _write_run_dir(tmp_path, prefix="ns")
         with pytest.raises(SystemExit) as exc_info:
@@ -345,8 +334,6 @@ class TestAnalyzeCLI:
         assert out.count("Wrote ") == 1
 
     def test_format_json_writes_json(self, tmp_path, capsys):
-        import json
-
         ckpt_path = _write_run_dir(tmp_path, prefix="ns")
         with pytest.raises(SystemExit) as exc_info:
             main(
@@ -461,9 +448,7 @@ class TestAnalyzeCLI:
         bogus = tmp_path / "ns.energies"
         bogus.write_text("not a checkpoint")
         with pytest.raises(SystemExit) as exc_info:
-            main(
-                ["analyze", str(bogus), "--t-min", "0.5", "--t-max", "5.0"]
-            )
+            main(["analyze", str(bogus), "--t-min", "0.5", "--t-max", "5.0"])
         assert exc_info.value.code == 2
         err = capsys.readouterr().err
         assert "jaxrens analyze:" in err

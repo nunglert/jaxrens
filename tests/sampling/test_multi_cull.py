@@ -1,15 +1,4 @@
-"""Multi-walker culling (``n_cull > 1``) in the NS step.
-
-Verifies:
-- ``_select_culls``: top-``n_cull`` selection (descending, random ties),
-  contour = lowest culled potential, distinct clone sources disjoint from the
-  culls, extras disjoint from both.
-- ``ns_step(n_cull=c)``: info shapes, untouched survivors, contour invariant,
-  first-step evidence equals the pymatnest-weighted dead points.
-- ``n_cull = 1`` keeps the historical single-cull path bit-for-bit.
-- The dead-point ladder of a full run tracks the analytic prior mass of a
-  3-D harmonic well for both ``n_cull = 1`` and ``n_cull > 1``.
-"""
+"""Tests for multi-walker culling (n_cull > 1) in the NS step."""
 
 from __future__ import annotations
 
@@ -34,15 +23,18 @@ from jaxrens.sampling.nested_sampling import (
 
 
 def _keys(seed=0):
+    """Return the three keys that _select_culls takes."""
     return jax.random.split(jax.random.key(seed), 3)
 
 
-# ---------------------------------------------------------------------------
-# _select_culls
-# ---------------------------------------------------------------------------
-
-
 class TestSelectCulls:
+    """Check how _select_culls picks the culled, clone and extra walkers.
+
+    The culls are the top n_cull potentials in descending order with ties
+    broken at random, the clone sources are distinct survivors, and the extras
+    avoid both.  With n_cull = 1 it reproduces the single-cull path.
+    """
+
     @pytest.mark.parametrize("n_cull,n_extra", [(2, 0), (4, 3), (5, 10)])
     def test_selection_invariants(self, n_cull, n_extra):
         n = 30
@@ -111,11 +103,6 @@ class TestSelectCulls:
             np.testing.assert_array_equal(walk[1:], extras)
 
 
-# ---------------------------------------------------------------------------
-# ns_step with n_cull > 1
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def harmonic_state():
     backend = create_harmonic(k=1.0)
@@ -136,6 +123,12 @@ def harmonic_state():
 
 
 class TestNsStepMultiCull:
+    """Check ns_step with n_cull = 4 and 3 extra walkers on a harmonic well.
+
+    The tests cover the info shapes, the dead points, the contour invariant,
+    walkers that are not walked, and the first-step evidence.
+    """
+
     N_CULL = 4
     N_EXTRA = 3
 
@@ -179,11 +172,13 @@ class TestNsStepMultiCull:
         assert int(new_state.iteration) == 1
         assert float(new_state.emax) == float(info["emax"])
 
-    def test_unwalked_survivors_untouched(self, stepped, harmonic_state):
+    def test_unwalked_survivors_untouched(self, stepped):
         state, new_state, info = stepped
-        walked = set(np.asarray(info["worst_indices"]).tolist())
-        # Extras are the other walked slots; recover them as the walkers
-        # whose positions changed outside the culled set.
+        culled = set(np.asarray(info["worst_indices"]).tolist())
+        # The starting counters are zero, so a slot was walked exactly when
+        # its proposal counter is positive afterwards.
+        proposed = np.asarray(new_state.population.n_proposed)
+        walked = set(np.flatnonzero(proposed.sum(axis=1) > 0).tolist())
         old = np.asarray(state.population.positions)
         new = np.asarray(new_state.population.positions)
         changed = {
@@ -191,7 +186,8 @@ class TestNsStepMultiCull:
             for i in range(old.shape[0])
             if not np.array_equal(old[i], new[i])
         }
-        assert len(changed - walked) <= self.N_EXTRA
+        assert len(walked - culled) == self.N_EXTRA
+        assert changed <= walked
 
     def test_first_step_evidence(self, stepped):
         state, new_state, info = stepped
@@ -205,22 +201,18 @@ class TestNsStepMultiCull:
         )
 
 
-class TestNCull1Unchanged:
-    def test_single_cull_info_has_unit_cull_axis(self, harmonic_state):
-        state, step_fn = harmonic_state
-        jit_step = jax.jit(ns_step, static_argnums=(1, 2, 3))
-        _, info = jit_step(state, step_fn, 5, 2)
-        assert info["dead_walkers"].energy.shape == (1,)
-        assert info["worst_idx"].shape == ()
-        assert float(info["emax"]) == float(jnp.max(state.population.energy))
-
-
-# ---------------------------------------------------------------------------
-# Full run: dead-point ladder vs the analytic prior mass
-# ---------------------------------------------------------------------------
+def test_single_cull_info_has_unit_cull_axis(harmonic_state):
+    state, step_fn = harmonic_state
+    jit_step = jax.jit(ns_step, static_argnums=(1, 2, 3))
+    _, info = jit_step(state, step_fn, 5, 2)
+    assert info["dead_walkers"].energy.shape == (1,)
+    assert info["worst_idx"].shape == ()
+    assert float(info["emax"]) == float(jnp.max(state.population.energy))
 
 
 class _DeadEnergies:
+    """Callback that collects the energy of every dead point."""
+
     def __init__(self):
         self.energies = []
 
@@ -232,8 +224,11 @@ class _DeadEnergies:
 
 @pytest.mark.parametrize("n_cull", [1, 5])
 def test_ladder_tracks_analytic_prior_mass(n_cull):
-    """3-D harmonic well ``E = r^2 / 2`` with a uniform prior on
-    ``[-L, L]^3``: inside the box, ``X(E) = (4/3) pi (2E)^{3/2} / (2L)^3``.
+    """The dead-point ladder tracks the analytic prior mass.
+
+    The well is the 3-D harmonic ``E = r^2 / 2`` with a uniform prior on
+    ``[-L, L]^3``, where inside the box ``X(E) = (4/3) pi (2E)^{3/2} /
+    (2L)^3``.
 
     The estimated ``log X_n`` of each dead point (pymatnest ladder with this
     ``n_cull``) must track ``log X(E_n)`` to within NS noise

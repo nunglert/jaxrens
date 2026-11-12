@@ -1,15 +1,4 @@
-"""Tests for BatchDescriptor and its three concrete implementations.
-
-Coverage:
-- SingleRun.split_keys: shape, bit-exact match with jax.random.split
-- SingleRun.reduce_for_termination: identity on scalar inputs
-- SingleRun.wrap_step: callable; runs on a fake ns_state
-- VmapRuns.split_keys: shape (n_runs, n_sub_keys, 2); matches vmap(split)
-- VmapRuns.reduce_for_termination: worst-of; scalar outputs
-- VmapRuns.wrap_step: callable; runs vmapped on a fake batched ns_state
-- PmapVmapRuns: all three methods raise NotImplementedError
-- JIT compatibility for SingleRun and VmapRuns utility paths
-"""
+"""Tests for SingleRun, VmapRuns, PmapVmapRuns and from_shape_prefix."""
 
 from __future__ import annotations
 
@@ -25,30 +14,22 @@ from jaxrens.sampling.batch_descriptor import (
     from_shape_prefix,
 )
 
-# ---------------------------------------------------------------------------
-# Helpers — minimal fake ns_step and ns_state
-# ---------------------------------------------------------------------------
-
 
 def _fake_ns_step(ns_state, step_fn, n_mcmc_steps, n_extra):
-    """Trivial ns_step replacement: identity on state, empty info dict."""
+    """Return the state unchanged with an empty info dict."""
     return ns_state, {}
 
 
 def _fake_ns_step_vmap(ns_state, step_fn, n_mcmc_steps, n_extra, move_key):
-    """Same contract; used to verify vmap wrapping passes state through.
-
-    Batched wrappers also pass the run-shared ``move_key``.
-    """
+    """Like _fake_ns_step, taking the run-shared ``move_key``."""
     return ns_state, {}
 
 
 class _FakeState:
-    """Minimal JAX-pytree-compatible stand-in for NSState.
+    """Pytree stand-in for NSState with a ``value`` and an ``rng_key``.
 
-    Registers as a pytree so vmap can map over a batch of them.  Carries an
-    ``rng_key`` of the same batch shape as ``value`` (batched ``wrap_step``
-    derives the run-shared move key from it).
+    The key has the batch shape of ``value``; batched ``wrap_step`` derives
+    the run-shared move key from it.
     """
 
     def __init__(self, value: jax.Array, rng_key: jax.Array | None = None):
@@ -74,21 +55,15 @@ class _FakeState:
 jax.tree_util.register_pytree_node_class(_FakeState)
 
 
-# ---------------------------------------------------------------------------
-# SingleRun tests
-# ---------------------------------------------------------------------------
-
-
 class TestSingleRun:
+    """Check key splitting, termination reduction and step wrapping."""
+
     def test_attributes(self):
         d = SingleRun()
         assert d.n_runs == 1
         assert d.shape_prefix == ()
 
-    # --- split_keys ---
-
     def test_split_keys_shape(self):
-        # With new-style typed keys, jax.random.split returns shape (n,) not (n, 2).
         d = SingleRun()
         key = jax.random.key(0)
         result = d.split_keys(key, 5)
@@ -99,7 +74,7 @@ class TestSingleRun:
         key = jax.random.key(7)
         result = d.split_keys(key, 5)
         expected = jax.random.split(key, 5)
-        # key arrays cannot be cast to np.ndarray directly; compare via key_data
+        # Typed keys are compared through their key_data.
         np.testing.assert_array_equal(
             np.asarray(jax.random.key_data(result)),
             np.asarray(jax.random.key_data(expected)),
@@ -121,8 +96,6 @@ class TestSingleRun:
             np.asarray(jax.random.key_data(expected)),
         )
 
-    # --- reduce_for_termination ---
-
     def test_reduce_identity_on_scalars(self):
         d = SingleRun()
         log_ev = jnp.array(-5.3)
@@ -141,13 +114,6 @@ class TestSingleRun:
         assert abs(ev_out - (-3.0)) < 1e-9
         assert abs(hmax_out - 1.5) < 1e-9
 
-    # --- wrap_step ---
-
-    def test_wrap_step_returns_callable(self):
-        d = SingleRun()
-        jit_step = d.wrap_step(_fake_ns_step, None, 10, 0)
-        assert callable(jit_step)
-
     def test_wrap_step_call_shape(self):
         """Calling the wrapped step returns (state, dict) unchanged."""
         d = SingleRun()
@@ -158,31 +124,16 @@ class TestSingleRun:
         assert isinstance(out_info, dict)
         np.testing.assert_allclose(float(out_state.value), 42.0)
 
-    def test_wrap_step_under_jit(self):
-        """Wrapping via SingleRun must be JIT-safe — no tracing issues."""
-        d = SingleRun()
-        jit_step = d.wrap_step(_fake_ns_step, None, 5, 0)
-        # The returned object is already jit'd; calling it exercises tracing.
-        state = _FakeState(jnp.array(0.0))
-        out_state, _ = jit_step(state, None, 5, 0)
-        assert out_state is not None
-
-
-# ---------------------------------------------------------------------------
-# VmapRuns tests
-# ---------------------------------------------------------------------------
-
 
 class TestVmapRuns:
+    """Check the vmap descriptor: key splitting, reduction, step wrapping."""
+
     def test_attributes(self):
         d = VmapRuns(n_runs=3)
         assert d.n_runs == 3
         assert d.shape_prefix == (3,)
 
-    # --- split_keys ---
-
     def test_split_keys_shape(self):
-        # With new-style typed keys, jax.random.split returns shape (n,) not (n, 2).
         d = VmapRuns(n_runs=3)
         base_key = jax.random.key(0)
         run_keys = jax.random.split(base_key, 3)  # (3,)
@@ -212,8 +163,6 @@ class TestVmapRuns:
         result = _split(run_keys)
         assert result.shape == (4, 3)
 
-    # --- reduce_for_termination ---
-
     def test_reduce_worst_of(self):
         d = VmapRuns(n_runs=3)
         log_ev = jnp.array([-10.0, -5.0, -7.0])
@@ -223,14 +172,6 @@ class TestVmapRuns:
         assert isinstance(hmax_out, float)
         assert abs(ev_out - (-10.0)) < 1e-6  # min(log_evidence)
         assert abs(hmax_out - 5.0) < 1e-6  # max(hmax)
-
-    def test_reduce_scalar_outputs(self):
-        d = VmapRuns(n_runs=5)
-        log_ev = jnp.zeros(5)
-        hmax = jnp.ones(5)
-        ev_out, hmax_out = d.reduce_for_termination(log_ev, hmax)
-        assert isinstance(ev_out, float)
-        assert isinstance(hmax_out, float)
 
     def test_reduce_single_run_edge(self):
         """VmapRuns(n_runs=1) reduce is equivalent to SingleRun reduce."""
@@ -245,60 +186,31 @@ class TestVmapRuns:
         assert abs(ev_v - ev_s) < 1e-6
         assert abs(h_v - h_s) < 1e-6
 
-    # --- wrap_step ---
-
-    def test_wrap_step_returns_callable(self):
-        d = VmapRuns(n_runs=2)
-        jit_step = d.wrap_step(_fake_ns_step_vmap, None, 5, 0)
-        assert callable(jit_step)
-
     def test_wrap_step_call_batched(self):
         """Wrapped step must vmap over a batch of states."""
         d = VmapRuns(n_runs=4)
         jit_step = d.wrap_step(_fake_ns_step_vmap, None, 5, 0)
-        # Batch of 4 fake states
         batched_state = _FakeState(jnp.arange(4, dtype=jnp.float32))
         out_states, out_infos = jit_step(batched_state)
         assert isinstance(out_states, _FakeState)
-        # vmap over value dim should give shape (4,)
         assert out_states.value.shape == (4,)
-
-    def test_wrap_step_under_jit(self):
-        d = VmapRuns(n_runs=3)
-        jit_step = d.wrap_step(_fake_ns_step_vmap, None, 5, 0)
-        batched_state = _FakeState(jnp.ones(3))
-        out_states, _ = jit_step(batched_state)
-        assert out_states.value.shape == (3,)
-
-
-# ---------------------------------------------------------------------------
-# PmapVmapRuns tests
-# ---------------------------------------------------------------------------
 
 
 class TestPmapVmapRuns:
-    def test_attributes(self):
-        d = PmapVmapRuns(n_gpu=2, n_per_gpu=4)
-        assert d.n_runs == 8
-        assert d.shape_prefix == (2, 4)
+    """Check the (n_gpu, n_per_gpu) descriptor on a single device."""
+
+    @pytest.mark.parametrize("n_gpu,n_per", [(1, 1), (2, 4), (4, 8)])
+    def test_attributes(self, n_gpu, n_per):
+        d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per)
+        assert d.n_runs == n_gpu * n_per
+        assert d.shape_prefix == (n_gpu, n_per)
 
     def test_is_batched(self):
         d = PmapVmapRuns(n_gpu=1, n_per_gpu=3)
         assert d.is_batched is True
 
-    def test_n_runs_computed_correctly(self):
-        for n_gpu, n_per in [(1, 1), (2, 4), (4, 8)]:
-            d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per)
-            assert d.n_runs == n_gpu * n_per
-            assert d.shape_prefix == (n_gpu, n_per)
-
-    # --- split_keys ---
-
     def test_split_keys_shape(self):
-        """split_keys takes (G, P) keys, returns (G, P, n_sub_keys) — matches the
-        ABC contract `(*B,) -> (*B, n_sub_keys)`.  Production callers (manager,
-        run_loop) always pass the per-replica `NSState.rng_key` of shape (G, P).
-        """
+        """(G, P) keys give (G, P, n_sub_keys), as the ABC contract says."""
         n_gpu, n_per_gpu = 1, 3
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
         base_key = jax.random.key(0)
@@ -336,8 +248,6 @@ class TestPmapVmapRuns:
         result = _split(per_replica_keys)
         assert result.shape == (n_gpu, n_per_gpu, 4)
 
-    # --- reduce_for_termination ---
-
     def test_reduce_worst_of_2d(self):
         """reduce_for_termination on (G, P) input returns worst-of scalars."""
         d = PmapVmapRuns(n_gpu=1, n_per_gpu=3)
@@ -349,37 +259,16 @@ class TestPmapVmapRuns:
         assert abs(ev_out - (-10.0)) < 1e-6  # min across all
         assert abs(hmax_out - 5.0) < 1e-6  # max across all
 
-    def test_reduce_scalar_outputs(self):
-        d = PmapVmapRuns(n_gpu=1, n_per_gpu=4)
-        log_ev = jnp.zeros((1, 4))
-        hmax = jnp.ones((1, 4))
-        ev_out, hmax_out = d.reduce_for_termination(log_ev, hmax)
-        assert isinstance(ev_out, float)
-        assert isinstance(hmax_out, float)
-
-    # --- wrap_step ---
-
-    def test_wrap_step_returns_callable(self):
-        d = PmapVmapRuns(n_gpu=1, n_per_gpu=2)
-        jit_step = d.wrap_step(_fake_ns_step_vmap, None, 5, 0)
-        assert callable(jit_step)
-
     def test_wrap_step_call_pmap_vmap(self):
         """wrap_step on (G, P)-batched fake state runs without error."""
         n_gpu, n_per_gpu = 1, 2
         d = PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
         jit_step = d.wrap_step(_fake_ns_step_vmap, None, 5, 0)
-        # (G, P) batch — pmap maps over G, vmap maps over P.
+        # pmap maps over G, vmap over P.
         batched_state = _FakeState(jnp.ones((n_gpu, n_per_gpu)))
         out_states, out_infos = jit_step(batched_state)
         assert isinstance(out_states, _FakeState)
         assert out_states.value.shape == (n_gpu, n_per_gpu)
-
-
-# ---------------------------------------------------------------------------
-# Derived helpers (walker_axis, flatten/unflatten, extract_step_sizes,
-# broadcast_step_sizes, reduce_emax) — shared across all three descriptors.
-# ---------------------------------------------------------------------------
 
 
 class _FakePop:
@@ -397,12 +286,16 @@ _DESCRIPTOR_CASES = [
 
 
 class TestWalkerAxis:
+    """Check that walker_axis equals the rank of shape_prefix."""
+
     @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
     def test_matches_shape_prefix_length(self, descriptor):
         assert descriptor.walker_axis == len(descriptor.shape_prefix)
 
 
 class TestFlattenUnflatten:
+    """Check that flatten merges the batch axes and unflatten restores them."""
+
     @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
     def test_roundtrip(self, descriptor):
         trailing = (4, 5)
@@ -421,6 +314,8 @@ class TestFlattenUnflatten:
 
 
 class TestExtractStepSizes:
+    """Check that extract_step_sizes keeps one walker's per-move step sizes."""
+
     @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
     def test_shape(self, descriptor):
         K, n_moves = 5, 3
@@ -433,8 +328,7 @@ class TestExtractStepSizes:
     def test_picks_walker_zero(self, descriptor):
         K, n_moves = 4, 2
         shape = descriptor.shape_prefix + (K, n_moves)
-        # Fill with the walker index along the K axis so we can verify
-        # extract_step_sizes pulls walker 0 specifically.
+        # Each walker holds its own index, so walker 0 gives zeros.
         walker_idx = jnp.broadcast_to(
             jnp.arange(K, dtype=jnp.float32).reshape(
                 (1,) * len(descriptor.shape_prefix) + (K, 1)
@@ -447,6 +341,8 @@ class TestExtractStepSizes:
 
 
 class TestBroadcastStepSizes:
+    """Check that broadcast_step_sizes repeats per-move sizes over walkers."""
+
     @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
     def test_shape(self, descriptor):
         K, n_moves = 6, 4
@@ -462,7 +358,6 @@ class TestBroadcastStepSizes:
             dtype=jnp.float32,
         ).reshape(descriptor.shape_prefix + (n_moves,))
         out = descriptor.broadcast_step_sizes(per_move_ss, K)
-        # Pull walker w; should equal per_move_ss for every w.
         for w in range(K):
             slicer = (slice(None),) * len(descriptor.shape_prefix) + (w,)
             np.testing.assert_array_equal(
@@ -471,6 +366,8 @@ class TestBroadcastStepSizes:
 
 
 class TestReduceEmax:
+    """Check that reduce_emax takes the maximum energy of each replica."""
+
     @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
     def test_shape(self, descriptor):
         K = 5
@@ -481,7 +378,7 @@ class TestReduceEmax:
     @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
     def test_value(self, descriptor):
         K = 4
-        # Energy with the maximum sitting at walker K-1 in every replica.
+        # The maximum sits at walker K-1 in every replica.
         ramp = jnp.arange(K, dtype=jnp.float32)
         energy = jnp.broadcast_to(
             ramp.reshape((1,) * len(descriptor.shape_prefix) + (K,)),
@@ -493,26 +390,12 @@ class TestReduceEmax:
 
 
 class TestScalarKey:
-    @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
-    def test_returns_scalar_key(self, descriptor):
-        # Build a per-replica key tree of the right shape, then ensure the
-        # result is a scalar (ndim == 0) — caller can feed it to scalar APIs
-        # like ``replica_exchange_step``.
-        n_per_replica = descriptor.n_runs
-        if n_per_replica == 1 and descriptor.shape_prefix == ():
-            # SingleRun: scalar input.
-            key = jax.random.key(0)
-        else:
-            flat = jax.random.split(jax.random.key(0), n_per_replica)
-            key = flat.reshape(descriptor.shape_prefix)
-        out = descriptor.scalar_key(key)
-        assert jnp.asarray(out).ndim == 0
+    """Check that scalar_key returns the key of the first replica."""
 
     def test_singlerun_passthrough(self):
         d = SingleRun()
         key = jax.random.key(7)
         assert jnp.asarray(d.scalar_key(key)).ndim == 0
-        # Same bits going in and out for a scalar input.
         out = d.scalar_key(key)
         assert (
             jax.random.key_data(out).tolist()
@@ -523,7 +406,6 @@ class TestScalarKey:
         d = VmapRuns(n_runs=4)
         flat = jax.random.split(jax.random.key(11), 4)
         out = d.scalar_key(flat)
-        # The first replica's key should match.
         assert (
             jax.random.key_data(out).tolist()
             == jax.random.key_data(flat[0]).tolist()
@@ -541,6 +423,8 @@ class TestScalarKey:
 
 
 class TestFromShapePrefix:
+    """Check that from_shape_prefix maps rank 0, 1 and 2 to the descriptors."""
+
     def test_scalar_returns_singlerun(self):
         out = from_shape_prefix(())
         assert isinstance(out, SingleRun)
@@ -573,7 +457,7 @@ class TestFromShapePrefix:
 
 
 class TestWrapForBatch:
-    """``wrap_for_batch`` mirrors ``wrap_step`` but for arbitrary callables."""
+    """Check that wrap_for_batch maps an arbitrary callable over the batch."""
 
     def _square(self, x):
         return x * x
@@ -595,7 +479,6 @@ class TestWrapForBatch:
     def test_pmap_vmap_runs_on_GP_batch(self):
         n_devices = jax.local_device_count()
         d = PmapVmapRuns(n_gpu=n_devices, n_per_gpu=3)
-        # Force n_gpu==local_devices since pmap requires that.
         wrapped = d.wrap_for_batch(self._square)
         x = jnp.arange(n_devices * 3, dtype=jnp.float32).reshape(n_devices, 3)
         out = wrapped(x)
@@ -603,6 +486,8 @@ class TestWrapForBatch:
 
 
 class TestDerivedHelpersJIT:
+    """Check that the derived helpers can be traced under jax.jit."""
+
     @pytest.mark.parametrize("descriptor", _DESCRIPTOR_CASES)
     def test_extract_and_broadcast_jit(self, descriptor):
         K, n_moves = 3, 2

@@ -1,38 +1,20 @@
-"""Multi-GPU parity test for inter-replica-exchange (RE) flavors.
+"""Check that inter-replica exchange gives the same result on any GPU layout.
 
-Why this test exists
---------------------
-The pmap RE path in ``InterREManager`` (``src/jaxrens/sampling/inter_re_manager.py``)
-all-gathers each device's shard, swaps on the full population using the same
-RNG on every device, then re-shards via ``axis_index``.  On ``n_gpu=1`` the
-all_gather is structurally a no-op, so single-device tests cannot probe:
+On the ``PmapVmapRuns`` path, ``InterREManager`` all-gathers every
+device's replicas, swaps on the full population with the same RNG on every
+device, and re-shards with ``axis_index``. With one device the all-gather
+does nothing, so only a real multi-device run can catch a wrong gather
+axis, swap decisions that differ between devices, or a wrong re-shard
+slice.
 
-* axis-correctness of the all_gather → reshape → step → reshape → slice
-  round-trip for ``n_gpu>1``;
-* the "every device produces identical swap decisions" invariant that
-  guarantees consistent re-sharding;
-* whether per-replica ``log_Z`` and per-iteration swap-accept counts depend
-  on the device topology.
-
-This file runs each RE flavor (``pressure``, ``semi_grand``, ``xrens``) twice
-with the *same per-replica seed and same initial walkers* under two device
-layouts:
-
-* topology A — ``(n_gpu=1, n_per_gpu=R)``  (single-device pmap, degenerate);
-* topology B — ``(n_gpu=N, n_per_gpu=R/N)`` (real cross-device pmap).
-
-It then asserts:
-
-* per-replica ``log_Z`` agrees within a tight tolerance (float32 reductions
-  may differ in the last bit between devices);
-* per-iteration swap-attempt and swap-accept counts match exactly (these are
-  integer outputs and should be bit-identical given the same RNG and the same
-  all-gathered population).
-
-Marked ``@pytest.mark.multi_gpu`` only (no ``heavy``) so it runs as a fast
-check on a 2- or 4-GPU host.  Uses the cheap multi-species LJ backend
-(``ε`` and ``σ`` per species, Lorentz-Berthelot mixing) so XRENS sees real
-composition-dependent energies.
+Each RE flavor (``pressure``, ``semi_grand``, ``xrens``) runs twice from
+the same per-replica seeds and initial walkers: once as
+``(n_gpu=1, n_per_gpu=R)`` and once as ``(n_gpu=N, n_per_gpu=R/N)``. The
+per-replica ``log_Z`` must agree within a small float32 tolerance, and the
+per-iteration swap attempt and accept counts must match exactly. The
+backend is a two-species LJ (per-species ``epsilon`` and ``sigma``), so
+XRENS sees energies that depend on composition. The test is marked
+``multi_gpu`` but not ``heavy``.
 """
 
 from __future__ import annotations
@@ -54,14 +36,8 @@ from jaxrens.state.config import InterREConfig
 
 from . import multi_gpu_n_devices
 
-
-# ---------------------------------------------------------------------------
-# Problem setup helpers
-# ---------------------------------------------------------------------------
-
-
 _BASE_SEED = 20260508
-_N_TOTAL = 4          # number of replicas (must divide both 1 and N_GPU choices)
+_N_TOTAL = 4  # number of replicas (must divide both 1 and N_GPU choices)
 _N_WALKERS = 8
 _N_ATOMS = 4
 _CELL_SIDE = 4.0
@@ -69,7 +45,7 @@ _MAX_ITERS = 8
 _N_MCMC = 3
 _INITIAL_STEP_SIZE = 0.15
 
-# Two species so XRENS / per-species LJ have real work to do.
+# Two species, so XRENS swaps change the energy.
 _EPS_TABLE = (1.0, 0.8)
 _SIG_TABLE = (1.0, 1.1)
 _CUTOFF = 2.5
@@ -84,18 +60,19 @@ def _initial_types_for_composition(comp: tuple[int, ...]) -> jnp.ndarray:
 
 
 def _build_problem(flavor: str):
-    """Build the shared per-replica problem that's identical across topologies.
+    """Build the per-replica inputs for ``run_ns_multi_gpu``.
 
-    Returns a dict carrying everything needed to feed both ``run_ns_multi_gpu``
-    invocations.  All randomness is seeded so two calls with the same flavor
-    produce identical inputs.
+    All randomness is seeded, so two calls with the same flavor return
+    identical inputs.
     """
     backend = create_lj(epsilon=_EPS_TABLE, sigma=_SIG_TABLE, cutoff=_CUTOFF)
 
     descriptors = [
         MoveKernel(
-            "rw", random_walk.build_kernel,
-            step_size=_INITIAL_STEP_SIZE, step_size_max=1.0,
+            "rw",
+            random_walk.build_kernel,
+            step_size=_INITIAL_STEP_SIZE,
+            step_size_max=1.0,
         )
     ]
     init_fn, step_fn, _ = build_mwg(backend, descriptors)
@@ -103,34 +80,29 @@ def _build_problem(flavor: str):
     base_key = jax.random.key(_BASE_SEED)
     pos_key, types_key, run_keys_key = jax.random.split(base_key, 3)
 
-    # Per-replica RNG keys — flat (n_total,) so that reshape((G, P)) is
-    # layout-invariant: replica i gets the same key regardless of (G, P).
+    # Flat (n_total,) keys, so replica i gets the same key for any (G, P).
     rng_keys_flat = jax.random.split(run_keys_key, _N_TOTAL)
 
-    # Initial positions: random in a cube smaller than the cell to avoid
-    # immediate hard-overlap; same per-replica positions in both topologies.
+    # Keep atoms 0.5 away from the cell faces.
     positions = jax.random.uniform(
         pos_key,
         (_N_TOTAL, _N_WALKERS, _N_ATOMS, 3),
-        minval=0.5, maxval=_CELL_SIDE - 0.5,
+        minval=0.5,
+        maxval=_CELL_SIDE - 0.5,
     )
 
-    # Cells: identical cubic cell on every replica/walker so volume is
-    # well-defined (pressure-RENS uses _get_volume(cell)).
+    # Pressure RE needs the cell volume.
     cells = jnp.broadcast_to(
         _CELL_SIDE * jnp.eye(3),
         (_N_TOTAL, _N_WALKERS, 3, 3),
     )
 
-    # Per-replica types that match each replica's composition target.  Even
-    # for non-XRENS flavors this is harmless (the type vector is just along
-    # for the ride).  Same dtype as the existing tests use.
+    # Each replica starts at its XRENS composition target; the other flavors
+    # only carry the types along.
     types_per_replica = jnp.stack(
         [_initial_types_for_composition(c) for c in _COMP_TARGETS]
     )  # (n_total, n_atoms)
 
-    # Initial energies: evaluate the LJ backend on each (replica, walker) pair
-    # using that replica's types.  Vmap nesting matches positions shape.
     def _energy_one(pos_aw3, types_a):
         return backend(pos_aw3, types_a, _CELL_SIDE * jnp.eye(3), 0)[0]
 
@@ -142,7 +114,9 @@ def _build_problem(flavor: str):
 
     if flavor == "pressure":
         inter_re_cfg = InterREConfig(
-            flavor="pressure", re_interval=1, n_swap_cycles=1,
+            flavor="pressure",
+            re_interval=1,
+            n_swap_cycles=1,
         )
         ensemble_params_per_run = [
             {"pressure": 0.0},
@@ -152,7 +126,9 @@ def _build_problem(flavor: str):
         ]
     elif flavor == "semi_grand":
         inter_re_cfg = InterREConfig(
-            flavor="semi_grand", re_interval=1, n_swap_cycles=1,
+            flavor="semi_grand",
+            re_interval=1,
+            n_swap_cycles=1,
             chemical_potentials=(
                 (0.0, 0.0),
                 (0.5, 0.0),
@@ -163,7 +139,9 @@ def _build_problem(flavor: str):
         ensemble_params_per_run = None  # injected by run_ns_multi_gpu
     elif flavor == "xrens":
         inter_re_cfg = InterREConfig(
-            flavor="xrens", re_interval=1, n_swap_cycles=1,
+            flavor="xrens",
+            re_interval=1,
+            n_swap_cycles=1,
             composition_targets=_COMP_TARGETS,
         )
         ensemble_params_per_run = None  # injected by run_ns_multi_gpu
@@ -202,9 +180,7 @@ class _SwapStatsCollector:
 
 def _run(flavor: str, n_gpu: int) -> dict[str, Any]:
     """Drive ``run_ns_multi_gpu`` once for a given device topology."""
-    assert _N_TOTAL % n_gpu == 0, (
-        f"_N_TOTAL={_N_TOTAL} must be divisible by n_gpu={n_gpu}"
-    )
+    assert _N_TOTAL % n_gpu == 0
     n_per_gpu = _N_TOTAL // n_gpu
 
     prob = _build_problem(flavor)
@@ -243,15 +219,9 @@ def _run(flavor: str, n_gpu: int) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Parity tests
-# ---------------------------------------------------------------------------
-
-
-# Tight float32 tolerance: log_Z is dominated by per-replica live-set
-# evolution (no cross-device reductions), so we expect near-bit-exact
-# agreement.  Loosened slightly to absorb the small float-order difference
-# in pmap collectives versus single-device pmap.
+# log_Z comes from each replica's own live set with no cross-device
+# reduction, so the two layouts should agree almost bit for bit. The
+# tolerance absorbs float32 ordering differences in the pmap collectives.
 _LOG_Z_ATOL = 1e-3
 _LOG_Z_RTOL = 1e-3
 
@@ -259,15 +229,7 @@ _LOG_Z_RTOL = 1e-3
 @pytest.mark.multi_gpu
 @pytest.mark.parametrize("flavor", ["pressure", "semi_grand", "xrens"])
 def test_re_pmap_topology_parity(flavor: str) -> None:
-    """``(n_gpu=1, n_per_gpu=R)`` and ``(n_gpu=N, n_per_gpu=R/N)`` agree.
-
-    The all-gather/replicate/swap path must produce identical per-replica
-    log-evidence and identical per-iteration swap-accept counts regardless
-    of how the R replicas are distributed across devices.  Mismatches here
-    indicate a real cross-device correctness bug — wrong ``axis=`` on the
-    all_gather, divergent swap RNG between devices, or a re-shard slicing
-    error.
-    """
+    """Check that one device and N devices give the same log_Z and swaps."""
     n_devices = multi_gpu_n_devices()
     if _N_TOTAL % n_devices != 0:
         pytest.fail(
@@ -280,38 +242,33 @@ def test_re_pmap_topology_parity(flavor: str) -> None:
 
     # Per-replica log-evidence must agree.
     np.testing.assert_allclose(
-        out_a["log_evidence"], out_b["log_evidence"],
-        atol=_LOG_Z_ATOL, rtol=_LOG_Z_RTOL,
-        err_msg=(
-            f"[{flavor}] log_Z disagrees between (n_gpu=1, n_per_gpu={_N_TOTAL}) "
-            f"and (n_gpu={n_devices}, n_per_gpu={_N_TOTAL // n_devices}):\n"
-            f"  topology A: {out_a['log_evidence']}\n"
-            f"  topology B: {out_b['log_evidence']}"
-        ),
+        out_a["log_evidence"],
+        out_b["log_evidence"],
+        atol=_LOG_Z_ATOL,
+        rtol=_LOG_Z_RTOL,
     )
+    assert (out_a["n_dead"] == out_b["n_dead"]).all()
 
-    # NS termination counter (n_dead) must match exactly.
-    assert (out_a["n_dead"] == out_b["n_dead"]).all(), (
-        f"[{flavor}] n_dead diverged: A={out_a['n_dead']}, B={out_b['n_dead']}"
-    )
+    # Swap counts are integers. Every device decides on the same gathered
+    # population with the same RNG, so they must match exactly; a mismatch
+    # means divergent swap RNG or a float-order difference that flipped a
+    # borderline accept.
+    assert out_a["swap_attempted"] == out_b["swap_attempted"]
+    assert out_a["swap_accepted"] == out_b["swap_accepted"]
 
-    # Per-iteration swap stats are integers — every device produces the same
-    # decisions on the same all-gathered population, so this should match
-    # exactly.  A mismatch here is the smoking gun for divergent swap RNG
-    # or a float-order difference flipping a borderline accept/reject.
-    assert out_a["swap_attempted"] == out_b["swap_attempted"], (
-        f"[{flavor}] per-iter n_swap_pairs_attempted diverged: "
-        f"A={out_a['swap_attempted']}, B={out_b['swap_attempted']}"
-    )
-    assert out_a["swap_accepted"] == out_b["swap_accepted"], (
-        f"[{flavor}] per-iter n_swap_pairs_accepted diverged: "
-        f"A={out_a['swap_accepted']}, B={out_b['swap_accepted']}"
-    )
+    # Without any swap attempt the parity checks above would be vacuous.
+    assert sum(out_a["swap_attempted"]) > 0
 
-    # Sanity: the swap pass actually fired and proposed at least one pair.
-    # If everything in this test is a no-op the parity assertion above is
-    # vacuous.
-    assert sum(out_a["swap_attempted"]) > 0, (
-        f"[{flavor}] no swap pairs attempted across {_MAX_ITERS} iters — "
-        f"the swap pass never fired and the parity assertion is vacuous."
+    # The final live walkers must also land on the same replica. XRENS and
+    # semi-grand swaps change the types, which log_Z alone may not reveal.
+    res_a, res_b = out_a["result"], out_b["result"]
+    shape = (_N_TOTAL, _N_WALKERS, _N_ATOMS)
+    np.testing.assert_array_equal(
+        np.asarray(res_a["types"]).reshape(shape),
+        np.asarray(res_b["types"]).reshape(shape),
+    )
+    np.testing.assert_allclose(
+        np.asarray(res_a["energies"]).reshape(shape[:2]),
+        np.asarray(res_b["energies"]).reshape(shape[:2]),
+        atol=_LOG_Z_ATOL,
     )

@@ -106,8 +106,10 @@ def truncate_h5_traj(path: Path | str, restart_iteration: int) -> None:
     """Delete per-iteration groups (keyed by ``str(iteration)``) >= cut.
 
     The HDF5 trajectory writer stores each dead point as a group named after
-    its iteration (``"{iteration}_{cull_rank}"`` when ``n_cull > 1``).  Snapshot groups (``snapshot_*``) are left untouched — they
-    are keyed separately and overwritten by cadence, not appended.
+    its iteration (``"{iteration}_{cull_rank}"`` when ``n_cull > 1``) and
+    each walker snapshot as ``"snapshot_{iteration}"``.  Both kinds are
+    deleted at and after the cut: the resumed run writes them again with
+    ``create_group``, which fails on an existing name.
     """
     path = Path(path)
     if restart_iteration <= 0 or not path.exists():
@@ -116,10 +118,9 @@ def truncate_h5_traj(path: Path | str, restart_iteration: int) -> None:
 
     with h5py.File(path, "r+") as f:
         for key in list(f.keys()):
-            if key.startswith("snapshot_"):
-                continue
+            label = key.removeprefix("snapshot_")
             try:
-                it = int(key.split("_", 1)[0])
+                it = int(label.split("_", 1)[0])
             except ValueError:
                 continue
             if it >= restart_iteration:

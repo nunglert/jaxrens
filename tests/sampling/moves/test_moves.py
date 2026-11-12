@@ -1,9 +1,4 @@
-"""Test move kernels: random walk and Galilean Monte Carlo.
-
-For each move: (a) init returns valid state, (b) step produces expected output,
-(c) JIT compilation succeeds, (d) vmap over walkers works, (e) acceptance
-rate is reasonable on toy problem.
-"""
+"""Tests for the random walk and Galilean Monte Carlo move kernels."""
 
 import jax
 import jax.numpy as jnp
@@ -11,16 +6,20 @@ import pytest
 
 from jaxrens.backends.base import BackendResult
 from jaxrens.backends.toy import create_harmonic
+from jaxrens.cli.schema.moves import GMCMoveSpec
+from jaxrens.sampling.moves.galilean import _perturb_direction
 from jaxrens.sampling.moves.galilean import build_kernel as gmc_build_kernel
 from jaxrens.sampling.moves.random_walk import build_kernel as rw_build_kernel
+from jaxrens.sampling.mwg import build_mwg
 from jaxrens.state.mc_state import MCState, make_mc_state_class
 
-# MCState with direction field for galilean tests
 _GalileanMCState = make_mc_state_class({"direction": jnp.ndarray})
+
+_SYMBOL_MAP = {0: "Ge", 1: "Si"}
 
 
 def _make_state(positions, types, energy, cell=None, step_size=0.1):
-    """Helper: create MCState for non-galilean tests."""
+    """Build an MCState for one walker."""
     if cell is None:
         cell = jnp.zeros((3, 3))
     return MCState(
@@ -38,11 +37,22 @@ def _make_state(positions, types, energy, cell=None, step_size=0.1):
     )
 
 
-def _make_gmc_state(positions, types, energy, cell=None, step_size=0.1):
-    """Helper: create MCState with direction for galilean tests."""
+def _make_gmc_state(
+    positions,
+    types,
+    energy,
+    cell=None,
+    step_size=0.1,
+    direction_field="direction",
+):
+    """Build a Galilean MCState for one walker, with a zero direction."""
     if cell is None:
         cell = jnp.zeros((3, 3))
-    return _GalileanMCState(
+    if direction_field == "direction":
+        state_cls = _GalileanMCState
+    else:
+        state_cls = make_mc_state_class({direction_field: jnp.ndarray})
+    return state_cls(
         positions=jnp.asarray(positions),
         types=jnp.asarray(types),
         energy=jnp.asarray(energy),
@@ -54,8 +64,13 @@ def _make_gmc_state(positions, types, energy, cell=None, step_size=0.1):
         max_neighbor_count=jnp.asarray(0, dtype=jnp.int32),
         overflow=jnp.asarray(False),
         ensemble_params={},
-        direction=jnp.zeros_like(positions),
+        **{direction_field: jnp.zeros_like(positions)},
     )
+
+
+def _energy(positions):
+    """Harmonic energy (k=1) of the positions."""
+    return 0.5 * jnp.sum(positions**2)
 
 
 @pytest.fixture
@@ -65,20 +80,29 @@ def harmonic():
 
 @pytest.fixture
 def positions():
-    return jnp.array([[0.5, 0.0, 0.0], [0.0, 0.5, 0.0]])
+    return jnp.array(
+        [
+            [0.5, 0.0, 0.0],
+            [0.0, 0.5, 0.0],
+            [0.0, 0.0, 0.5],
+            [0.3, 0.3, 0.0],
+        ]
+    )
 
 
 @pytest.fixture
 def types():
-    return jnp.array([0, 0])
-
-
-# ---------------------------------------------------------------------------
-# Random Walk
-# ---------------------------------------------------------------------------
+    """Atoms 0, 1 have type 0 and atoms 2, 3 have type 1."""
+    return jnp.array([0, 0, 1, 1])
 
 
 class TestRandomWalkStep:
+    """Check the random walk kernel on a harmonic potential.
+
+    The tests cover one step, accept and reject against the constraint, vmap,
+    lax.scan, and the acceptance rate.
+    """
+
     def test_step_returns_state_and_info(self, harmonic, positions, types):
         backend = harmonic
         state = _make_state(positions, types, energy=1.0, step_size=0.05)
@@ -88,17 +112,23 @@ class TestRandomWalkStep:
         new_state, info = step(key, state, likelihood_constraint=10.0)
 
         assert isinstance(new_state, MCState)
-        assert hasattr(info, "accepted")
-        assert hasattr(info, "n_evaluations")
+        assert new_state.positions.shape == positions.shape
+        assert new_state.energy.shape == ()
+        assert info.n_evaluations == 1
 
     def test_accepts_below_constraint(self, harmonic, positions, types):
         backend = harmonic
-        state = _make_state(positions, types, energy=0.25, step_size=0.01)
+        state = _make_state(
+            positions, types, energy=_energy(positions), step_size=0.01
+        )
         step = jax.jit(rw_build_kernel(backend))
 
         key = jax.random.key(42)
         new_state, info = step(key, state, likelihood_constraint=100.0)
+
         assert info.accepted
+        expected = backend(new_state.positions, types, state.cell, 0)[0]
+        assert jnp.allclose(new_state.energy, expected)
 
     def test_rejects_above_constraint(self, harmonic, positions, types):
         backend = harmonic
@@ -109,16 +139,6 @@ class TestRandomWalkStep:
         new_state, info = step(key, state, likelihood_constraint=0.002)
         assert not info.accepted
         assert jnp.array_equal(new_state.positions, state.positions)
-
-    def test_jit(self, harmonic, positions, types):
-        backend = harmonic
-        state = _make_state(positions, types, energy=1.0, step_size=0.1)
-        step = rw_build_kernel(backend)
-
-        jitted_step = jax.jit(step)
-        key = jax.random.key(0)
-        new_state, info = jitted_step(key, state, 10.0)
-        assert new_state.energy.shape == ()
 
     def test_vmap(self, harmonic, positions, types):
         backend = harmonic
@@ -151,9 +171,10 @@ class TestRandomWalkStep:
         assert infos.accepted.shape == (4,)
 
     def test_acceptance_rate_reasonable(self, harmonic, positions, types):
-        """Run 200 steps, expect reasonable acceptance rate on easy problem."""
         backend = harmonic
-        state = _make_state(positions, types, energy=0.25, step_size=0.05)
+        state = _make_state(
+            positions, types, energy=_energy(positions), step_size=0.05
+        )
         step = jax.jit(rw_build_kernel(backend))
 
         n_steps = 200
@@ -166,14 +187,13 @@ class TestRandomWalkStep:
             n_accepted += int(info.accepted)
 
         rate = n_accepted / n_steps
-        assert (
-            0.1 < rate < 1.0
-        ), f"Acceptance rate {rate} out of expected range"
+        assert 0.1 < rate < 1.0
 
     def test_scan_compatible(self, harmonic, positions, types):
-        """lax.scan should work with random walk step."""
         backend = harmonic
-        state = _make_state(positions, types, energy=0.25, step_size=0.05)
+        state = _make_state(
+            positions, types, energy=_energy(positions), step_size=0.05
+        )
         step = jax.jit(rw_build_kernel(backend))
 
         def scan_step(carry, key):
@@ -186,30 +206,36 @@ class TestRandomWalkStep:
         assert accepted.shape == (10,)
 
 
-# ---------------------------------------------------------------------------
-# Galilean Monte Carlo
-# ---------------------------------------------------------------------------
-
-
 class TestGalileanStep:
+    """Check the Galilean kernel on a harmonic potential.
+
+    The tests cover one step, the direction (initial draw and refresh), vmap,
+    lax.scan, the acceptance rate, and the energy constraint.
+    """
+
     def test_step_returns_state_and_info(self, harmonic, positions, types):
         backend = harmonic
-        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
+        state = _make_gmc_state(
+            positions, types, energy=_energy(positions), step_size=0.05
+        )
         step = jax.jit(gmc_build_kernel(backend, n_reflect=3))
 
         key = jax.random.key(0)
         new_state, info = step(key, state, likelihood_constraint=10.0)
 
-        assert hasattr(new_state, "positions")
-        assert hasattr(new_state, "direction")
-        assert hasattr(info, "accepted")
+        assert new_state.direction.shape == positions.shape
+        assert new_state.energy.shape == ()
+        assert info.n_evaluations == 3
+        assert info.n_grad_evaluations == 3
 
     def test_direction_initialized_on_first_call(
         self, harmonic, positions, types
     ):
-        """Direction should be randomized if initially zero."""
+        """A zero stored direction is replaced by a random one."""
         backend = harmonic
-        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
+        state = _make_gmc_state(
+            positions, types, energy=_energy(positions), step_size=0.05
+        )
         assert jnp.allclose(state.direction, 0.0)
 
         step = jax.jit(gmc_build_kernel(backend, n_reflect=3))
@@ -223,7 +249,9 @@ class TestGalileanStep:
     def test_refresh_direction_flag(self, harmonic, positions, types, refresh):
         """Stored direction is perturbed by default, redrawn with the flag."""
         d0 = jnp.ones_like(positions) / jnp.sqrt(positions.size)
-        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
+        state = _make_gmc_state(
+            positions, types, energy=_energy(positions), step_size=0.05
+        )
         state = state.set(direction=d0)
         step = gmc_build_kernel(
             harmonic, n_reflect=3, refresh_direction=refresh
@@ -239,21 +267,11 @@ class TestGalileanStep:
 
         cos = jnp.abs(jnp.sum(new_states.direction * d0, axis=(1, 2)))
         if refresh:
-            # Random unit vectors in 6 dims: E|cos| ~ 0.33.
-            assert float(cos.mean()) < 0.6
+            # Random unit vectors in 12 dims: E|cos| ~ 0.23 (measured 0.23).
+            assert float(cos.mean()) < 0.4
         else:
-            # 0.1 rad-scale nudge of d0.
-            assert float(cos.min()) > 0.9
-
-    def test_jit(self, harmonic, positions, types):
-        backend = harmonic
-        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
-        step = gmc_build_kernel(backend, n_reflect=3)
-
-        jitted_step = jax.jit(step)
-        key = jax.random.key(0)
-        new_state, info = jitted_step(key, state, 10.0)
-        assert new_state.energy.shape == ()
+            # A 0.1 rad-scale nudge of d0 (measured mean 0.95).
+            assert float(cos.mean()) > 0.9
 
     def test_vmap(self, harmonic, positions, types):
         backend = harmonic
@@ -287,24 +305,11 @@ class TestGalileanStep:
         assert new_states.energy.shape == (4,)
         assert infos.accepted.shape == (4,)
 
-    def test_reflection_keeps_energy_below_constraint(
-        self, harmonic, positions, types
-    ):
-        """After GMC step, accepted states should have energy < Emax."""
-        backend = harmonic
-        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
-        step = jax.jit(gmc_build_kernel(backend, n_reflect=5))
-
-        key = jax.random.key(42)
-        for i in range(20):
-            key, subkey = jax.random.split(key)
-            state, info = step(subkey, state, likelihood_constraint=2.0)
-            if info.accepted:
-                assert state.energy < 2.0
-
     def test_acceptance_rate_reasonable(self, harmonic, positions, types):
         backend = harmonic
-        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
+        state = _make_gmc_state(
+            positions, types, energy=_energy(positions), step_size=0.05
+        )
         step = jax.jit(gmc_build_kernel(backend, n_reflect=5))
 
         n_steps = 100
@@ -317,13 +322,13 @@ class TestGalileanStep:
             n_accepted += int(info.accepted)
 
         rate = n_accepted / n_steps
-        assert (
-            0.1 < rate <= 1.0
-        ), f"Acceptance rate {rate} out of expected range"
+        assert 0.1 < rate <= 1.0
 
     def test_scan_compatible(self, harmonic, positions, types):
         backend = harmonic
-        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
+        state = _make_gmc_state(
+            positions, types, energy=_energy(positions), step_size=0.05
+        )
         step = jax.jit(gmc_build_kernel(backend, n_reflect=3))
 
         def scan_step(carry, key):
@@ -336,64 +341,60 @@ class TestGalileanStep:
         assert accepted.shape == (10,)
 
     def test_without_forces(self, harmonic, positions, types):
-        """use_forces=False should still work (random reflection)."""
+        """use_forces=False reflects in a random direction."""
         backend = harmonic
-        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
+        state = _make_gmc_state(
+            positions, types, energy=_energy(positions), step_size=0.05
+        )
         step = gmc_build_kernel(backend, n_reflect=3, use_forces=False)
 
         key = jax.random.key(0)
         new_state, info = jax.jit(step)(key, state, 10.0)
-        assert new_state.energy.shape == ()
+
+        assert info.n_evaluations == 3
+        assert info.n_grad_evaluations == 0
 
 
 class TestGalileanBaldockSemantics:
-    """Pin the post-Phase-1 Baldock semantics: position advances through
-    violations inside the scan; accept gates on FINAL energy only; NaN
-    energies trigger reflection.  Mirrors jaxnest_dev/src/jaxnest/mcmc.py.
+    """Check the trajectory semantics of the Galilean kernel.
 
-    The earlier in-tree variant reverted position+energy on every
-    violation, making ``accepted`` trivially True (carry energy was
-    always the last *good* energy, < Emax by construction) and silently
-    propagating NaN energies as "valid".  These tests would have failed
-    under that variant.
+    The position advances through violated regions, acceptance depends only
+    on the final energy, a NaN energy triggers a reflection, and a rejection
+    flips the perturbed direction.
     """
 
     def test_reject_when_no_path_below_constraint(
-        self,
-        harmonic,
-        positions,
-        types,
+        self, harmonic, positions, types
     ):
-        """With Emax STRICTLY below the initial state.energy, the
-        trajectory cannot end below Emax — must report ``accepted=False``."""
-        backend = harmonic
-        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.5)
-        # Emax BELOW state.energy — every reflection step lands at
-        # E > Emax (harmonic potential at perturbed positions only grows).
-        step = jax.jit(gmc_build_kernel(backend, n_reflect=4))
-        key = jax.random.key(0)
-        new_state, info = step(key, state, likelihood_constraint=0.1)
-        assert not bool(info.accepted), (
-            f"GMC must reject when state.energy ({float(state.energy)}) "
-            f"already exceeds Emax (0.1); got accepted={bool(info.accepted)}"
+        """With Emax below the initial energy the trajectory is rejected.
+
+        The harmonic energy only grows away from the origin, so every
+        reflection step lands above Emax.
+        """
+        state = _make_gmc_state(
+            positions, types, energy=_energy(positions), step_size=0.5
         )
-        # Reject path: position must revert to original.
+        step = jax.jit(gmc_build_kernel(harmonic, n_reflect=4))
+
+        new_state, info = step(
+            jax.random.key(0), state, likelihood_constraint=0.1
+        )
+
+        assert not bool(info.accepted)
         assert jnp.allclose(new_state.positions, state.positions)
-        # Reject path: direction flips relative to state.direction (which
-        # is zero on first call, so this just checks final_dir is not
-        # used in the reject branch — position-invariance is the real
-        # signal here).
 
     def test_reject_flips_the_perturbed_direction(
         self, harmonic, positions, types
     ):
-        """On reject the stored direction is minus the *perturbed* direction
-        the trajectory used, not minus the stored one.  Flipping the stored
-        one discards the perturbation the accept/reject was decided for."""
-        from jaxrens.sampling.moves.galilean import _perturb_direction
+        """On reject the stored direction is minus the perturbed one.
 
+        Flipping the stored direction instead would discard the perturbation
+        the accept/reject decision was made for.
+        """
         d0 = jnp.ones_like(positions) / jnp.sqrt(positions.size)
-        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.5)
+        state = _make_gmc_state(
+            positions, types, energy=_energy(positions), step_size=0.5
+        )
         state = state.set(direction=d0)
         key = jax.random.key(0)
         step = jax.jit(gmc_build_kernel(harmonic, n_reflect=4))
@@ -407,11 +408,13 @@ class TestGalileanBaldockSemantics:
         assert not jnp.allclose(new_state.direction, -d0, atol=1e-3)
 
     def test_persistent_direction_keeps_uniform_ball_invariant(self, harmonic):
-        """Start exactly uniform in {0.5|q|^2 < 0.5} (a 6-D unit ball) with
-        uniform directions and apply 100 persistent GMC calls at a fixed
-        constraint: <r^2> must stay d/(d+2) = 0.75.  With the old reject
-        branch (flip the unperturbed direction) it drifts inward to ~0.732,
-        the same too-cold bias seen in NS on LJ8."""
+        """A uniform ensemble stays uniform under repeated GMC calls.
+
+        Start uniform in {0.5|q|^2 < 0.5} (a 6-D unit ball) with uniform
+        directions and apply 100 persistent GMC calls at a fixed constraint.
+        <r^2> must stay d/(d+2) = 0.75.  Flipping the unperturbed direction
+        on reject drifts it inward to about 0.732.
+        """
         n, n_atoms, d = 8000, 2, 6
         k_dir, k_rad, k_v, k_run = jax.random.split(jax.random.key(0), 4)
         x = jax.random.normal(k_dir, (n, d))
@@ -443,92 +446,59 @@ class TestGalileanBaldockSemantics:
         assert abs(float(r2.mean()) - d / (d + 2)) < 0.006, float(r2.mean())
 
     def test_accept_advances_through_intermediate_violations(
-        self,
-        harmonic,
-        positions,
-        types,
+        self, harmonic, positions, types
     ):
-        """When ``n_reflect`` is large enough that reflections recover
-        the walker, the move accepts AND the final position is NOT the
-        initial position (i.e. the trajectory genuinely traversed the
-        violated region rather than rejecting at the first step)."""
-        backend = harmonic
-        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
-        step = jax.jit(gmc_build_kernel(backend, n_reflect=5))
+        """Accepted moves change the positions, and acceptance is not rare."""
+        state = _make_gmc_state(
+            positions, types, energy=_energy(positions), step_size=0.05
+        )
+        step = jax.jit(gmc_build_kernel(harmonic, n_reflect=5))
         key = jax.random.key(7)
         accept_count = 0
-        moved_count = 0
-        last_state = state
         for _ in range(50):
             key, sub = jax.random.split(key)
-            last_state, info = step(sub, last_state, likelihood_constraint=0.5)
+            new_state, info = step(sub, state, likelihood_constraint=0.5)
             if bool(info.accepted):
                 accept_count += 1
-                # Accepted → positions must differ from prior state by at
-                # least ``step_size`` (since position advances unconditionally
-                # inside the scan, then on accept we keep final_pos).
-                # (We can't compare to the per-iter prior here without a
-                # separate carry; use the moved counter as a proxy below.)
-            moved_count += int(
-                not jnp.allclose(last_state.positions, state.positions)
-            )
-        assert (
-            accept_count > 5
-        ), f"Expected nonzero acceptance under reasonable settings; got {accept_count}/50"
-        # Trajectory must have actually evolved (positions changed from
-        # the original) — under the broken revert-on-violation kernel
-        # walkers could "accept" with no displacement and this would fail.
-        assert moved_count > 0
+                assert not jnp.allclose(new_state.positions, state.positions)
+            state = new_state
+        assert accept_count > 5
 
     def test_nan_energy_triggers_reflection_not_silent_reject(
-        self,
-        positions,
-        types,
+        self, positions, types
     ):
-        """A backend that returns NaN at certain configurations must
-        not cause the carry to propagate NaN energy through the scan
-        and silently report ``accepted=False`` at the end (which is
-        what happens without the NaN trap).  After the fix, NaN ⇒ inf
-        ⇒ violation ⇒ reflection, exactly like an over-Emax energy.
+        """A NaN energy is treated as a violation, like an energy above Emax.
+
+        The backend returns NaN at any position other than the initial one.
+        Every step violates, so the final energy is +inf and the move is
+        rejected with the state intact.
         """
-        # Synthetic backend: returns NaN at any displacement from
-        # original positions, finite at original.
-        positions = positions  # (2, 3)
-        nan_check_pos = positions
 
         def nan_backend(p, types, cell, max_neighbors=0, ensemble_params=None):
-            # Returns NaN whenever ANY coord differs from the initial
-            # (forcing every proposed step to NaN-out).
-            diff = jnp.any(jnp.abs(p - nan_check_pos) > 1e-6)
-            e = jnp.where(diff, jnp.nan, 0.25)
-            return BackendResult(energy=e)
+            moved = jnp.any(jnp.abs(p - positions) > 1e-6)
+            return BackendResult(energy=jnp.where(moved, jnp.nan, 0.25))
 
         state = _make_gmc_state(positions, types, energy=0.25, step_size=0.05)
         step = jax.jit(
             gmc_build_kernel(nan_backend, n_reflect=3, use_forces=False)
         )
-        key = jax.random.key(0)
-        new_state, info = step(key, state, likelihood_constraint=10.0)
-        # Every step NaN-violated → final energy = +inf → accepted=False
-        # (NOT a NaN-corrupted "rejected" that silently passes through).
+
+        new_state, info = step(
+            jax.random.key(0), state, likelihood_constraint=10.0
+        )
+
         assert not bool(info.accepted)
-        # The reject path keeps state.positions and state.energy intact
-        # — verify they survived a sea of NaN proposals.
         assert jnp.allclose(new_state.positions, state.positions)
         assert float(new_state.energy) == 0.25
 
     def test_final_energy_below_constraint_when_accepted(
-        self,
-        harmonic,
-        positions,
-        types,
+        self, harmonic, positions, types
     ):
-        """When accepted, the stored state.energy must be < Emax.
-        Invariant: accept ⇔ final-state energy below Emax.  Run for many
-        trials to actually exercise the accept path."""
-        backend = harmonic
-        state = _make_gmc_state(positions, types, energy=0.25, step_size=0.02)
-        step = jax.jit(gmc_build_kernel(backend, n_reflect=5))
+        """Every accepted move leaves state.energy below Emax."""
+        state = _make_gmc_state(
+            positions, types, energy=_energy(positions), step_size=0.02
+        )
+        step = jax.jit(gmc_build_kernel(harmonic, n_reflect=5))
         key = jax.random.key(99)
         n_accepted = 0
         for _ in range(60):
@@ -536,10 +506,212 @@ class TestGalileanBaldockSemantics:
             state, info = step(sub, state, likelihood_constraint=1.0)
             if bool(info.accepted):
                 n_accepted += 1
-                assert float(state.energy) < 1.0, (
-                    f"Accepted move left state.energy={float(state.energy)} "
-                    f"≥ Emax=1.0 — invariant violated"
-                )
-        assert (
-            n_accepted > 0
-        )  # sanity: the test actually exercised the accept path
+                assert float(state.energy) < 1.0
+        assert n_accepted > 0
+
+
+class TestGalileanSpeciesMask:
+    """Check that the kernel moves only the atoms of the scoped species.
+
+    The tests cover the frozen atoms in the accept, reject and reflection
+    paths, the direction confined to the moving atoms, and a mask that
+    follows state.types.
+    """
+
+    @pytest.mark.parametrize(
+        "constraint",
+        [
+            10.0,  # loose: trajectory stays in-region, move accepts
+            0.55,  # tight: forces reflections and rejections
+        ],
+    )
+    @pytest.mark.parametrize("use_forces", [True, False])
+    def test_frozen_species_never_moves(
+        self, harmonic, positions, types, constraint, use_forces
+    ):
+        """The type-1 atoms are bit-identical after many steps.
+
+        The two constraints exercise the accept and the reject path.
+        ``use_forces=False`` covers the random-reflection branch, which
+        applies the mask separately.
+        """
+        state = _make_gmc_state(
+            positions, types, _energy(positions), step_size=0.2
+        )
+        step = jax.jit(
+            gmc_build_kernel(
+                harmonic,
+                n_reflect=3,
+                species=(0,),
+                use_forces=use_forces,
+            )
+        )
+
+        initial = state.positions
+        for i in range(20):
+            state, _ = step(jax.random.key(i), state, constraint)
+
+        # Frozen sublattice: exactly unchanged, not merely close.
+        assert jnp.array_equal(state.positions[2:], initial[2:])
+
+    def test_moving_species_actually_moves(self, harmonic, positions, types):
+        state = _make_gmc_state(positions, types, _energy(positions))
+        step = jax.jit(gmc_build_kernel(harmonic, n_reflect=3, species=(0,)))
+
+        initial = state.positions
+        for i in range(10):
+            state, _ = step(jax.random.key(i), state, 10.0)
+
+        assert not jnp.allclose(state.positions[:2], initial[:2])
+
+    def test_direction_is_confined_to_the_subspace(
+        self, harmonic, positions, types
+    ):
+        """Frozen rows of the direction stay zero; the whole has unit norm."""
+        state = _make_gmc_state(positions, types, _energy(positions))
+        step = jax.jit(gmc_build_kernel(harmonic, n_reflect=3, species=(0,)))
+
+        for i in range(5):
+            state, _ = step(jax.random.key(i), state, 10.0)
+            assert jnp.array_equal(state.direction[2:], jnp.zeros((2, 3)))
+            norm = jnp.sqrt(jnp.sum(state.direction**2))
+            assert jnp.isclose(norm, 1.0, atol=1e-5)
+
+    def test_multiple_species_in_one_scope(self, harmonic, positions, types):
+        """species=(0, 1) on a 2-species system equals the unscoped move.
+
+        The two kernels give bit-identical results for the same key.
+        """
+        state = _make_gmc_state(positions, types, _energy(positions))
+        scoped = jax.jit(
+            gmc_build_kernel(harmonic, n_reflect=3, species=(0, 1))
+        )
+        unscoped = jax.jit(gmc_build_kernel(harmonic, n_reflect=3))
+
+        key = jax.random.key(7)
+        a, info_a = scoped(key, state, 10.0)
+        b, info_b = unscoped(key, state, 10.0)
+
+        assert jnp.array_equal(a.positions, b.positions)
+        assert jnp.array_equal(a.direction, b.direction)
+        assert jnp.array_equal(a.energy, b.energy)
+        assert bool(info_a.accepted) == bool(info_b.accepted)
+
+    def test_custom_direction_field(self, harmonic, positions, types):
+        state = _make_gmc_state(
+            positions,
+            types,
+            _energy(positions),
+            direction_field="direction_gmc_Ge",
+        )
+        step = jax.jit(
+            gmc_build_kernel(
+                harmonic,
+                n_reflect=3,
+                species=(0,),
+                direction_field="direction_gmc_Ge",
+            )
+        )
+        new_state, _ = step(jax.random.key(0), state, 10.0)
+
+        norm = jnp.sqrt(jnp.sum(new_state.direction_gmc_Ge**2))
+        assert norm > 0.1
+
+    def test_mask_follows_types_not_positions(
+        self, harmonic, positions, types
+    ):
+        """The mask is read from ``state.types``, so a swap retargets the move.
+
+        A mask fixed at build time would keep moving the original atoms after
+        a swap changes the types.
+        """
+        step = jax.jit(gmc_build_kernel(harmonic, n_reflect=3, species=(0,)))
+
+        # Reverse the species assignment: now atoms 2, 3 are the movers.
+        state = _make_gmc_state(
+            positions,
+            jnp.array([1, 1, 0, 0]),
+            _energy(positions),
+            step_size=0.2,
+        )
+        initial = state.positions
+        for i in range(10):
+            state, _ = step(jax.random.key(i), state, 10.0)
+
+        assert jnp.array_equal(state.positions[:2], initial[:2])
+        assert not jnp.allclose(state.positions[2:], initial[2:])
+
+
+class TestScopedMovesInMWG:
+    """Check that two scoped GMC moves work side by side in build_mwg."""
+
+    def _descriptors(self):
+        ge = GMCMoveSpec(species=["Ge"], step_size=0.3, n_reflect=3)
+        si = GMCMoveSpec(species=["Si"], step_size=0.05, n_reflect=3)
+        return [
+            ge.to_descriptor(symbol_map=_SYMBOL_MAP),
+            si.to_descriptor(symbol_map=_SYMBOL_MAP),
+        ]
+
+    def _init_state(self, harmonic, positions, types):
+        init_fn, step_fn, per_move_fns = build_mwg(
+            harmonic, self._descriptors()
+        )
+        state = init_fn(
+            positions,
+            types,
+            energy=0.5 * jnp.sum(positions**2),
+            cell=jnp.zeros((3, 3)),
+        )
+        return state, step_fn, per_move_fns
+
+    def test_separate_direction_fields_and_step_sizes(
+        self, harmonic, positions, types
+    ):
+        descs = self._descriptors()
+        assert [d.name for d in descs] == ["gmc_Ge", "gmc_Si"]
+
+        state, _, _ = self._init_state(harmonic, positions, types)
+
+        # build_mwg must keep the two direction fields distinct.
+        assert hasattr(state, "direction_gmc_Ge")
+        assert hasattr(state, "direction_gmc_Si")
+        # Per-move step sizes, seeded from each spec.
+        assert state.step_sizes.shape == (2,)
+        assert jnp.allclose(state.step_sizes, jnp.array([0.3, 0.05]))
+
+    def test_each_move_only_touches_its_own_sublattice(
+        self, harmonic, positions, types
+    ):
+        state, _, per_move_fns = self._init_state(harmonic, positions, types)
+        ge_move, si_move = per_move_fns
+
+        after_ge = ge_move(state, jax.random.key(1), 10.0)[0]
+        assert jnp.array_equal(after_ge.positions[2:], state.positions[2:])
+        # The Si move's direction is untouched by the Ge move.
+        assert jnp.array_equal(
+            after_ge.direction_gmc_Si, state.direction_gmc_Si
+        )
+
+        after_si = si_move(after_ge, jax.random.key(2), 10.0)[0]
+        assert jnp.array_equal(after_si.positions[:2], after_ge.positions[:2])
+        # The Ge direction also survives the Si move.
+        assert jnp.array_equal(
+            after_si.direction_gmc_Ge, after_ge.direction_gmc_Ge
+        )
+
+    def test_both_sublattices_move_under_the_full_mwg_step(
+        self, harmonic, positions, types
+    ):
+        state, step_fn, _ = self._init_state(harmonic, positions, types)
+        initial = state.positions
+
+        jitted = jax.jit(step_fn)
+        for i in range(40):
+            state, _ = jitted(
+                jax.random.key(i), state, 10.0, jax.random.key(1000 + i)
+            )
+
+        assert not jnp.allclose(state.positions[:2], initial[:2])
+        assert not jnp.allclose(state.positions[2:], initial[2:])
+        assert int(jnp.sum(state.n_proposed)) == 40

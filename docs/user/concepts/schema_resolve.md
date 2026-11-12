@@ -506,7 +506,7 @@ multi-replica runs. The shape depends on the batcher:
 |---|---|---|
 | `base_backend` | `Hamiltonian(model, [SoftCoreTerm?])` — no ensemble term | same |
 | `ensemble_params_per_run` | length-1 tuple | length-`n_total` tuple, flat order `g * P + p` |
-| `init.initial_positions` shape | `(n_live, A, 3)` | `(n_total, n_live, A, 3)` |
+| `init.initial_positions` shape | `(K, N, 3)` | `(n_total, K, N, 3)` |
 | `init.initial_energies` shape | `(n_live,)` | `(n_total, n_live)` |
 | `batcher` | `SingleRun()` | `PmapVmapRuns(n_gpu, n_per_gpu)` |
 

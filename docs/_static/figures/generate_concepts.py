@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import numpy as np
-
 from _common import FIGDIR
 
 
@@ -137,12 +136,12 @@ def fig_pytree_shapes() -> None:
 
     header = ["", "positions", "energy", "log_evidence"]
     rows = [
-        ("SingleRun", "(K, A, 3)", "(K,)", "()"),
-        ("VmapRuns", "(R, K, A, 3)", "(R, K)", "(R,)"),
-        ("PmapVmapRuns", "(G, P, K, A, 3)", "(G, P, K)", "(G, P)"),
+        ("SingleRun", "(K, N, 3)", "(K,)", "()"),
+        ("VmapRuns", "(R, K, N, 3)", "(R, K)", "(R,)"),
+        ("PmapVmapRuns", "(G, P, K, N, 3)", "(G, P, K)", "(G, P)"),
     ]
 
-    col_x = [0.4, 2.2, 5.4, 7.6]
+    col_x = [0.4, 2.5, 5.4, 7.6]
     header_y = 4.1
     row_ys = [3.1, 2.2, 1.3]
     cell_colors = {

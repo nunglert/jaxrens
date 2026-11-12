@@ -162,8 +162,10 @@ def _implied_n_total(tree: dict) -> int:
     """Replicate ``_derive_replica_axes`` n_total inference from a dumped config.
 
     Reads only the fields that participate in the replica-axis derivation:
-    ``ensemble.pressure`` (when list-valued), ``inter_re.composition_targets``,
-    ``inter_re.chemical_potentials``. Returns 1 for the single-replica case.
+    ``ensemble.pressure`` (when list-valued), ``ensemble.chemical_potentials``
+    (when it is a list of μ-vectors, as for ``semi_grand``),
+    ``inter_re.composition_targets``, ``inter_re.chemical_potentials``.
+    Returns 1 for the single-replica case.
     Unknown / inconsistent shapes return ``-1`` so a downstream diff bubbles
     up clearly.
     """
@@ -173,6 +175,11 @@ def _implied_n_total(tree: dict) -> int:
         p = ens.get("pressure")
         if isinstance(p, list) and len(p) > 1:
             lengths.append(len(p))
+        # A flat list is one μ-vector (one replica); a list of lists has one
+        # μ-vector per replica.
+        mu = ens.get("chemical_potentials")
+        if isinstance(mu, list) and len(mu) > 1 and isinstance(mu[0], list):
+            lengths.append(len(mu))
     ire = _dig(tree, "inter_re")
     if isinstance(ire, dict):
         comp = ire.get("composition_targets")
@@ -298,6 +305,7 @@ def validate_restart_compatibility(
             f"  snapshot implies n_total = {snap_n_total} replicas\n"
             f"  current  implies n_total = {cur_n_total} replicas\n"
             f"  (driven by len(ensemble.pressure) / "
+            f"len(ensemble.chemical_potentials) / "
             f"len(inter_re.composition_targets) / "
             f"len(inter_re.chemical_potentials))\n"
             f"  snapshot: {snapshot_path}\n"

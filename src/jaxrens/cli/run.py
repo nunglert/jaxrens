@@ -327,17 +327,22 @@ def run_from_config(
             "Prefer populating ResolvedInit.initial_energies via the resolver."
         )
 
-        def eval_one(pos):
+        # Each walker is evaluated with its own cell and with the ensemble
+        # params, so P V and -mu N match what the moves compute later.
+        cells_for_energy = (
+            initial_cells
+            if initial_cells is not None
+            else jnp.zeros((initial_positions.shape[0], 3, 3))
+        )
+
+        def eval_one(pos, cell):
             return backend(
-                pos,
-                initial_types,
-                initial_cells[0]
-                if initial_cells is not None
-                else jnp.zeros((3, 3)),
-                0,
+                pos, initial_types, cell, 0, ensemble_params=ensemble_params
             ).energy
 
-        initial_energies = jax.vmap(eval_one)(initial_positions)
+        initial_energies = jax.vmap(eval_one)(
+            initial_positions, cells_for_energy
+        )
 
     # Build MWG sampler. Prefer pre-built MoveKernels when available — they
     # carry n_atoms / n_species that MoveConfig can't express (volume, shear,
@@ -756,8 +761,8 @@ def run_multi_gpu_from_config(resolved, *, writer_mode: str = "w") -> dict:
     # before invoking this function.
 
     n_live = ns.n_live
-    positions = resolved.init.initial_positions  # (n_total, K, A, 3)
-    types = resolved.init.initial_types  # (A,)
+    positions = resolved.init.initial_positions  # (n_total, K, N, 3)
+    types = resolved.init.initial_types  # (N,)
     cells = resolved.init.initial_cells  # (n_total, K, 3, 3) | None
     energies = resolved.init.initial_energies  # (n_total, K)
 
@@ -1214,7 +1219,7 @@ def run_sharded_from_config(resolved, *, writer_mode: str = "w") -> dict:
     working_dir = resolved.output.working_dir
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    positions = resolved.init.initial_positions  # (K, A, 3)
+    positions = resolved.init.initial_positions  # (K, N, 3)
     types = resolved.init.initial_types
     cells = resolved.init.initial_cells
     energies = resolved.init.initial_energies

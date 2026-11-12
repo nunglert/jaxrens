@@ -1,7 +1,9 @@
-"""Unit tests for the BackendResult pytree and eval_energy_and_forces.
+"""Unit tests for the ``BackendResult`` pytree and ``eval_energy_and_forces``.
 
-Covers the new structured backend return contract (energy + control +
-reserved diagnostics slots) and the native-or-autodiff force dispatch.
+``BackendResult`` is what every backend returns: the energy, control fields
+for the neighbor-bucket manager, and reserved slots for diagnostics.
+``eval_energy_and_forces`` uses a backend's own forces when it has them and
+falls back to autodiff otherwise.
 """
 
 import jax
@@ -9,10 +11,6 @@ import jax.numpy as jnp
 import pytest
 
 from jaxrens.backends.base import BackendResult, eval_energy_and_forces
-
-# ---------------------------------------------------------------------------
-# Fake backends
-# ---------------------------------------------------------------------------
 
 
 class EnergyOnlyBackend:
@@ -70,19 +68,19 @@ def cell():
     return 5.0 * jnp.eye(3)
 
 
-# ---------------------------------------------------------------------------
-# BackendResult as a pytree
-# ---------------------------------------------------------------------------
-
-
 class TestBackendResultPytree:
+    """Check that ``BackendResult`` works as a pytree: only the set fields are
+    leaves, it round-trips through flatten/unflatten, a result with sentinel
+    control fields has the same tree structure as a filled one, and
+    ``_replace`` passes the other fields through."""
+
     def test_energy_only_leaves(self):
         r = BackendResult(energy=jnp.array(1.5))
         leaves = jax.tree_util.tree_leaves(r)
-        # energy + the two control sentinels; the None fields contribute no leaves
+        # energy + the two control sentinels; None fields give no leaves
         assert len(leaves) == 3
 
-    def test_none_fields_excluded(self):
+    def test_unset_fields_default_to_none(self):
         r = BackendResult(energy=jnp.array(1.0))
         assert r.forces is None
         assert r.energy_members is None and r.forces_members is None
@@ -118,12 +116,11 @@ class TestBackendResultPytree:
         assert jnp.array_equal(wrapped.forces, base.forces)
 
 
-# ---------------------------------------------------------------------------
-# treedef stability (the lax.scan / lax.cond safety property)
-# ---------------------------------------------------------------------------
-
-
 class TestTreedefStability:
+    """Check that a backend returns the same tree structure on every call,
+    which is what keeps its results safe inside ``lax.scan`` and
+    ``lax.cond``."""
+
     def test_backend_treedef_stable_across_calls(self, pos, species, cell):
         b = NativeForceBackend()
         t1 = jax.tree_util.tree_structure(b(pos, species, cell, 10))
@@ -141,12 +138,12 @@ class TestTreedefStability:
         assert energies.shape == (3,)
 
 
-# ---------------------------------------------------------------------------
-# eval_energy_and_forces
-# ---------------------------------------------------------------------------
-
-
 class TestEvalEnergyAndForces:
+    """Check that ``eval_energy_and_forces`` uses a backend's native forces
+    when it has them and otherwise takes ``-grad`` of the energy, that the
+    control fields survive the fallback, and that it works under ``jit`` and
+    ``vmap``."""
+
     def test_autodiff_fallback_is_negative_grad(self, pos, species, cell):
         b = EnergyOnlyBackend()
         res = eval_energy_and_forces(b, pos, species, cell, 10)
@@ -155,20 +152,21 @@ class TestEvalEnergyAndForces:
         assert float(res.energy) == float((pos**2).sum())
 
     def test_fallback_preserves_control_fields(self, pos, species, cell):
-        # control fields from __call__ must survive the value_and_grad(has_aux) path
+        # control fields from __call__ must survive the value_and_grad(has_aux)
+        # path
         b = NativeForceBackend()
         # temporarily hide the native method to force the fallback
-        delattr_native = b.energy_and_forces
+        native = b.energy_and_forces
         object.__setattr__(b, "energy_and_forces", None)
         try:
             res = eval_energy_and_forces(b, pos, species, cell, 10)
         finally:
-            object.__setattr__(b, "energy_and_forces", delattr_native)
+            object.__setattr__(b, "energy_and_forces", native)
         assert int(res.max_neighbor_count) == 3
         assert jnp.allclose(res.forces, -2.0 * pos)
 
     def test_native_path_used_verbatim(self, pos, species, cell):
-        # native energy_and_forces returns forces=7 (not -dE/dx) — must be used as-is
+        # the native forces are 7, not -dE/dx, and must be used as they are
         b = NativeForceBackend()
         res = eval_energy_and_forces(b, pos, species, cell, 10)
         assert jnp.allclose(res.forces, 7.0)

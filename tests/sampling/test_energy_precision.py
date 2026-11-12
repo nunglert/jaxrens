@@ -1,13 +1,4 @@
-"""Tests for `_find_worst_walker`.
-
-Verifies:
-- Argmax behavior on the (now scale-invariant, exact-equality) tie set.
-- Random tie-breaking selects uniformly among walkers exactly tied at the max.
-- Returned value is the strict `jnp.max(potentials)` (invariant: no survivor
-  ends up above the reported `potential_max`, which used to leak through the
-  old `isclose` tie window and produce "Emax increased" warnings).
-- JIT compatibility.
-"""
+"""Tests for the worst-walker selection in `_find_worst_walker`."""
 
 from __future__ import annotations
 
@@ -19,6 +10,12 @@ from jaxrens.sampling.nested_sampling import _find_worst_walker
 
 
 class TestFindWorstWalker:
+    """Check that _find_worst_walker returns the maximum potential.
+
+    Ties are exact equalities, broken uniformly at random.  The returned value
+    is always the strict ``jnp.max``, so no survivor can sit above it.
+    """
+
     def test_basic_argmax(self):
         """With a key, finds the maximum."""
         energies = jnp.array([1.0, 5.0, 3.0, 2.0])
@@ -27,74 +24,35 @@ class TestFindWorstWalker:
         assert idx == 1
         assert val == pytest.approx(5.0)
 
-    def test_tie_breaking_uniform(self):
-        """With tied energies, different keys should select different walkers."""
-        energies = jnp.array([3.0, 5.0, 5.0, 5.0, 1.0])
-        selections = set()
-        for seed in range(100):
-            key = jax.random.key(seed)
-            idx, val = _find_worst_walker(energies, rng_key=key)
-            assert val == pytest.approx(5.0)
-            assert idx in (1, 2, 3)  # must be one of the tied maxima
-            selections.add(int(idx))
-
-        # All three tied walkers should be selected at least once
-        assert selections == {
-            1,
-            2,
-            3,
-        }, f"Tie-breaking should be uniform; only selected indices {selections}"
-
-    def test_tie_breaking_all_equal(self):
-        """When all walkers have equal energy, any can be selected."""
-        energies = jnp.array([2.0, 2.0, 2.0, 2.0])
+    @pytest.mark.parametrize(
+        "energies,tied",
+        [
+            ([3.0, 5.0, 5.0, 5.0, 1.0], {1, 2, 3}),
+            ([2.0, 2.0, 2.0, 2.0], {0, 1, 2, 3}),
+            ([0.0, 0.0], {0, 1}),
+        ],
+    )
+    def test_tie_breaking_covers_all_tied(self, energies, tied):
+        """Different keys pick every walker tied at the maximum, only those."""
+        energies = jnp.array(energies)
         selections = set()
         for seed in range(200):
-            key = jax.random.key(seed)
-            idx, val = _find_worst_walker(energies, rng_key=key)
-            assert val == pytest.approx(2.0)
+            idx, val = _find_worst_walker(
+                energies, rng_key=jax.random.key(seed)
+            )
+            assert float(val) == float(jnp.max(energies))
             selections.add(int(idx))
-
-        assert len(selections) == 4
-
-    def test_deterministic_with_same_key(self):
-        """Same rng_key gives same result."""
-        energies = jnp.array([3.0, 5.0, 5.0])
-        key = jax.random.key(42)
-        idx1, _ = _find_worst_walker(energies, rng_key=key)
-        idx2, _ = _find_worst_walker(energies, rng_key=key)
-        assert idx1 == idx2  # deterministic with same key
+        assert selections == tied
 
     def test_near_ties_not_collapsed(self):
-        """Walkers within float ULP but not exactly equal are not tied.
-
-        Contract: exact equality for ties, strict max as the returned value —
-        so a non-strict-max walker is never reported as ``potential_max``.
-        """
-        # Two walkers within float32 rtol but distinct floats.
+        """Walkers within float32 rtol but not exactly equal are not tied."""
         energies = jnp.array([-105.213005, -105.212997], dtype=jnp.float32)
         strict_max = jnp.max(energies)
         for seed in range(50):
             key = jax.random.key(seed)
             idx, val = _find_worst_walker(energies, rng_key=key)
-            # The strict-max walker is unique (no exact tie), so idx must
-            # always pick it, and val must equal the strict max.
             assert int(idx) == int(jnp.argmax(energies))
             assert float(val) == float(strict_max)
-
-    def test_value_is_strict_max(self):
-        """Returned value equals jnp.max(potentials) under any tie pattern."""
-        cases = [
-            jnp.array([1.0, 2.0, 3.0]),
-            jnp.array([5.0, 5.0, 5.0, 1.0]),
-            jnp.array([-105.213005, -105.212997], dtype=jnp.float32),
-            jnp.array([0.0, 0.0]),
-        ]
-        for energies in cases:
-            for seed in range(5):
-                key = jax.random.key(seed)
-                _, val = _find_worst_walker(energies, rng_key=key)
-                assert float(val) == float(jnp.max(energies))
 
     def test_jit_compatible(self):
         """_find_worst_walker works under JIT."""

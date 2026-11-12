@@ -7,10 +7,16 @@ admonition, output stamping) rather than any physics.
 
 from __future__ import annotations
 
+import inspect
+import subprocess
+import sys
 import warnings
 
 import pytest
 
+import jaxrens.unvalidated as mod
+from jaxrens.io.trajectory import H5TrajectoryWriter
+from jaxrens.sampling.moves import hmc
 from jaxrens.unvalidated import (
     REGISTRY,
     Unvalidated,
@@ -50,6 +56,10 @@ def _make(**kw):
 
 
 class TestDecorator:
+    """Check that ``@unvalidated`` registers the function, warns on its first
+    call only, leaves signature and return value alone, and adds a warning
+    admonition to the docstring."""
+
     def test_registers_at_import_without_calling(self):
         fn = _make()
         key = fn.__jaxrens_unvalidated__.feature
@@ -67,11 +77,10 @@ class TestDecorator:
             assert fn(1) == 3
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            assert fn(1) == 3  # second call is silent
+            assert fn(1) == 3
 
     def test_preserves_signature_and_return(self):
         fn = _make()
-        import inspect
 
         assert list(inspect.signature(fn).parameters) == ["a", "b"]
         with pytest.warns(UnvalidatedFeatureWarning):
@@ -101,6 +110,9 @@ class TestDecorator:
 
 
 class TestPolicy:
+    """Check that ``JAXRENS_UNVALIDATED`` chooses between warning, silent
+    recording and raising, and that its value is read on every call."""
+
     def test_ignore_is_silent_but_still_records(self, monkeypatch):
         monkeypatch.setenv("JAXRENS_UNVALIDATED", "ignore")
         fn = _make()
@@ -128,8 +140,6 @@ class TestPolicy:
 
     def test_invalid_policy_falls_back_to_warn(self, monkeypatch):
         monkeypatch.setenv("JAXRENS_UNVALIDATED", "nonsense")
-        import jaxrens.unvalidated as mod
-
         monkeypatch.setattr(mod, "_WARNED_BAD_POLICY", False)
         fn = _make()
         with pytest.warns((UnvalidatedFeatureWarning, RuntimeWarning)):
@@ -137,6 +147,10 @@ class TestPolicy:
 
 
 class TestCallForm:
+    """Check that ``warn_unvalidated`` (the call form, for a single branch)
+    registers and warns, that ``format_summary`` lists what fired, and that
+    the message names the ways to silence or escalate it."""
+
     def test_warn_unvalidated_registers_and_warns(self):
         with pytest.warns(UnvalidatedFeatureWarning, match=">2 species"):
             warn_unvalidated(
@@ -159,24 +173,24 @@ class TestCallForm:
 
 
 class TestHmcMarker:
-    def test_hmc_build_kernel_is_marked(self):
-        from jaxrens.sampling.moves import hmc
+    """Check that the HMC kernel builder carries the unvalidated marker."""
 
+    def test_hmc_build_kernel_is_marked(self):
         rec = hmc.build_kernel.__jaxrens_unvalidated__
         assert "delta_H" in rec.concern
         assert rec.since == "0.2.2"
 
     def test_hmc_build_kernel_warns_when_built(self):
-        from jaxrens.sampling.moves import hmc
-
         with pytest.warns(UnvalidatedFeatureWarning, match="hmc.build_kernel"):
             hmc.build_kernel(backend=object(), n_leapfrog=3)
 
 
 class TestTrajectoryStamping:
+    """Check that the HDF5 trajectory writer stamps the triggered markers into
+    the file attributes, and only when some have fired."""
+
     def test_h5_writer_stamps_triggered_markers(self, tmp_path):
         h5py = pytest.importorskip("h5py")
-        from jaxrens.io.trajectory import H5TrajectoryWriter
 
         with pytest.warns(UnvalidatedFeatureWarning):
             warn_unvalidated("feat.z", concern="unchecked", since="0.2.2")
@@ -191,7 +205,6 @@ class TestTrajectoryStamping:
 
     def test_no_attr_when_nothing_triggered(self, tmp_path):
         h5py = pytest.importorskip("h5py")
-        from jaxrens.io.trajectory import H5TrajectoryWriter
 
         path = tmp_path / "clean.h5"
         writer = H5TrajectoryWriter(path, symbol_map={0: "Si"})
@@ -203,9 +216,6 @@ class TestTrajectoryStamping:
 
 def test_module_does_not_import_jax():
     """The stamping helper is reachable from JAX-free writer paths."""
-    import subprocess
-    import sys
-
     r = subprocess.run(
         [
             sys.executable,

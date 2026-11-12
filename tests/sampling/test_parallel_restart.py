@@ -1,22 +1,4 @@
-"""Tests for commit 5: parallel restart support in run_ns_parallel / init_ns_parallel.
-
-Tests
------
-TestInitNsParallelRestart
-    - init_ns_parallel with restart_states seeds n_dead, iteration, log_evidence
-      per-run correctly.
-    - Mixed restart: some runs restarted, some fresh — verified independently.
-    - Validation: wrong-length restart_states raises ValueError.
-
-TestRunNsParallelRestart
-    - run_ns_parallel with restart_states: n_dead >= checkpoint_n_dead on each run.
-    - run_ns_parallel with restart_states: log_evidence is finite.
-    - Parity with single-run restart: parallel run with n_runs=1 restarts from the
-      same checkpoint as run_ns — output n_dead consistent.
-
-All tests use the harmonic toy backend + random_walk kernel for reproducibility
-and CPU-scale runtime.
-"""
+"""Tests for restart support in init_ns_parallel and run_ns_parallel."""
 
 from __future__ import annotations
 
@@ -34,15 +16,11 @@ from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk as rw_mod
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import (
-    init_ns,
     init_ns_parallel,
+    run_ns,
     run_ns_parallel,
 )
 from jaxrens.sampling.termination import IterationTermination
-
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
 
 
 def _rw_descriptor() -> MoveKernel:
@@ -61,7 +39,7 @@ def _make_harmonic_setup(
     n_walkers: int = 8,
     n_atoms: int = 1,
 ):
-    """Return a minimal harmonic NS problem (backend, init_fn, step_fn, arrays)."""
+    """Return a small harmonic NS problem (functions and arrays)."""
     backend = create_harmonic(k=1.0)
     init_fn, step_fn, _ = build_mwg(backend, [_rw_descriptor()])
     key = jax.random.key(seed)
@@ -70,7 +48,7 @@ def _make_harmonic_setup(
         pos_key, (n_walkers, n_atoms, 3), minval=-2.0, maxval=2.0
     )
     types = jnp.zeros((n_atoms,), dtype=jnp.int32)
-    cells = jnp.zeros((n_walkers, 3, 3))  # harmonic backend ignores cell
+    cells = jnp.zeros((n_walkers, 3, 3))
     energies = jax.vmap(
         lambda pos: backend(pos, types, jnp.zeros((3, 3)), 0)[0]
     )(positions)
@@ -96,11 +74,10 @@ def _write_checkpoint(
     name: str = "ckpt.checkpoint.h5",
     step_sizes: np.ndarray | None = None,
 ) -> Path:
-    """Write a minimal NS checkpoint seeded from the harmonic setup *s*.
+    """Write a small NS checkpoint seeded from the harmonic setup ``s``.
 
-    ``step_sizes`` (shape ``(K, n_moves)``) is written when given, emulating a
-    real checkpoint carrying adapted step sizes; ``None`` emulates a legacy
-    checkpoint that pre-dates persisting them.
+    ``step_sizes`` of shape ``(K, n_moves)`` is written when given.  ``None``
+    emulates a legacy checkpoint without step sizes.
     """
     rng = np.random.default_rng(7)
     n_walkers = s["n_walkers"]
@@ -139,45 +116,18 @@ def _load_bundle(path: Path) -> RestartBundle:
     return bundle
 
 
-# ---------------------------------------------------------------------------
-# TestInitNsParallelRestart
-# ---------------------------------------------------------------------------
-
-
 class TestInitNsParallelRestart:
-    """Unit tests for init_ns_parallel(..., restart_states=...)."""
+    """Check how init_ns_parallel seeds each run from restart_states.
 
-    def test_restart_seeds_iteration(self, tmp_path):
-        """init_ns_parallel seeds iteration counter from checkpoint."""
+    The iteration counter and log evidence come from the checkpoint, a
+    ``None`` entry starts a run fresh, and a wrong length raises ValueError.
+    """
+
+    def test_restart_seeds_iteration_and_log_evidence(self, tmp_path):
+        """Each run takes its iteration counter and log evidence."""
         n_dead_checkpoint = 7
-        s = _make_harmonic_setup(seed=11)
-
-        positions = jnp.stack([s["positions"]] * 2)
-        energies = jnp.stack([s["energies"]] * 2)
-        cells = jnp.stack([s["cells"]] * 2)
-        keys = jax.random.split(s["key"], 2)
-
-        p = _write_checkpoint(tmp_path, s, n_dead=n_dead_checkpoint)
-        bundle = _load_bundle(p)
-
-        ns_states = init_ns_parallel(
-            s["init_fn"],
-            positions,
-            s["types"],
-            energies,
-            cells,
-            keys,
-            restart_states=[bundle, bundle],
-        )
-
-        assert int(ns_states.iteration[0]) == n_dead_checkpoint
-        assert int(ns_states.iteration[1]) == n_dead_checkpoint
-
-    def test_restart_seeds_log_evidence(self, tmp_path):
-        """init_ns_parallel seeds log_evidence from checkpoint."""
-        n_dead_checkpoint = 3
         log_z = -9.5
-        s = _make_harmonic_setup(seed=12)
+        s = _make_harmonic_setup(seed=11)
 
         positions = jnp.stack([s["positions"]] * 2)
         energies = jnp.stack([s["energies"]] * 2)
@@ -199,11 +149,15 @@ class TestInitNsParallelRestart:
             restart_states=[bundle, bundle],
         )
 
-        assert abs(float(ns_states.log_evidence[0]) - log_z) < 1e-4
-        assert abs(float(ns_states.log_evidence[1]) - log_z) < 1e-4
+        np.testing.assert_array_equal(
+            np.asarray(ns_states.iteration), [n_dead_checkpoint] * 2
+        )
+        np.testing.assert_allclose(
+            np.asarray(ns_states.log_evidence), [log_z] * 2, atol=1e-4
+        )
 
     def test_restart_mixed_some_fresh(self, tmp_path):
-        """init_ns_parallel with [bundle, None]: run 0 restarted, run 1 fresh."""
+        """With [bundle, None] run 0 restarts and run 1 starts fresh."""
         n_dead_checkpoint = 6
         s = _make_harmonic_setup(seed=13)
 
@@ -225,13 +179,11 @@ class TestInitNsParallelRestart:
             restart_states=[bundle, None],
         )
 
-        # Run 0: restarted — iteration seeded from checkpoint.
         assert int(ns_states.iteration[0]) == n_dead_checkpoint
-        # Run 1: fresh — iteration starts at 0.
         assert int(ns_states.iteration[1]) == 0
 
     def test_restart_wrong_length_raises(self, tmp_path):
-        """init_ns_parallel raises ValueError when restart_states length != n_runs."""
+        """A restart_states list of the wrong length raises ValueError."""
         s = _make_harmonic_setup(seed=14)
         n_runs = 3
 
@@ -251,11 +203,11 @@ class TestInitNsParallelRestart:
                 energies,
                 cells,
                 keys,
-                restart_states=[bundle, bundle],  # length 2 != n_runs=3
+                restart_states=[bundle, bundle],
             )
 
     def test_no_restart_states_gives_fresh_start(self, tmp_path):
-        """Without restart_states, all runs start with n_dead=0."""
+        """Without restart_states every run starts at iteration 0."""
         s = _make_harmonic_setup(seed=16)
 
         positions = jnp.stack([s["positions"]] * 2)
@@ -276,20 +228,14 @@ class TestInitNsParallelRestart:
         assert int(ns_states.iteration[1]) == 0
 
 
-# ---------------------------------------------------------------------------
-# TestStepSizeRestore
-# ---------------------------------------------------------------------------
-
-
 class TestStepSizeRestore:
-    """Adapted step sizes survive a save_checkpoint -> restart round-trip."""
+    """Check that adapted step sizes survive a checkpoint and a restart."""
 
     def test_bundle_carries_step_sizes(self, tmp_path):
-        """load_restart populates RestartBundle.step_sizes when present."""
+        """load_restart fills RestartBundle.step_sizes when they are saved."""
         s = _make_harmonic_setup(seed=30)
-        n_walkers, n_atoms = s["n_walkers"], s["n_atoms"]
-        # One move (random_walk) → n_moves == 1.  Distinctive value so it can't
-        # be confused with any descriptor/initial default.
+        n_walkers = s["n_walkers"]
+        # One move; 0.0123 differs from every default step size.
         saved_ss = np.full((n_walkers, 1), 0.0123, dtype=np.float32)
 
         p = _write_checkpoint(tmp_path, s, step_sizes=saved_ss)
@@ -300,18 +246,16 @@ class TestStepSizeRestore:
         np.testing.assert_allclose(
             np.asarray(bundle.step_sizes), saved_ss, atol=1e-6
         )
-        # n_atoms unused beyond setup; reference to keep the linter quiet.
-        assert n_atoms == 1
 
     def test_legacy_checkpoint_step_sizes_none(self, tmp_path):
-        """Checkpoints without step_sizes leave bundle.step_sizes as None."""
+        """A checkpoint without step_sizes gives bundle.step_sizes None."""
         s = _make_harmonic_setup(seed=31)
-        p = _write_checkpoint(tmp_path, s)  # no step_sizes
+        p = _write_checkpoint(tmp_path, s)
         bundle = _load_bundle(p)
         assert bundle.step_sizes is None
 
     def test_restored_step_sizes_land_in_population(self, tmp_path):
-        """init_ns_parallel overrides the initial seed with restored step sizes."""
+        """Restored step sizes win over the initial step_sizes argument."""
         s = _make_harmonic_setup(seed=32)
         n_walkers = s["n_walkers"]
         saved_ss = np.full((n_walkers, 1), 0.0123, dtype=np.float32)
@@ -331,28 +275,60 @@ class TestStepSizeRestore:
             energies,
             cells,
             keys,
-            # Pass a contrasting initial seed; the restore must win over it.
             step_sizes=jnp.full(1, 0.5),
             restart_states=[bundle, bundle],
         )
 
-        # population.step_sizes has shape (n_runs, K, n_moves).
         pop_ss = np.asarray(ns_states.population.step_sizes)
         assert pop_ss.shape == (2, n_walkers, 1)
         np.testing.assert_allclose(pop_ss[0], saved_ss, atol=1e-6)
         np.testing.assert_allclose(pop_ss[1], saved_ss, atol=1e-6)
 
-    def test_legacy_restart_keeps_initial_step_sizes(self, tmp_path):
-        """Without saved step_sizes, the population keeps the initial seed."""
-        s = _make_harmonic_setup(seed=33)
+    def test_each_run_gets_its_own_step_sizes(self, tmp_path):
+        """Two checkpoints with different step sizes land in separate runs."""
+        s = _make_harmonic_setup(seed=34)
         n_walkers = s["n_walkers"]
+        ss_run0 = np.full((n_walkers, 1), 0.0123, dtype=np.float32)
+        ss_run1 = np.full((n_walkers, 1), 0.0456, dtype=np.float32)
+
+        bundles = [
+            _load_bundle(
+                _write_checkpoint(
+                    tmp_path, s, name=f"run{k}.checkpoint.h5", step_sizes=ss
+                )
+            )
+            for k, ss in enumerate((ss_run0, ss_run1))
+        ]
 
         positions = jnp.stack([s["positions"]] * 2)
         energies = jnp.stack([s["energies"]] * 2)
         cells = jnp.stack([s["cells"]] * 2)
         keys = jax.random.split(s["key"], 2)
 
-        p = _write_checkpoint(tmp_path, s)  # no step_sizes
+        ns_states = init_ns_parallel(
+            s["init_fn"],
+            positions,
+            s["types"],
+            energies,
+            cells,
+            keys,
+            restart_states=bundles,
+        )
+
+        pop_ss = np.asarray(ns_states.population.step_sizes)
+        np.testing.assert_allclose(pop_ss[0], ss_run0, atol=1e-6)
+        np.testing.assert_allclose(pop_ss[1], ss_run1, atol=1e-6)
+
+    def test_legacy_restart_keeps_initial_step_sizes(self, tmp_path):
+        """Without saved step_sizes the population keeps the initial ones."""
+        s = _make_harmonic_setup(seed=33)
+
+        positions = jnp.stack([s["positions"]] * 2)
+        energies = jnp.stack([s["energies"]] * 2)
+        cells = jnp.stack([s["cells"]] * 2)
+        keys = jax.random.split(s["key"], 2)
+
+        p = _write_checkpoint(tmp_path, s)
         bundle = _load_bundle(p)
 
         ns_states = init_ns_parallel(
@@ -368,89 +344,17 @@ class TestStepSizeRestore:
 
         pop_ss = np.asarray(ns_states.population.step_sizes)
         np.testing.assert_allclose(pop_ss, 0.5, atol=1e-6)
-        assert n_walkers == s["n_walkers"]
-
-
-# ---------------------------------------------------------------------------
-# TestRunNsParallelRestart
-# ---------------------------------------------------------------------------
 
 
 class TestRunNsParallelRestart:
-    """Integration tests for run_ns_parallel(..., restart_states=...)."""
+    """Check run_ns_parallel with restart_states."""
 
-    def test_parallel_restart_n_dead_increments(self, tmp_path):
-        """run_ns_parallel with restart_states: n_dead >= checkpoint_n_dead."""
-        n_dead_checkpoint = 4
-        n_extra_iters = 6
-        s = _make_harmonic_setup(seed=20)
-
-        positions = jnp.stack([s["positions"]] * 2)
-        energies = jnp.stack([s["energies"]] * 2)
-        cells = jnp.stack([s["cells"]] * 2)
-        keys = jax.random.split(s["key"], 2)
-
-        p = _write_checkpoint(tmp_path, s, n_dead=n_dead_checkpoint)
-        bundle = _load_bundle(p)
-
-        termination = [IterationTermination(n_extra_iters)]
-        out = run_ns_parallel(
-            positions,
-            s["types"],
-            energies,
-            cells,
-            init_fn=s["init_fn"],
-            step_fn=s["step_fn"],
-            rng_keys=keys,
-            max_iterations=n_extra_iters,
-            n_mcmc_steps=3,
-            termination_criteria=termination,
-            restart_states=[bundle, bundle],
-        )
-
-        # Both runs started with n_dead_checkpoint dead points and ran more
-        assert int(out["n_dead"][0]) >= n_dead_checkpoint
-        assert int(out["n_dead"][1]) >= n_dead_checkpoint
-
-    def test_parallel_restart_log_evidence_finite(self, tmp_path):
-        """run_ns_parallel with restart_states produces finite log_evidence."""
-        n_dead_checkpoint = 3
-        s = _make_harmonic_setup(seed=21)
-
-        positions = jnp.stack([s["positions"]] * 2)
-        energies = jnp.stack([s["energies"]] * 2)
-        cells = jnp.stack([s["cells"]] * 2)
-        keys = jax.random.split(s["key"], 2)
-
-        p = _write_checkpoint(
-            tmp_path, s, n_dead=n_dead_checkpoint, log_evidence=-5.0
-        )
-        bundle = _load_bundle(p)
-
-        termination = [IterationTermination(5)]
-        out = run_ns_parallel(
-            positions,
-            s["types"],
-            energies,
-            cells,
-            init_fn=s["init_fn"],
-            step_fn=s["step_fn"],
-            rng_keys=keys,
-            max_iterations=5,
-            n_mcmc_steps=3,
-            termination_criteria=termination,
-            restart_states=[bundle, bundle],
-        )
-
-        assert jnp.all(
-            jnp.isfinite(out["log_evidence"])
-        ), f"log_evidence not finite: {out['log_evidence']}"
-
-    def test_parallel_restart_output_shapes(self, tmp_path):
-        """run_ns_parallel with restart_states returns (n_runs, ...) shaped outputs."""
+    def test_parallel_restart_continues_from_checkpoint(self, tmp_path):
+        """Each run adds n_extra iterations to the checkpoint's dead points."""
         n_runs = 2
-        n_dead_checkpoint = 3
-        s = _make_harmonic_setup(seed=22)
+        n_dead_checkpoint = 4
+        n_extra = 6
+        s = _make_harmonic_setup(seed=20)
 
         positions = jnp.stack([s["positions"]] * n_runs)
         energies = jnp.stack([s["energies"]] * n_runs)
@@ -460,7 +364,6 @@ class TestRunNsParallelRestart:
         p = _write_checkpoint(tmp_path, s, n_dead=n_dead_checkpoint)
         bundle = _load_bundle(p)
 
-        termination = [IterationTermination(5)]
         out = run_ns_parallel(
             positions,
             s["types"],
@@ -469,22 +372,22 @@ class TestRunNsParallelRestart:
             init_fn=s["init_fn"],
             step_fn=s["step_fn"],
             rng_keys=keys,
-            max_iterations=5,
+            max_iterations=n_extra,
             n_mcmc_steps=3,
-            termination_criteria=termination,
-            restart_states=[bundle, bundle],
+            termination_criteria=[IterationTermination(n_extra)],
+            restart_states=[bundle] * n_runs,
         )
 
-        assert out["log_evidence"].shape == (n_runs,)
-        assert out["n_dead"].shape == (n_runs,)
         assert out["n_runs"] == n_runs
+        assert out["n_dead"].shape == (n_runs,)
+        assert out["log_evidence"].shape == (n_runs,)
+        np.testing.assert_array_equal(
+            np.asarray(out["n_dead"]), [n_dead_checkpoint + n_extra] * n_runs
+        )
+        assert jnp.all(jnp.isfinite(out["log_evidence"]))
 
     def test_parallel_restart_parity_with_single_restart(self, tmp_path):
-        """run_ns_parallel(n_runs=1, restart_states=[bundle]) is consistent
-        with run_ns(restart_state=bundle): both run more iterations past checkpoint.
-        """
-        from jaxrens.sampling.nested_sampling import run_ns
-
+        """A single parallel run matches run_ns after a restart."""
         n_dead_checkpoint = 4
         n_extra = 6
         s = _make_harmonic_setup(seed=23)
@@ -494,7 +397,6 @@ class TestRunNsParallelRestart:
 
         termination = [IterationTermination(n_extra)]
 
-        # Single run with restart
         out_single = run_ns(
             s["positions"],
             s["types"],
@@ -509,7 +411,6 @@ class TestRunNsParallelRestart:
             restart_state=bundle,
         )
 
-        # Parallel run with n_runs=1 + restart_states
         keys = jax.random.split(s["key"], 1)
         out_par = run_ns_parallel(
             s["positions"][None],
@@ -525,16 +426,16 @@ class TestRunNsParallelRestart:
             restart_states=[bundle],
         )
 
-        # Both should have run beyond n_dead_checkpoint
-        assert int(out_single["n_dead"]) >= n_dead_checkpoint
-        assert int(out_par["n_dead"][0]) >= n_dead_checkpoint
-
-        # log_evidence should be finite for both
-        assert jnp.isfinite(jnp.array(out_single["log_evidence"]))
-        assert jnp.all(jnp.isfinite(out_par["log_evidence"]))
+        assert int(out_single["n_dead"]) == n_dead_checkpoint + n_extra
+        assert int(out_par["n_dead"][0]) == int(out_single["n_dead"])
+        np.testing.assert_allclose(
+            float(out_par["log_evidence"][0]),
+            float(out_single["log_evidence"]),
+            rtol=1e-4,
+        )
 
     def test_parallel_restart_without_restart_states_is_fresh(self, tmp_path):
-        """run_ns_parallel without restart_states: n_dead starts from 0."""
+        """Without restart_states the runs start fresh."""
         n_extra = 6
         s = _make_harmonic_setup(seed=24)
 
@@ -557,14 +458,14 @@ class TestRunNsParallelRestart:
             termination_criteria=termination,
         )
 
-        # Fresh run: n_dead should equal n_extra iterations (no overflow retries
-        # in simple harmonic backend)
-        assert int(out["n_dead"][0]) >= 0
-        assert int(out["n_dead"][1]) >= 0
+        np.testing.assert_array_equal(np.asarray(out["n_dead"]), [n_extra] * 2)
+        np.testing.assert_array_equal(
+            np.asarray(out["iteration"]), [n_extra] * 2
+        )
         assert jnp.all(jnp.isfinite(out["log_evidence"]))
 
     def test_parallel_restart_wrong_length_propagates(self, tmp_path):
-        """run_ns_parallel propagates ValueError when restart_states length != n_runs."""
+        """run_ns_parallel raises ValueError for a wrong-length list."""
         n_runs = 2
         s = _make_harmonic_setup(seed=25)
 
@@ -589,5 +490,5 @@ class TestRunNsParallelRestart:
                 max_iterations=5,
                 n_mcmc_steps=3,
                 termination_criteria=termination,
-                restart_states=[bundle],  # length 1 != n_runs=2
+                restart_states=[bundle],
             )

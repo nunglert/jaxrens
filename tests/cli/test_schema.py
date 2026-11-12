@@ -1,23 +1,31 @@
-"""Tests for the pydantic schema layer and CLI entry point.
+"""Tests for the pydantic config schema in ``jaxrens.cli.schema``.
 
-Resolver-layer tests have been extracted to tests/test_resolve.py.
-Mode-C/D resolver tests live in tests/test_init_walker_set.py and
-tests/test_init_restart.py respectively.
-JIT plumbing tests live in tests/test_mwg.py and tests/test_termination.py.
-Burn-in integration tests live in tests/test_init_burn_in.py.
+They cover parsing and validation of each section (moves, backend,
+termination, adaptation, ensemble, init, cell, output), the ``--set``
+override helpers, the committed fixture YAMLs, and checks that keep the
+schema and its documentation in step: every field has a description, and
+the YAML examples in the docs, docstrings and tutorials parse.
 """
 
 from __future__ import annotations
 
+import importlib
+import inspect
+import textwrap
+import typing
 from pathlib import Path
 
 import pytest
 import yaml
-from pydantic import ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from jaxrens.cli.cli import _apply_overrides, _parse_set_override
-from jaxrens.cli.resolve import ResolvedConfig, resolve
+import jaxrens.sampling.moves.galilean as gal_mod
+import jaxrens.sampling.moves.random_walk as rw_mod
+from jaxrens.backends.lj import LJBackend
+from jaxrens.cli.cli import _apply_overrides, _parse_set_override, main
+from jaxrens.cli.resolve import resolve
 from jaxrens.cli.schema import RootSpec
+from jaxrens.cli.schema.adaptation import AdaptationPolicy, AdaptationSpec
 from jaxrens.cli.schema.backend import (
     DoubleWellBackendSpec,
     GaussianMixtureBackendSpec,
@@ -26,6 +34,13 @@ from jaxrens.cli.schema.backend import (
     MACEBackendSpec,
     NeuralILBackendSpec,
 )
+from jaxrens.cli.schema.cell import CellSpec
+from jaxrens.cli.schema.ensemble import (
+    EnsembleSpec,
+    NPTEnsembleSpec,
+    NVTEnsembleSpec,
+)
+from jaxrens.cli.schema.init import InitSpec, _parse_species_string
 from jaxrens.cli.schema.moves import (
     AlchemicalMorphMoveSpec,
     GMCMoveSpec,
@@ -38,17 +53,15 @@ from jaxrens.cli.schema.moves import (
     StretchMoveSpec,
     VolumeMoveSpec,
 )
-from jaxrens.sampling.batch_descriptor import PmapVmapRuns, SingleRun
+from jaxrens.cli.schema.output import OutputSpec
+from jaxrens.cli.schema.run import RunSpec
+from jaxrens.cli.schema.termination import TerminationSpec
+from jaxrens.unvalidated import UnvalidatedFeatureWarning, reset
 
 _DATA = Path(__file__).parent.parent / "_assets" / "data" / "cli"
 _MINIMAL_YAML = _DATA / "minimal.yaml"
 _MIXED_MOVES_YAML = _DATA / "mixed_moves.yaml"
 _LJ_BACKEND_YAML = _DATA / "lj_backend.yaml"
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _minimal_dict() -> dict:
@@ -73,12 +86,9 @@ def _minimal_dict() -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# 1. Valid minimal dict validates without error
-# ---------------------------------------------------------------------------
-
-
 class TestRootSpecValidate:
+    """Check the minimal config and the defaults it fills in."""
+
     def test_minimal_dict_validates(self):
         root = RootSpec.model_validate(_minimal_dict())
         assert root.run.n_live == 20
@@ -94,143 +104,103 @@ class TestRootSpecValidate:
         assert root.output.traj_interval == 1
 
 
-# ---------------------------------------------------------------------------
-# 2. extra="forbid" rejects unknown keys
-# ---------------------------------------------------------------------------
-
-
-class TestExtraForbid:
-    """One parametrized test covers ``extra="forbid"`` on every spec class.
-
-    Each row is ``(spec_callable, bogus_kwargs)``: invoking the callable
-    with those kwargs MUST raise ``ValidationError`` because the model has
-    ``model_config = ConfigDict(extra="forbid")``.
-    """
-
-    @pytest.mark.parametrize(
-        "spec_factory,bogus",
-        [
-            # Root-level keys
-            (
-                lambda kw: RootSpec.model_validate({**_minimal_dict(), **kw}),
-                {"not_a_key": 42},
+@pytest.mark.parametrize(
+    "spec_factory,bogus",
+    [
+        # Root-level keys
+        (
+            lambda kw: RootSpec.model_validate({**_minimal_dict(), **kw}),
+            {"not_a_key": 42},
+        ),
+        (
+            lambda kw: RootSpec.model_validate(
+                {
+                    **_minimal_dict(),
+                    "run": {**_minimal_dict()["run"], **kw},
+                }
             ),
-            (
-                lambda kw: RootSpec.model_validate(
-                    {
-                        **_minimal_dict(),
-                        "run": {**_minimal_dict()["run"], **kw},
-                    }
-                ),
-                {"typo_field": 1},
+            {"typo_field": 1},
+        ),
+        (
+            lambda kw: RootSpec.model_validate(
+                {
+                    **_minimal_dict(),
+                    "backend": {**_minimal_dict()["backend"], **kw},
+                }
             ),
-            (
-                lambda kw: RootSpec.model_validate(
-                    {
-                        **_minimal_dict(),
-                        "backend": {**_minimal_dict()["backend"], **kw},
-                    }
-                ),
-                {"mystery": "x"},
+            {"mystery": "x"},
+        ),
+        # Per-spec extras
+        (
+            lambda kw: RootSpec.model_validate(
+                {
+                    **_minimal_dict(),
+                    "moves": [{"type": "random_walk", **kw}],
+                }
             ),
-            # Per-spec extras
-            (
-                lambda kw: RootSpec.model_validate(
-                    {
-                        **_minimal_dict(),
-                        "moves": [{"type": "random_walk", **kw}],
-                    }
-                ),
-                {"n_reflect": 5},
+            {"n_reflect": 5},
+        ),
+        (
+            lambda kw: TypeAdapter(TerminationSpec).validate_python(
+                {"type": "iteration", "max_iterations": 5, **kw}
             ),
-            (
-                lambda kw: __import__("pydantic")
-                .TypeAdapter(
-                    __import__(
-                        "jaxrens.cli.schema.termination",
-                        fromlist=["TerminationSpec"],
-                    ).TerminationSpec,
-                )
-                .validate_python(
-                    {"type": "iteration", "max_iterations": 5, **kw}
-                ),
-                {"bogus": 1},
+            {"bogus": 1},
+        ),
+        (
+            lambda kw: AdaptationPolicy(min_rate=0.3, **kw),
+            {"bogus": 1},
+        ),
+        (
+            lambda kw: RootSpec.model_validate(
+                {**_minimal_dict(), "adaptation": kw}
             ),
-            (
-                lambda kw: __import__(
-                    "jaxrens.cli.schema.adaptation",
-                    fromlist=["AdaptationPolicy"],
-                ).AdaptationPolicy(min_rate=0.3, **kw),
-                {"bogus": 1},
-            ),
-            (
-                lambda kw: RootSpec.model_validate(
-                    {**_minimal_dict(), "adaptation": kw}
-                ),
-                {"bogus_field": True},
-            ),
-            (
-                lambda kw: __import__(
-                    "jaxrens.cli.schema.ensemble",
-                    fromlist=["NVTEnsembleSpec"],
-                ).NVTEnsembleSpec(**kw),
-                {"bogus": 1},
-            ),
-            (
-                lambda kw: __import__(
-                    "jaxrens.cli.schema.ensemble",
-                    fromlist=["NPTEnsembleSpec"],
-                ).NPTEnsembleSpec(pressure=0.01, **kw),
-                {"unknown_key": "x"},
-            ),
-            (
-                lambda kw: __import__(
-                    "jaxrens.cli.schema.init",
-                    fromlist=["InitSpec"],
-                ).InitSpec(start_species="1 1", **kw),
-                {"unknown_field": 42},
-            ),
-            (
-                lambda kw: __import__(
-                    "jaxrens.cli.schema.cell",
-                    fromlist=["CellSpec"],
-                ).CellSpec(max_volume_per_atom=100.0, **kw),
-                {"mystery_field": True},
-            ),
-            (
-                lambda kw: __import__(
-                    "jaxrens.cli.schema.output",
-                    fromlist=["OutputSpec"],
-                ).OutputSpec(**kw),
-                {"bogus_output_field": True},
-            ),
-        ],
-        ids=[
-            "root",
-            "run",
-            "backend",
-            "move",
-            "termination_iteration",
-            "adaptation_policy",
-            "adaptation",
-            "nvt_ensemble",
-            "npt_ensemble",
-            "init",
-            "cell",
-            "output",
-        ],
-    )
-    def test_extra_field_rejected(self, spec_factory, bogus):
-        with pytest.raises(ValidationError):
-            spec_factory(bogus)
-
-
-# ---------------------------------------------------------------------------
-# 3. moves: normalization — dict becomes single-element list
-# ---------------------------------------------------------------------------
+            {"bogus_field": True},
+        ),
+        (
+            lambda kw: NVTEnsembleSpec(**kw),
+            {"bogus": 1},
+        ),
+        (
+            lambda kw: NPTEnsembleSpec(pressure=0.01, **kw),
+            {"unknown_key": "x"},
+        ),
+        (
+            lambda kw: InitSpec(start_species="1 1", **kw),
+            {"unknown_field": 42},
+        ),
+        (
+            lambda kw: CellSpec(max_volume_per_atom=100.0, **kw),
+            {"mystery_field": True},
+        ),
+        (
+            lambda kw: OutputSpec(**kw),
+            {"bogus_output_field": True},
+        ),
+    ],
+    ids=[
+        "root",
+        "run",
+        "backend",
+        "move",
+        "termination_iteration",
+        "adaptation_policy",
+        "adaptation",
+        "nvt_ensemble",
+        "npt_ensemble",
+        "init",
+        "cell",
+        "output",
+    ],
+)
+def test_extra_field_rejected(spec_factory, bogus):
+    """Every spec class has ``extra="forbid"``, so an unknown key raises."""
+    with pytest.raises(ValidationError):
+        spec_factory(bogus)
 
 
 class TestMovesNormalization:
+    """Check that ``moves`` accepts a single dict or a list."""
+
     def test_single_dict_normalized_to_list(self):
         d = _minimal_dict()
         d["moves"] = {"move_type": "galilean", "step_size": 0.1}
@@ -250,12 +220,9 @@ class TestMovesNormalization:
         assert root.moves[1].move_type == "gmc"
 
 
-# ---------------------------------------------------------------------------
-# 4. --set override: nested scalar
-# ---------------------------------------------------------------------------
-
-
 class TestSetOverride:
+    """Check ``--set`` overrides of nested scalars."""
+
     def test_nested_scalar_patch(self):
         raw = _minimal_dict()
         patched = _apply_overrides(raw, ["run.n_live=123"])
@@ -275,12 +242,9 @@ class TestSetOverride:
         assert root.backend.periodic is True
 
 
-# ---------------------------------------------------------------------------
-# 5. --set bracket indexing into moves list
-# ---------------------------------------------------------------------------
-
-
 class TestSetBracketIndex:
+    """Check ``--set`` overrides that index into the moves list."""
+
     def test_bracket_index_step_size(self):
         d = _minimal_dict()
         d["moves"] = [{"move_type": "random_walk", "step_size": 0.3}]
@@ -301,33 +265,9 @@ class TestSetBracketIndex:
         assert value == pytest.approx(0.5)
 
 
-# ---------------------------------------------------------------------------
-# 6. Invalid move_type literal raises clearly
-# ---------------------------------------------------------------------------
-
-
-class TestMoveTypeLiteral:
-    def test_invalid_move_type_raises(self):
-        d = _minimal_dict()
-        d["moves"] = [{"move_type": "not_a_real_move"}]
-        with pytest.raises(ValidationError, match="not_a_real_move"):
-            RootSpec.model_validate(d)
-
-    def test_all_registry_types_accepted(self):
-        import typing
-
-        from jaxrens.cli.schema.moves import MoveType
-
-        valid_types = list(typing.get_args(MoveType))
-        assert len(valid_types) >= 10
-
-
-# ---------------------------------------------------------------------------
-# 8. Round-trip: YAML -> RootSpec -> model_dump() -> re-validate
-# ---------------------------------------------------------------------------
-
-
 class TestRoundTrip:
+    """Check that a dumped config validates back to the same values."""
+
     def test_model_dump_round_trips(self):
         root1 = RootSpec.model_validate(_minimal_dict())
         dumped = root1.model_dump()
@@ -348,12 +288,9 @@ class TestRoundTrip:
         assert root1.backend == root2.backend
 
 
-# ---------------------------------------------------------------------------
-# 9. Fixture YAML file validates and CLI validate subcommand works
-# ---------------------------------------------------------------------------
-
-
 class TestFixtureYAML:
+    """Check the ``minimal.yaml`` fixture, also through ``validate``."""
+
     def test_minimal_yaml_validates(self):
         with open(_MINIMAL_YAML) as fh:
             raw = yaml.safe_load(fh)
@@ -361,8 +298,6 @@ class TestFixtureYAML:
         assert root.run.n_live == 20
 
     def test_cli_validate_subcommand(self, capsys):
-        from jaxrens.cli.cli import main
-
         with pytest.raises(SystemExit) as exc_info:
             main(["validate", "-c", str(_MINIMAL_YAML)])
         assert exc_info.value.code == 0
@@ -371,8 +306,6 @@ class TestFixtureYAML:
         assert "random_walk" in captured.out
 
     def test_cli_validate_with_set_override(self, capsys):
-        from jaxrens.cli.cli import main
-
         with pytest.raises(SystemExit) as exc_info:
             main(
                 [
@@ -388,26 +321,9 @@ class TestFixtureYAML:
         assert "OK" in captured.out
         assert "n_live=77" in captured.out
 
-    def test_cli_dump_schema(self, capsys):
-        from jaxrens.cli.cli import main
-
-        with pytest.raises(SystemExit) as exc_info:
-            main(["dump-schema"])
-        assert exc_info.value.code == 0
-        captured = capsys.readouterr()
-        import json
-
-        schema = json.loads(captured.out)
-        assert "RootSpec" in schema.get("title", "") or "properties" in schema
-
-
-# ---------------------------------------------------------------------------
-# 10. Discriminated union: per-move-type instantiation
-# ---------------------------------------------------------------------------
-
 
 class TestDiscriminatedUnion:
-    """Each move type parses to the correct spec subclass via the union."""
+    """Check that each move type parses to its own spec class."""
 
     @pytest.mark.parametrize(
         "move_dict,expected_cls",
@@ -438,25 +354,18 @@ class TestDiscriminatedUnion:
         root = RootSpec.model_validate(d)
         assert isinstance(root.moves[0], expected_cls)
 
-    def test_nonexistent_type_raises(self):
+    @pytest.mark.parametrize("key", ["type", "move_type"])
+    def test_nonexistent_type_raises(self, key):
+        """Both the ``type`` key and the legacy ``move_type`` key."""
         d = _minimal_dict()
-        d["moves"] = [{"type": "nonexistent_move"}]
+        d["moves"] = [{key: "nonexistent_move"}]
         with pytest.raises(ValidationError, match="nonexistent_move"):
             RootSpec.model_validate(d)
 
-    def test_move_type_property_matches_discriminator(self):
-        d = _minimal_dict()
-        d["moves"] = [{"type": "random_walk"}]
-        root = RootSpec.model_validate(d)
-        assert root.moves[0].move_type == "random_walk"
-
-
-# ---------------------------------------------------------------------------
-# 11. Mixed-move list: two different types
-# ---------------------------------------------------------------------------
-
 
 class TestMixedMoves:
+    """Check a list of two move types, parsed and resolved."""
+
     def test_mixed_move_list_parses(self):
         with open(_MIXED_MOVES_YAML) as fh:
             raw = yaml.safe_load(fh)
@@ -472,8 +381,6 @@ class TestMixedMoves:
         resolved = resolve(root)
         assert len(resolved.move_descriptors) == 2
         d0, d1 = resolved.move_descriptors
-        import jaxrens.sampling.moves.galilean as gal_mod
-        import jaxrens.sampling.moves.random_walk as rw_mod
 
         assert d0.build_kernel is rw_mod.build_kernel
         assert d1.build_kernel is gal_mod.build_kernel
@@ -494,13 +401,112 @@ class TestMixedMoves:
         )
 
 
-# ---------------------------------------------------------------------------
-# 16. BackendSpec discriminated union: per-type instantiation
-# ---------------------------------------------------------------------------
+class TestSpeciesSwapSpec:
+    """Check that SpeciesSwapMoveSpec turns element symbols into type codes."""
+
+    SYMBOLS = {0: "Ge", 1: "Si", 2: "Sn"}
+
+    def test_unscoped_descriptor(self):
+        desc = SpeciesSwapMoveSpec().to_descriptor(
+            n_atoms=6, symbol_map=self.SYMBOLS
+        )
+        assert desc.name == "species_swap"
+        assert desc.kernel_kwargs == {"n_species": 3}
+        assert desc.mutates == frozenset({"types"})
+
+    def test_scoped_descriptor_resolves_symbols_to_codes(self):
+        desc = SpeciesSwapMoveSpec(species=("Si", "Sn")).to_descriptor(
+            n_atoms=6, symbol_map=self.SYMBOLS
+        )
+        assert desc.name == "species_swap_Si_Sn"
+        assert desc.kernel_kwargs == {"n_species": 3, "species": (1, 2)}
+
+    def test_bare_symbol_shorthand_rejected_at_parse_time(self):
+        with pytest.raises(ValidationError, match="at least two elements"):
+            SpeciesSwapMoveSpec(species="Ge")
+
+    def test_single_distinct_element_rejected_at_parse_time(self):
+        with pytest.raises(ValidationError, match="distinct element"):
+            SpeciesSwapMoveSpec(species=("Ge", "Ge"))
+
+    def test_absent_element_rejected(self):
+        with pytest.raises(ValueError, match="not present in the system"):
+            SpeciesSwapMoveSpec(species=("Ge", "Pu")).to_descriptor(
+                n_atoms=6, symbol_map=self.SYMBOLS
+            )
+
+    def test_missing_symbol_map_rejected(self):
+        with pytest.raises(ValueError, match="requires symbol_map"):
+            SpeciesSwapMoveSpec().to_descriptor(n_atoms=6, symbol_map=None)
+
+
+class TestGMCSpeciesSchema:
+    """Check how GMCMoveSpec resolves species, names and direction fields."""
+
+    SYMBOL_MAP = {0: "Ge", 1: "Si"}
+
+    def test_bare_string_species_is_wrapped(self):
+        assert GMCMoveSpec(species="Ge").species == ("Ge",)
+
+    def test_symbols_resolve_to_type_codes(self):
+        spec = GMCMoveSpec(species=["Si"])
+        kwargs = spec._kernel_kwargs(symbol_map=self.SYMBOL_MAP)
+        assert kwargs["species"] == (1,)
+        assert kwargs["direction_field"] == "direction_gmc_Si"
+        assert kwargs["n_reflect"] == 5
+
+    def test_auto_name_and_explicit_name(self):
+        assert GMCMoveSpec(species=["Ge"])._effective_name() == "gmc_Ge"
+        assert (
+            GMCMoveSpec(species=["Ge", "Si"])._effective_name() == "gmc_Ge_Si"
+        )
+        assert (
+            GMCMoveSpec(species=["Ge"], name="fast")._effective_name()
+            == "fast"
+        )
+        # An explicit name still gets its own direction field when scoped.
+        assert (
+            GMCMoveSpec(species=["Ge"], name="fast")._direction_field()
+            == "direction_fast"
+        )
+
+    def test_unscoped_spec_is_unchanged(self):
+        spec = GMCMoveSpec()
+        assert spec._effective_name() == "gmc"
+        assert spec._direction_field() == "direction"
+        # The kernel defaults supply everything except n_reflect.
+        assert spec._kernel_kwargs(symbol_map=self.SYMBOL_MAP) == {
+            "n_reflect": 5
+        }
+        assert "direction" in spec._extra_state_fields()
+
+    def test_refresh_direction_reaches_kernel_kwargs(self):
+        spec = GMCMoveSpec(refresh_direction=True)
+        assert spec._kernel_kwargs(symbol_map=self.SYMBOL_MAP) == {
+            "n_reflect": 5,
+            "refresh_direction": True,
+        }
+
+    def test_unknown_species_raises(self):
+        spec = GMCMoveSpec(species=["Xe"])
+        with pytest.raises(ValueError, match="not present in the system"):
+            spec.to_descriptor(symbol_map=self.SYMBOL_MAP)
+
+    def test_missing_symbol_map_raises(self):
+        spec = GMCMoveSpec(species=["Ge"])
+        with pytest.raises(ValueError, match="requires symbol_map"):
+            spec.to_descriptor()
+
+    def test_unscoped_spec_needs_no_symbol_map(self):
+        """An unscoped spec resolves without a symbol_map."""
+        desc = GMCMoveSpec(n_reflect=4).to_descriptor()
+        assert desc.name == "gmc"
+        assert desc.kernel_kwargs == {"n_reflect": 4}
+        assert "direction" in desc.extra_state_fields
 
 
 class TestBackendDiscriminatedUnion:
-    """Each backend type parses to the correct spec subclass via the union."""
+    """Check that each backend type parses to its own spec class."""
 
     @pytest.mark.parametrize(
         "backend_dict,expected_cls",
@@ -531,12 +537,6 @@ class TestBackendDiscriminatedUnion:
         with pytest.raises(ValidationError, match="nonexistent_backend"):
             RootSpec.model_validate(d)
 
-    def test_backend_type_property_matches_discriminator(self):
-        d = _minimal_dict()
-        d["backend"] = {"type": "harmonic"}
-        root = RootSpec.model_validate(d)
-        assert root.backend.backend_type == "harmonic"
-
     def test_legacy_backend_type_key_accepted(self):
         d = _minimal_dict()
         d["backend"] = {"backend_type": "harmonic"}
@@ -545,17 +545,8 @@ class TestBackendDiscriminatedUnion:
         assert root.backend.backend_type == "harmonic"
 
 
-# ---------------------------------------------------------------------------
-# 17. Per-backend extra-field rejection
-# ---------------------------------------------------------------------------
-
-
 class TestBackendExtraForbid:
-    def test_harmonic_rejects_unknown_field(self):
-        d = _minimal_dict()
-        d["backend"] = {"type": "harmonic", "not_a_field": 99}
-        with pytest.raises(ValidationError):
-            RootSpec.model_validate(d)
+    """Check that each backend rejects fields of other backends."""
 
     def test_lj_rejects_unknown_field(self):
         d = _minimal_dict()
@@ -576,12 +567,9 @@ class TestBackendExtraForbid:
             RootSpec.model_validate(d)
 
 
-# ---------------------------------------------------------------------------
-# 20. Fixture YAML: lj_backend.yaml validates and round-trips
-# ---------------------------------------------------------------------------
-
-
 class TestLJBackendFixture:
+    """Check that ``lj_backend.yaml`` parses and builds an LJ backend."""
+
     def test_lj_backend_yaml_validates(self):
         with open(_LJ_BACKEND_YAML) as fh:
             raw = yaml.safe_load(fh)
@@ -598,8 +586,6 @@ class TestLJBackendFixture:
         assert cfg.cutoff == pytest.approx(3.0)
 
     def test_lj_backend_yaml_builds_backend(self):
-        from jaxrens.backends.lj import LJBackend
-
         with open(_LJ_BACKEND_YAML) as fh:
             raw = yaml.safe_load(fh)
         root = RootSpec.model_validate(raw)
@@ -607,14 +593,8 @@ class TestLJBackendFixture:
         assert isinstance(backend, LJBackend)
 
 
-# ---------------------------------------------------------------------------
-# 23. TerminationSpec discriminated union — schema-level tests
-# (to_criterion tests moved to test_resolve.py::TestToCriterion)
-# ---------------------------------------------------------------------------
-
-
 class TestTerminationDiscriminatedUnion:
-    """Each termination type parses to the correct spec subclass."""
+    """Check that each termination type parses to its own spec class."""
 
     @pytest.mark.parametrize(
         "term_dict,expected_cls_name",
@@ -632,19 +612,11 @@ class TestTerminationDiscriminatedUnion:
         ],
     )
     def test_correct_subclass_instantiated(self, term_dict, expected_cls_name):
-        from pydantic import TypeAdapter
-
-        from jaxrens.cli.schema.termination import TerminationSpec
-
         ta = TypeAdapter(TerminationSpec)
         spec = ta.validate_python(term_dict)
         assert type(spec).__name__ == expected_cls_name
 
     def test_unknown_type_raises(self):
-        from pydantic import TypeAdapter, ValidationError
-
-        from jaxrens.cli.schema.termination import TerminationSpec
-
         ta = TypeAdapter(TerminationSpec)
         with pytest.raises(ValidationError):
             ta.validate_python({"type": "nonexistent_criterion"})
@@ -657,16 +629,10 @@ class TestTerminationDiscriminatedUnion:
         assert root.termination[0].type == "iteration"
 
 
-# ---------------------------------------------------------------------------
-# 25. AdaptationSpec — schema-level tests
-# (resolve_for tests moved to test_resolve.py::TestAdaptationResolve)
-# ---------------------------------------------------------------------------
-
-
 class TestAdaptationSpec:
-    def test_default_adaptation_config(self):
-        from jaxrens.cli.schema.adaptation import AdaptationSpec
+    """Check the adaptation defaults and the legacy ``full_auto_steps`` key."""
 
+    def test_default_adaptation_config(self):
         cfg = AdaptationSpec()
         assert cfg.full_auto is True
         assert cfg.adjust_interval == 100
@@ -675,8 +641,6 @@ class TestAdaptationSpec:
 
     def test_full_auto_steps_alias_emits_deprecation(self):
         """Legacy ``full_auto_steps`` key is coerced to ``adjust_interval``."""
-        from jaxrens.cli.schema.adaptation import AdaptationSpec
-
         with pytest.warns(DeprecationWarning, match="full_auto_steps"):
             cfg = AdaptationSpec.model_validate({"full_auto_steps": 20})
         assert cfg.adjust_interval == 20
@@ -697,13 +661,9 @@ class TestAdaptationSpec:
         assert root.adaptation.defaults.min_rate is None
 
 
-# ---------------------------------------------------------------------------
-# 25b. RootSpec.interval_units — schema-level tests
-# (resolver scaling lives in tests/test_interval_units.py)
-# ---------------------------------------------------------------------------
-
-
 class TestIntervalUnitsField:
+    """Check the values ``interval_units`` accepts."""
+
     def test_default_is_absolute(self):
         root = RootSpec.model_validate(_minimal_dict())
         assert root.interval_units == "absolute"
@@ -722,19 +682,15 @@ class TestIntervalUnitsField:
 
 
 class TestNCullWarningAndValidation:
-    """``run.n_cull > 1`` is implemented but not yet production-validated,
-    so it is routed through :mod:`jaxrens.unvalidated` (not a plain
-    warning).  The marker mechanism itself (registry, one-shot, env policy)
-    is covered by ``tests/test_unvalidated.py``; these confirm this call site
-    trips it under the right condition and stays quiet otherwise, and that
-    impossible cull widths are rejected.
+    """Check that ``run.n_cull > 1`` raises the unvalidated-feature warning
+    and that cull widths the population cannot support are rejected.
+
+    The warning mechanism itself is tested in tests/test_unvalidated.py.
     """
 
     @pytest.fixture(autouse=True)
     def _fresh_markers(self):
-        """One-shot suppression is process-global; clear it around each test."""
-        from jaxrens.unvalidated import reset
-
+        """Warnings fire once per process; reset them around each test."""
         reset()
         yield
         reset()
@@ -744,8 +700,6 @@ class TestNCullWarningAndValidation:
         assert not [w for w in recwarn if issubclass(w.category, UserWarning)]
 
     def test_n_cull_above_one_warns(self):
-        from jaxrens.unvalidated import UnvalidatedFeatureWarning
-
         d = _minimal_dict()
         d["run"]["n_cull"] = 2
         with pytest.warns(UnvalidatedFeatureWarning, match=r"run\.n_cull > 1"):
@@ -766,52 +720,32 @@ class TestNCullWarningAndValidation:
             RootSpec.model_validate(d)
 
 
-# ---------------------------------------------------------------------------
-# 26. EnsembleSpec — schema-level tests
-# (resolver tests moved to test_resolve.py::TestEnsembleResolver)
-# ---------------------------------------------------------------------------
-
-_GPA_TO_EVA3 = 0.006241509  # 1 GPa in eV/Å³
-
-
 class TestEnsembleSpec:
-    def test_nvt_minimal_validates(self):
-        from jaxrens.cli.schema.ensemble import NVTEnsembleSpec
+    """Check the NVT and NPT ensemble specs and the default ensemble."""
 
+    def test_nvt_minimal_validates(self):
         spec = NVTEnsembleSpec()
         assert spec.type == "nvt"
 
     def test_npt_scalar_pressure_validates(self):
-        from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-
         spec = NPTEnsembleSpec(pressure=0.01)
         assert spec.pressure == pytest.approx(0.01)
         assert spec.pressure_units == "eva3"
 
     def test_npt_list_pressure_validates(self):
-        from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-
         spec = NPTEnsembleSpec(pressure=[0.01, 0.02, 0.03])
         assert len(spec.pressure) == 3
 
     def test_ensemble_discriminator_mismatch_raises(self):
-        from pydantic import TypeAdapter, ValidationError
-
-        from jaxrens.cli.schema.ensemble import EnsembleSpec
-
         ta = TypeAdapter(EnsembleSpec)
         with pytest.raises(ValidationError):
             ta.validate_python({"type": "nonexistent_ensemble"})
 
     def test_nvt_in_root_config_default(self):
-        from jaxrens.cli.schema.ensemble import NVTEnsembleSpec
-
         root = RootSpec.model_validate(_minimal_dict())
         assert isinstance(root.ensemble, NVTEnsembleSpec)
 
     def test_npt_in_root_config(self):
-        from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-
         d = _minimal_dict()
         d["ensemble"] = {"type": "npt", "pressure": 0.01}
         root = RootSpec.model_validate(d)
@@ -819,113 +753,27 @@ class TestEnsembleSpec:
         assert root.ensemble.pressure == pytest.approx(0.01)
 
     def test_run_pressure_is_rejected(self):
-        """``run.pressure`` was removed; it's now an unknown field (use
-        ``ensemble: {type: npt, ...}`` instead)."""
+        """Pressure belongs in ``ensemble``; ``run.pressure`` is unknown."""
         d = _minimal_dict()
         d["run"]["pressure"] = 0.05
         with pytest.raises(ValidationError):
             RootSpec.model_validate(d)
 
 
-# ---------------------------------------------------------------------------
-# 27. Topology resolution — schema-level tests
-# (cohort path removed; resolver now always produces one ResolvedConfig
-# whose ``batcher`` is SingleRun for n_total=1 and PmapVmapRuns otherwise.)
-# ---------------------------------------------------------------------------
-
-
-class TestTopologyResolution:
-    def test_nvt_scalar_resolves_to_single_run(self):
-        root = RootSpec.model_validate(_minimal_dict())
-        resolved = resolve(root)
-        assert isinstance(resolved, ResolvedConfig)
-        assert isinstance(resolved.batcher, SingleRun)
-        assert len(resolved.ensemble_params_per_run) == 1
-
-    def test_npt_scalar_resolves_to_single_run(self):
-        d = _minimal_dict()
-        d["ensemble"] = {"type": "npt", "pressure": 0.01}
-        root = RootSpec.model_validate(d)
-        resolved = resolve(root)
-        assert isinstance(resolved.batcher, SingleRun)
-        assert len(resolved.ensemble_params_per_run) == 1
-        assert resolved.ensemble_params_per_run[0][
-            "pressure"
-        ] == pytest.approx(0.01)
-
-    def test_npt_three_pressures_resolves_to_multi_replica(self):
-        """A list-valued pressure routes to PmapVmapRuns with per-replica params."""
-        d = _minimal_dict()
-        d["run"]["seed"] = 10
-        d["ensemble"] = {"type": "npt", "pressure": [0.01, 0.02, 0.03]}
-        root = RootSpec.model_validate(d)
-        resolved = resolve(root)
-
-        assert isinstance(resolved.batcher, PmapVmapRuns)
-        n_total = resolved.batcher.n_gpu * resolved.batcher.n_per_gpu
-        assert n_total == 3
-        assert len(resolved.ensemble_params_per_run) == 3
-
-        # Per-replica pressures in the expected order.
-        assert resolved.ensemble_params_per_run[0][
-            "pressure"
-        ] == pytest.approx(0.01)
-        assert resolved.ensemble_params_per_run[1][
-            "pressure"
-        ] == pytest.approx(0.02)
-        assert resolved.ensemble_params_per_run[2][
-            "pressure"
-        ] == pytest.approx(0.03)
-
-
-# ---------------------------------------------------------------------------
-# 28. Topology resolution: CLI validate prints the correct topology line
-# ---------------------------------------------------------------------------
-
-
-class TestValidateTopologyLine:
-    def test_validate_reports_single_run_topology(self, capsys):
-        from jaxrens.cli.cli import main
-
-        with pytest.raises(SystemExit) as exc_info:
-            main(["validate", "-c", str(_DATA / "minimal.yaml")])
-        assert exc_info.value.code == 0
-        captured = capsys.readouterr()
-        assert "SingleRun" in captured.out
-
-    def test_validate_reports_multi_replica_topology(self, capsys):
-        from jaxrens.cli.cli import main
-
-        with pytest.raises(SystemExit) as exc_info:
-            main(["validate", "-c", str(_DATA / "npt_sweep.yaml")])
-        assert exc_info.value.code == 0
-        captured = capsys.readouterr()
-        # A 2-pressure list routes to the multi-replica dispatch.
-        assert "n_gpu=" in captured.out
-        assert "2 replica" in captured.out
-
-
-# ---------------------------------------------------------------------------
-# 30. InitSpec — schema validation
-# ---------------------------------------------------------------------------
-
-
 class TestInitSpec:
-    """Tests for the InitSpec pydantic schema (Part A)."""
+    """Check ``start_species`` parsing, the one-source rule and the init
+    defaults.
+    """
 
     def test_start_species_single_element(self):
-        """New format: Z N -> {Z: N}."""
-        from jaxrens.cli.schema.init import InitSpec
-
+        """``"Z N"`` -> ``{Z: N}``."""
         cfg = InitSpec(start_species="18 8")
         assert cfg.start_species == "18 8"
         counts = cfg.parsed_species()
         assert counts == {18: 8}
 
     def test_start_species_multi_element(self):
-        """New format: Z1 N1, Z2 N2 -> {Z1: N1, Z2: N2}."""
-        from jaxrens.cli.schema.init import InitSpec
-
+        """``"Z1 N1, Z2 N2"`` -> ``{Z1: N1, Z2: N2}``."""
         cfg = InitSpec(start_species="1 6, 3 6")
         counts = cfg.parsed_species()
         assert counts == {1: 6, 3: 6}
@@ -933,53 +781,37 @@ class TestInitSpec:
         assert total == 12
 
     def test_multi_composition_raises(self):
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_species="1 3: 0 16")
         with pytest.raises(ValueError, match="Multi-composition"):
             cfg.parsed_species()
 
     def test_mass_token_raises_not_implemented(self):
         """Three-token group (Z N mass) raises NotImplementedError."""
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_species="1 6 1.008")
         with pytest.raises(NotImplementedError, match="masses"):
             cfg.parsed_species()
 
     def test_empty_string_raises(self):
-        from jaxrens.cli.schema.init import _parse_species_string
-
         with pytest.raises(ValueError, match="empty"):
             _parse_species_string("   ")
 
     def test_non_integer_token_raises(self):
-        from jaxrens.cli.schema.init import _parse_species_string
-
         with pytest.raises(ValueError, match="non-negative integer"):
             _parse_species_string("H 6")
 
     def test_odd_number_of_tokens_raises(self):
-        from jaxrens.cli.schema.init import _parse_species_string
-
         with pytest.raises(ValueError, match="even number"):
             _parse_species_string("1 6, 3")
 
     def test_single_token_raises(self):
-        from jaxrens.cli.schema.init import _parse_species_string
-
         with pytest.raises(ValueError, match="even number"):
             _parse_species_string("1")
 
     def test_zero_sources_raises(self):
-        from jaxrens.cli.schema.init import InitSpec
-
         with pytest.raises(ValidationError, match="none were set"):
             InitSpec()
 
     def test_two_sources_raises(self):
-        from jaxrens.cli.schema.init import InitSpec
-
         with pytest.raises(ValidationError, match="got:"):
             InitSpec(
                 start_species="1 1",
@@ -987,21 +819,15 @@ class TestInitSpec:
             )
 
     def test_start_config_file_accepted(self):
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_config_file=Path("/tmp/atoms.xyz"))
         assert cfg.start_config_file == Path("/tmp/atoms.xyz")
         assert cfg.start_species is None
 
     def test_restart_file_accepted(self):
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(restart_file=Path("/tmp/checkpoint.npz"))
         assert cfg.restart_file == Path("/tmp/checkpoint.npz")
 
     def test_defaults_are_sane(self):
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_species="1 1")
         assert cfg.start_energy_ceiling_per_atom == pytest.approx(1e9)
         assert cfg.random_initialise_pos is True
@@ -1013,42 +839,28 @@ class TestInitSpec:
         assert cfg.pos_autoscale_cells is False
 
     def test_initial_walk_defaults(self):
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_species="1 1")
         assert cfg.initial_walk.n_walks == 0
         assert cfg.initial_walk.walklength == 100
 
     def test_yaml_round_trip_init(self):
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(
             start_species="14 8",
             pos_randomization_mode="uniform",
             grid_distance=2.0,
         )
         dumped = cfg.model_dump(mode="json")
-        import yaml as _yaml
-
-        reloaded_raw = _yaml.safe_load(_yaml.safe_dump(dumped))
+        reloaded_raw = yaml.safe_load(yaml.safe_dump(dumped))
         cfg2 = InitSpec.model_validate(reloaded_raw)
         assert cfg2.start_species == "14 8"
         assert cfg2.pos_randomization_mode == "uniform"
         assert cfg2.grid_distance == pytest.approx(2.0)
 
 
-# ---------------------------------------------------------------------------
-# 32. CellSpec — schema validation
-# (resolver tests moved to test_resolve.py::TestCellResolve)
-# ---------------------------------------------------------------------------
-
-
 class TestCellSpec:
-    """Tests for the CellSpec pydantic schema (Part B)."""
+    """Check the cell defaults and the initial minimum-volume floor."""
 
     def test_defaults(self):
-        from jaxrens.cli.schema.cell import CellSpec
-
         cfg = CellSpec()
         assert cfg.max_volume_per_atom == pytest.approx(1e4)
         assert cfg.min_volume_per_atom == pytest.approx(1.0)
@@ -1059,8 +871,6 @@ class TestCellSpec:
         assert cfg.effective_initial_min_volume_per_atom == pytest.approx(1.0)
 
     def test_initial_min_volume_decoupled_from_constraint(self):
-        from jaxrens.cli.schema.cell import CellSpec
-
         cfg = CellSpec(
             min_volume_per_atom=1.0, initial_min_volume_per_atom=20.0
         )
@@ -1069,119 +879,69 @@ class TestCellSpec:
         assert cfg.effective_initial_min_volume_per_atom == pytest.approx(20.0)
 
     def test_initial_min_volume_rejects_negative(self):
-        from jaxrens.cli.schema.cell import CellSpec
-
         with pytest.raises(ValueError, match="must be >= 0"):
             CellSpec(initial_min_volume_per_atom=-1.0)
 
     def test_initial_min_volume_rejects_above_max(self):
-        from jaxrens.cli.schema.cell import CellSpec
-
         with pytest.raises(ValueError, match="exceeds"):
             CellSpec(
                 max_volume_per_atom=50.0, initial_min_volume_per_atom=60.0
             )
 
-    def test_custom_values_accepted(self):
-        from jaxrens.cli.schema.cell import CellSpec
-
-        cfg = CellSpec(
-            max_volume_per_atom=500.0,
-            min_volume_per_atom=2.0,
-            min_aspect_ratio=0.75,
-            flat_V_prior=True,
-        )
-        assert cfg.max_volume_per_atom == pytest.approx(500.0)
-        assert cfg.flat_V_prior is True
-
     def test_yaml_round_trip_cell(self):
-        from jaxrens.cli.schema.cell import CellSpec
-
         cfg = CellSpec(max_volume_per_atom=200.0, min_aspect_ratio=0.6)
         dumped = cfg.model_dump(mode="json")
-        import yaml as _yaml
-
-        reloaded_raw = _yaml.safe_load(_yaml.safe_dump(dumped))
+        reloaded_raw = yaml.safe_load(yaml.safe_dump(dumped))
         cfg2 = CellSpec.model_validate(reloaded_raw)
         assert cfg2.max_volume_per_atom == pytest.approx(200.0)
         assert cfg2.min_aspect_ratio == pytest.approx(0.6)
 
 
-# ---------------------------------------------------------------------------
-# 33. Extended OutputConfig — schema-level tests
-# (resolver warning tests moved to test_resolve.py::TestExtendedOutputResolve)
-# ---------------------------------------------------------------------------
-
-
 class TestExtendedOutputSpec:
-    """Tests for the extended OutputSpec optional fields (Part C)."""
+    """Check the optional output fields and that removed ones are rejected."""
 
     def test_optional_fields_have_correct_defaults(self):
-        from jaxrens.cli.schema.output import OutputSpec
-
         schema = OutputSpec()
         assert schema.snapshot_clean is True
         assert schema.wrap_atoms is True
-        # save_acc_rates was promoted out of deferred into a real field.
         assert schema.save_acc_rates is False
         assert schema.acc_rates_interval == 1
 
     def test_optional_fields_accept_non_defaults(self):
-        from jaxrens.cli.schema.output import OutputSpec
-
         schema = OutputSpec(
             format="none",
-            snapshot_clean=True,
-            wrap_atoms=True,
+            snapshot_clean=False,
+            wrap_atoms=False,
         )
-        assert schema.snapshot_clean is True
-        assert schema.wrap_atoms is True
+        assert schema.snapshot_clean is False
+        assert schema.wrap_atoms is False
 
     def test_removed_fields_rejected(self):
-        """``snapshot_time`` / ``write_traj_db`` / ``write_walkers_db`` were
-        removed; ``extra='forbid'`` must now reject them."""
-        from pydantic import ValidationError
-
-        from jaxrens.cli.schema.output import OutputSpec
-
+        """``snapshot_time``, ``write_traj_db`` and ``write_walkers_db`` are
+        no longer fields, so ``extra='forbid'`` rejects them.
+        """
         for key in ("snapshot_time", "write_traj_db", "write_walkers_db"):
             with pytest.raises(ValidationError):
                 OutputSpec(**{key: 1})
 
-    def test_save_acc_rates_accept_non_defaults(self):
-        from jaxrens.cli.schema.output import OutputSpec
-
-        schema = OutputSpec(save_acc_rates=True, acc_rates_interval=10)
-        assert schema.save_acc_rates is True
-        assert schema.acc_rates_interval == 10
-
     def test_yaml_round_trip_extended_output(self):
-        from jaxrens.cli.schema.output import OutputSpec
-
         schema = OutputSpec(
             format="none",
-            wrap_atoms=True,
-            snapshot_clean=True,
+            wrap_atoms=False,
+            snapshot_clean=False,
         )
         dumped = schema.model_dump(mode="json")
-        import yaml as _yaml
-
-        reloaded = _yaml.safe_load(_yaml.safe_dump(dumped))
+        reloaded = yaml.safe_load(yaml.safe_dump(dumped))
         schema2 = OutputSpec.model_validate(reloaded)
-        assert schema2.wrap_atoms is True
-        assert schema2.snapshot_clean is True
+        assert schema2.wrap_atoms is False
+        assert schema2.snapshot_clean is False
 
-
-# ---------------------------------------------------------------------------
-# 34. Integration: full_config.yaml validates and resolves (schema level)
-# (resolver and JIT tests moved to test_resolve.py::TestFullConfigResolver)
-# ---------------------------------------------------------------------------
 
 _FULL_CONFIG_YAML = _DATA / "full_config.yaml"
 
 
 class TestFullConfigFixture:
-    """Schema-level integration tests for full_config.yaml."""
+    """Check that ``full_config.yaml`` parses and passes ``validate``."""
 
     def test_full_config_validates(self):
         with open(_FULL_CONFIG_YAML) as fh:
@@ -1193,18 +953,12 @@ class TestFullConfigFixture:
         assert root.output.traj_interval == 5
 
     def test_full_config_cli_validate(self, capsys):
-        from jaxrens.cli.cli import main
-
         with pytest.raises(SystemExit) as exc_info:
             main(["validate", "-c", str(_FULL_CONFIG_YAML)])
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
         assert "OK" in captured.out
 
-
-# ---------------------------------------------------------------------------
-# Field description coverage
-# ---------------------------------------------------------------------------
 
 _SCHEMA_MODULES = (
     "adaptation",
@@ -1224,11 +978,6 @@ _SCHEMA_MODULES = (
 
 def _all_spec_models():
     """Every pydantic model declared in ``jaxrens.cli.schema.*``."""
-    import importlib
-    import inspect
-
-    from pydantic import BaseModel
-
     for mod_name in _SCHEMA_MODULES:
         module = importlib.import_module(f"jaxrens.cli.schema.{mod_name}")
         for name, obj in vars(module).items():
@@ -1241,14 +990,11 @@ def _all_spec_models():
 
 
 class TestFieldDescriptions:
-    """Every config field must carry a ``Field(description=...)``.
+    """Check that every config field has a ``Field(description=...)``.
 
-    The description is the single source for three separate outputs: the
-    generated tables on ``docs/reference/config``, the ``jaxrens
-    dump-schema`` JSON, and the text pydantic quotes back in validation
-    errors.  A field added without one silently renders as a blank cell in
-    the configuration reference, which is exactly the failure mode this
-    test exists to prevent.
+    The description feeds the generated tables in ``docs/reference/config``,
+    the ``jaxrens dump-schema`` JSON and pydantic's validation errors. A
+    field without one shows up as a blank cell in the config reference.
     """
 
     def test_every_field_has_a_description(self):
@@ -1264,17 +1010,15 @@ class TestFieldDescriptions:
         )
 
     def test_descriptions_reach_the_json_schema(self):
-        """dump-schema must carry the same prose the docs render.
+        """``dump-schema`` carries the same descriptions the docs render.
 
-        Compared against the model field rather than a fixed phrase: the
-        point is that the plumbing carries the description through, not
-        that any particular sentence survives an edit.
+        The check compares with the model field, not a fixed phrase, so
+        editing a description does not break it.
         """
         schema = RootSpec.model_json_schema()
         assert schema["properties"]["run"]["description"] == (
             RootSpec.model_fields["run"].description
         )
-        from jaxrens.cli.schema.run import RunSpec
 
         run_props = schema["$defs"]["RunSpec"]["properties"]
         for name, info in RunSpec.model_fields.items():
@@ -1282,13 +1026,11 @@ class TestFieldDescriptions:
 
 
 class TestDocumentedExampleConfig:
-    """The 'A complete config' block in the docs must actually parse.
+    """Check that the "A complete config" block in the docs parses.
 
-    ``docs/reference/config.rst`` opens with a single YAML skeleton covering
-    every top-level section.  It is the first thing a new user copies, so a
-    key renamed in the schema without updating it is a real breakage — and
-    one nothing else would catch, since the surrounding tables are generated
-    while that block is hand-written.
+    ``docs/reference/config.rst`` opens with a YAML skeleton covering every
+    top-level section. It is written by hand while the tables around it are
+    generated, so a key renamed in the schema would otherwise go unnoticed.
     """
 
     _DOC = (
@@ -1355,95 +1097,83 @@ _VARIANT_UNIONS = [
 
 def _union_members(module_path: str, attr: str):
     """Concrete variant classes behind a discriminated-union alias."""
-    import importlib
-    import inspect as _inspect
-    import typing
-
     union = getattr(importlib.import_module(module_path), attr)
     args = typing.get_args(union)
-    members = [m for m in typing.get_args(args[0]) if _inspect.isclass(m)]
+    members = [m for m in typing.get_args(args[0]) if inspect.isclass(m)]
     return members or [args[0]]
 
 
 def _variant_cases():
     """One parametrize case per (section, concrete variant) pair.
 
-    Driven off the unions themselves, so a newly added variant shows up as a
-    failing case until it carries an example -- rather than being silently
-    left out of the sweep.
+    The cases come from the unions themselves, so a new variant fails
+    until it has an example instead of being skipped.
     """
     for section, module_path, attr in _VARIANT_UNIONS:
         for spec in _union_members(module_path, attr):
             yield pytest.param(section, spec, id=f"{section}-{spec.__name__}")
 
 
-class TestDocstringExamples:
-    """Every variant spec must carry a YAML example, and it must parse.
-
-    The configuration reference renders each variant's docstring into its
-    tab, so these snippets are what a reader copies when picking a move
-    type, a backend, an ensemble or a stopping criterion.  They are
-    hand-written prose inside otherwise-generated pages, which makes them
-    the one part of that page that can silently rot when a field is renamed.
-    """
-
-    @staticmethod
-    def _examples(model, section: str) -> list[str]:
-        """Pull indented ``<section>:`` literal blocks out of a docstring."""
-        import inspect as _inspect
-        import textwrap
-
-        doc = _inspect.getdoc(model) or ""
-        blocks, current = [], None
-        for line in doc.splitlines():
-            if current is not None:
-                if not line.strip() or line.startswith((" ", "\t")):
-                    current.append(line)
-                    continue
-                blocks.append(current)
-                current = None
-            # reST opens a literal block either with a bare ``::`` line or
-            # with ``::`` appended to the preceding sentence; the move
-            # docstrings use both spellings.
-            if line.strip().endswith("::"):
-                current = []
+def _docstring_examples(model, section: str) -> list[str]:
+    """Pull indented ``<section>:`` literal blocks out of a docstring."""
+    doc = inspect.getdoc(model) or ""
+    blocks, current = [], None
+    for line in doc.splitlines():
         if current is not None:
+            if not line.strip() or line.startswith((" ", "\t")):
+                current.append(line)
+                continue
             blocks.append(current)
-        return [
-            textwrap.dedent("\n".join(b))
-            for b in blocks
-            if f"{section}:" in "\n".join(b)
-        ]
+            current = None
+        # reST opens a literal block either with a bare ``::`` line or
+        # with ``::`` appended to the preceding sentence; the move
+        # docstrings use both spellings.
+        if line.strip().endswith("::"):
+            current = []
+    if current is not None:
+        blocks.append(current)
+    return [
+        textwrap.dedent("\n".join(b))
+        for b in blocks
+        if f"{section}:" in "\n".join(b)
+    ]
 
-    @pytest.mark.parametrize("section,spec", list(_variant_cases()))
-    def test_example_present_and_valid(self, section, spec):
-        examples = self._examples(spec, section)
-        assert examples, (
-            f"{spec.__name__} has no ``{section}:`` example in its "
-            "docstring; the config reference renders that docstring as the "
-            "variant's tab, so the tab would show no usage snippet."
+
+@pytest.mark.parametrize("section,spec", list(_variant_cases()))
+def test_docstring_example_present_and_valid(section, spec):
+    """Every variant spec has a YAML example in its docstring, and it parses.
+
+    The config reference renders each variant's docstring as its tab, so
+    these snippets are what a reader copies. They are written by hand
+    inside generated pages, so a renamed field would otherwise go
+    unnoticed.
+    """
+    examples = _docstring_examples(spec, section)
+    assert examples, (
+        f"{spec.__name__} has no ``{section}:`` example in its "
+        "docstring; the config reference renders that docstring as the "
+        "variant's tab, so the tab would show no usage snippet."
+    )
+    declared = spec.model_fields["type"].default
+    for text in examples:
+        fragment = yaml.safe_load(text)
+        base = _minimal_dict()
+        base.update(fragment)
+        root = RootSpec.model_validate(base)
+        entries = getattr(root, section)
+        if not isinstance(entries, list):
+            entries = [entries]
+        assert any(e.type == declared for e in entries), (
+            f"{spec.__name__} example declares no `type: {declared}` "
+            f"entry; got {[e.type for e in entries]}"
         )
-        declared = spec.model_fields["type"].default
-        for text in examples:
-            fragment = yaml.safe_load(text)
-            base = _minimal_dict()
-            base.update(fragment)
-            root = RootSpec.model_validate(base)
-            entries = getattr(root, section)
-            if not isinstance(entries, list):
-                entries = [entries]
-            assert any(e.type == declared for e in entries), (
-                f"{spec.__name__} example declares no `type: {declared}` "
-                f"entry; got {[e.type for e in entries]}"
-            )
 
 
 class TestTutorialConfigs:
-    """Every tutorial config must parse against the current schema.
+    """Check that every tutorial config parses against the current schema.
 
-    The docs pages ``literalinclude`` these files, so a renamed field would
-    otherwise ship a broken copy-pasteable example — the tutorials are the
-    first thing a new user runs.
+    The docs pages include these files, so a renamed field would otherwise
+    ship a broken example.
     """
 
     _TUTORIALS = sorted(

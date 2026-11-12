@@ -23,15 +23,15 @@ descriptor, with leading axes peeled off for simpler runs.
 | $G$ | `n_gpu` — number of devices along the `"gpu"` mesh axis (the `shard_map` axis). `G = 1` for single-GPU runs. | leading axis under {class}`~jaxrens.sampling.batch_descriptor.PmapVmapRuns` |
 | $P$ | `n_per_gpu` — number of NS instances per device. **Not pressure** in this section. | second axis under `PmapVmapRuns` |
 | $R$ | `n_runs` — total parallel NS instances. Equal to $G \cdot P$ when both axes are flattened. | leading axis under {class}`~jaxrens.sampling.batch_descriptor.VmapRuns` |
-| $K$ | `n_walkers` — live walkers per NS instance. | walker batch axis on every state field |
-| $N_\mathrm{atoms}$ | `n_atoms` — atoms per configuration. Static field; changing it triggers a JIT recompile. | trailing axis on `positions`, `types`, etc. |
+| $K$ | `n_walkers` (YAML key `run.n_live`) — live walkers per NS instance. Used for the walker count everywhere, including the NS formulas below. | walker batch axis on every state field |
+| $N$ (or $N_\mathrm{atoms}$) | `n_atoms` — atoms per configuration. Not to be confused with the bold species-count vector $\mathbf N(\sigma)$. Static field; changing it triggers a JIT recompile. | trailing axis on `positions`, `types`, etc. |
 | $S$ | `n_species` — distinct species labels. Static field. | length of $\mathbf c_i$, $\boldsymbol\mu_i$, $\mathbf N(\sigma)$ |
 | $M$ | number of move kernels in the MWG composer | length of `step_sizes` |
 
 A typical positions array under {class}`~jaxrens.sampling.batch_descriptor.PmapVmapRuns`
-has shape $(G, P, K, A, 3)$; under `VmapRuns` it collapses to
-$(R, K, A, 3)$; under {class}`~jaxrens.sampling.batch_descriptor.SingleRun`
-to $(K, A, 3)$.
+has shape $(G, P, K, N, 3)$; under `VmapRuns` it collapses to
+$(R, K, N, 3)$; under {class}`~jaxrens.sampling.batch_descriptor.SingleRun`
+to $(K, N, 3)$.
 
 ## Nested-sampling quantities
 
@@ -47,7 +47,7 @@ to $(K, A, 3)$.
 | $X$ | Prior mass in the constrained-likelihood transform: $X(L^\star) = \int_{L > L^\star} \pi\,\mathrm d r$. Maps the multi-D integral onto $X \in [0, 1]$. |
 | $L_i^\star$ | Likelihood threshold at iteration $i$. Equals the *worst* live walker's likelihood when the walker was retired. |
 | $E_{\max}$ | $H$-threshold equivalent to $L_i^\star$ (since $L = e^{-H}$ is monotonic in $-H$). The constraint MCMC enforces is $H(r) < E_{\max}$. |
-| $X_i$ | Prior mass remaining at iteration $i$. Expectation $X_i \approx \exp(-i / N)$ for $K = N$ live walkers and $n_\text{cull} = 1$. |
+| $X_i$ | Prior mass remaining at iteration $i$. Expectation $X_i \approx \exp(-i / K)$ for $K$ live walkers and $n_\text{cull} = 1$. |
 | $w_i$ | Trapezoid quadrature weight: $w_i = \tfrac{1}{2}(X_{i-1} - X_{i+1})$. |
 | $i$ | Outer-loop iteration index (Python). Used in `manager.fires(i)` and similar. |
 
@@ -64,10 +64,10 @@ the replica $i \in \{0, \dots, n_\text{total} - 1\}$.
 | $T$ | Temperature. **Not a free parameter in NS** — the role of temperature is played by the threshold $E_{\max}$. Mentioned only in cross-references to ordinary MCMC. |
 | $\boldsymbol\mu$ | Per-species chemical potential vector, length $S$. |
 | $\mathbf N(\sigma)$ | Species-count vector of a configuration, $\mathbf N(\sigma)_s = \#\{a : \sigma_a = s\}$. |
-| $\mathbf c$ | Target composition vector, $\sum_s c_s = A$. Each XRENS replica fixes one. |
+| $\mathbf c$ | Target composition vector, $\sum_s c_s = N$. Each XRENS replica fixes one. |
 | $\Omega$ | Grand-canonical energy used in semi-grand swaps: $\Omega = U - \boldsymbol\mu \cdot \mathbf N(\sigma)$. |
 | $h$ | Cell matrix (3×3), columns are the lattice vectors. |
-| $\mathbf q$ | Position array (per atom: ℝ³, per walker: $(A, 3)$). |
+| $\mathbf q$ | Position array (per atom: ℝ³, per walker: $(N, 3)$). |
 | $\sigma$ | Species / type array. Integer-valued, per-atom. |
 
 ## MWG and move kernels

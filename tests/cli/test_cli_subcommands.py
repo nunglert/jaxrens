@@ -1,10 +1,8 @@
-"""Coverage-focused tests for ``jaxrens.cli.cli`` subcommand handlers
-and main() exception plumbing.
+"""Tests for the ``jaxrens`` subcommands other than ``run``.
 
-Pure argparse / formatting tests — no JAX execution.  Complements
-``test_schema.py`` (which exercises ``main(["validate", ...])`` on the
-happy path) and ``test_cli.py`` (which exercises ``run_from_config``
-directly).
+They cover ``--version``, ``dump-schema``, the ``plot`` error paths, the
+three ``validate`` tiers and the error messages ``main`` prints for bad
+config files. No test runs NS.
 """
 
 from __future__ import annotations
@@ -13,22 +11,20 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
+from jaxrens import __version__
+from jaxrens.cli import resolve as _r
 from jaxrens.cli.cli import main
 
 _DATA = Path(__file__).parent.parent / "_assets" / "data" / "cli"
 
 
-# ---------------------------------------------------------------------------
-# --version
-# ---------------------------------------------------------------------------
-
-
 class TestVersion:
+    """Check the ``--version`` report."""
+
     @pytest.mark.parametrize("flag", ["--version", "-V"])
     def test_prints_version_and_exits_zero(self, flag, capsys):
-        from jaxrens import __version__
-
         with pytest.raises(SystemExit) as exc_info:
             main([flag])
         assert exc_info.value.code == 0
@@ -46,19 +42,15 @@ class TestVersion:
         assert "\x1b[" not in capsys.readouterr().out
 
 
-# ---------------------------------------------------------------------------
-# dump-schema
-# ---------------------------------------------------------------------------
-
-
 class TestDumpSchema:
+    """Check that ``dump-schema`` prints the RootSpec JSON schema."""
+
     def test_prints_valid_json_schema(self, capsys):
         with pytest.raises(SystemExit) as exc_info:
             main(["dump-schema"])
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         schema = json.loads(out)
-        # RootSpec is a pydantic model; its JSON schema always has these.
         assert "properties" in schema
         assert "run" in schema["properties"]
         assert "moves" in schema["properties"]
@@ -69,15 +61,12 @@ class TestDumpSchema:
         with pytest.raises(SystemExit) as exc_info:
             main(["dump-schema", "--format", "json"])
         assert exc_info.value.code == 0
-        json.loads(capsys.readouterr().out)  # parses
-
-
-# ---------------------------------------------------------------------------
-# plot (error paths)
-# ---------------------------------------------------------------------------
+        json.loads(capsys.readouterr().out)
 
 
 class TestPlotErrors:
+    """Check that ``plot`` turns input errors into exit code 2."""
+
     def test_missing_file_returns_2(self, tmp_path, capsys):
         nonexistent = tmp_path / "nope.adaptation.h5"
         with pytest.raises(SystemExit) as exc_info:
@@ -96,12 +85,9 @@ class TestPlotErrors:
         assert "jaxrens plot:" in err
 
 
-# ---------------------------------------------------------------------------
-# Validation-error formatting + did-you-mean
-# ---------------------------------------------------------------------------
-
-
 class TestValidationErrorFormatting:
+    """Check the "did you mean" hint for unknown config keys."""
+
     def test_extra_forbidden_emits_did_you_mean(self, tmp_path, capsys):
         """Typo in a known field name triggers the fuzzy-match hint."""
         bad_yaml = tmp_path / "bad.yaml"
@@ -129,8 +115,7 @@ class TestValidationErrorFormatting:
         assert "n_live" in err
 
     def test_extra_forbidden_at_root_exact_leaf(self, tmp_path, capsys):
-        """An extra top-level field that exists deeper in the schema
-        triggers the exact-leaf-match branch."""
+        """A root key that is a valid field deeper down is pointed there."""
         bad_yaml = tmp_path / "bad.yaml"
         # ``step_size`` is a valid leaf under ``moves`` but not at root.
         bad_yaml.write_text(
@@ -157,12 +142,11 @@ class TestValidationErrorFormatting:
         assert "step_size" in err
 
 
-# ---------------------------------------------------------------------------
-# main() exception handlers
-# ---------------------------------------------------------------------------
-
-
 class TestMainExceptionHandlers:
+    """Check that ``main`` reports file, YAML and ``--set`` errors with exit
+    code 2 instead of a traceback.
+    """
+
     def test_missing_config_file_returns_2(self, tmp_path, capsys):
         nonexistent = tmp_path / "no_such_file.yaml"
         with pytest.raises(SystemExit) as exc_info:
@@ -170,6 +154,30 @@ class TestMainExceptionHandlers:
         assert exc_info.value.code == 2
         err = capsys.readouterr().err
         assert "jaxrens:" in err
+
+    @pytest.mark.parametrize(
+        "spec, message",
+        [
+            ("run.n_live", "expects KEY=VALUE"),
+            ("moves[5].step_size=1", "key path does not exist"),
+            ("run.n_live.x=1", "key path does not exist"),
+        ],
+        ids=["no-equals", "missing-index", "below-scalar"],
+    )
+    def test_bad_set_override_returns_2(self, capsys, spec, message):
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    "validate",
+                    "-c",
+                    str(_DATA / "minimal.yaml"),
+                    "--set",
+                    spec,
+                    "--parse-only",
+                ]
+            )
+        assert exc_info.value.code == 2
+        assert message in capsys.readouterr().err
 
     def test_malformed_yaml_returns_2(self, tmp_path, capsys):
         bad_yaml = tmp_path / "broken.yaml"
@@ -181,15 +189,11 @@ class TestMainExceptionHandlers:
         assert "YAML parse error" in err
 
 
-# ---------------------------------------------------------------------------
-# validate --parse-only
-# ---------------------------------------------------------------------------
-
-
 class TestValidateParseOnly:
+    """Check that ``validate --parse-only`` reports the parsed config."""
+
     def test_parse_only_skips_resolver(self, capsys):
-        """``--parse-only`` returns 0 and prints the parse-only marker
-        without touching the resolver."""
+        """``--parse-only`` returns 0 and says it only parsed the config."""
         with pytest.raises(SystemExit) as exc_info:
             main(
                 [
@@ -221,58 +225,41 @@ class TestValidateParseOnly:
         assert "n_live=128" in out
 
 
-# ---------------------------------------------------------------------------
-# validate topology lines (the 3 batcher branches of _cmd_validate)
-# ---------------------------------------------------------------------------
+def test_validate_single_run_topology(capsys, monkeypatch):
+    monkeypatch.setattr(_r, "_local_device_count", lambda: 1)
+    with pytest.raises(SystemExit) as exc_info:
+        main(["validate", "-c", str(_DATA / "minimal.yaml")])
+    assert exc_info.value.code == 0
+    out = capsys.readouterr().out
+    assert "OK" in out
+    assert "SingleRun" in out
 
 
-class TestValidateTopologyLines:
-    @pytest.fixture(autouse=True)
-    def _single_device(self, monkeypatch):
-        """Force ``_local_device_count`` to 1 so SingleRun fixtures
-        actually resolve to SingleRun regardless of the host's GPU count."""
-        from jaxrens.cli import resolve as _r
-
-        monkeypatch.setattr(_r, "_local_device_count", lambda: 1)
-
-    def test_single_run_topology(self, capsys):
-        with pytest.raises(SystemExit) as exc_info:
-            main(["validate", "-c", str(_DATA / "minimal.yaml")])
-        assert exc_info.value.code == 0
-        out = capsys.readouterr().out
-        assert "OK" in out
-        assert "SingleRun" in out
-
-    # NOTE: PmapVmapRuns topology line is exercised by
-    # ``tests/cli/test_schema.py::TestValidateTopologyLine::
-    # test_validate_reports_multi_replica_topology`` which monkeypatches
-    # the device count and hits the resolver's multi-replica branch
-    # through ``main(["validate", ...])`` end-to-end.
-
-
-# ---------------------------------------------------------------------------
-# validate tiers: --parse-only < default (plan) < --full
-# ---------------------------------------------------------------------------
+def test_validate_multi_replica_topology(capsys, monkeypatch):
+    """Two pressures on one device give n_gpu=1 x n_per_gpu=2."""
+    monkeypatch.setattr(_r, "_local_device_count", lambda: 1)
+    with pytest.raises(SystemExit) as exc_info:
+        main(["validate", "-c", str(_DATA / "npt_sweep.yaml")])
+    assert exc_info.value.code == 0
+    out = capsys.readouterr().out
+    assert "n_gpu=" in out
+    assert "2 replica" in out
 
 
 class TestValidateTiers:
-    """``validate`` must not build a backend or place walkers by default.
+    """Check that default ``validate`` stops at the plan and ``--full``
+    resolves everything.
 
-    The full resolve costs seconds on a toy backend and minutes on an MLIP,
-    nearly all of it constructing an energy model and compiling a kernel that
-    validation never calls.  These tests pin the tier boundary so a later
-    change cannot quietly put that cost back on the default path.
+    The default tier must not build a backend or place walkers: the full
+    resolve takes seconds on a toy backend and minutes on an MLIP, nearly
+    all of it spent on an energy model that validation never calls.
     """
 
     @pytest.fixture(autouse=True)
     def _single_device(self, monkeypatch):
-        from jaxrens.cli import resolve as _r
-
         monkeypatch.setattr(_r, "_local_device_count", lambda: 1)
 
     def test_default_tier_does_not_materialise(self, capsys, monkeypatch):
-        from jaxrens.cli import resolve as _r
-
         def _boom(*a, **k):  # pragma: no cover - must never run
             raise AssertionError(
                 "default `validate` resolved the full config; it must stop "
@@ -306,12 +293,11 @@ class TestValidateTiers:
         assert "n_atoms=" in capsys.readouterr().out
 
     def test_plan_rejects_missing_path(self, tmp_path, capsys):
-        import yaml as _yaml
-
-        raw = _yaml.safe_load((_DATA / "minimal.yaml").read_text())
+        raw = yaml.safe_load((_DATA / "minimal.yaml").read_text())
         raw["init"] = {"start_config_file": str(tmp_path / "nope.xyz")}
         cfg = tmp_path / "missing_path.yaml"
-        cfg.write_text(_yaml.safe_dump(raw))
+        cfg.write_text(yaml.safe_dump(raw))
         with pytest.raises(SystemExit) as exc_info:
             main(["validate", "-c", str(cfg)])
-        assert exc_info.value.code != 0
+        assert exc_info.value.code == 2
+        assert "does not exist" in capsys.readouterr().err

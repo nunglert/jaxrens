@@ -1,28 +1,37 @@
-"""Schema -> descriptor logic and resolver wiring for the ``constraints`` section.
+"""Tests for the ``constraints`` config section.
 
-The descriptor-construction logic (matrix assembly, type-dependence flag,
-validation) is unit-tested directly against ``to_descriptor`` with a synthetic
-symbol map — deterministic and independent of how initial positions are
-generated. A few thin resolve-level tests then confirm the wiring and the
-init-time validity check.
+``MinDistanceConstraintSpec.to_descriptor`` is tested directly with a fixed
+symbol map: the threshold matrix, the type-dependence flag and input
+validation. The rest checks that ``resolve`` wires the descriptors in and
+rejects initial walkers that already violate a constraint.
 """
 
 from __future__ import annotations
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jaxrens.cli.resolve import resolve
+from jaxrens.cli.resolve import (
+    ResolvedInit,
+    _check_initial_constraints,
+    resolve,
+)
+from jaxrens.cli.run import run_from_config
 from jaxrens.cli.schema import RootSpec
 from jaxrens.cli.schema.constraints import MinDistanceConstraintSpec
+from jaxrens.cli.schema.moves import RandomWalkMoveSpec
+from jaxrens.constraints.min_distance import min_distance_descriptor
+from jaxrens.state.config import (
+    BackendConfig,
+    MoveConfig,
+    NSConfig,
+    OutputConfig,
+)
 
 H_ONLY = {0: "H"}
 H_O = {0: "H", 1: "O"}
-
-
-# --------------------------------------------------------------------------
-# Descriptor construction (no resolver / no init geometry)
-# --------------------------------------------------------------------------
 
 
 def test_scalar_matrix_and_aspects():
@@ -31,9 +40,8 @@ def test_scalar_matrix_and_aspects():
     )
     assert desc.name == "minimum_distance"
     assert desc.reject_reason == 4
-    assert desc.depends_on == frozenset(
-        {"positions", "cell"}
-    )  # uniform: no types
+    # A uniform floor does not depend on types.
+    assert desc.depends_on == frozenset({"positions", "cell"})
     matrix = np.asarray(desc.build_kwargs["d_min_matrix"])
     assert matrix.shape == (1, 1)
     assert float(matrix[0, 0]) == pytest.approx(0.5)
@@ -71,19 +79,16 @@ def test_negative_scalar_raises():
         MinDistanceConstraintSpec(d_min=-1.0).to_descriptor(symbol_map=H_ONLY)
 
 
-def test_malformed_pair_key_raises():
+@pytest.mark.parametrize("key", ["HO", "H-", "-O", "H-O-Si"])
+def test_malformed_pair_key_raises(key):
     with pytest.raises(ValueError, match="element-symbol pair"):
-        MinDistanceConstraintSpec(d_min={"HO": 1.0}).to_descriptor(
+        MinDistanceConstraintSpec(d_min={key: 1.0}).to_descriptor(
             symbol_map=H_O
         )
 
 
-# --------------------------------------------------------------------------
-# Resolver wiring + init-time validity (2 atoms, grid-spaced >= 1.5 A)
-# --------------------------------------------------------------------------
-
-
 def _base_dict(**overrides) -> dict:
+    """Config with two H atoms, placed on a grid at least 1.5 A apart."""
     d = {
         "run": {
             "n_live": 8,
@@ -114,6 +119,8 @@ def test_constraint_is_wired_into_resolved_config():
     )
     (desc,) = resolved.constraint_descriptors
     assert desc.name == "minimum_distance"
+    matrix = np.asarray(desc.build_kwargs["d_min_matrix"])
+    assert matrix == pytest.approx(np.full((1, 1), 0.8))
 
 
 def test_initial_violation_fails_fast():
@@ -122,31 +129,18 @@ def test_initial_violation_fails_fast():
 
 
 def test_check_initial_constraints_handles_multi_replica_layout():
-    """``_check_initial_constraints`` must accept the 4D stacked layout.
+    """``_check_initial_constraints`` accepts the multi-replica layout.
 
     The multi-replica resolver stacks walkers as ``(n_total, K, n_atoms, 3)``
-    (and cells as ``(n_total, K, 3, 3)``), whereas the single-replica path is
-    3D. A single vmap over axis 0 leaves the cell batched and breaks
-    ``pairwise_distances`` broadcasting; the function must flatten the leading
-    replica/live axes first. Covers both a valid stack and a violating one.
+    and cells as ``(n_total, K, 3, 3)``; the single-replica path is 3D. The
+    function has to flatten the leading axes before its vmap, or the cell
+    stays batched and ``pairwise_distances`` fails to broadcast.
     """
-    import jax.numpy as jnp
-
-    from jaxrens.cli.resolve import ResolvedInit, _check_initial_constraints
-    from jaxrens.constraints.min_distance import min_distance_descriptor
-
     desc = min_distance_descriptor(
         np.full((1, 1), 1.7, dtype=np.float32), type_dependent=False
     )
     n_total, K, n_atoms = 2, 4, 2
-    types = jnp.zeros(
-        (
-            n_total,
-            K,
-            n_atoms,
-        ),
-        dtype=jnp.int32,
-    )
+    types = jnp.zeros((n_total, K, n_atoms), dtype=jnp.int32)
     cells = jnp.broadcast_to(jnp.eye(3) * 10.0, (n_total, K, 3, 3))
 
     # Atoms 2 A apart (> 1.7 floor) -> all walkers valid.
@@ -172,27 +166,12 @@ def test_check_initial_constraints_handles_multi_replica_layout():
 
 
 def test_end_to_end_run_with_active_constraint(tmp_path):
-    """A full NS run with a live minimum-distance gate completes cleanly.
+    """A full NS run with a minimum-distance constraint keeps the floor.
 
-    Two atoms under a harmonic well are pulled toward the origin (and each
-    other); a 0.5 A floor makes the gate actually fire during the run. The
-    run must still converge to a finite evidence and never move a walker into
-    a sub-threshold configuration.
+    The harmonic well pulls both atoms toward the origin, and so toward each
+    other. Without the constraint the closest final pair is about 0.39 A
+    apart (seed 1), so the final check fails if the constraint is ignored.
     """
-    import jax
-    import jax.numpy as jnp
-    import numpy as np
-
-    from jaxrens.cli.run import run_from_config
-    from jaxrens.cli.schema.moves import RandomWalkMoveSpec
-    from jaxrens.constraints.min_distance import min_distance_descriptor
-    from jaxrens.state.config import (
-        BackendConfig,
-        MoveConfig,
-        NSConfig,
-        OutputConfig,
-    )
-
     n_live, d_min = 16, 0.5
     key = jax.random.key(0)
     # Two atoms per walker, well separated initially (~2 A apart).
@@ -219,3 +198,5 @@ def test_end_to_end_run_with_active_constraint(tmp_path):
 
     assert result["iteration"] > 0
     assert jnp.isfinite(result["log_evidence"])
+    p = np.asarray(result["positions"])
+    assert np.linalg.norm(p[:, 0] - p[:, 1], axis=-1).min() >= d_min

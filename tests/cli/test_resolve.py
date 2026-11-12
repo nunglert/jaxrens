@@ -1,20 +1,55 @@
-"""Resolver-layer tests.
+"""Tests for the resolver in jaxrens.cli.resolve.
 
-Covers: resolve(), _resolve_init(), to_descriptor(), to_move_config(),
-to_backend_config(), build_backend(), to_criterion(), to_ensemble_params(),
-adapt overlay logic, cohort expansion, full-config resolver, and InitSpec
-resolution (Part A and Part B, Mode B resolver tests).
+``resolve`` turns a validated ``RootSpec`` into a ``ResolvedConfig``: the
+library dataclasses, the initial walkers with their energies, and the
+batcher. The file also tests the schema methods the resolver calls
+(``to_descriptor``, ``to_move_config``, ``to_backend_config``,
+``build_backend``, ``to_criterion``, ``resolve_for``,
+``to_ensemble_params``) and ``_resolve_init`` for each init mode.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 
+import ase
+import ase.io
+import h5py
+import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 import yaml
 
-from jaxrens.cli.resolve import ResolvedConfig, resolve
+import jaxrens.cli.resolve as _r
+from jaxrens.backends.base import BackendResult
+from jaxrens.backends.ensemble import EnsembleBackend
+from jaxrens.backends.lj import LJBackend
+from jaxrens.backends.toy import (
+    DoubleWellBackend,
+    GaussianMixtureBackend,
+    HarmonicBackend,
+    create_harmonic,
+)
+from jaxrens.cli.resolve import (
+    ResolvedConfig,
+    _finalise_initial_energies_and_counts,
+    _resolve_init,
+    _warn_if_pressure_without_volume,
+    resolve,
+)
 from jaxrens.cli.schema import RootSpec
+from jaxrens.cli.schema.adaptation import (
+    _FALLBACK_ADJUST_FACTOR,
+    _FALLBACK_MAX_RATE,
+    _FALLBACK_MIN_RATE,
+    _FALLBACK_STEP_SIZE_MAX,
+    AdaptationPolicy,
+    AdaptationSpec,
+)
 from jaxrens.cli.schema.backend import (
     DoubleWellBackendSpec,
     GaussianMixtureBackendSpec,
@@ -23,6 +58,9 @@ from jaxrens.cli.schema.backend import (
     MACEBackendSpec,
     NeuralILBackendSpec,
 )
+from jaxrens.cli.schema.cell import CellSpec
+from jaxrens.cli.schema.ensemble import NPTEnsembleSpec, NVTEnsembleSpec
+from jaxrens.cli.schema.init import InitSpec
 from jaxrens.cli.schema.moves import (
     AlchemicalMorphMoveSpec,
     GMCMoveSpec,
@@ -31,22 +69,47 @@ from jaxrens.cli.schema.moves import (
     SingleAtomMoveSpec,
     VolumeMoveSpec,
 )
+from jaxrens.cli.schema.termination import (
+    EnergyTerminationSpec,
+    IterationTerminationSpec,
+    PriorMassTerminationSpec,
+    TemperatureTerminationSpec,
+)
+from jaxrens.init.restart import RestartBundle
+from jaxrens.init.walker_set import load_walker_set
+from jaxrens.io.checkpoint import save_checkpoint
+from jaxrens.sampling.batch_descriptor import (
+    PmapVmapRuns,
+    ShardedSingleRun,
+    SingleRun,
+)
+from jaxrens.sampling.nested_sampling import _choose_starting_bucket
+from jaxrens.sampling.termination import (
+    EnergyTermination,
+    IterationTermination,
+    PriorMassTermination,
+    TempTermination,
+)
 from jaxrens.state.config import (
     BackendConfig,
     MoveConfig,
     NSConfig,
     OutputConfig,
 )
+from jaxrens.utils.cell import get_volume
 
 _DATA = Path(__file__).parent.parent / "_assets" / "data" / "cli"
 _MINIMAL_YAML = _DATA / "minimal.yaml"
 _LJ_BACKEND_YAML = _DATA / "lj_backend.yaml"
 _FULL_CONFIG_YAML = _DATA / "full_config.yaml"
 
+_GPA_TO_EVA3 = 0.006241509  # 1 GPa in eV/Å³
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+_PERMISSIVE_CELL = CellSpec(
+    max_volume_per_atom=10000.0,
+    min_volume_per_atom=0.01,
+    min_aspect_ratio=0.001,
+)
 
 
 def _minimal_dict() -> dict:
@@ -104,21 +167,62 @@ def _species_dict(
     }
 
 
-# ---------------------------------------------------------------------------
-# 7. resolve() produces correct library dataclasses
-# ---------------------------------------------------------------------------
+def _sharded_root(tmp_path, *, shard_n_gpu, n_live=8, pressures=None):
+    """Validate a small LJ NPT config through RootSpec so resolve() is fast."""
+    cfg = {
+        "run": {
+            "n_live": n_live,
+            "max_iterations": 1,
+            "n_mcmc_steps": 1,
+            "seed": 0,
+        },
+        "backend": {
+            "type": "lj",
+            "epsilon": 1.0,
+            "sigma": 1.0,
+            "cutoff": 2.5,
+            "periodic": True,
+        },
+        "ensemble": {
+            "type": "npt",
+            "pressure": pressures if pressures is not None else 0.1,
+            "pressure_units": "eva3",
+        },
+        "moves": [
+            {"type": "random_walk", "step_size": 0.1},
+        ],
+        "termination": [{"type": "iteration", "max_iterations": 1}],
+        "init": {
+            "start_species": "18 4",
+            "random_initialise_pos": True,
+            "pos_randomization_mode": "grid",
+            "grid_distance": 1.0,
+            "random_initialise_cell": False,
+            "start_energy_ceiling_per_atom": 100.0,
+        },
+        "cell": {
+            "max_volume_per_atom": 30.0,
+            "min_volume_per_atom": 1.5,
+            "min_aspect_ratio": 0.6,
+            "flat_V_prior": False,
+        },
+        "output": {
+            "format": "extxyz",
+            "working_dir": str(tmp_path / "out"),
+            "out_file_prefix": "test",
+            "info_interval": 50,
+            "traj_interval": 50,
+            "snapshot_interval": 100000,
+            "checkpoint_interval": 100000,
+        },
+    }
+    if shard_n_gpu != 1:
+        cfg["run"]["shard_n_gpu"] = shard_n_gpu
+    return RootSpec.model_validate(cfg)
 
 
 class TestResolve:
-    def test_resolve_types(self):
-        root = RootSpec.model_validate(_minimal_dict())
-        resolved = resolve(root)
-        assert isinstance(resolved, ResolvedConfig)
-        assert isinstance(resolved.ns, NSConfig)
-        assert isinstance(resolved.moves, tuple)
-        assert all(isinstance(m, MoveConfig) for m in resolved.moves)
-        assert isinstance(resolved.backend, BackendConfig)
-        assert isinstance(resolved.output, OutputConfig)
+    """Check that resolve() builds the expected library dataclasses."""
 
     def test_resolve_values_match_hand_built(self):
         d = _minimal_dict()
@@ -177,14 +281,10 @@ class TestResolve:
         assert resolved.moves[1].move_type == "gmc"
 
 
-# ---------------------------------------------------------------------------
-# 12. to_descriptor() pins kernel kwargs mapping (parametrized)
-# ---------------------------------------------------------------------------
-
-
 class TestToDescriptor:
-    """to_descriptor() must produce the same kernel kwargs that
-    _build_kernel_kwargs used to produce in cli/run.py."""
+    """Check the kernel kwargs, step size, weight and name that
+    to_descriptor() puts on each move's MoveKernel.
+    """
 
     def test_random_walk_descriptor(self):
         spec = RandomWalkMoveSpec(step_size=0.2, weight=2.0)
@@ -193,18 +293,6 @@ class TestToDescriptor:
         assert desc.step_size == pytest.approx(0.2)
         assert desc.weight == pytest.approx(2.0)
         assert desc.extra_state_fields == {}
-
-    def test_galilean_descriptor_n_reflect(self):
-        spec = GMCMoveSpec(n_reflect=7, step_size=0.05)
-        desc = spec.to_descriptor()
-        assert desc.kernel_kwargs == {"n_reflect": 7}
-        assert "direction" in desc.extra_state_fields
-
-    def test_gmc_descriptor_n_reflect(self):
-        spec = GMCMoveSpec(n_reflect=3)
-        desc = spec.to_descriptor()
-        assert desc.kernel_kwargs == {"n_reflect": 3}
-        assert "direction" in desc.extra_state_fields
 
     def test_hmc_descriptor_n_leapfrog(self):
         spec = HMCMoveSpec(n_leapfrog=15)
@@ -218,8 +306,6 @@ class TestToDescriptor:
         assert desc.kernel_kwargs == {}
 
     def test_volume_descriptor(self):
-        from jaxrens.cli.schema.cell import CellSpec
-
         cell_cfg = CellSpec(
             max_volume_per_atom=50.0,
             min_volume_per_atom=1.0,
@@ -257,12 +343,9 @@ class TestToDescriptor:
         assert desc.name == "gal_heavy"
 
 
-# ---------------------------------------------------------------------------
-# 13. to_move_config() round-trips through MoveConfig
-# ---------------------------------------------------------------------------
-
-
 class TestToMoveConfig:
+    """Check that to_move_config() maps each move spec onto MoveConfig."""
+
     def test_random_walk_move_config(self):
         spec = RandomWalkMoveSpec(
             step_size=0.3, weight=2.0, adaptation_warmup=50
@@ -285,40 +368,21 @@ class TestToMoveConfig:
         assert mc.n_steps == 20
 
 
-# ---------------------------------------------------------------------------
-# 14. ResolvedConfig.move_descriptors present and typed
-# ---------------------------------------------------------------------------
-
-
-class TestResolvedDescriptors:
-    def test_resolve_produces_move_descriptors(self):
-        from jaxrens.sampling.move_kernel import MoveKernel
-
-        root = RootSpec.model_validate(_minimal_dict())
-        resolved = resolve(root)
-        assert hasattr(resolved, "move_descriptors")
-        assert isinstance(resolved.move_descriptors, tuple)
-        assert all(
-            isinstance(d, MoveKernel) for d in resolved.move_descriptors
-        )
-        assert len(resolved.move_descriptors) == len(resolved.moves)
-
-    def test_resolve_descriptor_matches_move(self):
-        d = _minimal_dict()
-        d["moves"] = [{"type": "hmc", "n_leapfrog": 6, "step_size": 0.02}]
-        root = RootSpec.model_validate(d)
-        resolved = resolve(root)
-        desc = resolved.move_descriptors[0]
-        assert desc.kernel_kwargs["n_leapfrog"] == 6
-        assert desc.step_size == pytest.approx(0.02)
-
-
-# ---------------------------------------------------------------------------
-# 18. to_backend_config() produces correct BackendConfig
-# ---------------------------------------------------------------------------
+def test_resolve_descriptor_matches_move():
+    d = _minimal_dict()
+    d["moves"] = [{"type": "hmc", "n_leapfrog": 6, "step_size": 0.02}]
+    root = RootSpec.model_validate(d)
+    resolved = resolve(root)
+    desc = resolved.move_descriptors[0]
+    assert desc.kernel_kwargs["n_leapfrog"] == 6
+    assert desc.step_size == pytest.approx(0.02)
 
 
 class TestToBackendConfig:
+    """Check the BackendConfig that to_backend_config() builds for each
+    backend spec.
+    """
+
     def test_harmonic_to_backend_config(self):
         spec = HarmonicBackendSpec(periodic=True)
         cfg = spec.to_backend_config()
@@ -371,23 +435,18 @@ class TestToBackendConfig:
         assert cfg.checkpoint_path == "/tmp/mace_model"
 
 
-# ---------------------------------------------------------------------------
-# 19. build_backend() for lightweight backends
-# ---------------------------------------------------------------------------
-
-
 class TestBuildBackend:
-    def test_harmonic_build_backend(self):
-        from jaxrens.backends.toy import HarmonicBackend
+    """Check that build_backend() builds each lightweight backend with the
+    spec's parameters.
+    """
 
+    def test_harmonic_build_backend(self):
         spec = HarmonicBackendSpec(k=2.0)
         backend = spec.build_backend()
         assert isinstance(backend, HarmonicBackend)
         assert backend.k == pytest.approx(2.0)
 
     def test_double_well_build_backend(self):
-        from jaxrens.backends.toy import DoubleWellBackend
-
         spec = DoubleWellBackendSpec(a=0.5, b=2.0)
         backend = spec.build_backend()
         assert isinstance(backend, DoubleWellBackend)
@@ -395,16 +454,12 @@ class TestBuildBackend:
         assert backend.b == pytest.approx(2.0)
 
     def test_gaussian_mixture_build_backend(self):
-        from jaxrens.backends.toy import GaussianMixtureBackend
-
         spec = GaussianMixtureBackendSpec(sigma=0.3)
         backend = spec.build_backend()
         assert isinstance(backend, GaussianMixtureBackend)
         assert backend.sigma == pytest.approx(0.3)
 
     def test_lj_build_backend(self):
-        from jaxrens.backends.lj import LJBackend
-
         spec = LJBackendSpec(epsilon=0.5, sigma=1.2, cutoff=4.0)
         backend = spec.build_backend()
         assert isinstance(backend, LJBackend)
@@ -413,28 +468,15 @@ class TestBuildBackend:
         assert backend.cutoff == pytest.approx(4.0)
 
 
-# ---------------------------------------------------------------------------
-# 21. resolve() energy_backend field
-# ---------------------------------------------------------------------------
-
-
 class TestResolveEnergyBackend:
-    def test_resolve_has_base_backend(self):
-        root = RootSpec.model_validate(_minimal_dict())
-        resolved = resolve(root)
-        assert hasattr(resolved, "base_backend")
-        assert resolved.base_backend is not None
+    """Check that ResolvedConfig.base_backend wraps the configured model."""
 
     def test_resolve_base_backend_is_harmonic(self):
-        from jaxrens.backends.toy import HarmonicBackend
-
         root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
         assert isinstance(resolved.base_backend.model, HarmonicBackend)
 
     def test_resolve_base_backend_is_callable(self):
-        import jax.numpy as jnp
-
         root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
         positions = jnp.zeros((1, 3))
@@ -444,8 +486,6 @@ class TestResolveEnergyBackend:
         assert jnp.isfinite(energy)
 
     def test_resolve_base_backend_lj(self):
-        from jaxrens.backends.lj import LJBackend
-
         with open(_LJ_BACKEND_YAML) as fh:
             raw = yaml.safe_load(fh)
         root = RootSpec.model_validate(raw)
@@ -453,25 +493,18 @@ class TestResolveEnergyBackend:
         assert isinstance(resolved.base_backend.model, LJBackend)
 
 
-# ---------------------------------------------------------------------------
-# to_criterion tests (split from TestTerminationDiscriminatedUnion)
-# ---------------------------------------------------------------------------
-
-
 class TestToCriterion:
-    def test_to_criterion_iteration(self):
-        from jaxrens.cli.schema.termination import IterationTerminationSpec
-        from jaxrens.sampling.termination import IterationTermination
+    """Check to_criterion() for each termination spec, and the criteria
+    resolve() builds from the termination list and run.max_iterations.
+    """
 
+    def test_to_criterion_iteration(self):
         spec = IterationTerminationSpec(max_iterations=42)
         crit = spec.to_criterion()
         assert isinstance(crit, IterationTermination)
         assert crit.max_iterations == 42
 
     def test_to_criterion_prior_mass(self):
-        from jaxrens.cli.schema.termination import PriorMassTerminationSpec
-        from jaxrens.sampling.termination import PriorMassTermination
-
         spec = PriorMassTerminationSpec(threshold=0.05)
         crit = spec.to_criterion(n_live=30, n_cull=1)
         assert isinstance(crit, PriorMassTermination)
@@ -479,16 +512,11 @@ class TestToCriterion:
         assert crit.threshold == pytest.approx(0.05)
 
     def test_to_criterion_prior_mass_requires_n_live(self):
-        from jaxrens.cli.schema.termination import PriorMassTerminationSpec
-
         spec = PriorMassTerminationSpec(threshold=0.05)
         with pytest.raises(ValueError, match="requires n_live"):
             spec.to_criterion()
 
     def test_to_criterion_temperature(self):
-        from jaxrens.cli.schema.termination import TemperatureTerminationSpec
-        from jaxrens.sampling.termination import TempTermination
-
         spec = TemperatureTerminationSpec(target_temp=500.0, threshold=8.0)
         crit = spec.to_criterion(n_live=20, n_cull=2)
         assert isinstance(crit, TempTermination)
@@ -497,23 +525,15 @@ class TestToCriterion:
         assert crit.threshold == pytest.approx(8.0)
 
     def test_to_criterion_energy(self):
-        from jaxrens.cli.schema.termination import EnergyTerminationSpec
-        from jaxrens.sampling.termination import EnergyTermination
-
         spec = EnergyTerminationSpec(min_energy=-3.5)
         crit = spec.to_criterion()
         assert isinstance(crit, EnergyTermination)
         assert crit.min_energy == pytest.approx(-3.5)
 
-    def test_termination_none_resolves_to_legacy_defaults(self):
+    def test_termination_none_resolves_to_prior_mass_and_iteration(self):
         root = RootSpec.model_validate(_minimal_dict())
         assert root.termination is None
         resolved = resolve(root)
-        from jaxrens.sampling.termination import (
-            IterationTermination,
-            PriorMassTermination,
-        )
-
         assert len(resolved.termination) == 2
         types_found = {type(c) for c in resolved.termination}
         assert IterationTermination in types_found
@@ -525,8 +545,6 @@ class TestToCriterion:
         d["run"]["n_live"] = 15
         root = RootSpec.model_validate(d)
         resolved = resolve(root)
-        from jaxrens.sampling.termination import PriorMassTermination
-
         pm = next(
             c
             for c in resolved.termination
@@ -535,10 +553,18 @@ class TestToCriterion:
         assert pm.threshold == pytest.approx(0.05)
         assert pm.n_live == 15
 
+    def test_no_termination_and_no_max_iterations_gives_prior_mass_only(
+        self,
+    ):
+        d = _minimal_dict()
+        d["run"].pop("max_iterations")
+        resolved = resolve(RootSpec.model_validate(d))
+        assert len(resolved.termination) == 1
+        assert isinstance(resolved.termination[0], PriorMassTermination)
+
     def test_two_criteria_resolve_to_two_element_tuple(self):
         d = _minimal_dict()
-        # Drop run.max_iterations so the resolver doesn't auto-append a
-        # third IterationTermination on top of the explicit list.
+        # Without run.max_iterations the resolver adds no third criterion.
         d["run"].pop("max_iterations", None)
         d["termination"] = [
             {"type": "iteration", "max_iterations": 50},
@@ -548,6 +574,15 @@ class TestToCriterion:
         resolved = resolve(root)
         assert len(resolved.termination) == 2
 
+    def test_max_iterations_appended_to_explicit_list(self):
+        d = _minimal_dict()
+        d["termination"] = [{"type": "energy", "min_energy": -99.0}]
+        resolved = resolve(RootSpec.model_validate(d))
+        energy, iteration = resolved.termination
+        assert isinstance(energy, EnergyTermination)
+        assert isinstance(iteration, IterationTermination)
+        assert iteration.max_iterations == 50
+
     def test_termination_iteration_fixture_yaml(self):
         fixture = _DATA / "termination_iteration.yaml"
         with open(fixture) as fh:
@@ -555,27 +590,16 @@ class TestToCriterion:
         root = RootSpec.model_validate(raw)
         assert root.termination is not None
         assert len(root.termination) == 1
-        from jaxrens.cli.schema.termination import IterationTerminationSpec
-
         assert isinstance(root.termination[0], IterationTerminationSpec)
         assert root.termination[0].max_iterations == 5
 
 
-# ---------------------------------------------------------------------------
-# Adaptation resolver tests (split from TestAdaptationSpec)
-# ---------------------------------------------------------------------------
-
-
 class TestAdaptationResolve:
-    def test_resolve_for_no_override_uses_fallbacks(self):
-        from jaxrens.cli.schema.adaptation import (
-            _FALLBACK_ADJUST_FACTOR,
-            _FALLBACK_MAX_RATE,
-            _FALLBACK_MIN_RATE,
-            _FALLBACK_STEP_SIZE_MAX,
-            AdaptationSpec,
-        )
+    """Check how AdaptationSpec.resolve_for() layers per-move overrides on
+    the defaults, and the per-move policies resolve() returns.
+    """
 
+    def test_resolve_for_no_override_uses_fallbacks(self):
         cfg = AdaptationSpec()
         policy = cfg.resolve_for("random_walk")
         assert policy.min_rate == pytest.approx(_FALLBACK_MIN_RATE)
@@ -584,23 +608,12 @@ class TestAdaptationResolve:
         assert policy.step_size_max == pytest.approx(_FALLBACK_STEP_SIZE_MAX)
 
     def test_resolve_for_with_defaults_min_rate(self):
-        from jaxrens.cli.schema.adaptation import (
-            _FALLBACK_MAX_RATE,
-            AdaptationPolicy,
-            AdaptationSpec,
-        )
-
         cfg = AdaptationSpec(defaults=AdaptationPolicy(min_rate=0.3))
         policy = cfg.resolve_for("random_walk")
         assert policy.min_rate == pytest.approx(0.3)
         assert policy.max_rate == pytest.approx(_FALLBACK_MAX_RATE)
 
     def test_resolve_for_per_move_overrides_default(self):
-        from jaxrens.cli.schema.adaptation import (
-            AdaptationPolicy,
-            AdaptationSpec,
-        )
-
         cfg = AdaptationSpec(
             defaults=AdaptationPolicy(min_rate=0.3, max_rate=0.7),
             per_move={"galilean": AdaptationPolicy(min_rate=0.5)},
@@ -610,11 +623,6 @@ class TestAdaptationResolve:
         assert policy.max_rate == pytest.approx(0.7)
 
     def test_resolve_for_per_move_none_falls_through_to_defaults(self):
-        from jaxrens.cli.schema.adaptation import (
-            AdaptationPolicy,
-            AdaptationSpec,
-        )
-
         cfg = AdaptationSpec(
             defaults=AdaptationPolicy(adjust_factor=2.0),
             per_move={"random_walk": AdaptationPolicy(min_rate=0.4)},
@@ -624,11 +632,6 @@ class TestAdaptationResolve:
         assert policy.adjust_factor == pytest.approx(2.0)
 
     def test_resolve_for_keyed_by_move_name_not_type(self):
-        from jaxrens.cli.schema.adaptation import (
-            AdaptationPolicy,
-            AdaptationSpec,
-        )
-
         cfg = AdaptationSpec(
             per_move={
                 "rw_slow": AdaptationPolicy(min_rate=0.1),
@@ -671,8 +674,6 @@ class TestAdaptationResolve:
         assert gal_policy.max_rate == pytest.approx(0.7)
 
     def test_resolved_policies_use_fallback_when_no_adaptation_set(self):
-        from jaxrens.cli.schema.adaptation import _FALLBACK_MIN_RATE
-
         root = RootSpec.model_validate(_minimal_dict())
         resolved = resolve(root)
         assert len(resolved.adaptation_policies) == 1
@@ -681,32 +682,23 @@ class TestAdaptationResolve:
         )
 
 
-# ---------------------------------------------------------------------------
-# EnsembleSpec resolver tests (split from TestEnsembleSpec)
-# ---------------------------------------------------------------------------
-
-_GPA_TO_EVA3 = 0.006241509  # 1 GPa in eV/Å³
-
-
 class TestEnsembleResolver:
-    def test_nvt_to_ensemble_params_empty(self):
-        from jaxrens.cli.schema.ensemble import NVTEnsembleSpec
+    """Check the ensemble params that the NVT and NPT specs produce,
+    including the GPa to eV/Å³ conversion.
+    """
 
+    def test_nvt_to_ensemble_params_empty(self):
         spec = NVTEnsembleSpec()
         params = spec.to_ensemble_params()
         assert params == {}
 
     def test_npt_scalar_to_ensemble_params(self):
-        from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-
         spec = NPTEnsembleSpec(pressure=0.05)
         params = spec.to_ensemble_params(cohort_index=0)
         assert "pressure" in params
         assert params["pressure"] == pytest.approx(0.05)
 
     def test_npt_list_to_ensemble_params_by_index(self):
-        from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-
         pressures = [0.01, 0.02, 0.03]
         spec = NPTEnsembleSpec(pressure=pressures)
         for i, p in enumerate(pressures):
@@ -714,22 +706,11 @@ class TestEnsembleResolver:
             assert params["pressure"] == pytest.approx(p)
 
     def test_npt_gpa_converts_to_eva3(self):
-        from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-
         spec = NPTEnsembleSpec(pressure=1.0, pressure_units="gpa")
         params = spec.to_ensemble_params(cohort_index=0)
         assert params["pressure"] == pytest.approx(_GPA_TO_EVA3, rel=1e-5)
 
-    def test_npt_eva3_passes_through_unchanged(self):
-        from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-
-        spec = NPTEnsembleSpec(pressure=0.007, pressure_units="eva3")
-        params = spec.to_ensemble_params(cohort_index=0)
-        assert params["pressure"] == pytest.approx(0.007)
-
     def test_npt_gpa_list_conversion(self):
-        from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-
         spec = NPTEnsembleSpec(pressure=[1.0, 2.0], pressure_units="gpa")
         assert spec.to_ensemble_params(cohort_index=0)[
             "pressure"
@@ -739,45 +720,16 @@ class TestEnsembleResolver:
         ] == pytest.approx(2.0 * _GPA_TO_EVA3)
 
 
-# ---------------------------------------------------------------------------
-# Multi-replica resolver tests
-# ---------------------------------------------------------------------------
-
-
 class TestMultiReplicaResolver:
-    def test_npt_three_pressures_and_values(self):
-        """A 3-pressure list resolves to one 3-replica ResolvedConfig."""
-        from jaxrens.sampling.batch_descriptor import PmapVmapRuns
-
-        d = _minimal_dict()
-        d["run"]["seed"] = 10
-        d["ensemble"] = {"type": "npt", "pressure": [0.01, 0.02, 0.03]}
-        root = RootSpec.model_validate(d)
-        resolved = resolve(root)
-
-        assert isinstance(resolved.batcher, PmapVmapRuns)
-        n_total = resolved.batcher.n_gpu * resolved.batcher.n_per_gpu
-        assert n_total == 3
-        assert len(resolved.ensemble_params_per_run) == 3
-        assert resolved.ensemble_params_per_run[0][
-            "pressure"
-        ] == pytest.approx(0.01)
-        assert resolved.ensemble_params_per_run[1][
-            "pressure"
-        ] == pytest.approx(0.02)
-        assert resolved.ensemble_params_per_run[2][
-            "pressure"
-        ] == pytest.approx(0.03)
+    """Check the batcher and per-replica params resolve() picks for the
+    scalar and list-valued NPT fixtures.
+    """
 
     def test_npt_sweep_fixture_yaml_validates(self):
-        from jaxrens.sampling.batch_descriptor import PmapVmapRuns
-
         fixture = _DATA / "npt_sweep.yaml"
         with open(fixture) as fh:
             raw = yaml.safe_load(fh)
         root = RootSpec.model_validate(raw)
-        from jaxrens.cli.schema.ensemble import NPTEnsembleSpec
-
         assert isinstance(root.ensemble, NPTEnsembleSpec)
         resolved = resolve(root)
         assert isinstance(resolved.batcher, PmapVmapRuns)
@@ -785,8 +737,6 @@ class TestMultiReplicaResolver:
         assert n_total == 2
 
     def test_npt_scalar_fixture_yaml_single_run(self):
-        from jaxrens.sampling.batch_descriptor import SingleRun
-
         fixture = _DATA / "npt_scalar.yaml"
         with open(fixture) as fh:
             raw = yaml.safe_load(fh)
@@ -799,99 +749,66 @@ class TestMultiReplicaResolver:
         ] == pytest.approx(0.01)
 
 
-# ---------------------------------------------------------------------------
-# CellSpec resolver-warning tests (split from TestCellSpec)
-# ---------------------------------------------------------------------------
+class TestShardedSingleRun:
+    """Check that run.shard_n_gpu selects the ShardedSingleRun batcher and
+    the configs it is rejected with.
+    """
 
-
-class TestCellResolve:
-    def test_resolved_config_has_cell_field(self):
-        from jaxrens.cli.schema.cell import CellSpec
-
-        root = RootSpec.model_validate(_minimal_dict())
+    def test_resolver_routes_shard_to_sharded_batcher(self, tmp_path):
+        root = _sharded_root(tmp_path, shard_n_gpu=2)
         resolved = resolve(root)
-        assert hasattr(resolved, "cell")
-        assert isinstance(resolved.cell, CellSpec)
+        assert isinstance(resolved.batcher, ShardedSingleRun)
+        assert resolved.batcher.n_gpu == 2
 
-    def test_non_default_cell_resolves_without_warning(self, caplog):
-        """Cell values are now consumed by move descriptors — no deferred warning."""
-        import logging
+    def test_resolver_default_keeps_single_run(self, tmp_path):
+        root = _sharded_root(tmp_path, shard_n_gpu=1)
+        resolved = resolve(root)
+        assert isinstance(resolved.batcher, SingleRun)
 
-        d = _minimal_dict()
-        d["cell"] = {"max_volume_per_atom": 9999.0}
-        root = RootSpec.model_validate(d)
-        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            resolved = resolve(root)
-        deferred_warnings = [
-            r
-            for r in caplog.records
-            if "not yet" in r.message.lower() and "cell" in r.message.lower()
-        ]
-        assert len(deferred_warnings) == 0
-        assert resolved.cell.max_volume_per_atom == pytest.approx(9999.0)
-
-    def test_default_cell_no_warning(self, caplog):
-        import logging
-
-        root = RootSpec.model_validate(_minimal_dict())
-        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+    def test_resolver_rejects_shard_with_pressure_list(self, tmp_path):
+        root = _sharded_root(tmp_path, shard_n_gpu=2, pressures=[1.0, 2.0])
+        with pytest.raises(ValueError, match="shard_n_gpu"):
             resolve(root)
-        cell_warnings = [
-            r
-            for r in caplog.records
-            if "cell" in r.message.lower() and "not yet" in r.message.lower()
-        ]
-        assert len(cell_warnings) == 0
+
+    def test_resolver_rejects_indivisible_n_live(self, tmp_path):
+        root = _sharded_root(tmp_path, shard_n_gpu=3, n_live=8)
+        with pytest.raises(ValueError, match="divisible"):
+            resolve(root)
 
 
-# ---------------------------------------------------------------------------
-# ExtendedOutput resolver-warning tests (split from TestExtendedOutputSpec)
-# ---------------------------------------------------------------------------
+def test_cell_spec_is_passed_through():
+    d = _minimal_dict()
+    d["cell"] = {"max_volume_per_atom": 9999.0}
+    resolved = resolve(RootSpec.model_validate(d))
+    assert resolved.cell.max_volume_per_atom == pytest.approx(9999.0)
 
 
 class TestExtendedOutputResolve:
-    def test_snapshot_clean_is_wired_through(self, caplog):
-        """``snapshot_clean`` is consumed by the runtime: setting it must NOT
-        emit a deferred-field warning and must land on
-        ``ResolvedConfig.output.snapshot_clean``.
-        """
-        import logging
+    """Check that snapshot_clean and wrap_atoms reach
+    ResolvedConfig.output.
+    """
 
+    def test_snapshot_clean_is_wired_through(self):
         d = _minimal_dict()
-        d["output"]["snapshot_clean"] = True
-        root = RootSpec.model_validate(d)
-        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            resolved = resolve(root)
-        assert not any("snapshot_clean" in r.message for r in caplog.records)
-        assert resolved.output.snapshot_clean is True
+        d["output"]["snapshot_clean"] = False
+        resolved = resolve(RootSpec.model_validate(d))
+        assert resolved.output.snapshot_clean is False
 
     def test_snapshot_clean_defaults_true(self):
         d = _minimal_dict()
         resolved = resolve(RootSpec.model_validate(d))
         assert resolved.output.snapshot_clean is True
 
-    def test_wrap_atoms_is_wired(self, caplog):
-        """``wrap_atoms`` is wired through OutputConfig → the trajectory
-        writers, so setting it must NOT emit a deferred-field warning and must
-        land on ``ResolvedConfig.output.wrap_atoms``.
-        """
-        import logging
-
+    def test_wrap_atoms_is_wired(self):
         d = _minimal_dict()
-        d["output"]["wrap_atoms"] = True
-        root = RootSpec.model_validate(d)
-        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
-            resolved = resolve(root)
-        assert not any("wrap_atoms" in r.message for r in caplog.records)
-        assert resolved.output.wrap_atoms is True
-
-
-# ---------------------------------------------------------------------------
-# Full config fixture — resolver tests
-# ---------------------------------------------------------------------------
+        d["output"]["wrap_atoms"] = False
+        resolved = resolve(RootSpec.model_validate(d))
+        assert resolved.output.wrap_atoms is False
 
 
 class TestFullConfigResolver:
+    """Check that the full and minimal YAML fixtures resolve."""
+
     def test_full_config_resolves(self):
         with open(_FULL_CONFIG_YAML) as fh:
             raw = yaml.safe_load(fh)
@@ -901,8 +818,7 @@ class TestFullConfigResolver:
         assert resolved.init.initial_positions.shape == (20, 2, 3)
         assert resolved.init.initial_types.shape == (20, 2)
 
-    def test_minimal_yaml_still_resolves_backward_compat(self):
-        """Existing minimal fixture still resolves after step-6 additions."""
+    def test_minimal_yaml_resolves(self):
         with open(_MINIMAL_YAML) as fh:
             raw = yaml.safe_load(fh)
         root = RootSpec.model_validate(raw)
@@ -911,36 +827,15 @@ class TestFullConfigResolver:
         assert resolved.init.initial_types.shape == (20, 1)
 
 
-# ---------------------------------------------------------------------------
-# InitSpec resolver — Part A
-# ---------------------------------------------------------------------------
-
-
-class TestInitSpecResolverPartA:
-    """Tests for _resolve_init and ResolvedInit (Part A resolver)."""
-
-    def test_start_species_produces_resolved_init(self):
-        from jaxrens.cli.resolve import ResolvedInit, _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
-        cfg = InitSpec(start_species="1 3")
-        result = _resolve_init(cfg, n_live=10, seed=0)
-        assert isinstance(result, ResolvedInit)
+class TestResolveInit:
+    """Check the shapes, seeding and missing-file errors of _resolve_init."""
 
     def test_start_species_positions_shape(self):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_species="1 3")
         result = _resolve_init(cfg, n_live=10, seed=0)
         assert result.initial_positions.shape == (10, 3, 3)
 
     def test_start_species_types_shape_and_dtype(self):
-        import jax.numpy as jnp
-
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_species="14 2, 8 1")
         result = _resolve_init(cfg, n_live=5, seed=1)
         # initial_types carries a leading n_live axis (per-walker), matching
@@ -949,25 +844,16 @@ class TestInitSpecResolverPartA:
         assert result.initial_types.dtype == jnp.int32
 
     def test_start_species_n_atoms_matches_counts(self):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_species="6 3, 1 2")
         result = _resolve_init(cfg, n_live=4, seed=0)
         assert result.initial_positions.shape[1] == 5
 
     def test_start_config_file_nonexistent_raises(self, tmp_path):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_config_file=tmp_path / "does_not_exist.xyz")
         with pytest.raises(FileNotFoundError):
             _resolve_init(cfg, n_live=4, seed=0)
 
     def test_start_walker_set_nonexistent_raises_file_not_found(self):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(
             start_walker_set=Path("/tmp/does_not_exist_walker.extxyz")
         )
@@ -975,61 +861,32 @@ class TestInitSpecResolverPartA:
             _resolve_init(cfg, n_live=4, seed=0)
 
     def test_restart_file_nonexistent_raises_file_not_found(self):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(restart_file=Path("/tmp/does_not_exist_checkpoint.h5"))
         with pytest.raises(FileNotFoundError):
             _resolve_init(cfg, n_live=4, seed=0)
 
-    def test_resolved_config_has_init_field(self):
-        root = RootSpec.model_validate(_minimal_dict())
-        resolved = resolve(root)
-        assert hasattr(resolved, "init")
-        from jaxrens.cli.resolve import ResolvedInit
-
-        assert isinstance(resolved.init, ResolvedInit)
-
     def test_positions_are_finite(self):
-        import jax.numpy as jnp
-
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_species="1 3")
         result = _resolve_init(cfg, n_live=8, seed=42)
         assert jnp.all(jnp.isfinite(result.initial_positions))
 
     def test_deterministic_with_same_seed(self):
-        import jax.numpy as jnp
-
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_species="1 3")
         r1 = _resolve_init(cfg, n_live=4, seed=99)
         r2 = _resolve_init(cfg, n_live=4, seed=99)
         assert jnp.allclose(r1.initial_positions, r2.initial_positions)
 
     def test_different_seeds_differ(self):
-        import jax.numpy as jnp
-
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_species="1 3")
         r1 = _resolve_init(cfg, n_live=4, seed=0)
         r2 = _resolve_init(cfg, n_live=4, seed=1)
         assert not jnp.allclose(r1.initial_positions, r2.initial_positions)
 
 
-# ---------------------------------------------------------------------------
-# InitSpec resolver — Part B
-# ---------------------------------------------------------------------------
-
-
-class TestInitSpecResolverPartB:
-    """Resolver unit tests for Part B (species/cell/grid resolver logic)."""
+class TestResolveInitModes:
+    """Check the cells, positions and energies built from start_species
+    (mode A) and start_config_file (mode B).
+    """
 
     def test_start_species_cells_shape(self):
         root = RootSpec.model_validate(_species_dict(n_atoms=2, n_live=6))
@@ -1044,17 +901,37 @@ class TestInitSpecResolverPartB:
         assert resolved.init.initial_positions.shape == (6, 2, 3)
 
     def test_start_species_initial_energies_populated(self):
-        import jax.numpy as jnp
-
         root = RootSpec.model_validate(_species_dict(n_atoms=2, n_live=4))
         resolved = resolve(root)
         assert resolved.init.initial_energies is not None
         assert resolved.init.initial_energies.shape == (4,)
         assert jnp.all(jnp.isfinite(resolved.init.initial_energies))
+        # The harmonic backend has no max_neighbors_for, so no counts.
+        assert resolved.init.initial_max_neighbor_counts is None
+
+    def test_npt_initial_energies_include_pv_term(self):
+        """NPT initial energies are the NVT ones plus P * V per walker.
+
+        Grid placement does not call the backend, so both runs start from
+        the same positions and cells.
+        """
+        pressure = 0.1
+        d = _species_dict(n_atoms=2, n_live=4)
+        nvt = resolve(RootSpec.model_validate(d))
+        d["ensemble"] = {"type": "npt", "pressure": pressure}
+        npt = resolve(RootSpec.model_validate(d))
+
+        np.testing.assert_allclose(
+            npt.init.initial_positions, nvt.init.initial_positions
+        )
+        volumes = np.asarray(get_volume(npt.init.initial_cells))
+        np.testing.assert_allclose(
+            np.asarray(npt.init.initial_energies - nvt.init.initial_energies),
+            pressure * volumes,
+            rtol=1e-5,
+        )
 
     def test_random_initialise_cell_true_produces_diverse_cells(self):
-        import jax.numpy as jnp
-
         d = _species_dict(n_atoms=2, n_live=8)
         d["init"]["random_initialise_cell"] = True
         root = RootSpec.model_validate(d)
@@ -1066,8 +943,6 @@ class TestInitSpecResolverPartB:
         assert jnp.any(diffs > 1e-5)
 
     def test_grid_mode_pairwise_distances(self):
-        import jax.numpy as jnp
-
         root = RootSpec.model_validate(
             _species_dict(n_atoms=2, n_live=4, mode="grid")
         )
@@ -1077,13 +952,9 @@ class TestInitSpecResolverPartB:
         for wi in range(4):
             p = positions[wi]
             d = float(jnp.linalg.norm(p[0] - p[1]))
-            assert (
-                d >= grid_dist - 1e-4
-            ), f"Walker {wi}: pairwise dist {d} < {grid_dist}"
+            assert d >= grid_dist - 1e-4
 
     def test_uniform_mode_energies_below_ceiling(self):
-        import jax.numpy as jnp
-
         n_atoms = 2
         ceiling_per_atom = 1e6
         d = _species_dict(n_atoms=n_atoms, n_live=4, mode="uniform")
@@ -1095,41 +966,30 @@ class TestInitSpecResolverPartB:
         ceiling_total = ceiling_per_atom * n_atoms
         assert jnp.all(energies <= ceiling_total + 1e-3)
 
-    def test_random_initialise_pos_false_emits_warning(self, caplog):
-        import logging
-
+    def test_random_initialise_pos_false_identical_positions(self, caplog):
         d = _species_dict(n_atoms=2, n_live=4)
         d["init"]["random_initialise_pos"] = False
         root = RootSpec.model_validate(d)
         with caplog.at_level(logging.WARNING):
-            resolve(root)
+            resolved = resolve(root)
         assert any(
             "correlation" in rec.message.lower() for rec in caplog.records
         )
+        positions = np.asarray(resolved.init.initial_positions)
+        for wi in range(1, 4):
+            np.testing.assert_allclose(positions[wi], positions[0])
 
     def test_start_species_symbol_map_populated(self):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(start_species="14 8")
         result = _resolve_init(cfg, n_live=4, seed=0)
-        assert result.symbol_map is not None
-        assert isinstance(result.symbol_map, dict)
-
-    # -----------------------------------------------------------------
-    # Mode B: start_config_file
-    # -----------------------------------------------------------------
+        assert result.symbol_map == {0: "Si"}
 
     def _make_founder(self, tmp_path, symbols=("Si", "Si"), cell_size=6.0):
         """Write a minimal single-frame extxyz and return its path."""
-        import ase
-        import ase.io
-        import numpy as _np
-
-        pos = _np.zeros((len(symbols), 3), dtype=_np.float32)
+        pos = np.zeros((len(symbols), 3), dtype=np.float32)
         for i in range(len(symbols)):
             pos[i, 0] = i * (cell_size / (len(symbols) + 1))
-        cell = _np.eye(3) * cell_size
+        cell = np.eye(3) * cell_size
         atoms = ase.Atoms(
             symbols=list(symbols), positions=pos, cell=cell, pbc=True
         )
@@ -1138,10 +998,6 @@ class TestInitSpecResolverPartB:
         return p
 
     def test_mode_b_random_pos_true_positions_shape(self, tmp_path):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.cell import CellSpec
-        from jaxrens.cli.schema.init import InitSpec
-
         p = self._make_founder(tmp_path, symbols=["Si", "Si"], cell_size=6.0)
         cfg = InitSpec(
             start_config_file=p,
@@ -1160,14 +1016,6 @@ class TestInitSpecResolverPartB:
     def test_mode_b_random_pos_false_identical_positions(
         self, tmp_path, caplog
     ):
-        import logging
-
-        import numpy as np
-
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.cell import CellSpec
-        from jaxrens.cli.schema.init import InitSpec
-
         p = self._make_founder(tmp_path, symbols=["Si", "O"], cell_size=6.0)
         cfg = InitSpec(
             start_config_file=p,
@@ -1195,12 +1043,6 @@ class TestInitSpecResolverPartB:
     def test_mode_b_random_pos_false_warning_mentions_burn_in(
         self, tmp_path, caplog
     ):
-        import logging
-
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.cell import CellSpec
-        from jaxrens.cli.schema.init import InitSpec
-
         p = self._make_founder(tmp_path, symbols=["Si"], cell_size=5.0)
         cfg = InitSpec(
             start_config_file=p,
@@ -1217,12 +1059,6 @@ class TestInitSpecResolverPartB:
         assert any("burn-in" in r.message for r in caplog.records)
 
     def test_mode_b_random_cell_true_cells_diverge(self, tmp_path):
-        import numpy as np
-
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.cell import CellSpec
-        from jaxrens.cli.schema.init import InitSpec
-
         p = self._make_founder(tmp_path, symbols=["Si", "Si"], cell_size=8.0)
         cfg = InitSpec(
             start_config_file=p,
@@ -1241,12 +1077,6 @@ class TestInitSpecResolverPartB:
         assert not all_same
 
     def test_mode_b_random_cell_false_cells_identical(self, tmp_path):
-        import numpy as np
-
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.cell import CellSpec
-        from jaxrens.cli.schema.init import InitSpec
-
         p = self._make_founder(tmp_path, symbols=["Si", "Si"], cell_size=6.0)
         cfg = InitSpec(
             start_config_file=p,
@@ -1265,10 +1095,6 @@ class TestInitSpecResolverPartB:
             np.testing.assert_allclose(cells[0], cells[wi])
 
     def test_mode_b_symbol_map_from_file(self, tmp_path):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.cell import CellSpec
-        from jaxrens.cli.schema.init import InitSpec
-
         p = self._make_founder(tmp_path, symbols=["Si", "O"], cell_size=6.0)
         cfg = InitSpec(
             start_config_file=p,
@@ -1285,12 +1111,6 @@ class TestInitSpecResolverPartB:
         assert result.symbol_map == {0: "Si", 1: "O"}
 
     def test_mode_b_positions_are_finite(self, tmp_path):
-        import jax.numpy as jnp
-
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.cell import CellSpec
-        from jaxrens.cli.schema.init import InitSpec
-
         p = self._make_founder(tmp_path, symbols=["Si", "Si"], cell_size=6.0)
         cfg = InitSpec(
             start_config_file=p,
@@ -1307,16 +1127,6 @@ class TestInitSpecResolverPartB:
         assert jnp.all(jnp.isfinite(result.initial_positions))
 
     def test_mode_b_energies_computed_with_backend(self, tmp_path):
-        import jax.numpy as jnp
-
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import (
-            _finalise_initial_energies_and_counts,
-            _resolve_init,
-        )
-        from jaxrens.cli.schema.cell import CellSpec
-        from jaxrens.cli.schema.init import InitSpec
-
         p = self._make_founder(tmp_path, symbols=["Si"], cell_size=5.0)
         cfg = InitSpec(
             start_config_file=p,
@@ -1333,8 +1143,8 @@ class TestInitSpecResolverPartB:
         result = _resolve_init(
             cfg, n_live=3, seed=0, energy_backend=backend, cell_cfg=cell_cfg
         )
-        # _resolve_init now returns structural-init only; finalize is the
-        # caller's responsibility (mirrors _resolve_one).
+        # _resolve_init returns positions, types and cells only; the
+        # energies are computed by the caller.
         energies, _ = _finalise_initial_energies_and_counts(
             backend,
             result.initial_positions,
@@ -1346,14 +1156,307 @@ class TestInitSpecResolverPartB:
         assert jnp.all(jnp.isfinite(energies))
 
 
-# ---------------------------------------------------------------------------
-# Backend-aware species mapping
-#
-# Model-based backends (MACE, future NeuralIL) expose an ``atomic_numbers``
-# attribute defining the z-table the model was trained on. Species indices
-# must match that table; the default 0-based unique mapping gives wrong
-# one-hot encodings for multi-element systems.
-# ---------------------------------------------------------------------------
+def _write_si_o_frames(path: Path, n_frames: int) -> None:
+    """Write ``n_frames`` copies of a Si2O cell, Si listed first."""
+    atoms = ase.Atoms(
+        "Si2O",
+        positions=[[0.0, 0.0, 0.0], [2.0, 2.0, 2.0], [1.0, 3.0, 1.0]],
+        cell=[6.0, 6.0, 6.0],
+        pbc=True,
+    )
+    ase.io.write(str(path), [atoms.copy() for _ in range(n_frames)])
+
+
+class TestWalkerSetInit:
+    """Check _resolve_init with start_walker_set (mode C).
+
+    The walkers come from the file unchanged: random_initialise_pos and
+    random_initialise_cell only log a warning, and a walker cell outside
+    the CellSpec bounds raises.
+    """
+
+    def test_extxyz_shapes(self, tmp_path):
+        p = tmp_path / "walkers.extxyz"
+        _write_si_o_frames(p, 4)
+        cfg = InitSpec(start_walker_set=p)
+        result = _resolve_init(
+            cfg, n_live=4, seed=0, energy_backend=create_harmonic()
+        )
+        assert result.initial_positions.shape == (4, 3, 3)
+        assert result.initial_types.shape == (4, 3)
+        assert result.initial_cells.shape == (4, 3, 3)
+
+    def test_extxyz_symbol_map_without_z_table(self, tmp_path):
+        p = tmp_path / "walkers.extxyz"
+        _write_si_o_frames(p, 3)
+        cfg = InitSpec(start_walker_set=p)
+        result = _resolve_init(
+            cfg, n_live=3, seed=0, energy_backend=create_harmonic()
+        )
+        assert result.symbol_map == {0: "Si", 1: "O"}
+
+    def test_hdf5_positions_shape(self, tmp_path):
+        rng = np.random.default_rng(7)
+        p = tmp_path / "walkers.h5"
+        with h5py.File(p, "w") as f:
+            f["positions"] = rng.uniform(0.5, 5.5, (5, 2, 3)).astype(
+                np.float32
+            )
+            f["types"] = np.zeros((5, 2), dtype=np.int32)
+            f["cells"] = np.stack([np.eye(3) * 6.0] * 5).astype(np.float32)
+            f.attrs["symbol_map"] = json.dumps({"0": "Si"})
+        cfg = InitSpec(start_walker_set=p)
+        result = _resolve_init(
+            cfg,
+            n_live=5,
+            seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_PERMISSIVE_CELL,
+        )
+        assert result.initial_positions.shape == (5, 2, 3)
+
+    def test_random_initialise_pos_true_keeps_file_positions(
+        self, tmp_path, caplog
+    ):
+        p = tmp_path / "walkers.extxyz"
+        _write_si_o_frames(p, 3)
+        cfg = InitSpec(start_walker_set=p, random_initialise_pos=True)
+        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+            result = _resolve_init(
+                cfg, n_live=3, seed=0, energy_backend=create_harmonic()
+            )
+        assert any(
+            "ignoring random_initialise_pos/cell" in r.message
+            for r in caplog.records
+        )
+        ws = load_walker_set(p, n_live_expected=3)
+        np.testing.assert_allclose(
+            np.array(result.initial_positions),
+            np.array(ws.positions),
+            atol=1e-5,
+        )
+
+    def test_random_initialise_cell_true_keeps_file_cells(
+        self, tmp_path, caplog
+    ):
+        p = tmp_path / "walkers.extxyz"
+        _write_si_o_frames(p, 3)
+        cfg = InitSpec(start_walker_set=p, random_initialise_cell=True)
+        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+            result = _resolve_init(
+                cfg, n_live=3, seed=0, energy_backend=create_harmonic()
+            )
+        assert any(
+            "ignoring random_initialise_pos/cell" in r.message
+            for r in caplog.records
+        )
+        ws = load_walker_set(p, n_live_expected=3)
+        np.testing.assert_allclose(
+            np.array(result.initial_cells),
+            np.array(ws.cells),
+            atol=1e-5,
+        )
+
+    def test_cell_config_violation_raises(self, tmp_path):
+        """A 216 Å³ cell with one atom exceeds max_volume_per_atom = 1."""
+        atoms = ase.Atoms(
+            ["Si"],
+            positions=[[3.0, 3.0, 3.0]],
+            cell=np.eye(3) * 6.0,
+            pbc=True,
+        )
+        p = tmp_path / "toosmall.extxyz"
+        ase.io.write(str(p), [atoms], format="extxyz")
+        strict_cfg = CellSpec(
+            max_volume_per_atom=1.0,
+            min_volume_per_atom=0.0001,
+            min_aspect_ratio=0.001,
+        )
+        cfg = InitSpec(start_walker_set=p)
+        with pytest.raises(RuntimeError, match="invalid cell"):
+            _resolve_init(cfg, n_live=1, seed=0, cell_cfg=strict_cfg)
+
+
+def _write_restart_checkpoint(
+    tmp_path: Path, n_walkers: int = 4, n_atoms: int = 1, n_dead: int = 5
+) -> Path:
+    """Write a single-run NS checkpoint with ``n_dead`` dead points."""
+    rng = np.random.default_rng(0)
+    positions = rng.uniform(-2, 2, (n_walkers, n_atoms, 3)).astype(np.float32)
+    state = {
+        "positions": positions,
+        "types": np.zeros((n_walkers, n_atoms), dtype=np.int32),
+        "energies": rng.uniform(1, 10, n_walkers).astype(np.float32),
+        "cells": np.stack([np.eye(3, dtype=np.float32) * 6.0] * n_walkers),
+        "dead_energies": rng.uniform(10, 20, n_dead).astype(np.float32),
+        "dead_positions": rng.uniform(-2, 2, (n_dead, n_atoms, 3)).astype(
+            np.float32
+        ),
+        "dead_volumes": None,
+        "live_volumes": None,
+        "log_evidence": -7.3,
+        "iteration": n_dead,
+        "n_dead": n_dead,
+        "n_walkers": n_walkers,
+        "rng_key": jax.random.key(1),
+    }
+    p = tmp_path / "ns.checkpoint.h5"
+    save_checkpoint(p, state, symbol_map={0: "Si"})
+    return p
+
+
+def _write_batched_checkpoint(
+    tmp_path: Path, n_dead: tuple[int, ...], n_walkers: int = 4
+) -> tuple[Path, np.ndarray]:
+    """Write a (n_total,)-batched checkpoint with one atom per walker.
+
+    Returns the path and the saved positions, of shape
+    ``(n_total, n_walkers, 1, 3)``.
+    """
+    n_total = len(n_dead)
+    rng = np.random.default_rng(0)
+    positions = rng.uniform(-2, 2, (n_total, n_walkers, 1, 3)).astype(
+        np.float32
+    )
+    energies = rng.uniform(0, 5, (n_total, n_walkers)).astype(np.float32)
+    state = {
+        "positions": positions,
+        "types": np.zeros((n_total, n_walkers, 1), dtype=np.int32),
+        "energies": energies,
+        "cells": np.broadcast_to(
+            np.eye(3, dtype=np.float32) * 5.0, (n_total, n_walkers, 3, 3)
+        ).copy(),
+        "dead_volumes": None,
+        "live_volumes": None,
+        "log_evidence": np.full(n_total, -10.0),
+        "iteration": np.array(n_dead, dtype=np.int32),
+        "emax": energies.max(axis=-1),
+        "n_dead": np.array(n_dead, dtype=np.int32),
+        "n_walkers": n_walkers,
+        "rng_key": jax.random.split(jax.random.key(0), n_total),
+    }
+    p = tmp_path / "batched.checkpoint.h5"
+    save_checkpoint(p, state, symbol_map={0: "Si"})
+    return p, positions
+
+
+def _restart_root(restart_file: Path, pressures: list[float]) -> RootSpec:
+    return RootSpec.model_validate(
+        {
+            "run": {
+                "n_live": 4,
+                "max_iterations": 5,
+                "n_mcmc_steps": 2,
+                "seed": 0,
+            },
+            "moves": [{"type": "random_walk", "step_size": 0.3}],
+            "backend": {"type": "harmonic"},
+            "output": {
+                "format": "none",
+                "working_dir": ".",
+                "info_interval": 999,
+            },
+            "ensemble": {"type": "npt", "pressure": pressures},
+            "init": {"restart_file": str(restart_file)},
+            "cell": {
+                "max_volume_per_atom": 10000.0,
+                "min_volume_per_atom": 0.01,
+                "min_aspect_ratio": 0.001,
+            },
+        }
+    )
+
+
+class TestRestartInit:
+    """Check init from restart_file (mode D): the walkers and restart
+    state loaded for one or several replicas, and the errors when the
+    checkpoint does not match the replica count.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _single_device(self, monkeypatch):
+        monkeypatch.setattr(_r, "_local_device_count", lambda: 1)
+
+    def test_single_run_loads_walkers_and_restart_state(self, tmp_path):
+        p = _write_restart_checkpoint(tmp_path, n_dead=5)
+        cfg = InitSpec(restart_file=p)
+        result = _resolve_init(
+            cfg,
+            n_live=4,
+            seed=0,
+            energy_backend=create_harmonic(),
+            cell_cfg=_PERMISSIVE_CELL,
+        )
+        assert result.initial_positions.shape == (4, 1, 3)
+        assert isinstance(result.restart_state, RestartBundle)
+        assert result.restart_state.n_dead == 5
+        assert result.restart_state.iteration == 5
+        assert result.symbol_map == {0: "Si"}
+
+    def test_random_initialise_pos_true_warns(self, tmp_path, caplog):
+        p = _write_restart_checkpoint(tmp_path)
+        cfg = InitSpec(restart_file=p, random_initialise_pos=True)
+        with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+            _resolve_init(
+                cfg,
+                n_live=4,
+                seed=0,
+                energy_backend=create_harmonic(),
+                cell_cfg=_PERMISSIVE_CELL,
+            )
+        assert any("verbatim" in r.message for r in caplog.records)
+
+    def test_multi_replica_with_single_run_checkpoint_raises(self, tmp_path):
+        p = _write_restart_checkpoint(tmp_path)
+        root = _restart_root(p, [0.01, 0.02, 0.03])
+        with pytest.raises(
+            ValueError, match="scalar single-run checkpoint"
+        ) as exc_info:
+            resolve(root)
+        assert "n_total=3" in str(exc_info.value)
+
+    def test_multi_replica_loads_batched_checkpoint(self, tmp_path):
+        p, positions = _write_batched_checkpoint(tmp_path, n_dead=(3, 7))
+        resolved = resolve(_restart_root(p, [0.01, 0.02]))
+        np.testing.assert_allclose(
+            np.asarray(resolved.init.initial_positions), positions
+        )
+        bundles = resolved.init.restart_state
+        assert len(bundles) == 1
+        assert [b.n_dead for b in bundles[0]] == [3, 7]
+
+    def test_multi_replica_count_mismatch_raises(self, tmp_path):
+        p, _ = _write_batched_checkpoint(tmp_path, n_dead=(3, 7))
+        root = _restart_root(p, [0.01, 0.02, 0.03])
+        with pytest.raises(ValueError, match="checkpoint has n_total=2"):
+            resolve(root)
+
+
+@pytest.mark.multi_gpu
+def test_multi_replica_restart_retiles_single_gpu_checkpoint(tmp_path):
+    """Restart a checkpoint saved with n_gpu=1 on a host with 2 or 4 devices.
+
+    The 4 replicas are re-tiled as ``(n_gpu, 4 // n_gpu)``; replica order
+    must survive, so the restart bundles flatten back to the saved n_dead.
+    On one GPU, run it on CPU with
+    ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=2``.
+    """
+    n_gpu = len(jax.local_devices())
+    if n_gpu not in (2, 4):
+        pytest.fail(f"needs 2 or 4 local devices, got {n_gpu}")
+    n_per_gpu = 4 // n_gpu
+
+    n_dead = (3, 7, 5, 2)
+    p, positions = _write_batched_checkpoint(tmp_path, n_dead=n_dead)
+    resolved = resolve(_restart_root(p, [0.01, 0.02, 0.03, 0.04]))
+
+    assert resolved.batcher == PmapVmapRuns(n_gpu=n_gpu, n_per_gpu=n_per_gpu)
+    np.testing.assert_allclose(
+        np.asarray(resolved.init.initial_positions), positions
+    )
+    bundles = resolved.init.restart_state
+    assert [len(row) for row in bundles] == [n_per_gpu] * n_gpu
+    assert [b.n_dead for row in bundles for b in row] == list(n_dead)
 
 
 class _FakeZTableBackend:
@@ -1371,23 +1474,18 @@ class _FakeZTableBackend:
     def __call__(
         self, positions, species, cell, max_neighbors, ensemble_params=None
     ):
-        import jax.numpy as jnp
-
-        from jaxrens.backends.base import BackendResult
-
         return BackendResult(energy=jnp.float32(0.0))
 
 
 class TestBackendAwareSpeciesMapping:
-    """Resolver respects ``energy_backend.atomic_numbers`` when present."""
+    """Check that start_species maps onto ``atomic_numbers`` when the
+    backend has a z-table, and onto 0-based indices otherwise.
+
+    Model-based backends (MACE, NeuralIL) expect species indices in the
+    order of the z-table they were trained on.
+    """
 
     def test_no_atomic_numbers_keeps_zero_based_mapping(self):
-        import jax.numpy as jnp
-
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         cfg = InitSpec(
             start_species="8 3, 22 1, 38 1",
             random_initialise_pos=False,
@@ -1408,9 +1506,6 @@ class TestBackendAwareSpeciesMapping:
         assert result.symbol_map == {0: "O", 1: "Ti", 2: "Sr"}
 
     def test_backend_z_table_overrides_mapping(self):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         # Mimic mace_mp's 89-element z-table (Z=1..89).
         backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
         cfg = InitSpec(
@@ -1431,11 +1526,6 @@ class TestBackendAwareSpeciesMapping:
         assert result.symbol_map == {7: "O", 21: "Ti", 37: "Sr"}
 
     def test_missing_z_in_backend_table_raises(self):
-        import pytest
-
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         # Backend supports only a small subset (no Sr, Z=38).
         backend = _FakeZTableBackend(atomic_numbers=[1, 8, 22])
         cfg = InitSpec(
@@ -1447,10 +1537,6 @@ class TestBackendAwareSpeciesMapping:
             _resolve_init(cfg, n_live=2, seed=0, energy_backend=backend)
 
     def test_hamiltonian_passes_model_atomic_numbers_through(self):
-        from jaxrens.backends.ensemble import EnsembleBackend
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
         wrapped = EnsembleBackend(backend, pressure=0.1)
         assert wrapped.model.atomic_numbers == list(range(1, 90))
@@ -1471,31 +1557,15 @@ class TestBackendAwareSpeciesMapping:
         assert bool((result.initial_types == result.initial_types[0]).all())
 
 
-def _write_si_o_frames(path: Path, n_frames: int) -> None:
-    """Write ``n_frames`` copies of a Si2O cell, Si listed first."""
-    import ase.io
-    from ase import Atoms
-
-    atoms = Atoms(
-        "Si2O",
-        positions=[[0.0, 0.0, 0.0], [2.0, 2.0, 2.0], [1.0, 3.0, 1.0]],
-        cell=[6.0, 6.0, 6.0],
-        pbc=True,
-    )
-    ase.io.write(str(path), [atoms.copy() for _ in range(n_frames)])
-
-
 class TestBackendAwareSpeciesMappingFromFile:
-    """File-based init modes map species onto the backend z-table too.
+    """Check that file-based init modes map species onto the backend
+    z-table too.
 
     The loaders number species 0, 1, ... in order of first appearance; with
-    an 89-element z-table that turned Si into index 0 (= H).
+    an 89-element z-table that would turn Si into index 0 (= H).
     """
 
     def test_config_file_uses_backend_z_table(self, tmp_path):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         p = tmp_path / "founder.extxyz"
         _write_si_o_frames(p, 1)
         backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
@@ -1510,10 +1580,6 @@ class TestBackendAwareSpeciesMappingFromFile:
         assert result.symbol_map == {13: "Si", 7: "O"}
 
     def test_config_file_without_z_table_keeps_loader_indices(self, tmp_path):
-        from jaxrens.backends.toy import create_harmonic
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         p = tmp_path / "founder.extxyz"
         _write_si_o_frames(p, 1)
         cfg = InitSpec(
@@ -1528,9 +1594,6 @@ class TestBackendAwareSpeciesMappingFromFile:
         assert result.symbol_map == {0: "Si", 1: "O"}
 
     def test_config_file_missing_z_raises(self, tmp_path):
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         p = tmp_path / "founder.extxyz"
         _write_si_o_frames(p, 1)
         backend = _FakeZTableBackend(atomic_numbers=[1, 8])
@@ -1543,11 +1606,6 @@ class TestBackendAwareSpeciesMappingFromFile:
             _resolve_init(cfg, n_live=2, seed=0, energy_backend=backend)
 
     def test_walker_set_extxyz_uses_backend_z_table(self, tmp_path):
-        import jax.numpy as jnp
-
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         p = tmp_path / "walkers.extxyz"
         _write_si_o_frames(p, 3)
         backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
@@ -1562,15 +1620,6 @@ class TestBackendAwareSpeciesMappingFromFile:
         assert result.symbol_map == {13: "Si", 7: "O"}
 
     def test_walker_set_hdf5_uses_symbol_map(self, tmp_path):
-        import json
-
-        import h5py
-        import jax.numpy as jnp
-        import numpy as np
-
-        from jaxrens.cli.resolve import _resolve_init
-        from jaxrens.cli.schema.init import InitSpec
-
         p = tmp_path / "walkers.h5"
         with h5py.File(p, "w") as f:
             f["positions"] = np.zeros((2, 3, 3), dtype=np.float32)
@@ -1589,35 +1638,39 @@ class TestBackendAwareSpeciesMappingFromFile:
         assert bool((result.initial_types == jnp.array([13, 13, 7])).all())
         assert result.symbol_map == {13: "Si", 7: "O"}
 
+    def test_non_element_labels_raise(self, tmp_path):
+        p = tmp_path / "walkers.h5"
+        with h5py.File(p, "w") as f:
+            f["positions"] = np.zeros((2, 1, 3), dtype=np.float32)
+            f["types"] = np.zeros((2, 1), dtype=np.int32)
+            f["cells"] = np.broadcast_to(
+                np.eye(3, dtype=np.float32) * 6.0, (2, 3, 3)
+            )
+            f.attrs["symbol_map"] = json.dumps({"0": "A"})
+        backend = _FakeZTableBackend(atomic_numbers=list(range(1, 90)))
+        cfg = InitSpec(start_walker_set=p)
+        with pytest.raises(ValueError, match="not element symbols"):
+            _resolve_init(cfg, n_live=2, seed=0, energy_backend=backend)
+
 
 class _BucketRecordingBackend:
-    """Stub backend exposing ``max_neighbors_for`` and recording the
-    ``max_neighbors`` value passed into ``__call__``.
-
-    Used to verify that ``_finalise_initial_energies_and_counts`` honours
-    ``ladder`` / ``offset`` and dispatches the energy compile at the chosen
-    bucket size — the wiring change that ``_resolve_one`` now uses for the
-    single-run finalize seam.
+    """Stub backend with ``max_neighbors_for`` that records the
+    ``max_neighbors`` bucket each energy call is compiled at.
     """
+
+    r_cutoff = 5.0
 
     def __init__(self, per_walker_count: int):
         self._per_walker_count = int(per_walker_count)
         self.calls: list[int] = []
 
     def max_neighbors_for(self, positions, cell):
-        import jax.numpy as jnp
-
         return jnp.int32(self._per_walker_count)
 
     def __call__(
         self, positions, species, cell, max_neighbors, ensemble_params=None
     ):
-        import jax.numpy as jnp
-
         self.calls.append(int(max_neighbors))
-
-        from jaxrens.backends.base import BackendResult
-
         return BackendResult(
             energy=jnp.float32(0.0),
             max_neighbor_count=jnp.int32(int(max_neighbors)),
@@ -1626,23 +1679,16 @@ class _BucketRecordingBackend:
 
 
 class TestFinaliseInitialBucketChoice:
-    """``_finalise_initial_energies_and_counts`` bucket-choice paths.
+    """Check the neighbor bucket _finalise_initial_energies_and_counts
+    compiles the energy at.
 
-    When ``ladder`` is supplied, the helper must dispatch at
-    ``_choose_starting_bucket(counts, ladder, offset)``; when not, it
-    must fall back to ``int(jnp.max(counts))``.  The single-run path
-    in ``_resolve_one`` now passes ``ladder``/``offset`` (matching the
-    multi-run path); this test pins that the helper does the right thing
-    given those args.
+    With ``ladder`` it uses ``_choose_starting_bucket(counts, ladder,
+    offset)``, the same choice cli/run.py makes; without it, it falls back
+    to ``int(max(counts))``.
     """
 
     def _positions_types_cells(self, n_walkers: int = 3, n_atoms: int = 2):
-        import jax.numpy as jnp
-
         positions = jnp.zeros((n_walkers, n_atoms, 3), dtype=jnp.float32)
-        # types carries the per-walker leading axis (n_walkers, n_atoms) —
-        # the finalize seam vmaps it over the walker axis alongside
-        # positions / cells.
         types = jnp.zeros((n_walkers, n_atoms), dtype=jnp.int32)
         cells = jnp.broadcast_to(
             jnp.eye(3, dtype=jnp.float32) * 10.0, (n_walkers, 3, 3)
@@ -1650,12 +1696,6 @@ class TestFinaliseInitialBucketChoice:
         return positions, types, cells
 
     def test_ladder_and_offset_used_when_provided(self):
-        import jax.numpy as jnp
-
-        from jaxrens.cli.resolve import _finalise_initial_energies_and_counts
-        from jaxrens.sampling.batch_descriptor import SingleRun
-        from jaxrens.sampling.nested_sampling import _choose_starting_bucket
-
         per_walker = 27
         backend = _BucketRecordingBackend(per_walker_count=per_walker)
         positions, types, cells = self._positions_types_cells()
@@ -1682,15 +1722,12 @@ class TestFinaliseInitialBucketChoice:
         )
         # 27 + 4 = 31 → smallest ladder entry ≥ 31 is 32.
         assert expected_bucket == 32
-        # The energy call was dispatched at the ladder-chosen bucket,
-        # NOT at int(max(counts)) = 27.
-        assert backend.calls, "energy backend was never called"
+        # The energy call was compiled at the ladder bucket, not at
+        # int(max(counts)) = 27.
+        assert backend.calls
         assert all(c == expected_bucket for c in backend.calls)
 
     def test_no_ladder_falls_back_to_max_counts(self):
-        from jaxrens.cli.resolve import _finalise_initial_energies_and_counts
-        from jaxrens.sampling.batch_descriptor import SingleRun
-
         per_walker = 27
         backend = _BucketRecordingBackend(per_walker_count=per_walker)
         positions, types, cells = self._positions_types_cells()
@@ -1703,28 +1740,71 @@ class TestFinaliseInitialBucketChoice:
             batcher=SingleRun(),
         )
 
-        # Legacy fallback: bucket = int(jnp.max(counts)) = 27.
-        assert backend.calls, "energy backend was never called"
+        assert backend.calls
         assert all(c == per_walker for c in backend.calls)
 
-    def test_resolve_populates_neighbor_counts_via_new_seam(self):
-        """End-to-end: ``resolve`` runs the finalize seam after
-        ``_resolve_init``, so ``initial_max_neighbor_counts`` is no
-        longer ``None`` for ladder-aware backends.
+    def test_resolve_uses_backend_ladder(self, monkeypatch):
+        """resolve() stores the counts and compiles at the ladder bucket.
 
-        Uses a small species harmonic config (which doesn't expose
-        ``max_neighbors_for`` → counts will be ``None``), then a stubbed
-        ladder-aware backend via monkeypatch to prove the seam wires
-        through to the bucket-choice path.
+        27 neighbors + offset 5 = 32; the first entry of the default
+        ladder [30, 35, 40, 45, 50] that holds it is 35.
         """
-        from jaxrens.cli.resolve import resolve
-        from jaxrens.cli.schema import RootSpec
+        backend = _BucketRecordingBackend(per_walker_count=27)
+        monkeypatch.setattr(
+            HarmonicBackendSpec, "build_backend", lambda self: backend
+        )
+        resolved = resolve(
+            RootSpec.model_validate(_species_dict(n_atoms=2, n_live=4))
+        )
+        assert (
+            list(map(int, resolved.init.initial_max_neighbor_counts))
+            == [27] * 4
+        )
+        assert backend.calls == [35]
 
-        # Sanity: with a backend that lacks max_neighbors_for, the seam
-        # runs but counts stay None.  This exercises the new code path
-        # without any monkeypatching.
-        root = RootSpec.model_validate(_species_dict(n_atoms=2, n_live=4))
-        resolved = resolve(root)
-        assert resolved.init.initial_energies is not None
-        # Harmonic backend has no max_neighbors_for → counts stay None.
-        assert resolved.init.initial_max_neighbor_counts is None
+
+_ZERO_CELLS = np.zeros((3, 3, 3))
+_REAL_CELLS = np.broadcast_to(np.eye(3) * 5.0, (3, 3, 3))
+_REPLICA_CELLS = np.broadcast_to(np.eye(3) * 5.0, (2, 2, 3, 3)).copy()
+_REPLICA_CELLS[1, 0] = 0.0
+
+
+@pytest.mark.parametrize(
+    "params,cells,expected",
+    [
+        (({"pressure": 0.1},), _ZERO_CELLS, "3 of 3"),
+        (({"pressure": 0.1},), None, "have no cell"),
+        (({"pressure": 0.1},), _REAL_CELLS, None),
+        (({"pressure": 0.0},), _ZERO_CELLS, None),
+        (({},), _ZERO_CELLS, None),
+        (({"pressure": 0.0}, {"pressure": 0.1}), _REPLICA_CELLS, "1 of 4"),
+    ],
+    ids=[
+        "zero_cells",
+        "no_cells",
+        "real_cells",
+        "zero_pressure",
+        "nvt",
+        "one_zero_cell_of_two_replicas",
+    ],
+)
+def test_warn_if_pressure_without_volume(params, cells, expected, caplog):
+    """A nonzero pressure with missing or zero-volume cells logs a warning,
+    since P*V is 0 and the pressure has no effect. Real cells, P = 0 and
+    NVT log nothing.
+    """
+    resolved = SimpleNamespace(
+        ensemble_params_per_run=params,
+        init=SimpleNamespace(
+            initial_cells=None if cells is None else jnp.asarray(cells)
+        ),
+    )
+    with caplog.at_level(logging.WARNING, logger="jaxrens.cli.resolve"):
+        _warn_if_pressure_without_volume(resolved)
+
+    messages = [r.message for r in caplog.records]
+    if expected is None:
+        assert messages == []
+    else:
+        assert len(messages) == 1
+        assert expected in messages[0]

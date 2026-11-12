@@ -1,28 +1,29 @@
-"""End-to-end integration: tiny H NS through the nequix backend.
+"""End-to-end NPT nested sampling of H with the nequix backend.
 
-Mirrors :mod:`tests.integration.test_neuralil_pipeline` but for nequix.
-The point is to exercise the *nequix wiring* — backend build, ``.nqx``
-checkpoint load, the resolver's pre-NS energy eval, the bucketed
-``max_neighbors_list`` ladder, supercell edge finding, and a few MCMC
-steps with ``value_and_grad(nequix)`` — not to validate any scientific
-result.
-
-Skipped when:
-
-* ``nequix`` is not importable.
-
-Sized for the integration tier (seconds to a minute on GPU; longer on
-CPU but tractable).  Two-pressure multi-run + an 8-replica multi-GPU
-variant, mirroring the LJ / MACE / NeuralIL integration suites.
+The tests run a tiny config (8 atoms, ``n_live=4``, 5 iterations, two
+pressures) through ``resolve`` and ``run_multi_gpu_from_config`` with the
+``.nqx`` model in ``tests/_assets/models/nequix_small``. This covers the
+model load, the ``max_neighbors_list`` bucket ladder, the supercell edge
+search and ``value_and_grad`` of nequix in the galilean move. The results
+are not checked for physical accuracy. The tests skip when ``nequix`` is
+not installed.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import ase.io
 import numpy as np
 import pytest
 import yaml
+
+from jaxrens.cli.resolve import resolve
+from jaxrens.cli.run import run_multi_gpu_from_config
+from jaxrens.cli.schema import RootSpec
+from jaxrens.io.checkpoint import load_checkpoint
+from jaxrens.io.energy_log import EnergyLogger
+from jaxrens.sampling.batch_descriptor import PmapVmapRuns
 
 from . import multi_gpu_n_devices
 
@@ -79,7 +80,7 @@ adaptation:
     step_size_max: 0.3
 
 init:
-  start_species: "1 8"      # 8 H atoms (Z=1 → first slot of nequix's z-table)
+  start_species: "1 8"      # 8 H atoms; Z=1 is the first slot of the z-table
   random_initialise_pos: true
   pos_randomization_mode: grid
   grid_distance: 1.5
@@ -92,10 +93,9 @@ init:
     emax_offset_per_atom: 1.0
 
 cell:
-  # V/atom large enough that the cubic init cell axis stays well above
-  # ``2 * r_cutoff / min(supercell_trafo)`` (= 4 Å here at sc=(3,3,3)),
-  # so the supercell expansion captures all true neighbors throughout
-  # the run.
+  # The smallest allowed cell edge stays well above
+  # 2 * r_cutoff / min(supercell_trafo) = 4 Å, so the 3x3x3 supercell
+  # finds every neighbour during the run.
   max_volume_per_atom: 250.0
   min_volume_per_atom: 80.0
   min_aspect_ratio: 0.5
@@ -116,28 +116,11 @@ output:
 @pytest.mark.nequix
 @pytest.mark.heavy
 def test_nequix_full_pipeline(tmp_path: Path) -> None:
-    """Two-pressure nequix NS run.  Exercises:
+    """Run two pressure replicas, which go through the multi-GPU dispatcher.
 
-    * Resolver — config → ``ResolvedConfig`` (two-pressure path).
-    * Backend build — ``create_nequix`` loading the bundled ``.nqx`` model.
-    * Initial walker sampling + ``_finalise_initial_energies_and_counts``
-      (no-``max_neighbors_for`` path for nequix).
-    * Bucketed kernel dispatch — ``max_neighbors_list`` ladder.
-    * Symbol-map plumbing through the resolver via the backend's
-      ``atomic_numbers`` property.
-    * ``init_ns_multi_gpu`` building a ``(G, P, ...)`` NSState.
-    * Batched burn-in (1 walk, 2 MCMC steps).
-    * NS loop with galilean (``value_and_grad(nequix)``) + volume moves
-      under pmap-vmap dispatch (single device, ``n_gpu=1, n_per_gpu=2``).
-    * Streamed I/O — per-replica ``.energies`` / ``.traj.extxyz``, plus
-      global HDF5 checkpoints.
+    On one device the layout is ``(G, P) = (1, 2)``.
     """
     pytest.importorskip("nequix")
-
-    from jaxrens.cli.resolve import resolve
-    from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootSpec
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
 
     raw = yaml.safe_load(_CONFIG_YAML)
     raw["backend"]["checkpoint_path"] = str(_MODEL_NQX)
@@ -145,46 +128,38 @@ def test_nequix_full_pipeline(tmp_path: Path) -> None:
 
     root = RootSpec.model_validate(raw)
     resolved = resolve(root)
-    assert isinstance(
-        resolved.batcher, PmapVmapRuns
-    ), "Two-pressure config should route through the multi-GPU dispatcher."
+    assert isinstance(resolved.batcher, PmapVmapRuns)
 
-    run_multi_gpu_from_config(resolved)
+    result = run_multi_gpu_from_config(resolved)
+    assert np.all(np.asarray(result["n_dead"]) == 5)
 
     out = tmp_path / "out"
     n_total = resolved.ns.n_gpu * resolved.ns.n_per_gpu
-    assert n_total == 2, f"expected 2 replicas, got {n_total}"
-
-    from jaxrens.io.energy_log import EnergyLogger
+    assert n_total == 2
 
     for r in range(n_total):
         energies_path = out / f"nequix_smoke.run{r:02d}.energies"
         traj_path = out / f"nequix_smoke.run{r:02d}.traj.extxyz"
-        assert (
-            energies_path.exists()
-        ), f"missing per-replica energy log: {energies_path}"
-        assert (
-            traj_path.exists()
-        ), f"missing per-replica trajectory: {traj_path}"
+        assert energies_path.exists()
+        assert traj_path.exists()
         log = EnergyLogger.read(energies_path)
-        assert log.energies.shape == (5,), (
-            f"{energies_path.name}: expected 5 data entries, "
-            f"got {log.energies.shape}"
-        )
+        assert log.energies.shape == (5,)
+        # start_species "1 8" must reach the trajectory as 8 H atoms through
+        # the model's z-table.
+        frames = ase.io.read(traj_path, index=":")
+        assert [f.info["iter"] for f in frames] == [0, 1, 2, 3, 4]
+        assert all(f.get_chemical_symbols() == ["H"] * 8 for f in frames)
 
     final_ckpt = out / "nequix_smoke.final.checkpoint.h5"
-    assert final_ckpt.exists(), f"missing final checkpoint: {final_ckpt}"
-
-    from jaxrens.io.checkpoint import load_checkpoint
+    assert final_ckpt.exists()
 
     state = load_checkpoint(final_ckpt)
     log_z = np.asarray(state["log_evidence"])
-    assert log_z.shape == (resolved.ns.n_gpu, resolved.ns.n_per_gpu), (
-        f"expected (G, P)=({resolved.ns.n_gpu}, {resolved.ns.n_per_gpu}), "
-        f"got {log_z.shape}"
-    )
-    assert np.all(np.isfinite(log_z)), f"log_evidence not finite: {log_z}"
+    assert log_z.shape == (resolved.ns.n_gpu, resolved.ns.n_per_gpu)
+    assert np.all(np.isfinite(log_z))
+    np.testing.assert_array_equal(result["log_evidence"], log_z)
 
+    # (n_gpu, n_per_gpu, n_live, n_atoms, 3)
     saved_positions = np.asarray(state["positions"])
     assert saved_positions.shape == (
         resolved.ns.n_gpu,
@@ -193,12 +168,6 @@ def test_nequix_full_pipeline(tmp_path: Path) -> None:
         8,
         3,
     )
-
-
-# ---------------------------------------------------------------------------
-# Multi-GPU variant — pressure replicas distributed 2-per-device on
-# whatever JAX exposes (either 2 or 4 local devices).
-# ---------------------------------------------------------------------------
 
 
 _NEQUIX_MULTI_GPU_CONFIG_YAML = """
@@ -222,8 +191,8 @@ ensemble:
   pressure: [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75]
   pressure_units: gpa
 
-# RE every 2 iters → 2 swap rounds during the run, exercising the
-# cross-device gather + accept/reject path.
+# RE every 2 iterations gives 2 swap rounds in 5 iterations, across
+# devices.
 inter_re:
   flavor: pressure
   re_interval: 2
@@ -287,19 +256,12 @@ output:
 @pytest.mark.gpu
 @pytest.mark.heavy
 def test_nequix_multi_gpu_pipeline(tmp_path: Path) -> None:
-    """nequix NPT NS with pressure replicas distributed 2-per-GPU.
+    """Run two pressure replicas per GPU with pressure replica exchange.
 
-    Same code path as :func:`test_nequix_full_pipeline` but with multiple
-    real devices and an inner vmap of width 2, exercising the full
-    pmap(vmap(vmap)) hierarchy across cross-device pmap communication.
-    Runs on either 2 or 4 local devices.
+    This goes through the full ``pmap(vmap(vmap))`` hierarchy on 2 or 4
+    devices.
     """
     pytest.importorskip("nequix")
-
-    from jaxrens.cli.resolve import resolve
-    from jaxrens.cli.run import run_multi_gpu_from_config
-    from jaxrens.cli.schema import RootSpec
-    from jaxrens.sampling.batch_descriptor import PmapVmapRuns
 
     n_gpu = multi_gpu_n_devices()
     n_total = n_gpu * 2
@@ -315,13 +277,10 @@ def test_nequix_multi_gpu_pipeline(tmp_path: Path) -> None:
     assert resolved.ns.n_gpu == n_gpu
     assert resolved.ns.n_per_gpu == 2
 
-    run_multi_gpu_from_config(resolved)
+    result = run_multi_gpu_from_config(resolved)
+    assert np.all(np.asarray(result["n_dead"]) == 5)
 
     out = tmp_path / "out"
-    n_total = resolved.ns.n_gpu * resolved.ns.n_per_gpu
-
-    from jaxrens.io.energy_log import EnergyLogger
-
     for r in range(n_total):
         energies_path = out / f"nequix_mgpu.run{r:02d}.energies"
         traj_path = out / f"nequix_mgpu.run{r:02d}.traj.extxyz"
@@ -333,12 +292,11 @@ def test_nequix_multi_gpu_pipeline(tmp_path: Path) -> None:
     final_ckpt = out / "nequix_mgpu.final.checkpoint.h5"
     assert final_ckpt.exists()
 
-    from jaxrens.io.checkpoint import load_checkpoint
-
     state = load_checkpoint(final_ckpt)
     log_z = np.asarray(state["log_evidence"])
     assert log_z.shape == (n_gpu, 2)
     assert np.all(np.isfinite(log_z))
+    np.testing.assert_array_equal(result["log_evidence"], log_z)
 
     saved_positions = np.asarray(state["positions"])
     assert saved_positions.shape == (n_gpu, 2, 4, 8, 3)

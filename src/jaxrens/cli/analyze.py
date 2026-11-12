@@ -32,7 +32,11 @@ _CHECKPOINT_SUFFIXES = (".final.checkpoint.h5", ".checkpoint.h5")
 # name -> (Monitor method name, human title, data column header)
 _OBSERVABLES = {
     "heat_capacity": ("heat_capacity", "heat capacity", "Cv"),
-    "partition_function": ("partition_function", "log partition function", "log_Z"),
+    "partition_function": (
+        "partition_function",
+        "log partition function",
+        "log_Z",
+    ),
     "free_energy": ("free_energy", "free energy", "F"),
 }
 
@@ -70,7 +74,9 @@ def _default_output(
     return input_path.parent / f"{prefix}.{observable}.{suffix}"
 
 
-def _write_csv(path: Path, T: np.ndarray, column: str, values: np.ndarray) -> None:
+def _write_csv(
+    path: Path, T: np.ndarray, column: str, values: np.ndarray
+) -> None:
     """Fixed-width, right-aligned columns -- readable in a plain editor.
 
     Only defined for one scalar value per temperature; a non-scalar
@@ -178,7 +184,13 @@ def analyze_file(
     prefix = _prefix_from_checkpoint(input_path)
     method_name, title, column = _OBSERVABLES[observable]
 
-    monitor = Monitor.from_directory(input_path.parent, prefix=prefix)
+    # Load the checkpoint the caller named: from_directory picks the file by
+    # prefix, so tell it which of the two forms this is.
+    monitor = Monitor.from_directory(
+        input_path.parent,
+        prefix=prefix,
+        prefer_final=input_path.name.endswith(".final.checkpoint.h5"),
+    )
     T = np.linspace(t_min, t_max, n_t)
     values = np.asarray(getattr(monitor, method_name)(T, k_B=k_b))
 
@@ -191,8 +203,13 @@ def analyze_file(
         _write_csv(output_path, T, column, values)
     else:
         _write_json(
-            output_path, T, column, values,
-            observable=observable, prefix=prefix, k_b=k_b,
+            output_path,
+            T,
+            column,
+            values,
+            observable=observable,
+            prefix=prefix,
+            k_b=k_b,
         )
 
     if not plot:

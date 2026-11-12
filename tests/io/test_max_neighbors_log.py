@@ -1,17 +1,9 @@
-"""Tests for the per-iteration neighbor-bucket diagnostic log.
+"""Tests for MaxNeighborsLogger, the per-iteration neighbor-bucket log.
 
-Covers:
-- ``MaxNeighborsLogger`` round-trip (write → read produces identical arrays).
-- Auto-flush behaviour: deferring the file creation until first flush.
-- Shape coercion: 1D inputs broadcast to (1, n_walkers); per-run scalars
-  broadcast to (n_runs,).
-- ``MaxNeighborsCallback`` end-to-end against a SingleRun ``_run_loop``
-  invocation: the file appears at the expected path with the right shapes,
-  and the recorded bucket size + max-neighbor counts match what the loop
-  produced.
-- ``Monitor.from_directory`` loads the trace into ``max_neighbors_trace``.
-- ``plot_max_neighbors`` smoke test in both ``percentiles`` and ``heatmap``
-  kinds.
+Covers the .max_neighbors.h5 round-trip with single and multiple runs,
+the peak_per_iter and headroom helpers, MaxNeighborsCallback inside a
+SingleRun _run_loop, loading the trace in Monitor.from_directory, and
+plot_max_neighbors in its percentiles and heatmap kinds.
 """
 
 from __future__ import annotations
@@ -40,12 +32,11 @@ from jaxrens.sampling.nested_sampling import init_ns
 from jaxrens.sampling.run_loop import _run_loop
 from jaxrens.sampling.termination import IterationTermination
 
-# ---------------------------------------------------------------------------
-# Logger round-trip
-# ---------------------------------------------------------------------------
-
 
 class TestMaxNeighborsLogger:
+    """Check that counts, bucket sizes and overflow flags read back
+    unchanged, and the derived per-iteration helpers."""
+
     def test_round_trip_single_run(self, tmp_path: Path):
         log_path = tmp_path / "ns.max_neighbors.h5"
         logger = MaxNeighborsLogger(log_path, n_runs=1, n_walkers=4)
@@ -95,16 +86,44 @@ class TestMaxNeighborsLogger:
             bucket_size=np.array([45, 50, 50], dtype=np.int32),
             overflow=np.array([False, True, False], dtype=np.bool_),
         )
+        # 1D counts are accepted only with n_runs=1, and per-run arrays
+        # must have length n_runs. Both checks run before buffering.
+        with pytest.raises(ValueError, match="Expected counts of shape"):
+            logger.write_entry(1, counts[0], np.int32(50), np.bool_(False))
+        with pytest.raises(ValueError, match="Expected per-run array"):
+            logger.write_entry(1, counts, np.array([50, 50]), np.bool_(False))
         logger.close()
 
         loaded = MaxNeighborsLogger.read(log_path)
+        assert loaded.iterations.tolist() == [0]
         assert loaded.max_neighbor_count.shape == (1, n_runs, n_walkers)
         np.testing.assert_array_equal(loaded.max_neighbor_count[0], counts)
         np.testing.assert_array_equal(loaded.bucket_size[0], [45, 50, 50])
         np.testing.assert_array_equal(loaded.overflow[0], [False, True, False])
 
+    def test_batched_prefix_flattened(self, tmp_path: Path):
+        """PmapVmapRuns-shaped input, counts (G, P, K) and per-run (G, P),
+        is flattened to n_runs = G * P in row-major order."""
+        log_path = tmp_path / "ns.max_neighbors.h5"
+        logger = MaxNeighborsLogger(log_path, n_runs=4, n_walkers=3)
+        logger.write_entry(
+            iteration=0,
+            max_neighbor_count=np.arange(12).reshape(2, 2, 3),
+            bucket_size=np.array([[10, 20], [30, 40]]),
+            overflow=np.array([[False, True], [False, False]]),
+        )
+        logger.close()
+
+        loaded = MaxNeighborsLogger.read(log_path)
+        np.testing.assert_array_equal(
+            loaded.max_neighbor_count[0], np.arange(12).reshape(4, 3)
+        )
+        np.testing.assert_array_equal(loaded.bucket_size[0], [10, 20, 30, 40])
+        np.testing.assert_array_equal(
+            loaded.overflow[0], [False, True, False, False]
+        )
+
     def test_per_iter_helpers(self):
-        # Build a small in-memory log and verify the property accessors.
         log = MaxNeighborsLog(
             iterations=np.array([0, 1], dtype=np.int64),
             max_neighbor_count=np.array(
@@ -120,11 +139,6 @@ class TestMaxNeighborsLogger:
             log.peak_per_iter, np.array([[12], [20]])
         )
         np.testing.assert_array_equal(log.headroom, np.array([[18], [10]]))
-
-
-# ---------------------------------------------------------------------------
-# Callback end-to-end inside _run_loop
-# ---------------------------------------------------------------------------
 
 
 def _rw_descriptor(step_size: float = 0.3) -> MoveKernel:
@@ -161,10 +175,18 @@ def _build_ns_state(n_walkers: int = 4, n_atoms: int = 2):
 
 
 class TestMaxNeighborsCallback:
-    """End-to-end smoke test: ``_run_loop`` + MaxNeighborsCallback writes
-    the expected HDF5 file with sensible shapes."""
+    """Check that MaxNeighborsCallback inside _run_loop writes a
+    .max_neighbors.h5 file with one row per iteration."""
 
-    def test_writes_expected_shapes_single_run(self, tmp_path: Path):
+    @pytest.mark.parametrize(
+        "interval, expected_iters",
+        [(1, [0, 1, 2, 3, 4]), (2, [0, 2, 4])],
+    )
+    def test_writes_one_row_per_fired_iteration(
+        self, tmp_path: Path, interval, expected_iters
+    ):
+        """Five iterations (0-4); the callback writes those with
+        iteration % interval == 0."""
         ns_state, step_fn = _build_ns_state(n_walkers=4, n_atoms=2)
         log_path = tmp_path / "ns.max_neighbors.h5"
         mn_logger = MaxNeighborsLogger(
@@ -172,7 +194,7 @@ class TestMaxNeighborsCallback:
             n_runs=1,
             n_walkers=4,
         )
-        cb = MaxNeighborsCallback(mn_logger, interval=1)
+        cb = MaxNeighborsCallback(mn_logger, interval=interval)
 
         batcher = SingleRun()
         adapt_step = build_adapt_step(
@@ -203,75 +225,25 @@ class TestMaxNeighborsCallback:
         assert log_path.exists()
 
         loaded = MaxNeighborsLogger.read(log_path)
+        n_rows = len(expected_iters)
         assert loaded.n_runs == 1
         assert loaded.n_walkers == 4
-        # Schema: ``(n_entries, 1, 4)``; we ran 6 iterations (0..5) with
-        # interval=1, plus a possible iter-0 reset depending on cadence.
-        assert loaded.max_neighbor_count.ndim == 3
-        assert loaded.max_neighbor_count.shape[1:] == (1, 4)
-        assert loaded.bucket_size.shape == (loaded.iterations.shape[0], 1)
-        assert loaded.overflow.shape == loaded.bucket_size.shape
-        # The harmonic backend never overflows.
+        assert loaded.iterations.tolist() == expected_iters
+        assert loaded.max_neighbor_count.shape == (n_rows, 1, 4)
+        assert loaded.bucket_size.shape == (n_rows, 1)
+        # The harmonic backend has no neighbor list: counts and bucket are
+        # all 0 and nothing overflows.
+        assert not loaded.max_neighbor_count.any()
+        assert not loaded.bucket_size.any()
         assert not loaded.overflow.any()
 
 
-# ---------------------------------------------------------------------------
-# Postprocess loader + plotter
-# ---------------------------------------------------------------------------
-
-
-def _seed_dummy_run_dir(tmp_path: Path) -> Path:
-    """Drop in the minimal checkpoint + energies needed by Monitor.from_directory.
-
-    Mirrors the pattern in ``test_postprocess_monitor.py`` (passes a dict to
-    ``save_checkpoint`` rather than going through real ``run_ns``).
-    """
-    from jaxrens.io.checkpoint import save_checkpoint
-    from jaxrens.io.energy_log import EnergyLogger
-
-    n_live = 4
-    n_dead = 3
-    rng = np.random.default_rng(42)
-    dead_e = np.sort(rng.uniform(0.0, 5.0, n_dead))
-    live_e = rng.uniform(4.0, 6.0, n_live)
-    positions = rng.uniform(0.0, 1.0, (n_live, 2, 3))
-    dead_positions = rng.uniform(0.0, 1.0, (n_dead, 2, 3))
-
-    ns_state = {
-        "positions": jnp.asarray(positions),
-        "types": jnp.zeros(2, dtype=jnp.int32),
-        "energies": jnp.asarray(live_e),
-        "cells": None,
-        "dead_energies": jnp.asarray(
-            np.concatenate([dead_e, np.full(100, np.inf)])
-        ),
-        "dead_positions": jnp.asarray(
-            np.concatenate([dead_positions, np.zeros((100, 2, 3))], axis=0)
-        ),
-        "dead_volumes": None,
-        "live_volumes": None,
-        "log_evidence": 0.0,
-        "iteration": n_dead,
-        "n_dead": n_dead,
-        "n_walkers": n_live,
-    }
-    save_checkpoint(tmp_path / "ns.final.checkpoint.h5", ns_state)
-
-    en = EnergyLogger(tmp_path / "ns.energies", n_walkers=n_live, n_cull=1)
-    en.write_header()
-    for i, e in enumerate(dead_e):
-        en.write_entry(i, float(e))
-    en.close()
-    return tmp_path
-
-
+@pytest.mark.usefixtures("minimal_run_dir")
 class TestMonitorLoaderAndPlot:
-    """Verify Monitor.from_directory picks up max_neighbors_trace and the
-    plot_max_neighbors helper runs end-to-end in both display kinds."""
+    """Check that Monitor.from_directory loads max_neighbors_trace and that
+    plot_max_neighbors draws both kinds and rejects bad input."""
 
     def test_monitor_loads_trace_when_file_present(self, tmp_path: Path):
-        _seed_dummy_run_dir(tmp_path)
-        # Add a max_neighbors.h5 with two entries.
         mn = MaxNeighborsLogger(
             tmp_path / "ns.max_neighbors.h5",
             n_runs=1,
@@ -297,12 +269,10 @@ class TestMonitorLoaderAndPlot:
         assert monitor.max_neighbors_trace.n_walkers == 4
 
     def test_monitor_trace_is_none_when_file_absent(self, tmp_path: Path):
-        _seed_dummy_run_dir(tmp_path)
         monitor = Monitor.from_directory(tmp_path)
         assert monitor.max_neighbors_trace is None
 
     def test_plot_percentiles_smoke(self, tmp_path: Path):
-        _seed_dummy_run_dir(tmp_path)
         mn = MaxNeighborsLogger(
             tmp_path / "ns.max_neighbors.h5",
             n_runs=1,
@@ -326,12 +296,11 @@ class TestMonitorLoaderAndPlot:
             percentiles=(50, 95, 100),
             show_bucket=True,
         )
-        # Two percentile lines + bucket step = at least 3 lines on the axes.
-        assert len(ax.lines) >= 3
+        # Three percentile lines plus the bucket step.
+        assert len(ax.lines) == 4
         ax.figure.savefig(tmp_path / "smoke_percentiles.png")
 
     def test_plot_heatmap_smoke(self, tmp_path: Path):
-        _seed_dummy_run_dir(tmp_path)
         mn = MaxNeighborsLogger(
             tmp_path / "ns.max_neighbors.h5",
             n_runs=1,
@@ -350,12 +319,12 @@ class TestMonitorLoaderAndPlot:
         mn.close()
         monitor = Monitor.from_directory(tmp_path)
         ax = plot_max_neighbors(monitor, kind="heatmap", show_bucket=False)
-        # pcolormesh + nothing else.
-        assert len(ax.collections) >= 1
+        # One pcolormesh and no bucket line.
+        assert len(ax.collections) == 1
+        assert len(ax.lines) == 0
         ax.figure.savefig(tmp_path / "smoke_heatmap.png")
 
     def test_invalid_kind_raises(self, tmp_path: Path):
-        _seed_dummy_run_dir(tmp_path)
         mn = MaxNeighborsLogger(
             tmp_path / "ns.max_neighbors.h5",
             n_runs=1,
@@ -373,7 +342,6 @@ class TestMonitorLoaderAndPlot:
             plot_max_neighbors(monitor, kind="banana")
 
     def test_no_trace_raises_helpful_error(self, tmp_path: Path):
-        _seed_dummy_run_dir(tmp_path)
         monitor = Monitor.from_directory(tmp_path)
         with pytest.raises(ValueError, match="No max_neighbors_trace"):
             plot_max_neighbors(monitor)

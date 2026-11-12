@@ -2184,16 +2184,57 @@ def resolve(root: RootSpec) -> ResolvedConfig:
         # so ``ensemble_params_per_run`` always has length 1 in the
         # resolved config.
         ensemble_params = root.ensemble.to_ensemble_params(cohort_index=0)
-        return _resolve_single_replica(
+        resolved = _resolve_single_replica(
             root,
             ensemble_params=ensemble_params,
             shard_n_gpu=root.run.shard_n_gpu,
         )
+    else:
+        resolved = _resolve_multi_replica(
+            root,
+            n_total=n_total,
+            n_gpu=n_gpu,
+            n_per_gpu=n_per_gpu,
+            params_per_run=params_per_run,
+        )
 
-    return _resolve_multi_replica(
-        root,
-        n_total=n_total,
-        n_gpu=n_gpu,
-        n_per_gpu=n_per_gpu,
-        params_per_run=params_per_run,
+    _warn_if_pressure_without_volume(resolved)
+    return resolved
+
+
+def _warn_if_pressure_without_volume(resolved: ResolvedConfig) -> None:
+    """Warn if a nonzero pressure is set but an initial cell has no volume.
+
+    Non-periodic structures carry a zero cell (or none at all), so the
+    ``P * V`` term is 0. The pressure then has no effect on the energies or
+    on pressure replica exchange, and the run behaves like NVT.
+    """
+    has_pressure = any(
+        "pressure" in params
+        and bool(jnp.any(jnp.asarray(params["pressure"]) != 0))
+        for params in resolved.ensemble_params_per_run
+        if isinstance(params, dict)
     )
+    if not has_pressure:
+        return
+
+    cells = resolved.init.initial_cells
+    if cells is None:
+        logger.warning(
+            "A nonzero ensemble pressure is set but the initial walkers "
+            "have no cell. P*V is 0, so the pressure has no effect on the "
+            "energies or on replica exchange."
+        )
+        return
+
+    volumes = get_volume(jnp.asarray(cells).reshape(-1, 3, 3))
+    n_zero = int(jnp.sum(volumes < 1e-8))
+    if n_zero > 0:
+        logger.warning(
+            "A nonzero ensemble pressure is set but %d of %d initial cells "
+            "have zero volume (non-periodic structure?). P*V is 0 for "
+            "those walkers, so the pressure has no effect on their "
+            "energies or on replica exchange.",
+            n_zero,
+            int(volumes.shape[0]),
+        )

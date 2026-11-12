@@ -1,23 +1,22 @@
-"""Test energy backends: toy potentials, LJ, loader.
-
-Part of Step 2: backend protocol and implementations.
+"""Tests for the toy backends (harmonic, double well, Gaussian mixture), the
+Lennard-Jones backend and the ``load_backend`` entry point.
 """
 
 import jax
 import jax.numpy as jnp
 import pytest
 
-from jaxrens.backends.lj import create_lj
+from jaxrens.backends.lj import LJBackend, create_lj
 from jaxrens.backends.loader import load_backend
 from jaxrens.backends.toy import (
+    DoubleWellBackend,
+    GaussianMixtureBackend,
+    HarmonicBackend,
     create_double_well,
     create_gaussian_mixture,
     create_harmonic,
 )
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+from jaxrens.cli.schema.backend import HarmonicBackendSpec
 
 
 @pytest.fixture
@@ -30,17 +29,11 @@ def types_3():
     return jnp.array([0, 0, 1])
 
 
-@pytest.fixture
-def cell_5():
-    return 5.0 * jnp.eye(3)
-
-
-# ---------------------------------------------------------------------------
-# Toy backends
-# ---------------------------------------------------------------------------
-
-
 class TestHarmonic:
+    """Check the harmonic potential: energy at the origin and for a known
+    configuration, scaling with ``k``, and use under ``jit``, ``grad`` and
+    ``vmap``."""
+
     def test_energy_at_origin(self, types_3):
         backend = create_harmonic(k=1.0)
         pos = jnp.zeros((3, 3))
@@ -87,6 +80,9 @@ class TestHarmonic:
 
 
 class TestDoubleWell:
+    """Check the double-well potential: zero energy at the minima, the barrier
+    height at the origin, and use under ``jit``."""
+
     def test_minima_at_sqrt_b(self, types_3):
         backend = create_double_well(a=1.0, b=1.0)
         # Minimum at x = +-1, y=z=0
@@ -110,7 +106,11 @@ class TestDoubleWell:
 
 
 class TestGaussianMixture:
-    def test_energy_at_center(self, types_3):
+    """Check the Gaussian-mixture potential: the energy at a mode center is
+    the negative log density, two overlapping modes give a lower energy than
+    one, and the backend works under ``jit``."""
+
+    def test_energy_at_center(self):
         backend = create_gaussian_mixture(centers=[[0.0, 0.0, 0.0]], sigma=1.0)
         # Single atom at center of single Gaussian
         pos = jnp.zeros((1, 3))
@@ -125,7 +125,7 @@ class TestGaussianMixture:
         e = jax.jit(backend)(positions_3, types_3, jnp.zeros((3, 3)), 0)[0]
         assert e.shape == ()
 
-    def test_two_modes_lower_than_one(self, types_3):
+    def test_two_modes_lower_than_one(self):
         backend1 = create_gaussian_mixture(
             centers=[[0.0, 0.0, 0.0]], sigma=1.0
         )
@@ -140,12 +140,12 @@ class TestGaussianMixture:
         assert e2 < e1
 
 
-# ---------------------------------------------------------------------------
-# Lennard-Jones
-# ---------------------------------------------------------------------------
-
-
 class TestLJ:
+    """Check the Lennard-Jones backend: known pair energies (zero at
+    ``r = sigma``, ``-epsilon`` at the equilibrium distance), repulsion at
+    short range, minimum-image distances in a periodic cell, the cutoff, and
+    use under ``jit``, ``grad`` and ``vmap``."""
+
     def test_two_atoms_known_value(self):
         backend = create_lj(epsilon=1.0, sigma=1.0)
         # Two atoms at distance 1.0: E = 4*(1 - 1) = 0
@@ -188,15 +188,20 @@ class TestLJ:
         e = jax.jit(backend)(positions_3, types_3, jnp.zeros((3, 3)), 0)[0]
         assert e.shape == ()
 
-    def test_grad(self, positions_3, types_3):
-        backend = create_lj()
+    def test_grad(self):
+        backend = create_lj(epsilon=1.0, sigma=1.0)
+        pos = jnp.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        types = jnp.array([0, 0])
 
-        def energy_fn(pos):
-            return backend(pos, types_3, jnp.zeros((3, 3)), 0)[0]
+        def energy_fn(p):
+            return backend(p, types, jnp.zeros((3, 3)), 0)[0]
 
-        grad_fn = jax.grad(energy_fn)
-        forces = grad_fn(positions_3)
-        assert forces.shape == positions_3.shape
+        grad = jax.grad(energy_fn)(pos)
+        # dE/dr = 4*(-12/r**13 + 6/r**7) = -24 at r = 1, inside the repulsive
+        # range (r < 2**(1/6)): the energy falls as the atoms move apart, so
+        # the gradient is +24 on atom 0 (at the origin) and -24 on atom 1.
+        expected = jnp.array([[24.0, 0.0, 0.0], [-24.0, 0.0, 0.0]])
+        assert jnp.allclose(grad, expected, atol=1e-3)
 
     def test_vmap(self, positions_3, types_3):
         backend = create_lj()
@@ -219,51 +224,32 @@ class TestLJ:
         assert not jnp.allclose(e_no_cut, 0.0)
 
 
-# ---------------------------------------------------------------------------
-# Backend loader
-# ---------------------------------------------------------------------------
-
-
 class TestLoader:
-    def test_load_harmonic(self):
-        backend = load_backend("harmonic", k=2.0)
-        pos = jnp.zeros((3, 3))
-        types = jnp.array([0, 0, 0])
-        e = backend(pos, types, jnp.zeros((3, 3)), 0)[0]
-        assert jnp.allclose(e, 0.0)
+    """Check that ``load_backend`` builds the toy and LJ backends by name and
+    rejects an unknown name."""
 
-    def test_load_lj(self):
-        backend = load_backend("lj", epsilon=1.0, sigma=1.0)
-        assert backend is not None
-
-    def test_load_double_well(self):
-        backend = load_backend("double_well")
-        assert backend is not None
-
-    def test_load_gaussian_mixture(self):
-        backend = load_backend("gaussian_mixture")
-        assert backend is not None
+    @pytest.mark.parametrize(
+        "name,kwargs,expected_class",
+        [
+            ("harmonic", {"k": 2.0}, HarmonicBackend),
+            ("lj", {"epsilon": 1.0, "sigma": 1.0}, LJBackend),
+            ("double_well", {}, DoubleWellBackend),
+            ("gaussian_mixture", {}, GaussianMixtureBackend),
+        ],
+    )
+    def test_load_builds_the_named_backend(self, name, kwargs, expected_class):
+        assert isinstance(load_backend(name, **kwargs), expected_class)
 
     def test_load_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown backend"):
             load_backend("nonexistent_backend")
 
 
-# ---------------------------------------------------------------------------
-# Backend callable test (moved from test_schema.py::TestBuildBackend)
-# ---------------------------------------------------------------------------
-
-
-class TestHarmonicBackendCallable:
-    """Moved from test_schema.py::TestBuildBackend::test_harmonic_backend_callable."""
-
-    def test_harmonic_backend_callable(self):
-        from jaxrens.cli.schema.backend import HarmonicBackendSpec
-
-        spec = HarmonicBackendSpec(k=1.0)
-        backend = spec.build_backend()
-        positions = jnp.zeros((1, 3))
-        types = jnp.zeros((1,), dtype=jnp.int32)
-        cell = jnp.zeros((3, 3))
-        energy = backend(positions, types, cell, 0).energy
-        assert jnp.isfinite(energy)
+def test_harmonic_backend_callable():
+    spec = HarmonicBackendSpec(k=1.0)
+    backend = spec.build_backend()
+    positions = jnp.zeros((1, 3))
+    types = jnp.zeros((1,), dtype=jnp.int32)
+    cell = jnp.zeros((3, 3))
+    energy = backend(positions, types, cell, 0).energy
+    assert jnp.isfinite(energy)

@@ -1,36 +1,50 @@
-"""Tests for ``jaxrens.cli.plot`` and the ``jaxrens plot`` subcommand."""
+"""Tests for ``jaxrens.cli.plot``.
+
+They cover suffix dispatch, the default output path and the PNG written for
+each log kind. The ``jaxrens plot`` subcommand is tested in
+test_cli_subcommands.py.
+"""
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import h5py
 import matplotlib
+
+# Headless backend, set before anything imports pyplot.
 matplotlib.use("Agg")
 import numpy as np
 import pytest
+from matplotlib.image import imread
 
 from jaxrens.cli.plot import (
     _default_output,
+    _replica_label,
+    _replica_siblings,
     _suffix_kind,
     plot_file,
 )
-
-
-# ---------------------------------------------------------------------------
-# Suffix dispatch
-# ---------------------------------------------------------------------------
+from jaxrens.io.energy_log import EnergyLogger
+from jaxrens.io.max_neighbors_log import MaxNeighborsLogger
 
 
 class TestSuffixKind:
-    @pytest.mark.parametrize("name, expected", [
-        ("foo.adaptation.h5", "adaptation"),
-        ("run123.adaptation.h5", "adaptation"),
-        ("ns.re_stats.h5", "re_stats"),
-        ("sweep.re_stats.h5", "re_stats"),
-        ("any.energies", "energies"),
-        ("ns.run00.energies", "energies"),
-    ])
+    """Check that the file kind is read from the filename suffix."""
+
+    @pytest.mark.parametrize(
+        "name, expected",
+        [
+            ("foo.adaptation.h5", "adaptation"),
+            ("run123.adaptation.h5", "adaptation"),
+            ("ns.re_stats.h5", "re_stats"),
+            ("sweep.re_stats.h5", "re_stats"),
+            ("any.energies", "energies"),
+            ("ns.run00.energies", "energies"),
+            ("ns.max_neighbors.h5", "max_neighbors"),
+        ],
+    )
     def test_recognises(self, tmp_path, name, expected):
         assert _suffix_kind(tmp_path / name) == expected
 
@@ -40,6 +54,8 @@ class TestSuffixKind:
 
 
 class TestDefaultOutput:
+    """Check the default PNG path written next to the input file."""
+
     def test_strips_full_suffix(self, tmp_path):
         # The whole ``.adaptation.h5`` suffix is stripped, not just ``.h5``.
         out = _default_output(tmp_path / "myrun.adaptation.h5", "adaptation")
@@ -53,20 +69,46 @@ class TestDefaultOutput:
         out = _default_output(tmp_path / "ns.run00.energies", "energies")
         assert out.name == "ns.run00.energies.png"
 
+    def test_max_neighbors(self, tmp_path):
+        out = _default_output(
+            tmp_path / "ns.max_neighbors.h5", "max_neighbors"
+        )
+        assert out.name == "ns.max_neighbors.png"
 
-# ---------------------------------------------------------------------------
-# End-to-end: synthetic fixtures + plot_file
-# ---------------------------------------------------------------------------
+
+class TestReplicaSiblings:
+    """Check how one ``.runNN.energies`` file finds the other replicas."""
+
+    def test_siblings_in_numeric_order(self, tmp_path):
+        for name in ("ns.run1", "ns.run10", "ns.run2", "other.run0"):
+            (tmp_path / f"{name}.energies").touch()
+        siblings = _replica_siblings(tmp_path / "ns.run10.energies")
+        assert [p.name for p in siblings] == [
+            "ns.run1.energies",
+            "ns.run2.energies",
+            "ns.run10.energies",
+        ]
+
+    def test_single_run_log_is_alone(self, tmp_path):
+        path = tmp_path / "ns.energies"
+        path.touch()
+        assert _replica_siblings(path) == [path]
+
+    def test_replica_label(self):
+        assert _replica_label(Path("toy.run02.energies")) == "run02"
 
 
-def _write_adaptation_h5(path, n_entries=4, n_runs=2, n_moves=3,
-                         move_names=("a", "b", "c")):
+def _write_adaptation_h5(
+    path, n_entries=4, n_runs=2, n_moves=3, move_names=("a", "b", "c")
+):
     with h5py.File(path, "w") as f:
         f.attrs["adaptation_log_schema_version"] = 3
         f.attrs["n_moves"] = n_moves
         f.attrs["n_runs"] = n_runs
         f.attrs["move_names"] = json.dumps(list(move_names))
-        f.create_dataset("iterations", data=np.arange(n_entries, dtype=np.int64))
+        f.create_dataset(
+            "iterations", data=np.arange(n_entries, dtype=np.int64)
+        )
         f.create_dataset(
             "step_sizes",
             data=np.full((n_entries, n_runs, n_moves), 0.05, dtype=np.float32),
@@ -100,7 +142,9 @@ def _write_re_stats_h5(path, n_entries=3, n_pairs=2, flavor="pressure"):
     with h5py.File(path, "w") as f:
         f.attrs["n_pairs"] = n_pairs
         f.attrs["flavor"] = flavor
-        f.create_dataset("iterations", data=np.arange(n_entries, dtype=np.int64))
+        f.create_dataset(
+            "iterations", data=np.arange(n_entries, dtype=np.int64)
+        )
         f.create_dataset(
             "n_accepted_per_pair",
             data=np.full((n_entries, n_pairs), 3, dtype=np.int32),
@@ -111,11 +155,28 @@ def _write_re_stats_h5(path, n_entries=3, n_pairs=2, flavor="pressure"):
         )
 
 
-def _write_energies(path, n_entries=20, n_atoms=4, with_volume=True):
-    from jaxrens.io.energy_log import EnergyLogger
+def _write_max_neighbors_h5(path, n_entries=3, n_walkers=4):
+    logger = MaxNeighborsLogger(path, n_runs=1, n_walkers=n_walkers)
+    rng = np.random.default_rng(0)
+    for i in range(n_entries):
+        logger.write_entry(
+            iteration=i,
+            max_neighbor_count=rng.integers(
+                0, 40, size=n_walkers, dtype=np.int32
+            ),
+            bucket_size=np.int32(50),
+            overflow=np.bool_(False),
+        )
+    logger.close()
 
+
+def _write_energies(path, n_entries=20, n_atoms=4, with_volume=True):
     logger = EnergyLogger(
-        path=path, n_walkers=5, n_cull=1, n_dof=0, n_atoms=n_atoms,
+        path=path,
+        n_walkers=5,
+        n_cull=1,
+        n_dof=0,
+        n_atoms=n_atoms,
     )
     logger.write_header()
     rng = np.random.default_rng(0)
@@ -126,6 +187,8 @@ def _write_energies(path, n_entries=20, n_atoms=4, with_volume=True):
 
 
 class TestPlotFileEndToEnd:
+    """Check that ``plot_file`` writes a PNG for each kind of small log."""
+
     def test_adaptation_round_trip(self, tmp_path):
         in_path = tmp_path / "myrun.adaptation.h5"
         _write_adaptation_h5(in_path)
@@ -141,19 +204,33 @@ class TestPlotFileEndToEnd:
         assert out.exists()
         assert out.stat().st_size > 0
 
-    def test_energies_round_trip_npt(self, tmp_path):
-        in_path = tmp_path / "ns.run00.energies"
-        _write_energies(in_path, with_volume=True)
+    def test_max_neighbors_round_trip(self, tmp_path):
+        in_path = tmp_path / "ns.max_neighbors.h5"
+        _write_max_neighbors_h5(in_path)
         out = plot_file(in_path)
         assert out.exists()
         assert out.stat().st_size > 0
 
+    def test_energies_round_trip_npt(self, tmp_path):
+        """With volumes there are two panels: 2 * 4 in at 120 dpi = 960 px."""
+        in_path = tmp_path / "ns.run00.energies"
+        _write_energies(in_path, with_volume=True)
+        out = plot_file(in_path)
+        assert imread(out).shape[0] == 960
+
     def test_energies_round_trip_nvt(self, tmp_path):
-        """Volumes all-zero → only the energy panel is drawn."""
+        """All-zero volumes (NVT) give only the energy panel: 480 px high."""
         in_path = tmp_path / "ns.run00.energies"
         _write_energies(in_path, with_volume=False)
         out = plot_file(in_path)
+        assert imread(out).shape[0] == 480
+
+    def test_energies_multi_replica(self, tmp_path):
+        _write_energies(tmp_path / "ns.run00.energies")
+        _write_energies(tmp_path / "ns.run01.energies")
+        out = plot_file(tmp_path / "ns.run00.energies")
         assert out.exists()
+        assert out.stat().st_size > 0
 
     def test_explicit_output_path_honoured(self, tmp_path):
         in_path = tmp_path / "myrun.adaptation.h5"

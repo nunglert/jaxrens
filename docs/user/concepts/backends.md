@@ -30,8 +30,8 @@ potentials — exposes the same call signature:
 
 ```python
 result = backend(
-    positions,        # (A, 3)
-    species,          # (A,)   z-table indices
+    positions,        # (N, 3)
+    species,          # (N,)   z-table indices
     cell,             # (3, 3) lattice vectors as rows
     max_neighbors,    # int    MLIP-side buffer size
     ensemble_params,  # dict   {"pressure": ..., "chemical_potentials": ...} or None
