@@ -27,6 +27,14 @@ class MoveKernel:
             Weights are normalized to probabilities by the MWG factory.
         step_size: Per-move step size. Injected into MCState.step_size
             before calling the move's step_fn.
+        adjust_factor: Step-size factor of this move's adaptation (grow by
+            it, shrink by its inverse).  ``None`` uses the run-wide factor
+            passed to ``build_adapt_step``.
+        adaptive: Whether the step-size adaptation tunes ``step_size``.
+            False for moves whose acceptance is set by a discrete choice
+            (a jump on a grid) rather than by ``step_size``: there the step
+            size only scales a small noise, chasing an acceptance target
+            with it is pointless, so it stays at its configured value.
         extra_state_fields: Move-specific fields to add to MCState.
             Keys are field names, values are (type, initializer_fn) tuples.
             The initializer is called as
@@ -62,6 +70,8 @@ class MoveKernel:
     step_size_max: float = 10.0
     min_rate: float = 0.25
     max_rate: float = 0.65
+    adjust_factor: float | None = None
+    adaptive: bool = True
     extra_state_fields: dict[str, tuple[type, Callable]] = field(
         default_factory=dict
     )

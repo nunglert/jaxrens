@@ -189,6 +189,14 @@ class BaseMoveSpec(BaseModel):
         """
         return frozenset({"positions"})
 
+    def _adaptive(self) -> bool:
+        """Whether the step-size adaptation tunes this move's ``step_size``.
+
+        Moves whose acceptance is set by a discrete jump, not by
+        ``step_size``, override this to return False.
+        """
+        return True
+
     def to_descriptor(
         self,
         *,
@@ -220,6 +228,7 @@ class BaseMoveSpec(BaseModel):
             ),
             weight=self.weight,
             step_size=self.step_size,
+            adaptive=self._adaptive(),
             extra_state_fields=self._extra_state_fields(),
             reject_reasons=self._reject_reasons(),
             mutates=self._mutates(),
@@ -1083,7 +1092,8 @@ class GalleryHopMoveSpec(LayeredMoveSpec):
     another gallery (keeping its offset from the gallery centre) and/or by a
     host lattice vector in the plane, plus Gaussian noise of ``step_size``.
     Lets intercalants change gallery without crossing a sheet, which local
-    moves cannot do.
+    moves cannot do.  The jump sets the acceptance, so ``step_size`` is not
+    adapted: the noise keeps its configured width.
 
     ::
 
@@ -1145,6 +1155,9 @@ class GalleryHopMoveSpec(LayeredMoveSpec):
         # gallery.
         return frozenset({"energy", "prior"})
 
+    def _adaptive(self) -> bool:
+        return False
+
 
 class LayerSlideMoveSpec(LayeredMoveSpec):
     """Rigid in-plane translation of one sheet, or of one gallery's atoms.
@@ -1160,8 +1173,9 @@ class LayerSlideMoveSpec(LayeredMoveSpec):
     uniform on the grid without ``(0, 0)`` and ``k = subdivisions``, plus
     in-plane Gaussian noise of ``step_size``.  ``k = 1`` gives host lattice
     vectors (intercalant hollow to hollow); ``k = 3`` adds the third-cell
-    shifts between AA, AB and AC stacking.  ``k = 0`` drops the jump: a
-    continuous Gaussian slide of ``step_size``, adapted like a local move,
+    shifts between AA, AB and AC stacking.  With a jump the acceptance is set
+    by the jump, so ``step_size`` is not adapted.  ``k = 0`` drops the jump:
+    a continuous Gaussian slide of ``step_size``, adapted like a local move,
     that lets a sheet settle near its current registry.  Continuous moves are
     auto-named ``layer_slide_<symbols>_continuous``.
 
@@ -1249,6 +1263,9 @@ class LayerSlideMoveSpec(LayeredMoveSpec):
         # "prior": the chosen gallery holds no atom of the species.
         return frozenset({"energy", "prior"})
 
+    def _adaptive(self) -> bool:
+        return self.subdivisions == 0
+
 
 class StackingShiftMoveSpec(LayeredMoveSpec):
     """Change the stacking registry across one gallery by tilting c.
@@ -1264,9 +1281,10 @@ class StackingShiftMoveSpec(LayeredMoveSpec):
     ``{-1, 0, 1}^2`` without ``(0, 0)``, ``k = subdivisions``, plus in-plane
     noise of ``step_size``.  ``k = 1`` changes the in-plane offset of the
     intercalants between galleries (alpha-alpha / alpha-beta); ``k = 3``
-    changes the sheet stacking (AA / AB / AC).  ``k = 0`` drops the jump: a
-    continuous Gaussian tilt of ``step_size``, adapted like a local move,
-    auto-named ``stacking_shift_continuous``.
+    changes the sheet stacking (AA / AB / AC).  With a jump the acceptance is
+    set by the jump, so ``step_size`` is not adapted.  ``k = 0`` drops the
+    jump: a continuous Gaussian tilt of ``step_size``, adapted like a local
+    move, auto-named ``stacking_shift_continuous``.
 
     Requires ``cell.restrict_c_in_plane: true``: otherwise the equivalent
     cells ``c + p a + q b`` weigh the registries unequally in the prior.
@@ -1337,6 +1355,9 @@ class StackingShiftMoveSpec(LayeredMoveSpec):
 
     def _mutates(self) -> frozenset[str]:
         return frozenset({"positions", "cell"})
+
+    def _adaptive(self) -> bool:
+        return self.subdivisions == 0
 
 
 # ---------------------------------------------------------------------------

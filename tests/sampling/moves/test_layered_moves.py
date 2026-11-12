@@ -461,6 +461,8 @@ class TestGalleryHopWiring:
         }
         assert set(desc.extra_state_fields) == {"sheet_id"}
         assert desc.reject_reasons == {"energy", "prior"}
+        # the jump sets the acceptance: the noise width is never adapted
+        assert desc.adaptive is False
 
     def test_sheet_size_must_match_repeats(self):
         spec = GalleryHopMoveSpec(species="Li", in_plane_repeats=(2, 3))
@@ -919,6 +921,7 @@ class TestLayerSlideSpec:
         )
         assert desc.kernel_kwargs["subdivisions"] == 0
         assert desc.kernel_kwargs["slide_host"] is True
+        assert desc.adaptive is True
 
     def test_descriptor(self):
         desc = LayerSlideMoveSpec(species="C", subdivisions=3).to_descriptor(
@@ -933,6 +936,7 @@ class TestLayerSlideSpec:
             "in_plane_repeats": (3, 3),
         }
         assert set(desc.extra_state_fields) == {"sheet_id"}
+        assert desc.adaptive is False
         assert desc.reject_reasons == {"energy", "prior"}
 
     def test_gallery_hop_rejects_sheet_species(self):
@@ -1290,13 +1294,17 @@ class TestStackingShiftContinuous:
 
         spec = StackingShiftMoveSpec(subdivisions=0)
         assert spec._effective_name() == "stacking_shift_continuous"
-        desc = spec.to_descriptor(
+        kwargs = dict(
             n_atoms=39,
             cell_cfg=CellSpec(restrict_c_in_plane=True, min_aspect_ratio=0.5),
             symbol_map={0: "C", 1: "Li"},
             sheets=SheetInfo(2, 18),
         )
+        desc = spec.to_descriptor(**kwargs)
         assert desc.kernel_kwargs["subdivisions"] == 0
+        assert desc.adaptive is True
+        jump = StackingShiftMoveSpec(subdivisions=3).to_descriptor(**kwargs)
+        assert jump.adaptive is False
         with pytest.raises(pydantic.ValidationError):
             StackingShiftMoveSpec(subdivisions=-1)
 

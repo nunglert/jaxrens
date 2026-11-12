@@ -10,6 +10,8 @@ Covers:
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -22,7 +24,6 @@ from jaxrens.sampling.move_kernel import MoveKernel
 from jaxrens.sampling.moves import random_walk
 from jaxrens.sampling.mwg import build_mwg
 from jaxrens.sampling.nested_sampling import init_ns, init_ns_parallel, ns_step
-
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -294,3 +295,88 @@ class TestVmapRuns:
             np.asarray(jax.random.key_data(run_keys_in)),
             np.asarray(jax.random.key_data(run_keys_out)),
         )
+
+
+# ---------------------------------------------------------------------------
+# Moves with adaptive=False are left alone
+# ---------------------------------------------------------------------------
+
+
+class TestNotAdaptedMoves:
+    """``rw_2`` is marked non-adaptive; ``rw_1`` is adapted as usual."""
+
+    def _build(self, harmonic_setup, batcher, adaptive=(True, False)):
+        descriptors = [
+            dataclasses.replace(d, adaptive=a)
+            for d, a in zip(harmonic_setup["descriptors"], adaptive)
+        ]
+        return build_adapt_step(
+            move_descriptors=descriptors,
+            per_move_fns=harmonic_setup["per_move_fns"],
+            batcher=batcher,
+            adjust_n_samples=20,
+            adjust_factor=1.5,
+            adjust_max_rounds=8,
+            adjust_interval=50,
+        )
+
+    def test_all_moves_not_adaptive_is_inactive(self, harmonic_setup):
+        adapt = self._build(harmonic_setup, SingleRun(), (False, False))
+        assert adapt is None
+
+    def test_single_run(self, harmonic_setup):
+        adapt = self._build(harmonic_setup, SingleRun())
+        ns_state = harmonic_setup["ns_state"]
+        emax = jnp.max(ns_state.population.energy)
+        new_state, diag, _ = adapt(ns_state, emax, jax.random.key(30))
+        np.testing.assert_array_equal(
+            new_state.population.step_sizes[:, 1],
+            ns_state.population.step_sizes[:, 1],
+        )
+        assert np.isnan(float(diag["rate"][1]))
+        assert bool(diag["converged"][1])
+        assert int(diag["n_rounds"][1]) == 0
+        assert int(diag["trial_n_evaluations"][1]) == 0
+        assert np.all(np.asarray(diag["counts"][1]) == 0)
+        # the adaptive move still runs its trials
+        assert np.isfinite(float(diag["rate"][0]))
+        assert int(diag["n_rounds"][0]) >= 1
+
+    def test_vmap_runs(self, harmonic_setup):
+        n_runs = harmonic_setup["n_runs"]
+        adapt = self._build(harmonic_setup, VmapRuns(n_runs=n_runs))
+        ns_states = harmonic_setup["ns_states_batched"]
+        emax = jnp.max(ns_states.population.energy, axis=1)
+        keys = jax.random.split(jax.random.key(31), n_runs)
+        new_states, diag, _ = adapt(ns_states, emax, keys)
+        np.testing.assert_array_equal(
+            new_states.population.step_sizes[..., 1],
+            ns_states.population.step_sizes[..., 1],
+        )
+        assert diag["rate"].shape == (n_runs, 2)
+        assert np.all(np.isnan(np.asarray(diag["rate"][:, 1])))
+        assert np.all(np.isfinite(np.asarray(diag["rate"][:, 0])))
+
+    def test_per_move_adjust_factor(self, harmonic_setup, monkeypatch):
+        """Each move's builder gets its own factor, else the run-wide one."""
+        import jaxrens.sampling.adaptation.manager as manager
+
+        seen = {}
+        real = manager._build_per_move
+
+        def spy(desc, fn, batcher, n_samp, afac, *rest):
+            seen[desc.name] = afac
+            return real(desc, fn, batcher, n_samp, afac, *rest)
+
+        monkeypatch.setattr(manager, "_build_per_move", spy)
+        d1, d2 = harmonic_setup["descriptors"]
+        build_adapt_step(
+            move_descriptors=[d1, dataclasses.replace(d2, adjust_factor=2.0)],
+            per_move_fns=harmonic_setup["per_move_fns"],
+            batcher=SingleRun(),
+            adjust_n_samples=20,
+            adjust_factor=1.5,
+            adjust_max_rounds=8,
+            adjust_interval=50,
+        )
+        assert seen == {"rw_1": 1.5, "rw_2": 2.0}

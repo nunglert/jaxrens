@@ -30,7 +30,7 @@ adaptation:
   defaults:
     min_rate: 0.3
   per_move:
-    galilean:
+    gmc:  # type: galilean is an alias of gmc
       min_rate: 0.4
 
 ensemble:
