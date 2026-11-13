@@ -13,15 +13,44 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
+from scipy.special import logsumexp
 
-from jaxrens.postprocess.thermodynamics import calc_log_weights
-from jaxrens.postprocess.thermodynamics import expectation as _expectation
+from jaxrens.postprocess.thermodynamics import (
+    class_probability,
+    conditional_mean,
+)
 from jaxrens.postprocess.thermodynamics import free_energy as _free_energy
 from jaxrens.postprocess.thermodynamics import heat_capacity as _heat_capacity
-from jaxrens.postprocess.thermodynamics import log_evidence as _log_evidence
+from jaxrens.postprocess.thermodynamics import log_point_weights
 from jaxrens.postprocess.thermodynamics import (
     partition_function as _partition_function,
 )
+from jaxrens.postprocess.thermodynamics import (
+    thermal_weights,
+    weighted_covariance,
+    weighted_mean,
+    weighted_variance,
+)
+
+
+def _optional_array(x, dtype) -> np.ndarray | None:
+    return None if x is None else np.asarray(x, dtype=dtype)
+
+
+def per_walker(x, shape: tuple[int, ...]) -> np.ndarray | None:
+    """``x`` broadcast to ``shape``, or None if it is missing or does not fit.
+
+    Checkpoints may store the types (and cells) once for all walkers instead
+    of once per walker.  The live configurations are auxiliary data, so an
+    array that cannot be read per walker leaves them unset rather than
+    failing the load.
+    """
+    if x is None:
+        return None
+    try:
+        return np.broadcast_to(np.asarray(x), shape)
+    except ValueError:
+        return None
 
 
 class Monitor:
@@ -44,6 +73,14 @@ class Monitor:
         live_energies: Live-walker energies at run end, shape (n_live_actual,).
         live_volumes: Live-walker cell volumes for NPT, shape
             (n_live_actual,), or None.
+        live_positions: Live-walker positions at run end, shape
+            (n_live_actual, n_atoms, 3), or None.
+        live_cells: Live-walker cells (rows are lattice vectors), shape
+            (n_live_actual, 3, 3), or None for a non-periodic run.
+        live_types: Live-walker type codes, shape (n_live_actual, n_atoms),
+            or None.  With ``symbol_map`` and the positions and cells, the
+            live walkers can be turned into structures, so per-point
+            observables cover them exactly.
         log_evidence: Scalar log Z stored in the checkpoint.
         iteration: Iteration number at checkpoint.
         n_live: Number of live walkers used in the run.
@@ -126,6 +163,13 @@ class Monitor:
         live_volumes = None
         if state.get("live_volumes") is not None:
             live_volumes = np.asarray(state["live_volumes"], dtype=np.float64)
+
+        # Live-walker configurations.  Types and cells may be stored once
+        # for all walkers; broadcast them to one per walker.
+        live_positions = np.asarray(state["positions"], dtype=np.float64)
+        n_walkers_live, n_atoms = live_positions.shape[:2]
+        live_types = per_walker(state["types"], (n_walkers_live, n_atoms))
+        live_cells = per_walker(state.get("cells"), (n_walkers_live, 3, 3))
 
         energies_path = path / f"{prefix}.energies"
         # Pre-load the energies log when present — used for both the dead-
@@ -216,6 +260,9 @@ class Monitor:
             adaptation_trace=adaptation_trace,
             re_trace=re_trace,
             max_neighbors_trace=max_neighbors_trace,
+            live_positions=live_positions,
+            live_cells=live_cells,
+            live_types=live_types,
             label=label,
             path=path,
         )
@@ -243,6 +290,9 @@ class Monitor:
         adaptation_trace=None,
         re_trace=None,
         max_neighbors_trace=None,
+        live_positions: np.ndarray | None = None,
+        live_cells: np.ndarray | None = None,
+        live_types: np.ndarray | None = None,
         label: str = "",
         path: Path | None = None,
     ) -> None:
@@ -279,6 +329,9 @@ class Monitor:
         self.re_trace = re_trace
         # max_neighbors_trace is a MaxNeighborsLog dataclass or None
         self.max_neighbors_trace = max_neighbors_trace
+        self.live_positions = _optional_array(live_positions, np.float64)
+        self.live_cells = _optional_array(live_cells, np.float64)
+        self.live_types = _optional_array(live_types, np.int64)
         self.label = label
         self.path = Path(path) if path is not None else None
 
@@ -296,13 +349,46 @@ class Monitor:
         """True if volume information is present (NPT ensemble)."""
         return self.dead_volumes is not None
 
+    @property
+    def n_points(self) -> int:
+        """Number of points the thermal averages run over: dead + live."""
+        return self.n_dead + int(self.live_energies.shape[0])
+
+    @property
+    def point_energies(self) -> np.ndarray:
+        """Energies of the dead points followed by the live walkers,
+        shape ``(n_points,)``; enthalpies ``H = U + P V`` in NPT."""
+        arrs = self._arrays()
+        return np.concatenate([arrs["dead_e"], arrs["live_e"]])
+
+    @property
+    def point_volumes(self) -> np.ndarray | None:
+        """Cell volumes of the dead points followed by the live walkers,
+        shape ``(n_points,)``, or None when the run has no volumes (NVT)
+        or the live volumes are missing."""
+        if self.dead_volumes is None or self.live_volumes is None:
+            return None
+        return np.concatenate([self.dead_volumes, self.live_volumes])
+
     # ------------------------------------------------------------------
     # Observable methods — thin wrappers over thermodynamics.py
     # ------------------------------------------------------------------
+    #
+    # Every method takes the temperature ``T`` as a scalar or a 1-D array
+    # and computes the thermal weights once for the whole grid.  A scalar
+    # ``T`` gives a 0-d result (``(k,)`` for a vector observable), an array
+    # a leading ``n_T`` axis.  Per-point observables have one value per
+    # point, dead points first then live walkers: shape ``(n_points,)`` or
+    # ``(n_points, k)``.  Values for the dead points only, ``(n_dead,)`` or
+    # ``(n_dead, k)``, are averaged over the dead points alone: their
+    # weights are renormalised and the live walkers are left out.
+    # :meth:`live_weight` tells how much weight that leaves out.
 
     def _beta(self, T: np.ndarray | float, k_B: float = 1.0) -> np.ndarray:
         """Convert temperature to inverse temperature array."""
         T = np.asarray(T, dtype=np.float64)
+        if T.ndim > 1:
+            raise ValueError(f"T must be a scalar or 1-D, got shape {T.shape}")
         return 1.0 / (k_B * T)
 
     def _arrays(self):
@@ -318,55 +404,150 @@ class Monitor:
             }
         return self._cached_np
 
-    def _map_over_beta(self, scalar_fn, betas, **fn_kwargs):
-        """Apply ``scalar_fn(beta, ...)`` over a 1-D ``betas`` array.
+    def _per_point(self, values, name: str, dtype=np.float64):
+        """Per-point values and whether they include the live walkers.
 
-        Plain Python loop — the thermodynamics kernels are NumPy / fp64 so
-        the JIT-vmap indirection that previously lived here is gone.  ``betas``
-        is typically O(100) entries; the per-call cost is dominated by the
-        O(n_dead) reductions, not by the loop overhead.
+        Returns ``(values, with_live)``: ``with_live`` is True for
+        ``(n_points,)`` / ``(n_points, k)`` values and False for values on
+        the dead points only, ``(n_dead,)`` / ``(n_dead, k)``.
         """
-        return np.array([scalar_fn(b, **fn_kwargs) for b in betas])
+        values = np.asarray(values, dtype=dtype)
+        if values.ndim in (1, 2):
+            if values.shape[0] == self.n_points:
+                return values, True
+            if values.shape[0] == self.n_dead:
+                return values, False
+        raise ValueError(
+            f"{name} must have shape (n_points,) or (n_points, k) with "
+            f"n_points={self.n_points} (dead + live), or (n_dead,) / "
+            f"(n_dead, k) with n_dead={self.n_dead}; got {values.shape}"
+        )
+
+    def _dead_weights(self, T: np.ndarray | float, k_B: float) -> np.ndarray:
+        """Thermal weights of the dead points alone, renormalised to one.
+
+        Computed in log space, so they stay finite where the live walkers
+        carry nearly all the weight.
+        """
+        beta = self._beta(T, k_B)
+        dead_e = self._arrays()["dead_e"]
+        log_w = log_point_weights(self.n_dead, self.n_live, self.n_cull)[
+            : self.n_dead
+        ]
+        if beta.ndim == 0:
+            log_t = log_w - beta * dead_e
+        else:
+            log_t = log_w - beta[:, None] * dead_e
+        return np.exp(log_t - logsumexp(log_t, axis=-1, keepdims=True))
+
+    def _weights_for(self, T, k_B, *items):
+        """Weights and values on a common set of points.
+
+        ``items`` are ``(values, with_live)`` pairs from :meth:`_per_point`.
+        If all of them include the live walkers, every point is used;
+        otherwise only the dead points, with renormalised weights.
+        """
+        if all(with_live for _, with_live in items):
+            return self.weights(T, k_B), [v for v, _ in items]
+        w = self._dead_weights(T, k_B)
+        return w, [v[: self.n_dead] for v, _ in items]
+
+    def weights(self, T: np.ndarray | float, k_B: float = 1.0) -> np.ndarray:
+        """Normalised thermal weights of the dead points then live walkers.
+
+        Shape ``(n_points,)`` for a scalar ``T`` and ``(n_T, n_points)``
+        for an array.  ``weights(T) @ obs`` is ``<O>(T)``; compute it once
+        to evaluate many observables on the same grid with the estimators
+        of :mod:`jaxrens.postprocess.thermodynamics`.
+        """
+        arrs = self._arrays()
+        return thermal_weights(
+            self._beta(T, k_B),
+            arrs["dead_e"],
+            arrs["live_e"],
+            n_live=self.n_live,
+            n_cull=self.n_cull,
+        )
+
+    def live_weight(
+        self, T: np.ndarray | float, k_B: float = 1.0
+    ) -> np.ndarray:
+        """Total thermal weight of the live walkers, ``Σ_live w_i(T)``.
+
+        The share of every average that an observable given on the dead
+        points only leaves out.  Close to 0 at high ``T``; it grows towards
+        1 near and below the temperature the run ended at.
+        """
+        return self.weights(T, k_B)[..., self.n_dead :].sum(axis=-1)[()]
+
+    def partition_function(
+        self, T: np.ndarray | float, k_B: float = 1.0
+    ) -> np.ndarray:
+        """Log partition function ``log Z(T)``, relative to the prior."""
+        arrs = self._arrays()
+        return _partition_function(
+            self._beta(T, k_B),
+            arrs["dead_e"],
+            arrs["live_e"],
+            n_live=self.n_live,
+            n_cull=self.n_cull,
+        )[()]
 
     def log_Z(self, T: np.ndarray | float) -> np.ndarray:
-        """Compute log partition function at each temperature."""
-        T = np.asarray(T, dtype=np.float64)
-        scalar = T.ndim == 0
-        betas = 1.0 / np.atleast_1d(T)
-        arrs = self._arrays()
+        """``log Z(T)`` in reduced units (``k_B = 1``); see
+        :meth:`partition_function`."""
+        return self.partition_function(T, k_B=1.0)
 
-        def scalar_fn(beta):
-            return _partition_function(
-                beta,
-                arrs["dead_e"],
-                arrs["live_e"],
-                n_live=self.n_live,
-                n_cull=self.n_cull,
-            )
-
-        results = self._map_over_beta(scalar_fn, betas)
-        return results[0] if scalar else results
+    def free_energy(
+        self, T: np.ndarray | float, k_B: float = 1.0
+    ) -> np.ndarray:
+        """Free energy ``F = -k_B T log Z`` (Gibbs ``G`` in NPT), up to the
+        prior normalisation, a term proportional to ``T``."""
+        beta = self._beta(T, k_B)
+        return _free_energy(beta, self.partition_function(T, k_B))[()]
 
     def heat_capacity(
         self, T: np.ndarray | float, k_B: float = 1.0
     ) -> np.ndarray:
-        """Compute heat capacity C_v at each temperature."""
-        T = np.asarray(T, dtype=np.float64)
-        scalar = T.ndim == 0
-        betas = self._beta(np.atleast_1d(T), k_B)
+        """Heat capacity in units of ``k_B``, ``beta^2 Var(E)``; ``C_P`` in
+        NPT."""
         arrs = self._arrays()
+        return _heat_capacity(
+            self._beta(T, k_B),
+            arrs["dead_e"],
+            arrs["live_e"],
+            n_live=self.n_live,
+            n_cull=self.n_cull,
+        )[()]
 
-        def scalar_fn(beta):
-            return _heat_capacity(
-                beta,
-                arrs["dead_e"],
-                arrs["live_e"],
-                n_live=self.n_live,
-                n_cull=self.n_cull,
-            )
+    def mean_energy(
+        self, T: np.ndarray | float, k_B: float = 1.0
+    ) -> np.ndarray:
+        """Mean energy ``<E>(T)``; the mean enthalpy ``<H>`` in NPT."""
+        return weighted_mean(self.weights(T, k_B), self.point_energies)[()]
 
-        results = self._map_over_beta(scalar_fn, betas)
-        return results[0] if scalar else results
+    def entropy(self, T: np.ndarray | float, k_B: float = 1.0) -> np.ndarray:
+        """Entropy ``S = (<E> - F) / T = k_B (beta <E> + log Z)``.
+
+        Known up to an additive constant: ``log Z`` is relative to the
+        prior, whose normalisation is not included.  Differences in ``T``
+        (and in ``P`` within one run) are exact; comparing systems needs
+        the absolute normalisation.
+        """
+        beta = self._beta(T, k_B)
+        w, log_Z = self._weights_and_log_Z(beta)
+        return (k_B * (beta * (w @ self.point_energies) + log_Z))[()]
+
+    def _weights_and_log_Z(self, beta: np.ndarray):
+        arrs = self._arrays()
+        return thermal_weights(
+            beta,
+            arrs["dead_e"],
+            arrs["live_e"],
+            n_live=self.n_live,
+            n_cull=self.n_cull,
+            return_log_Z=True,
+        )
 
     def expectation(
         self,
@@ -374,90 +555,109 @@ class Monitor:
         T: np.ndarray | float,
         k_B: float = 1.0,
     ) -> np.ndarray:
-        """Compute thermal expectation <O>(T) for a per-dead-point observable.
+        """Thermal expectation ``<O>(T)``.
 
         Args:
-            observable: Per-dead-point values, shape ``(n_dead,)``.
-            T: Temperature(s), scalar or array.
+            observable: Per-point values, ``(n_points,)`` or
+                ``(n_points, k)``, dead points then live walkers.  Values
+                on the dead points only, ``(n_dead,)`` or ``(n_dead, k)``,
+                are averaged over the dead points alone (see
+                :meth:`live_weight` for the weight left out).
+            T: Temperature(s), scalar or 1-D.
             k_B: Boltzmann constant in the same energy units as the stored
                 ``dead_energies``.  Defaults to ``1.0``; pass e.g.
                 ``8.617e-5`` (eV/K) when ``T`` is in Kelvin and the energies
                 are in eV.
         """
-        observable = np.asarray(observable, dtype=np.float64)
-        if observable.shape != (self.n_dead,):
-            raise ValueError(
-                f"observable must have shape (n_dead,)=({self.n_dead},), "
-                f"got {observable.shape}"
-            )
-
-        T = np.asarray(T, dtype=np.float64)
-        scalar = T.ndim == 0
-        betas = self._beta(np.atleast_1d(T), k_B)
-        arrs = self._arrays()
-
-        live_obs = np.full(
-            self.live_energies.shape[0],
-            float(np.mean(observable)),
-            dtype=np.float64,
+        w, (obs,) = self._weights_for(
+            T, k_B, self._per_point(observable, "observable")
         )
-        obs_full = np.concatenate([observable, live_obs])
+        return weighted_mean(w, obs)[()]
 
-        def scalar_fn(beta):
-            return _expectation(
-                obs_full,
-                beta,
-                arrs["dead_e"],
-                arrs["live_e"],
-                n_live=self.n_live,
-                n_cull=self.n_cull,
-            )
-
-        results = self._map_over_beta(scalar_fn, betas)
-        return results[0] if scalar else results
-
-    def free_energy(
-        self, T: np.ndarray | float, k_B: float = 1.0
+    def variance(
+        self,
+        observable: np.ndarray,
+        T: np.ndarray | float,
+        k_B: float = 1.0,
     ) -> np.ndarray:
-        """Compute Helmholtz free energy F = -log Z / beta at each temperature."""
-        T = np.asarray(T, dtype=np.float64)
-        scalar = T.ndim == 0
-        betas = self._beta(np.atleast_1d(T), k_B)
-        arrs = self._arrays()
+        """Thermal variance ``Var(O)(T)``; same arguments as
+        :meth:`expectation`."""
+        w, (obs,) = self._weights_for(
+            T, k_B, self._per_point(observable, "observable")
+        )
+        return weighted_variance(w, obs)[()]
 
-        def scalar_fn(beta):
-            logZ = _partition_function(
-                beta,
-                arrs["dead_e"],
-                arrs["live_e"],
-                n_live=self.n_live,
-                n_cull=self.n_cull,
-            )
-            return _free_energy(beta, logZ)
-
-        results = self._map_over_beta(scalar_fn, betas)
-        return results[0] if scalar else results
-
-    def partition_function(
-        self, T: np.ndarray | float, k_B: float = 1.0
+    def covariance(
+        self,
+        a: np.ndarray,
+        b: np.ndarray,
+        T: np.ndarray | float,
+        k_B: float = 1.0,
     ) -> np.ndarray:
-        """Compute log Z(T) at each temperature."""
-        T = np.asarray(T, dtype=np.float64)
-        scalar = T.ndim == 0
-        betas = self._beta(np.atleast_1d(T), k_B)
-        arrs = self._arrays()
+        """Thermal covariance ``Cov(A, B)(T)``.
 
-        def scalar_fn(beta):
-            return _partition_function(
-                beta,
-                arrs["dead_e"],
-                arrs["live_e"],
-                n_live=self.n_live,
-                n_cull=self.n_cull,
-            )
+        ``a`` and ``b`` are per-point values as in :meth:`expectation`; a
+        scalar against a vector observable gives one covariance per
+        component.  If either is given on the dead points only, both are
+        taken on the dead points.  In NPT, ``-d<A>/dP = beta Cov(A, V)`` (pass
+        :attr:`point_volumes` as ``b``) and
+        ``d<A>/dT = Cov(A, H) / (k_B T^2)`` (pass :attr:`point_energies`).
+        """
+        w, (a, b) = self._weights_for(
+            T, k_B, self._per_point(a, "a"), self._per_point(b, "b")
+        )
+        return weighted_covariance(w, a, b)[()]
 
-        results = self._map_over_beta(scalar_fn, betas)
-        return results[0] if scalar else results
+    def class_probability(
+        self,
+        mask: np.ndarray,
+        T: np.ndarray | float,
+        k_B: float = 1.0,
+    ) -> np.ndarray:
+        """Thermal probability of a class of points, ``<1_C>(T)``.
+
+        Args:
+            mask: Class membership, boolean ``(n_points,)`` or
+                ``(n_points, k)`` for ``k`` classes, dead points then live
+                walkers; or on the dead points only, as in
+                :meth:`expectation`.
+            T: Temperature(s), scalar or 1-D.
+            k_B: Boltzmann constant.
+        """
+        w, (mask,) = self._weights_for(
+            T, k_B, self._per_point(mask, "mask", dtype=bool)
+        )
+        return class_probability(w, mask)[()]
+
+    def conditional_expectation(
+        self,
+        observable: np.ndarray,
+        T: np.ndarray | float,
+        k_B: float = 1.0,
+        *,
+        mask: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Thermal average within a class, ``<O 1_C> / <1_C>``.
+
+        Points where the observable is NaN are left out, so it also
+        averages an observable that is undefined on some points.  NaN where
+        the class has zero weight.
+
+        Args:
+            observable: Per-point values as in :meth:`expectation`, NaN for
+                undefined.
+            T: Temperature(s), scalar or 1-D.
+            k_B: Boltzmann constant.
+            mask: Class membership as in :meth:`class_probability`; None
+                keeps every point.  If the observable or the mask is given
+                on the dead points only, both are taken on the dead points.
+        """
+        items = [self._per_point(observable, "observable")]
+        if mask is not None:
+            items.append(self._per_point(mask, "mask", dtype=bool))
+        w, values = self._weights_for(T, k_B, *items)
+        mask = values[1] if mask is not None else None
+        return conditional_mean(w, values[0], mask)[()]
 
     def __repr__(self) -> str:
         return (

@@ -42,6 +42,10 @@ from jaxrens.postprocess.thermodynamics import (
 from jaxrens.postprocess.thermodynamics import (
     partition_function as thermo_partition_function,
 )
+from jaxrens.postprocess.thermodynamics import (
+    weighted_covariance,
+    weighted_variance,
+)
 
 
 def _make_monitor(
@@ -75,6 +79,219 @@ def _make_monitor(
         energy_trace=energy_trace,
         iteration_trace=iteration_trace,
     )
+
+
+def _harmonic_monitor(n_dead: int = 3000, n_live: int = 100) -> Monitor:
+    """Monitor for E = |x|^2 / 2 in 3D with dead points at their expected
+    prior mass, in NS order (descending energy)."""
+    x_dead = (n_live / (n_live + 1.0)) ** np.arange(1, n_dead + 1)
+    x_live = x_dead[-1] * (np.arange(n_live) + 0.5) / n_live
+    return Monitor(
+        dead_energies=50.0 * x_dead ** (2.0 / 3.0),
+        dead_volumes=None,
+        live_energies=50.0 * x_live ** (2.0 / 3.0),
+        live_volumes=None,
+        log_evidence=0.0,
+        iteration=n_dead,
+        n_live=n_live,
+    )
+
+
+class TestMonitorEstimators:
+    """Check the per-point estimators of Monitor on a harmonic run."""
+
+    T = np.array([0.5, 1.0, 2.0])
+
+    @pytest.fixture
+    def m(self):
+        return _harmonic_monitor(n_dead=2000, n_live=100)
+
+    def test_weights(self, m):
+        assert m.weights(1.0).shape == (m.n_points,)
+        w = m.weights(self.T)
+        assert w.shape == (3, m.n_points)
+        np.testing.assert_allclose(w.sum(axis=1), 1.0)
+
+    def test_live_values_are_used(self, m):
+        """A full (n_points,) observable is averaged with its own live
+        values, not with the dead-point mean."""
+        obs = np.zeros(m.n_points)
+        obs[m.n_dead :] = 1.0
+        w = m.weights(self.T)
+        np.testing.assert_allclose(
+            m.expectation(obs, self.T), w[:, m.n_dead :].sum(axis=1)
+        )
+        # Far below the last dead energy (~1e-4) the live walkers carry
+        # most of the weight.
+        assert m.expectation(obs, 1e-8) > 0.5
+
+    def test_vector_observable_shapes(self, m):
+        vec = np.stack([m.point_energies, m.point_energies**2], axis=1)
+        assert m.expectation(vec, self.T).shape == (3, 2)
+        assert m.expectation(vec, 1.0).shape == (2,)
+        assert m.variance(vec, self.T).shape == (3, 2)
+
+    def test_mean_energy_and_heat_capacity(self, m):
+        """<E> = 3 T / 2 and C = 3 / 2 for the 3D harmonic potential."""
+        np.testing.assert_allclose(
+            m.mean_energy(self.T), 1.5 * self.T, rtol=1e-3
+        )
+        np.testing.assert_allclose(
+            self.T**-2 * m.variance(m.point_energies, self.T),
+            m.heat_capacity(self.T),
+            rtol=1e-12,
+        )
+
+    def test_covariance_is_temperature_derivative(self, m):
+        """d<A>/dT = Cov(A, E) / T^2 (k_B = 1), checked by central finite
+        difference for A = sin(E)."""
+        a = np.sin(m.point_energies)
+        T, dT = 1.0, 1e-3
+        fd = (m.expectation(a, T + dT) - m.expectation(a, T - dT)) / (2 * dT)
+        cov = m.covariance(a, m.point_energies, T) / T**2
+        assert float(fd) == pytest.approx(float(cov), rel=1e-5)
+
+    def test_entropy(self, m):
+        """S = (<E> - F) / T, and dS/dT = C / T."""
+        np.testing.assert_allclose(
+            m.entropy(self.T),
+            (m.mean_energy(self.T) - m.free_energy(self.T)) / self.T,
+            rtol=1e-12,
+        )
+        T, dT = 1.0, 1e-3
+        dS = (m.entropy(T + dT) - m.entropy(T - dT)) / (2 * dT)
+        assert float(dS) == pytest.approx(
+            float(m.heat_capacity(T)) / T, rel=1e-5
+        )
+
+    def test_entropy_k_b(self, m):
+        """S scales with k_B at fixed beta."""
+        np.testing.assert_allclose(
+            m.entropy(self.T / 2.0, k_B=2.0),
+            2.0 * m.entropy(self.T),
+            rtol=1e-12,
+        )
+
+    def test_class_averages(self, m):
+        low = m.point_energies < np.median(m.point_energies)
+        e = m.point_energies
+        p_low = m.class_probability(low, self.T)
+        np.testing.assert_allclose(
+            p_low + m.class_probability(~low, self.T), 1.0
+        )
+        np.testing.assert_allclose(
+            m.conditional_expectation(e, self.T, mask=low),
+            m.expectation(e * low, self.T) / p_low,
+            rtol=1e-12,
+        )
+        with_nan = np.where(low, e, np.nan)
+        np.testing.assert_allclose(
+            m.conditional_expectation(with_nan, self.T),
+            m.conditional_expectation(e, self.T, mask=low),
+            rtol=1e-12,
+        )
+
+    def test_wrong_mask_length_raises(self, m):
+        with pytest.raises(ValueError, match="n_points"):
+            m.class_probability(np.ones(m.n_dead + 1, dtype=bool), 1.0)
+
+
+class TestDeadOnlyObservables:
+    """Values given on the dead points only are averaged over the dead
+    points alone, with renormalised weights; the live walkers are left
+    out, and live_weight tells how much weight that is."""
+
+    T = np.array([0.5, 1.0, 2.0])
+
+    @pytest.fixture
+    def m(self):
+        return _harmonic_monitor(n_dead=2000, n_live=100)
+
+    @staticmethod
+    def _dead_w(m, T):
+        w = m.weights(T)[..., : m.n_dead]
+        return w / w.sum(axis=-1, keepdims=True)
+
+    def test_expectation_over_dead_points(self, m):
+        obs = np.sin(m.dead_energies)
+        np.testing.assert_allclose(
+            m.expectation(obs, self.T),
+            self._dead_w(m, self.T) @ obs,
+            rtol=1e-10,
+        )
+
+    def test_no_warning(self, m):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            m.expectation(m.dead_energies, self.T)
+
+    def test_vector_and_variance(self, m):
+        vec = np.stack([m.dead_energies, m.dead_energies**2], axis=1)
+        w = self._dead_w(m, self.T)
+        np.testing.assert_allclose(
+            m.expectation(vec, self.T), w @ vec, rtol=1e-10
+        )
+        np.testing.assert_allclose(
+            m.variance(m.dead_energies, self.T),
+            [weighted_variance(w[i], m.dead_energies) for i in range(3)],
+            rtol=1e-10,
+        )
+
+    def test_mixed_covariance_uses_dead_points(self, m):
+        """A full and a dead-only observable meet on the dead points."""
+        full = np.cos(m.point_energies)
+        dead = m.dead_energies
+        w = self._dead_w(m, self.T)
+        ref = [
+            weighted_covariance(w[i], full[: m.n_dead], dead) for i in range(3)
+        ]
+        np.testing.assert_allclose(
+            m.covariance(full, dead, self.T), ref, rtol=1e-10
+        )
+
+    def test_dead_only_mask(self, m):
+        low = m.dead_energies < np.median(m.dead_energies)
+        w = self._dead_w(m, self.T)
+        np.testing.assert_allclose(
+            m.class_probability(low, self.T), w @ low, rtol=1e-10
+        )
+        # A full observable with a dead-only mask: both on the dead points.
+        np.testing.assert_allclose(
+            m.conditional_expectation(m.point_energies, self.T, mask=low),
+            (w @ (m.dead_energies * low)) / (w @ low),
+            rtol=1e-10,
+        )
+
+    def test_finite_where_live_walkers_dominate(self, m):
+        """Far below the last dead energy the dead weights are still
+        finite and normalised, and the live weight is close to 1."""
+        assert m.live_weight(1e-8) > 0.99
+        out = m.expectation(m.dead_energies, 1e-8)
+        assert np.isfinite(out)
+        # The lowest dead points dominate: the result is near the minimum.
+        assert out < np.quantile(m.dead_energies, 0.01)
+
+    def test_live_weight(self, m):
+        lw = m.live_weight(self.T)
+        w = m.weights(self.T)
+        assert lw.shape == (3,)
+        np.testing.assert_allclose(lw, w[:, m.n_dead :].sum(axis=1))
+        assert m.live_weight(1e-8) > m.live_weight(10.0)
+
+    def test_two_dimensional_temperature_raises(self, m):
+        with pytest.raises(ValueError, match="scalar or 1-D"):
+            m.mean_energy(np.ones((2, 2)))
+
+    def test_point_volumes(self):
+        nvt = _make_monitor()
+        npt = _make_monitor(with_volumes=True)
+        assert nvt.point_volumes is None
+        np.testing.assert_array_equal(
+            npt.point_volumes,
+            np.concatenate([npt.dead_volumes, npt.live_volumes]),
+        )
 
 
 class TestMonitorConstruction:
@@ -156,40 +373,32 @@ class TestMonitorObservables:
         assert np.all(np.isfinite(result))
 
     def test_expectation_matches_thermodynamics(self, monitor):
-        """The live walkers get the mean of the dead-point observable."""
+        """With values on every point, expectation is thermodynamics'
+        expectation over dead and live points."""
         T = np.array([1.0, 2.0])
-        betas = 1.0 / T
-        obs = monitor.dead_energies
-
-        dead_e = jnp.asarray(monitor.dead_energies)
-        live_e = jnp.asarray(monitor.live_energies)
-        live_obs_val = float(np.mean(obs))
-        live_obs = jnp.full(live_e.shape[0], live_obs_val)
-        obs_full = jnp.concatenate([jnp.asarray(obs), live_obs])
-
-        expected = np.array(
-            [
-                float(
-                    thermo_expectation(
-                        obs_full,
-                        float(b),
-                        dead_e,
-                        live_e,
-                        n_live=monitor.n_live,
-                    )
+        obs = monitor.point_energies
+        expected = [
+            float(
+                thermo_expectation(
+                    obs,
+                    1.0 / t,
+                    monitor.dead_energies,
+                    monitor.live_energies,
+                    n_live=monitor.n_live,
                 )
-                for b in betas
-            ]
+            )
+            for t in T
+        ]
+        np.testing.assert_allclose(
+            monitor.expectation(obs, T), expected, rtol=1e-12
         )
-        result = monitor.expectation(obs, T)
-        np.testing.assert_allclose(result, expected, rtol=1e-6)
 
     def test_expectation_wrong_shape_raises(self, monitor):
         with pytest.raises(ValueError, match="n_dead"):
             monitor.expectation(np.ones(monitor.n_dead + 5), np.array([1.0]))
 
     def test_expectation_shape(self, monitor):
-        obs = np.ones(monitor.n_dead)
+        obs = np.ones(monitor.n_points)
         T = np.array([0.5, 1.0, 2.0, 5.0])
         result = monitor.expectation(obs, T)
         assert result.shape == (4,)
@@ -225,7 +434,7 @@ class TestMonitorObservables:
         np.testing.assert_allclose(fn(T, k_B=2.0), fn(2.0 * T), rtol=1e-12)
 
     def test_expectation_k_b_scales_temperature(self, monitor):
-        obs = monitor.dead_energies
+        obs = monitor.point_energies
         T = np.array([0.5, 1.0, 2.0])
         np.testing.assert_allclose(
             monitor.expectation(obs, T, k_B=2.0),
@@ -305,6 +514,23 @@ class TestMonitorFromDirectory:
         assert m.energy_trace is not None
         assert len(m.energy_trace) == 20
         assert m.symbol_map == {0: "Ar"}
+        # Live walkers: positions per walker, types broadcast to every
+        # walker, no cells for this non-periodic run.
+        assert m.live_positions.shape == (10, 2, 3)
+        assert m.live_types.shape == (10, 2)
+        assert m.live_cells is None
+
+    def test_unreadable_types_leave_live_types_unset(self, tmp_path):
+        """Types that are neither per atom nor per walker and atom do not
+        fail the load; only the live types stay unset."""
+        _write_run_dir(tmp_path, n_live=5)
+        with h5py.File(tmp_path / "ns.final.checkpoint.h5", "a") as f:
+            del f["types"]
+            f.create_dataset("types", data=np.zeros(7, dtype=np.int32))
+        m = Monitor.from_directory(tmp_path, prefix="ns")
+        assert m.live_types is None
+        assert m.live_positions.shape == (5, 2, 3)
+        assert np.isfinite(m.heat_capacity(1.0))
 
     def test_from_directory_prefers_final(self, tmp_path):
         """.final.checkpoint.h5 wins over .checkpoint.h5."""
@@ -535,9 +761,14 @@ class TestFromMultiRunDirectoryConfigInference:
         n_runs: int,
         n_live: int = 4,
         n_dead_per_run: int = 6,
+        live_volumes: np.ndarray | None = None,
     ) -> None:
         """Write an (n_runs,)-shaped checkpoint and one .energies log per
-        replica, with the shapes from_multi_run_directory expects."""
+        replica, with the shapes from_multi_run_directory expects.
+
+        ``live_volumes`` of shape ``(n_runs, n_live)`` makes it an NPT
+        checkpoint; NPT runs are the only ones that save it.
+        """
         out_dir.mkdir(parents=True, exist_ok=True)
         rng = np.random.default_rng(0)
         live_e = rng.uniform(-1.0, 1.0, (n_runs, n_live)).astype(np.float32)
@@ -558,6 +789,8 @@ class TestFromMultiRunDirectoryConfigInference:
             f.create_dataset("log_evidence", data=log_Z)
             f.create_dataset("iteration", data=iteration)
             f.create_dataset("n_dead", data=n_dead)
+            if live_volumes is not None:
+                f.create_dataset("live_volumes", data=live_volumes)
             f.attrs["n_walkers"] = n_live
 
         for i in range(n_runs):
@@ -570,6 +803,56 @@ class TestFromMultiRunDirectoryConfigInference:
             for k in range(n_dead_per_run):
                 elog.write_entry(k, energy=float(-k), volume=10.0 + k)
             elog.close()
+
+    def test_npt_volumes_are_data_only(self, tmp_path):
+        """An NPT checkpoint gives each replica its dead and live volumes
+        and is_npt, and leaves log Z and Cv unchanged."""
+        live_v = np.arange(8, dtype=np.float64).reshape(2, 4) + 20.0
+        self._write_multi_run_artefacts(
+            tmp_path / "npt", prefix="ns", n_runs=2, live_volumes=live_v
+        )
+        self._write_multi_run_artefacts(
+            tmp_path / "nvt", prefix="ns", n_runs=2
+        )
+        npt = MonitorCollection.from_multi_run_directory(
+            tmp_path / "npt", prefix="ns"
+        )
+        nvt = MonitorCollection.from_multi_run_directory(
+            tmp_path / "nvt", prefix="ns"
+        )
+
+        T = np.array([0.5, 1.0, 2.0])
+        for i, (m_npt, m_nvt) in enumerate(zip(npt, nvt, strict=True)):
+            assert m_npt.is_npt is True
+            assert m_nvt.is_npt is False
+            assert m_nvt.dead_volumes is None and m_nvt.live_volumes is None
+            np.testing.assert_array_equal(
+                m_npt.dead_volumes, 10.0 + np.arange(6)
+            )
+            np.testing.assert_array_equal(m_npt.live_volumes, live_v[i])
+            np.testing.assert_array_equal(
+                m_npt.volume_trace, m_npt.dead_volumes
+            )
+            np.testing.assert_allclose(
+                m_npt.partition_function(T), m_nvt.partition_function(T)
+            )
+            np.testing.assert_allclose(
+                m_npt.heat_capacity(T), m_nvt.heat_capacity(T)
+            )
+
+    def test_live_configurations_per_replica(self, tmp_path):
+        """Each replica gets its own slice of the live positions and
+        types."""
+        self._write_multi_run_artefacts(tmp_path, prefix="ns", n_runs=3)
+        coll = MonitorCollection.from_multi_run_directory(
+            tmp_path, prefix="ns"
+        )
+        with h5py.File(tmp_path / "ns.final.checkpoint.h5", "r") as f:
+            positions = f["positions"][()]
+        for i, m in enumerate(coll):
+            np.testing.assert_array_equal(m.live_positions, positions[i])
+            assert m.live_types.shape == (4, 2)
+            assert m.live_cells is None
 
     def test_prefix_inferred_from_config(self, tmp_path):
         """output.out_file_prefix is used when prefix is omitted."""

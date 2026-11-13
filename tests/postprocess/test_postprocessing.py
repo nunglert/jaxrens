@@ -1,22 +1,34 @@
 """Tests for postprocess.thermodynamics.
 
-Checks calc_log_weights, log_evidence, partition_function, heat_capacity,
-expectation and free_energy against the analytic results for a 3D
-harmonic potential, and that each function maps a (G, P, n) batch slice
-by slice.
+Checks calc_log_weights, log_point_weights, thermal_weights, log_evidence,
+partition_function, heat_capacity, expectation and free_energy against the
+analytic results for a 3D harmonic potential, that each function maps a
+(G, P, n) batch slice by slice, and that a 1-D beta gives the same values
+as one call per temperature.  Also checks the estimators on a weight
+matrix: weighted_mean / variance / covariance, class_probability and
+conditional_mean.
 """
 
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from scipy.special import logsumexp
 
 from jaxrens.postprocess.thermodynamics import (
     calc_log_weights,
+    calc_log_weights_live,
+    class_probability,
+    conditional_mean,
     expectation,
     free_energy,
     heat_capacity,
     log_evidence,
+    log_point_weights,
     partition_function,
+    thermal_weights,
+    weighted_covariance,
+    weighted_mean,
+    weighted_variance,
 )
 
 N_DIM = 3
@@ -73,6 +85,66 @@ class TestCalcLogWeights:
 
         log_w = calc_log_weights(n_dead=n_dead, n_live=n_live, n_cull=1)
         np.testing.assert_allclose(log_w, expected, atol=1e-12)
+
+
+class TestLogPointWeights:
+    """Check the dead-then-live layout of log_point_weights."""
+
+    def test_layout(self):
+        log_w = log_point_weights(n_dead=30, n_live=10, n_cull=2)
+        np.testing.assert_array_equal(log_w[:30], calc_log_weights(30, 10, 2))
+        np.testing.assert_array_equal(
+            log_w[30:], np.full(10, float(calc_log_weights_live(30, 10, 2)))
+        )
+
+    def test_n_live_points(self):
+        log_w = log_point_weights(n_dead=30, n_live=10, n_live_points=3)
+        assert log_w.shape == (33,)
+
+    @pytest.mark.parametrize("n_cull", [1, 3])
+    def test_total_mass_independent_of_n_dead(self, n_cull):
+        """Dead plus live weights add up to the same X_0 after any number of
+        dead points."""
+        totals = [
+            logsumexp(log_point_weights(n_dead, 10, n_cull))
+            for n_dead in (0, 7, 300)
+        ]
+        np.testing.assert_allclose(totals, totals[0], rtol=1e-12)
+
+
+class TestThermalWeights:
+    """Check the normalised weight matrix the estimators are built on."""
+
+    def test_normalised(self, harmonic):
+        dead_E, live_E = harmonic
+        w = thermal_weights(1.0, dead_E, live_E, n_live=N_LIVE)
+        assert w.shape == (dead_E.shape[0] + live_E.shape[0],)
+        assert np.all(w >= 0.0)
+        assert w.sum() == pytest.approx(1.0, abs=1e-12)
+
+    def test_weighted_sum_is_expectation(self, harmonic):
+        dead_E, live_E = harmonic
+        all_E = np.concatenate([dead_E, live_E])
+        w = thermal_weights(2.0, dead_E, live_E, n_live=N_LIVE)
+        ref = expectation(all_E, 2.0, dead_E, live_E, n_live=N_LIVE)
+        assert w @ all_E == pytest.approx(float(ref), rel=1e-12)
+
+    def test_return_log_z_is_partition_function(self, harmonic):
+        dead_E, live_E = harmonic
+        w, log_Z = thermal_weights(
+            _BETAS, dead_E, live_E, N_LIVE, return_log_Z=True
+        )
+        assert log_Z.shape == w.shape[:-1] == (len(_BETAS),)
+        np.testing.assert_allclose(
+            log_Z,
+            partition_function(_BETAS, dead_E, live_E, n_live=N_LIVE),
+            rtol=1e-12,
+        )
+
+    def test_2d_beta_raises(self, harmonic):
+        dead_E, live_E = harmonic
+        with pytest.raises(ValueError, match="scalar or 1-D"):
+            thermal_weights(np.ones((2, 2)), dead_E, live_E, N_LIVE)
 
 
 class TestLogEvidence:
@@ -243,4 +315,186 @@ def test_batch_matches_per_slice(name):
             ref = fn(dead[g, p], live[g, p])
             np.testing.assert_allclose(
                 batched[g, p], ref, rtol=1e-12, err_msg=f"({g}, {p})"
+            )
+
+
+_BETAS = np.array([0.5, 1.0, 3.0])
+_TEMPERATURE_FNS = {
+    "thermal_weights": lambda b, d, l: thermal_weights(
+        b, d, l, n_live=_BATCH_N_LIVE
+    ),
+    "partition_function": lambda b, d, l: partition_function(
+        b, d, l, n_live=_BATCH_N_LIVE
+    ),
+    "heat_capacity": lambda b, d, l: heat_capacity(
+        b, d, l, n_live=_BATCH_N_LIVE
+    ),
+    "expectation": lambda b, d, l: expectation(
+        jnp.concatenate([d, l], axis=-1), b, d, l, n_live=_BATCH_N_LIVE
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_TEMPERATURE_FNS))
+def test_beta_grid_matches_per_beta(name):
+    """A 1-D beta on a (G, P, n) batch adds an n_T axis after the batch
+    axes, equal to one scalar-beta call per temperature."""
+    fn = _TEMPERATURE_FNS[name]
+    dead, live = _make_gp_data()
+    grid = fn(_BETAS, dead, live)
+    per_beta = [fn(b, dead, live) for b in _BETAS]
+    if name == "thermal_weights":
+        assert grid.shape == (2, 2, len(_BETAS), 550)
+        ref = np.stack(per_beta, axis=-2)
+    else:
+        assert grid.shape == (2, 2, len(_BETAS))
+        ref = np.stack(per_beta, axis=-1)
+    np.testing.assert_allclose(grid, ref, rtol=1e-12)
+
+
+@pytest.fixture
+def grid(harmonic):
+    """Weights on a beta grid, all energies, and a second observable."""
+    dead_E, live_E = harmonic
+    all_E = np.concatenate([dead_E, live_E])
+    w = thermal_weights(_BETAS, dead_E, live_E, n_live=N_LIVE)
+    other = np.sin(all_E) + 0.1 * all_E
+    return w, all_E, other, dead_E, live_E
+
+
+class TestWeightedMoments:
+    """Check weighted_mean, weighted_variance and weighted_covariance."""
+
+    def test_mean_is_expectation(self, grid):
+        w, all_E, _, dead_E, live_E = grid
+        ref = expectation(all_E, _BETAS, dead_E, live_E, n_live=N_LIVE)
+        np.testing.assert_allclose(weighted_mean(w, all_E), ref, rtol=1e-12)
+
+    def test_variance_of_energy_is_heat_capacity(self, grid):
+        w, all_E, _, dead_E, live_E = grid
+        cv = heat_capacity(_BETAS, dead_E, live_E, n_live=N_LIVE)
+        np.testing.assert_allclose(
+            _BETAS**2 * weighted_variance(w, all_E), cv, rtol=1e-12
+        )
+
+    def test_covariance_properties(self, grid):
+        """Symmetric, Cov(A, A) = Var(A), zero against a constant, linear
+        in each argument."""
+        w, a, b, _, _ = grid
+        c = np.cos(a)
+        np.testing.assert_allclose(
+            weighted_covariance(w, a, b), weighted_covariance(w, b, a)
+        )
+        np.testing.assert_allclose(
+            weighted_covariance(w, a, a), weighted_variance(w, a)
+        )
+        np.testing.assert_allclose(
+            weighted_covariance(w, a, np.full_like(a, 3.0)), 0.0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            weighted_covariance(w, 2.0 * a + b, c),
+            2.0 * weighted_covariance(w, a, c) + weighted_covariance(w, b, c),
+            rtol=1e-10,
+        )
+
+    def test_variance_survives_a_large_offset(self, grid):
+        """The deviation form keeps the variance of O + 1e8 equal to that
+        of O, where <O^2> - <O>^2 would lose it to rounding."""
+        w, a, _, _, _ = grid
+        np.testing.assert_allclose(
+            weighted_variance(w, a + 1e8), weighted_variance(w, a), rtol=1e-6
+        )
+
+    def test_vector_observable_matches_columns(self, grid):
+        w, a, b, _, _ = grid
+        vec = np.stack([a, b, a * b], axis=1)
+        mean = weighted_mean(w, vec)
+        var = weighted_variance(w, vec)
+        cov = weighted_covariance(w, a, vec)
+        assert mean.shape == var.shape == cov.shape == (len(_BETAS), 3)
+        for j in range(3):
+            np.testing.assert_allclose(mean[:, j], weighted_mean(w, vec[:, j]))
+            np.testing.assert_allclose(
+                var[:, j], weighted_variance(w, vec[:, j]), rtol=1e-12
+            )
+            np.testing.assert_allclose(
+                cov[:, j], weighted_covariance(w, a, vec[:, j]), rtol=1e-12
+            )
+
+    def test_batch_leading_axes(self):
+        """Weights with (G, P, n_T) leading axes give a (G, P, n_T) result,
+        slice by slice equal to the 1-D weights."""
+        dead, live = _make_gp_data()
+        w = thermal_weights(_BETAS, dead, live, n_live=_BATCH_N_LIVE)
+        obs = np.linspace(0.0, 1.0, w.shape[-1]) ** 2
+        vec = np.stack([obs, 1.0 - obs], axis=1)
+        var = weighted_variance(w, obs)
+        var_vec = weighted_variance(w, vec)
+        assert var.shape == (2, 2, len(_BETAS))
+        assert var_vec.shape == (2, 2, len(_BETAS), 2)
+        np.testing.assert_allclose(
+            var[1, 0], weighted_variance(w[1, 0], obs), rtol=1e-12
+        )
+        np.testing.assert_allclose(var_vec[..., 0], var, rtol=1e-12)
+
+    def test_wrong_point_count_raises(self, grid):
+        w, a, _, _, _ = grid
+        with pytest.raises(ValueError, match="n_pts="):
+            weighted_mean(w, a[:-1])
+
+
+class TestClassAverages:
+    """Check class_probability and conditional_mean."""
+
+    def test_complementary_classes_sum_to_one(self, grid):
+        w, a, _, _, _ = grid
+        mask = a < np.median(a)
+        np.testing.assert_allclose(
+            class_probability(w, mask) + class_probability(w, ~mask), 1.0
+        )
+        np.testing.assert_allclose(
+            class_probability(w, np.ones_like(mask)), 1.0
+        )
+
+    def test_conditional_mean_definition(self, grid):
+        """<O | C> = <O 1_C> / <1_C>."""
+        w, a, b, _, _ = grid
+        mask = a < np.median(a)
+        ref = weighted_mean(w, b * mask) / class_probability(w, mask)
+        np.testing.assert_allclose(
+            conditional_mean(w, b, mask), ref, rtol=1e-12
+        )
+
+    def test_conditional_mean_without_mask_is_mean(self, grid):
+        w, a, _, _, _ = grid
+        np.testing.assert_allclose(
+            conditional_mean(w, a), weighted_mean(w, a), rtol=1e-12
+        )
+
+    def test_nan_points_are_left_out(self, grid):
+        w, a, b, _, _ = grid
+        undefined = a > np.median(a)
+        with_nan = np.where(undefined, np.nan, b)
+        np.testing.assert_allclose(
+            conditional_mean(w, with_nan),
+            conditional_mean(w, b, ~undefined),
+            rtol=1e-12,
+        )
+
+    def test_empty_class_is_nan(self, grid):
+        w, a, _, _, _ = grid
+        out = conditional_mean(w, a, np.zeros(a.shape, dtype=bool))
+        assert out.shape == (len(_BETAS),)
+        assert np.all(np.isnan(out))
+
+    def test_vector_masks(self, grid):
+        """A (n_pts, k) mask gives k classes at once, column by column."""
+        w, a, b, _, _ = grid
+        masks = np.stack([a < np.median(a), a >= np.median(a)], axis=1)
+        prob = class_probability(w, masks)
+        cond = conditional_mean(w, b, masks)
+        assert prob.shape == cond.shape == (len(_BETAS), 2)
+        for j in range(2):
+            np.testing.assert_allclose(
+                cond[:, j], conditional_mean(w, b, masks[:, j]), rtol=1e-12
             )

@@ -18,11 +18,18 @@ from jaxrens.postprocess.plotting import (
 from jaxrens.postprocess.thermodynamics import (
     calc_log_weights,
     calc_log_weights_live,
+    class_probability,
+    conditional_mean,
     expectation,
     free_energy,
     heat_capacity,
     log_evidence,
+    log_point_weights,
     partition_function,
+    thermal_weights,
+    weighted_covariance,
+    weighted_mean,
+    weighted_variance,
 )
 
 __all__ = [
@@ -44,9 +51,16 @@ __all__ = [
     # Thermodynamics
     "calc_log_weights",
     "calc_log_weights_live",
+    "class_probability",
+    "conditional_mean",
     "expectation",
     "free_energy",
     "heat_capacity",
     "log_evidence",
+    "log_point_weights",
     "partition_function",
+    "thermal_weights",
+    "weighted_covariance",
+    "weighted_mean",
+    "weighted_variance",
 ]

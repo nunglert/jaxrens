@@ -13,12 +13,15 @@ from typing import Any
 
 import numpy as np
 
-from jaxrens.postprocess.monitor import Monitor
+from jaxrens.postprocess.monitor import Monitor, per_walker
 
 
 def _observable_volume(
     monitor: Monitor, T: np.ndarray, **kwargs
 ) -> np.ndarray:
+    if monitor.point_volumes is not None:
+        # Dead and live volumes: exact at low T as well.
+        return monitor.expectation(monitor.point_volumes, T, **kwargs)
     if not hasattr(monitor, "volume_trace"):
         raise AttributeError(
             f"Monitor {monitor.label!r} has no volume_trace; "
@@ -292,10 +295,10 @@ class MonitorCollection:
         # axis); 2-D is a flat ``(P,)`` sweep; 3-D a ``(G, P)`` grid.  The
         # single-run case is built here rather than delegated to
         # ``Monitor.from_directory`` so single- and multi-replica collections
-        # carry identical conventions: ``dead_volumes=None`` (energy column is
-        # the full thermal variable) with the bare cell volume stashed as
-        # ``volume_trace``.  Delegating instead yielded a Monitor that lacked
-        # ``volume_trace`` and folded the volume column into log Z.
+        # carry identical conventions: the energy column is the full thermal
+        # variable (``H = U + P V`` in NPT) and the bare cell volumes are
+        # data only, in ``dead_volumes`` / ``live_volumes`` and the
+        # ``volume_trace`` alias.
         if live_E.ndim == 1:
             n_total = 1
             single_run = True
@@ -320,6 +323,30 @@ class MonitorCollection:
                 f"Unexpected `energies` shape {live_E.shape} in "
                 f"{ckpt_path.name}; expected 1, 2, or 3 dims."
             )
+
+        # Live-walker cell volumes, saved by NPT runs only (their presence is
+        # the NPT signal, as in ``Monitor.from_directory``).  Same leading
+        # batch axes as ``energies``.
+        live_V = state.get("live_volumes")
+        live_V_flat = (
+            np.asarray(live_V, dtype=np.float64).reshape(live_E_flat.shape)
+            if live_V is not None
+            else None
+        )
+
+        # Live-walker configurations, one slice per replica.  Types and
+        # cells may be stored without the batch axes; broadcast them to
+        # every walker (None if they do not fit, see ``per_walker``).
+        lead = live_E_flat.shape  # (n_total, K)
+        positions = np.asarray(state["positions"])
+        n_atoms = positions.shape[-2]
+        live_pos_flat = positions.reshape(lead + (n_atoms, 3))
+        live_types_flat = per_walker(state["types"], live_E.shape + (n_atoms,))
+        if live_types_flat is not None:
+            live_types_flat = live_types_flat.reshape(lead + (n_atoms,))
+        live_cells_flat = per_walker(state.get("cells"), live_E.shape + (3, 3))
+        if live_cells_flat is not None:
+            live_cells_flat = live_cells_flat.reshape(lead + (3, 3))
 
         # Derive labels + per-replica metadata from config when caller did
         # not supply explicit labels.  ``metadata`` is always n_total long.
@@ -351,9 +378,15 @@ class MonitorCollection:
             label = labels[i] if labels is not None else f"run{i:02d}"
             m = Monitor(
                 dead_energies=np.asarray(elog.energies, dtype=np.float64),
-                dead_volumes=None,
+                dead_volumes=(
+                    np.asarray(elog.volumes, dtype=np.float64)
+                    if live_V_flat is not None
+                    else None
+                ),
                 live_energies=np.asarray(live_E_flat[i], dtype=np.float64),
-                live_volumes=None,
+                live_volumes=(
+                    live_V_flat[i] if live_V_flat is not None else None
+                ),
                 log_evidence=float(log_Z_flat[i]),
                 iteration=int(iter_flat[i]),
                 n_live=n_live,
@@ -362,10 +395,18 @@ class MonitorCollection:
                 energy_trace=np.asarray(elog.energies, dtype=np.float64),
                 iteration_trace=np.asarray(elog.iterations, dtype=np.int64),
                 adaptation_trace=None,
+                live_positions=live_pos_flat[i],
+                live_cells=(
+                    live_cells_flat[i] if live_cells_flat is not None else None
+                ),
+                live_types=(
+                    live_types_flat[i] if live_types_flat is not None else None
+                ),
                 label=label,
                 path=path,
             )
-            # Bare cell volume series, stashed for separate <V>(T) analysis.
+            # Bare cell volume per dead point, for <V>(T); kept for callers
+            # that read it (also set for NVT, where the column is zero).
             m.volume_trace = np.asarray(elog.volumes, dtype=np.float64)
             # Attach per-replica metadata from the config (e.g. pressure_gpa).
             for k, v in metadata[i].items():
