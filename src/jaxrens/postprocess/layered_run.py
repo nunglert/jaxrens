@@ -45,7 +45,7 @@ from jaxrens.postprocess.observables import (
 
 logger = logging.getLogger(__name__)
 
-OBSERVABLES_VERSION = 1
+OBSERVABLES_VERSION = 2
 """Bump when an observable changes, so cached values are recomputed."""
 
 _LAYERED_MOVES = ("gallery_hop", "layer_slide", "stacking_shift")

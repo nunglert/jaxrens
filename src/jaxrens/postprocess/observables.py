@@ -192,10 +192,6 @@ def registry_observables(
     return {"stacking_shift": shift[order], "stacking": label[order]}
 
 
-ALIGNED, SHIFTED = 0, 1
-"""Labels of ``li_stacking``: intercalant above intercalant, or shifted."""
-
-
 def li_order_observables(
     positions,
     cell,
@@ -216,10 +212,13 @@ def li_order_observables(
     over the three (3-state Potts magnetisation).  Few atoms per gallery
     keep ``m`` well above 0 even when disordered.
 
-    The phase of ``Z`` compares galleries: equal phases mean the atoms of
-    one gallery sit right above those of the other (alpha-alpha), 120 deg
-    apart mean shifted sublattices (alpha-beta).  Positions are Cartesian,
-    each gallery's atoms unwrapped along c to the gallery.
+    Two galleries are compared through ``C = Re(Z_0 Z_1*) = m_0 m_1
+    cos(dphi)``: 1 when both are ordered on the same sublattice (the atoms
+    of one sit right above those of the other, alpha-alpha), -1/2 when both
+    are ordered on different sublattices (alpha-beta), and close to 0 when
+    either is disordered, with no threshold on ``m`` and for any number of
+    atoms per gallery.  Positions are Cartesian, each gallery's atoms
+    unwrapped along c to the gallery.
 
     Args:
         positions: Shape ``(n_atoms, 3)``; need not be wrapped.
@@ -233,10 +232,10 @@ def li_order_observables(
     Returns:
         ``li_order``: ``m`` of each gallery, NaN with fewer than 2 atoms,
         ``(n_galleries,)`` in :func:`gallery_order`;
-        ``li_phase_shift``: ``|arg(Z_1 Z_0*)|`` (degrees, [0, 180]) of the
-        two fullest galleries, NaN if either has fewer than 2 atoms;
-        ``li_stacking``: ``ALIGNED`` (0) if ``li_phase_shift < 60``, else
-        ``SHIFTED`` (1); NaN when the shift is.
+        ``li_alignment``: ``C`` of the two fullest galleries, in
+        [-1/2, 1]; NaN if either has fewer than 2 atoms;
+        ``li_phase_shift``: ``|arg(Z_0 Z_1*)|`` (degrees, [0, 180]) of the
+        same galleries; NaN also when either ``Z`` vanishes (no direction).
 
     Raises:
         ValueError: If ``in_plane_repeats`` are not multiples of 3.
@@ -262,20 +261,21 @@ def li_order_observables(
         pos = unwrap_to_height(positions[atoms], cell, mid)
         z[g] = np.exp(1j * pos @ k).mean()
     z = z[gallery_order(geo, intercalant)]
-    shift = (
-        float(np.degrees(np.abs(np.angle(z[1] * np.conj(z[0])))))
-        if geo.n_sheets >= 2
-        else float("nan")
-    )
+    product = z[0] * np.conj(z[1])
+    no_direction = min(abs(z[0]), abs(z[1])) < _NO_DIRECTION
     return {
         "li_order": np.abs(z),
-        "li_phase_shift": shift,
-        "li_stacking": (
+        "li_alignment": float(product.real),
+        "li_phase_shift": (
             float("nan")
-            if np.isnan(shift)
-            else float(ALIGNED if shift < 60.0 else SHIFTED)
+            if no_direction or np.isnan(product)
+            else float(np.degrees(np.abs(np.angle(product))))
         ),
     }
+
+
+_NO_DIRECTION = 1e-6
+"""``|Z|`` below which a gallery's phase is undefined."""
 
 
 def _host_reciprocal(cell, normal, in_plane_repeats):

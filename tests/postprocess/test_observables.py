@@ -7,8 +7,6 @@ from jaxrens.postprocess.layers import layer_geometry
 from jaxrens.postprocess.observables import (
     AA,
     AB,
-    ALIGNED,
-    SHIFTED,
     cell_observables,
     layer_observables,
     li_order_observables,
@@ -203,30 +201,38 @@ class TestLiOrderObservables:
     def test_alpha_alpha(self):
         obs = _li_order(*_lic([ALPHA, ALPHA]))
         np.testing.assert_allclose(obs["li_order"], [1.0, 1.0])
-        assert obs["li_phase_shift"] == pytest.approx(0.0, abs=1e-9)
-        assert obs["li_stacking"] == ALIGNED
+        assert obs["li_alignment"] == pytest.approx(1.0)
+        assert obs["li_phase_shift"] == pytest.approx(0.0, abs=1e-6)
 
     def test_alpha_beta(self):
         obs = _li_order(*_lic([ALPHA, BETA]))
         np.testing.assert_allclose(obs["li_order"], [1.0, 1.0])
+        assert obs["li_alignment"] == pytest.approx(-0.5)
         assert obs["li_phase_shift"] == pytest.approx(120.0)
-        assert obs["li_stacking"] == SHIFTED
 
     @pytest.mark.parametrize(
-        "sites, m", [(ONE_EACH, 0.0), (TWO_ONE, 1 / np.sqrt(3))]
+        "sites, m, alignment",
+        [
+            # No preferred sublattice: no alignment, and no phase at all.
+            (ONE_EACH, 0.0, 0.0),
+            # Z = (2 + w) / 3 next to Z = 1: C = (2 + cos 120) / 3.
+            (TWO_ONE, 1 / np.sqrt(3), 0.5),
+        ],
     )
-    def test_partial_order(self, sites, m):
+    def test_partial_order(self, sites, m, alignment):
         obs = _li_order(*_lic([sites, ALPHA]))
         np.testing.assert_allclose(
             np.sort(obs["li_order"]), [m, 1.0], atol=1e-9
         )
+        assert obs["li_alignment"] == pytest.approx(alignment, abs=1e-9)
+        assert np.isnan(obs["li_phase_shift"]) == (m == 0.0)
 
     def test_single_atom_gallery(self):
         obs = _li_order(*_lic([[(0, 0)], [(0, 0), (1, 1)]]))
         assert obs["li_order"][0] == pytest.approx(1.0)
         assert np.isnan(obs["li_order"][1])
         assert np.isnan(obs["li_phase_shift"])
-        assert np.isnan(obs["li_stacking"])
+        assert np.isnan(obs["li_alignment"])
 
     def test_stage_two(self):
         obs = _li_order(*_lic([[], ALPHA], spacings=(3.35, 3.7)))
@@ -245,6 +251,7 @@ class TestLiOrderObservables:
         np.testing.assert_allclose(obs["li_order"], ref["li_order"])
         assert obs["li_phase_shift"] == pytest.approx(ref["li_phase_shift"])
         assert obs["li_phase_shift"] == pytest.approx(120.0)
+        assert obs["li_alignment"] == pytest.approx(-0.5)
 
     def test_needs_multiples_of_three(self):
         pos, typ, cell = _lic([[(0, 0), (1, 1)], []], reps=2)
