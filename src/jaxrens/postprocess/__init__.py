@@ -1,7 +1,9 @@
 """Post-processing of nested sampling results."""
 
 from jaxrens.postprocess.collection import MonitorCollection
+from jaxrens.postprocess.layers import LayerGeometry, layer_geometry
 from jaxrens.postprocess.monitor import Monitor
+from jaxrens.postprocess.observables import cell_observables, layer_observables
 from jaxrens.postprocess.plotting import (
     plot_acceptance_rates,
     plot_energy_trace,
@@ -36,6 +38,12 @@ __all__ = [
     # Monitor
     "Monitor",
     "MonitorCollection",
+    # Layered geometry
+    "LayerGeometry",
+    "layer_geometry",
+    # Structural observables
+    "cell_observables",
+    "layer_observables",
     # Plotting helpers
     "plot_acceptance_rates",
     "plot_energy_trace",
