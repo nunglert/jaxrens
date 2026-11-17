@@ -218,7 +218,12 @@ def li_order_observables(
     are ordered on different sublattices (alpha-beta), and close to 0 when
     either is disordered, with no threshold on ``m`` and for any number of
     atoms per gallery.  Positions are Cartesian, each gallery's atoms
-    unwrapped along c to the gallery.
+    unwrapped along c to the gallery, so ``dphi = 0`` means atoms right
+    above atoms whatever the sheets do.  The values 1 and -1/2 assume atoms
+    on hexagon centres (or C sites, same phase class) and sheets in AA or
+    AB registry (``K . dt = 0``); atoms off those sites, or sheets shifted
+    by other amounts (e.g. half a lattice vector, ``K . dt = 60 deg``),
+    give any ``dphi`` and ``C`` down to -1.
 
     Args:
         positions: Shape ``(n_atoms, 3)``; need not be wrapped.
@@ -232,8 +237,8 @@ def li_order_observables(
     Returns:
         ``li_order``: ``m`` of each gallery, NaN with fewer than 2 atoms,
         ``(n_galleries,)`` in :func:`gallery_order`;
-        ``li_alignment``: ``C`` of the two fullest galleries, in
-        [-1/2, 1]; NaN if either has fewer than 2 atoms;
+        ``li_alignment``: ``C`` of the two fullest galleries, in [-1, 1];
+        NaN if either has fewer than 2 atoms;
         ``li_phase_shift``: ``|arg(Z_0 Z_1*)|`` (degrees, [0, 180]) of the
         same galleries; NaN also when either ``Z`` vanishes (no direction).
 

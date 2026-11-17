@@ -227,6 +227,16 @@ class TestLiOrderObservables:
         assert obs["li_alignment"] == pytest.approx(alignment, abs=1e-9)
         assert np.isnan(obs["li_phase_shift"]) == (m == 0.0)
 
+    def test_off_site_atoms_reach_minus_one(self):
+        # Gallery 1 shifted by 3/2 a2, off the hexagon centres:
+        # K . (3/2 a2) = 180 deg, so C = -1, below the alpha-beta -1/2.
+        pos, typ, cell = _lic([ALPHA, ALPHA])
+        top = np.flatnonzero(typ == LI)[3:]
+        pos[top] += 1.5 * A2
+        obs = _li_order(pos, typ, cell)
+        assert obs["li_alignment"] == pytest.approx(-1.0)
+        assert obs["li_phase_shift"] == pytest.approx(180.0)
+
     def test_single_atom_gallery(self):
         obs = _li_order(*_lic([[(0, 0)], [(0, 0), (1, 1)]]))
         assert obs["li_order"][0] == pytest.approx(1.0)
