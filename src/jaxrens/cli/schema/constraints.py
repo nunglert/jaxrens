@@ -16,6 +16,10 @@ Example YAML::
           default: 1.0
           Si-Si: 2.0
           Si-O: 1.6
+      - type: in_plane_strain      # layered cells: strain of (a, b)
+        reference: [7.386, 7.386, 120.0]
+        lambda_min: 0.94
+        lambda_max: 1.06
 """
 
 from __future__ import annotations
@@ -23,9 +27,13 @@ from __future__ import annotations
 from typing import Annotated, Literal, Union
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from jaxrens.constraints.base import ConstraintDescriptor
+from jaxrens.constraints.in_plane_strain import (
+    in_plane_strain_descriptor,
+    reference_lattice_2d,
+)
 from jaxrens.constraints.min_distance import min_distance_descriptor
 
 
@@ -136,7 +144,70 @@ class MinDistanceConstraintSpec(BaseConstraintSpec):
         return min_distance_descriptor(matrix, type_dependent=type_dependent)
 
 
+class InPlaneStrainConstraintSpec(BaseConstraintSpec):
+    """Bound the strain of the (a, b) lattice with respect to a reference.
+
+    For layered cells whose sheets only move with the cell: the volume,
+    shear and stretch moves then strain the sheets themselves, and this
+    keeps that strain physical.  The principal stretches of (a, b) with
+    respect to ``reference`` (1 = undeformed) must lie in
+    ``[lambda_min, lambda_max]``.  Rigid rotations and changes of ``c`` do
+    not count.  See :mod:`jaxrens.constraints.in_plane_strain`.
+
+    ::
+
+        constraints:
+          - type: in_plane_strain
+            reference: [7.386, 7.386, 120.0]   # |a|, |b| (A), angle (deg)
+            lambda_min: 0.94
+            lambda_max: 1.06
+    """
+
+    type: Literal["in_plane_strain"] = Field(
+        default="in_plane_strain",
+        description="Discriminator selecting this constraint.",
+    )
+    reference: tuple[float, float, float] = Field(
+        description=(
+            "Reference in-plane lattice as ``[|a|, |b|, gamma]``: lengths "
+            "of a and b (Angstrom) and the angle between them (degrees).  "
+            "Usually the (a, b) of the starting cells."
+        ),
+    )
+    lambda_min: float = Field(
+        description=("Smallest allowed principal stretch of (a, b), below 1."),
+    )
+    lambda_max: float = Field(
+        description="Largest allowed principal stretch of (a, b), above 1.",
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "InPlaneStrainConstraintSpec":
+        a, b, gamma = self.reference
+        if a <= 0.0 or b <= 0.0 or not 0.0 < gamma < 180.0:
+            raise ValueError(
+                "in_plane_strain reference must be [|a| > 0, |b| > 0, "
+                f"0 < gamma < 180], got {list(self.reference)}."
+            )
+        if not 0.0 < self.lambda_min < 1.0 < self.lambda_max:
+            raise ValueError(
+                "in_plane_strain needs 0 < lambda_min < 1 < lambda_max, got "
+                f"lambda_min={self.lambda_min}, "
+                f"lambda_max={self.lambda_max}."
+            )
+        return self
+
+    def to_descriptor(
+        self, *, symbol_map: dict[int, str]
+    ) -> ConstraintDescriptor:
+        return in_plane_strain_descriptor(
+            reference_lattice_2d(*self.reference),
+            self.lambda_min,
+            self.lambda_max,
+        )
+
+
 ConstraintSpec = Annotated[
-    Union[MinDistanceConstraintSpec],
+    Union[MinDistanceConstraintSpec, InPlaneStrainConstraintSpec],
     Field(discriminator="type"),
 ]

@@ -15,6 +15,10 @@ from jaxrens.constraints.cell_geometry import (
     build_cell_geometry,
     cell_geometry_descriptor,
 )
+from jaxrens.constraints.in_plane_strain import (
+    build_in_plane_strain,
+    in_plane_strain_descriptor,
+)
 from jaxrens.constraints.min_distance import (
     build_min_distance,
     min_distance_descriptor,
@@ -29,4 +33,6 @@ __all__ = [
     "min_distance_descriptor",
     "build_cell_geometry",
     "cell_geometry_descriptor",
+    "build_in_plane_strain",
+    "in_plane_strain_descriptor",
 ]

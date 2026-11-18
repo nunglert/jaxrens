@@ -20,7 +20,10 @@ from jaxrens.cli.resolve import (
 )
 from jaxrens.cli.run import run_from_config
 from jaxrens.cli.schema import RootSpec
-from jaxrens.cli.schema.constraints import MinDistanceConstraintSpec
+from jaxrens.cli.schema.constraints import (
+    InPlaneStrainConstraintSpec,
+    MinDistanceConstraintSpec,
+)
 from jaxrens.cli.schema.moves import RandomWalkMoveSpec
 from jaxrens.constraints.min_distance import min_distance_descriptor
 from jaxrens.state.config import (
@@ -84,6 +87,79 @@ def test_malformed_pair_key_raises(key):
     with pytest.raises(ValueError, match="element-symbol pair"):
         MinDistanceConstraintSpec(d_min={key: 1.0}).to_descriptor(
             symbol_map=H_O
+        )
+
+
+def test_in_plane_strain_spec_to_descriptor():
+    spec = InPlaneStrainConstraintSpec(
+        reference=[7.386, 7.386, 120.0], lambda_min=0.94, lambda_max=1.06
+    )
+    desc = spec.to_descriptor(symbol_map=H_ONLY)
+    assert desc.name == "in_plane_strain"
+    assert desc.depends_on == frozenset({"cell"})
+    ref = np.asarray(desc.build_kwargs["ref_2d"])
+    assert np.linalg.norm(ref, axis=1) == pytest.approx([7.386, 7.386])
+    cos = ref[0] @ ref[1] / 7.386**2
+    assert np.degrees(np.arccos(cos)) == pytest.approx(120.0)
+
+
+@pytest.mark.parametrize(
+    "kw, match",
+    [
+        ({"lambda_min": 1.02, "lambda_max": 1.06}, "lambda_min < 1"),
+        ({"lambda_min": 0.94, "lambda_max": 0.99}, "lambda_min < 1"),
+        ({"reference": [7.386, -1.0, 120.0]}, "reference"),
+        ({"reference": [7.386, 7.386, 180.0]}, "reference"),
+    ],
+)
+def test_in_plane_strain_spec_validation(kw, match):
+    args = {
+        "reference": [7.386, 7.386, 120.0],
+        "lambda_min": 0.94,
+        "lambda_max": 1.06,
+    }
+    args.update(kw)
+    with pytest.raises(ValueError, match=match):
+        InPlaneStrainConstraintSpec(**args)
+
+
+def test_in_plane_strain_parsed_from_constraints_list():
+    root = RootSpec.model_validate(
+        _base_dict(
+            constraints=[
+                {
+                    "type": "in_plane_strain",
+                    "reference": [7.386, 7.386, 120.0],
+                    "lambda_min": 0.94,
+                    "lambda_max": 1.06,
+                }
+            ]
+        )
+    )
+    (spec,) = root.constraints
+    assert isinstance(spec, InPlaneStrainConstraintSpec)
+
+
+def test_in_plane_strain_initial_check():
+    desc = InPlaneStrainConstraintSpec(
+        reference=[7.386, 7.386, 120.0], lambda_min=0.94, lambda_max=1.06
+    ).to_descriptor(symbol_map=H_ONLY)
+    a = 7.386
+    hexa = jnp.array(
+        [[a, 0.0, 0.0], [-a / 2, a * np.sqrt(3) / 2, 0.0], [0.0, 0.0, 7.0]]
+    )
+    positions = jnp.zeros((3, 2, 3))
+    types = jnp.zeros((3, 2), dtype=jnp.int32)
+    cells = jnp.stack([hexa, hexa * 1.02, hexa])
+    _check_initial_constraints(
+        (desc,), ResolvedInit(positions, types, cells, None, symbol_map=H_ONLY)
+    )  # must not raise
+    s = np.sqrt(3.0)
+    cells = cells.at[1].set(hexa @ jnp.diag(jnp.array([1 / s, s, 1.0])))
+    with pytest.raises(ValueError, match="violates the 'in_plane_strain'"):
+        _check_initial_constraints(
+            (desc,),
+            ResolvedInit(positions, types, cells, None, symbol_map=H_ONLY),
         )
 
 
