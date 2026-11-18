@@ -278,6 +278,10 @@ Omitting the key (the default) means no constraints and zero overhead.
          default: 1.0
          Si-Si: 2.0
          Si-O: 1.6
+     - type: in_plane_strain      # layered cells: strain of (a, b)
+       reference: [7.386, 7.386, 120.0]   # |a|, |b| (Angstrom), gamma (deg)
+       lambda_min: 0.94
+       lambda_max: 1.06
 
 .. yaml-variants:: jaxrens.cli.schema.constraints.ConstraintSpec
    :prefix: constraints[]
