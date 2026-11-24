@@ -43,8 +43,10 @@ from jaxrens.cli.schema.ensemble import (
 from jaxrens.cli.schema.init import InitSpec, _parse_species_string
 from jaxrens.cli.schema.moves import (
     AlchemicalMorphMoveSpec,
+    GalleryStrainMoveSpec,
     GMCMoveSpec,
     HMCMoveSpec,
+    NormalStrainMoveSpec,
     RandomWalkMoveSpec,
     ShearMoveSpec,
     SingleAtomMoveSpec,
@@ -340,6 +342,8 @@ class TestDiscriminatedUnion:
                 SpeciesSwapMoveSpec,
             ),
             ({"type": "volume"}, VolumeMoveSpec),
+            ({"type": "normal_strain"}, NormalStrainMoveSpec),
+            ({"type": "gallery_strain"}, GalleryStrainMoveSpec),
             ({"type": "shear"}, ShearMoveSpec),
             ({"type": "stretch"}, StretchMoveSpec),
             (

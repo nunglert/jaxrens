@@ -54,6 +54,7 @@ MoveType = Literal[
     "single_atom_sweep",
     "species_swap",
     "volume",
+    "normal_strain",
     "shear",
     "stretch",
     "alchemical_morph",
@@ -773,6 +774,60 @@ class VolumeMoveSpec(BaseMoveSpec):
         }
 
 
+class NormalStrainMoveSpec(BaseMoveSpec):
+    """Cell strain along the normal to the (a, b) plane.
+
+    Changes the height ``h`` of the cell along ``n = a x b / |a x b|`` by
+    ``step_size * N(0, 1)`` (Angstrom) and scales every position along ``n``
+    by the same factor.  ``a``, ``b``, the in-plane part of ``c`` and the
+    fractional coordinates are unchanged.  In a layered host every gallery
+    widens or narrows together, without straining the sheets, which the
+    isotropic ``volume`` move and ``stretch`` cannot do.
+
+    Same volume prior and ``cell:`` bounds as ``volume``.  ``step_size`` is
+    a length, adapted like a local move.
+
+    ::
+
+        moves:
+          - {type: normal_strain, step_size: 0.05, weight: 1}
+    """
+
+    type: Literal["normal_strain"] = Field(
+        default="normal_strain",
+        description="Discriminator selecting this move.",
+    )
+
+    def _reject_reasons(self) -> frozenset[str]:
+        return frozenset({"energy", "cell", "prior"})
+
+    def _mutates(self) -> frozenset[str]:
+        return frozenset({"positions", "cell"})
+
+    def _build_kernel(self) -> Callable:
+        return volume.build_normal_strain_kernel
+
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        symbol_map: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        if n_atoms is None or cell_cfg is None:
+            raise ValueError(
+                "NormalStrainMoveSpec.to_descriptor() requires n_atoms and "
+                "cell_cfg from the resolver."
+            )
+        return {
+            "n_atoms": n_atoms,
+            "max_vol_per_atom": cell_cfg.max_volume_per_atom,
+            "min_vol_per_atom": cell_cfg.min_volume_per_atom,
+            "min_aspect": cell_cfg.min_aspect_ratio,
+            "flat_v_prior": cell_cfg.flat_V_prior,
+            **_restrict_kwargs(cell_cfg),
+        }
+
+
 class ShearMoveSpec(BaseMoveSpec):
     """Volume-preserving shear of the cell, co-transforming positions.
 
@@ -1360,6 +1415,62 @@ class StackingShiftMoveSpec(LayeredMoveSpec):
         return self.subdivisions == 0
 
 
+class GalleryStrainMoveSpec(LayeredMoveSpec):
+    """Change the width of one gallery by stretching c along the normal.
+
+    Picks one gallery uniformly, moves the cell boundary to its centre (a
+    change of representation only), and lengthens ``c`` along the sheet
+    normal by ``step_size * N(0, 1)`` (Angstrom) with the atoms fixed: the
+    periodic images above the boundary rise, so only that gallery widens or
+    narrows and the cell height changes by the same amount.  The non-host
+    atoms of the gallery keep their relative height between its two sheets.
+    The other galleries, the sheets and the in-plane lattice are unchanged.
+
+    Lets each gallery find its own spacing (staging), which
+    ``normal_strain`` (all galleries together) cannot.  Same volume prior and
+    ``cell:`` bounds as ``volume``; ``step_size`` is adapted.
+
+    ::
+
+        moves:
+          - {type: gallery_strain, step_size: 0.05}
+    """
+
+    type: Literal["gallery_strain"] = Field(
+        default="gallery_strain",
+        description="Discriminator selecting this move.",
+    )
+
+    def _build_kernel(self) -> Callable:
+        return layered_moves.build_gallery_strain_kernel
+
+    def _kernel_kwargs(
+        self,
+        n_atoms: int | None = None,
+        cell_cfg: "CellSpec | None" = None,
+        symbol_map: dict[int, str] | None = None,
+    ) -> dict[str, Any]:
+        if n_atoms is None or cell_cfg is None:
+            raise ValueError(
+                "GalleryStrainMoveSpec.to_descriptor() requires n_atoms and "
+                "cell_cfg from the resolver."
+            )
+        return {
+            "n_atoms": n_atoms,
+            "max_vol_per_atom": cell_cfg.max_volume_per_atom,
+            "min_vol_per_atom": cell_cfg.min_volume_per_atom,
+            "min_aspect": cell_cfg.min_aspect_ratio,
+            "flat_v_prior": cell_cfg.flat_V_prior,
+            **_restrict_kwargs(cell_cfg),
+        }
+
+    def _reject_reasons(self) -> frozenset[str]:
+        return frozenset({"energy", "cell", "prior"})
+
+    def _mutates(self) -> frozenset[str]:
+        return frozenset({"positions", "cell"})
+
+
 # ---------------------------------------------------------------------------
 # Discriminated union
 # ---------------------------------------------------------------------------
@@ -1375,12 +1486,14 @@ MoveSpec = Annotated[
         Lattice1DMoveSpec,
         Distance1DMoveSpec,
         VolumeMoveSpec,
+        NormalStrainMoveSpec,
         ShearMoveSpec,
         StretchMoveSpec,
         AlchemicalMorphMoveSpec,
         GalleryHopMoveSpec,
         LayerSlideMoveSpec,
         StackingShiftMoveSpec,
+        GalleryStrainMoveSpec,
     ],
     Field(discriminator="type"),
 ]

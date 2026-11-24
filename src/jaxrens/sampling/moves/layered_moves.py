@@ -20,6 +20,8 @@ unchanged by in-plane translations and by tilting ``c`` within the plane.
 - build_layer_slide_kernel: slide one sheet, or one gallery's atoms, in plane
 - build_stacking_shift_kernel: change the registry across one gallery by
   tilting c
+- build_gallery_strain_kernel: change the width of one gallery by
+  stretching c along the normal
 """
 
 from __future__ import annotations
@@ -547,6 +549,136 @@ def build_stacking_shift_kernel(
             result.overflow,
             cell_valid,
             result.energy < likelihood_constraint,
+        )
+
+    return step
+
+
+def build_gallery_strain_kernel(
+    backend: Any,
+    host_codes: tuple[int, ...],
+    n_sheets: int,
+    in_plane_repeats: tuple[int, int],
+    n_atoms: int,
+    max_vol_per_atom: float = 100.0,
+    min_vol_per_atom: float = 1.0,
+    min_aspect: float = 0.5,
+    flat_v_prior: bool = False,
+    restrict_c_in_plane: bool = False,
+):
+    """Build a kernel changing the width of one gallery.
+
+    1. Pick a gallery ``g`` uniformly; the cut is at its centre.
+    2. Move every atom by an integer multiple of ``c`` so that its height is
+       in ``[cut, cut + 1)``, as in ``build_stacking_shift_kernel``.  This
+       only changes the representation of the configuration.
+    3. Lengthen the cell along the sheet normal, ``c' = c + delta e``, with
+       ``delta = step_size * N(0, 1)`` (Angstrom) and ``e`` the unit normal
+       pointing towards increasing heights.  The atoms stay fixed in
+       Cartesian space, so the periodic images above the boundary rise by
+       ``delta``: gallery ``g`` widens from ``w`` to ``w + delta`` and every
+       other gallery keeps its width.
+    4. The non-host atoms of ``g`` keep their relative position ``u`` in the
+       gallery (0 at its lower sheet, 1 at its upper sheet): an atom at
+       distance ``d`` above the lower sheet moves to ``d (w + delta) / w``.
+    5. Every atom is translated along ``e`` so that the centre of ``g``
+       keeps its fractional height.
+
+    Step 5 makes the reverse move (same gallery, ``-delta``) the exact
+    inverse.  Without it the position of the crystal along the normal, which
+    lives on a circle of length ``h``, would be mapped onto a circle of a
+    different length by a rigid shift, which is not invertible.  Keeping
+    the fractional position instead stretches that circle by ``h' / h``.
+    Step 4 scales ``n_g`` atoms along the normal, so the acceptance is
+    ``min(1, ((w + delta) / w)^n_g * h' / h)``; with ``flat_v_prior`` the
+    prior is flat in fractional coordinates and the factor ``(h / h')^N``
+    is added.
+    Rejection follows the cell moves: energy (1), cell geometry or
+    ``w + delta <= 0`` (2), prior factor (3).
+
+    Args:
+        backend: EnergyBackend instance.
+        host_codes: Type codes of the sheet atoms (used by ``sheet_id``).
+        n_sheets: Number of sheets, from ``check_sheets``.
+        in_plane_repeats: Unused; carried for the shared layered wiring.
+        n_atoms, max_vol_per_atom, min_vol_per_atom, min_aspect,
+            flat_v_prior, restrict_c_in_plane: As for the volume move.
+
+    Returns:
+        step function: (rng_key, state, Emax) -> (new_state, MoveInfo).
+        The state must carry the ``sheet_id`` field.
+    """
+    del host_codes, in_plane_repeats  # sheet_id already uses the host codes
+    cell_geometry = build_cell_geometry(
+        n_atoms,
+        max_vol_per_atom,
+        min_vol_per_atom,
+        min_aspect,
+        restrict_c_in_plane,
+    )
+
+    def step(rng_key, state, likelihood_constraint):
+        k_g, k_d, k_prior = jax.random.split(rng_key, 3)
+        cell, positions = state.cell, state.positions
+
+        s3 = fractional_heights(positions, cell)
+        heights = sheet_heights(s3, state.sheet_id, n_sheets)
+        lower, width, centre = galleries(heights)
+        g = jax.random.randint(k_g, (), 0, n_sheets)
+
+        n_hat, h = _normal_and_height(cell)
+        e = jnp.sign(h) * n_hat
+        h_abs = jnp.abs(h)
+        shift = jnp.floor(positions @ n_hat / h - centre[g])
+        wrapped = positions - shift[:, None] * cell[2]
+
+        w = width[g] * h_abs
+        delta = state.step_size * jax.random.normal(k_d)
+        valid = w + delta > 0.0
+        # An invalid proposal is rejected below; evaluate delta = 0 instead
+        # so the backend never sees a collapsed gallery.
+        delta = jnp.where(valid, delta, 0.0)
+        lam = (w + delta) / w
+
+        # Intercalants of g: below its centre they sit above the lower sheet
+        # at the top of the wrapped cell, which stays put; above the centre
+        # they sit below the upper sheet, whose images rise by delta.
+        in_g = (state.sheet_id < 0) & (gallery_of(s3, lower, width) == g)
+        d = jnp.mod(s3 - lower[g], 1.0) * h_abs
+        lift = jnp.where(d < 0.5 * w, d, d - w) * (lam - 1.0)
+        # After the strain the centre of g sits delta / 2 below the cut;
+        # bring it to the same fractional height in the new cell.
+        recentre = (centre[g] + 0.5) * delta
+        new_positions = wrapped + (in_g * lift + recentre)[:, None] * e
+        new_cell = cell.at[2].add(delta * e)
+
+        result = backend(
+            new_positions,
+            state.types,
+            new_cell,
+            state.max_neighbors,
+            ensemble_params=state.ensemble_params,
+        )
+        cell_valid = valid & cell_geometry(
+            new_positions, state.types, new_cell
+        )
+
+        log_stretch = jnp.log((h_abs + delta) / h_abs)
+        log_p = jnp.sum(in_g) * jnp.log(lam) + log_stretch
+        if flat_v_prior:
+            log_p = log_p - n_atoms * log_stretch
+        prior_ok = jnp.log(jax.random.uniform(k_prior)) < log_p
+
+        return finalize_cell_move(
+            state,
+            new_positions,
+            new_cell,
+            result.energy,
+            result.max_neighbor_count,
+            result.overflow,
+            cell_valid,
+            result.energy < likelihood_constraint,
+            prior_ok=prior_ok,
         )
 
     return step

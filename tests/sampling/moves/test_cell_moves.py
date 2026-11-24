@@ -1,4 +1,4 @@
-"""Tests for the volume, shear and stretch cell move kernels."""
+"""Tests for the volume, normal-strain, shear and stretch cell moves."""
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +9,9 @@ from jaxrens.backends.lj import create_lj
 from jaxrens.sampling.moves.shear import build_kernel as shear_build_kernel
 from jaxrens.sampling.moves.stretch import build_kernel as stretch_build_kernel
 from jaxrens.sampling.moves.volume import build_kernel as vol_build_kernel
+from jaxrens.sampling.moves.volume import (
+    build_normal_strain_kernel as normal_strain_build_kernel,
+)
 from jaxrens.state.mc_state import MCState
 from jaxrens.utils.cell import (
     check_cell_shape,
@@ -291,6 +294,113 @@ class TestVolumeMoveStep(_CellMoveChecks):
         assert not jnp.allclose(old_vol, new_vol, atol=1e-8)
 
 
+class TestNormalStrainMoveStep(_CellMoveChecks):
+    """Check the normal-strain move on a quadratic-energy backend.
+
+    Besides the shared checks, the tests cover what the strain keeps fixed,
+    the rejection of non-positive heights and the volume prior.
+    """
+
+    build = staticmethod(normal_strain_build_kernel)
+    shape_kwargs = {
+        "max_vol_per_atom": 63.0,
+        "min_vol_per_atom": 62.0,
+        "min_aspect": 0.99,
+    }
+
+    def test_strains_only_along_the_normal(self, types):
+        # Tilted c and a non-orthogonal (a, b): the normal is not z.
+        cell = jnp.array([[4.0, 0.0, 0.0], [1.0, 4.0, 0.0], [0.7, -0.4, 6.0]])
+        rot = jnp.array([[0.8, 0.0, 0.6], [0.0, 1.0, 0.0], [-0.6, 0.0, 0.8]])
+        cell = cell @ rot
+        frac = jnp.array([[0.1, 0.2, 0.3], [0.6, 0.5, 0.9]])
+        positions = frac @ cell
+        state = _make_cell_state(
+            positions, types, energy=0.5, cell=cell, step_size=0.5
+        )
+        step = jax.jit(self.build(cell_energy_backend, N_ATOMS))
+
+        new_state, info = step(
+            jax.random.key(3), state, likelihood_constraint=1e6
+        )
+
+        assert info.accepted
+        new_cell = new_state.cell
+        n = jnp.cross(cell[0], cell[1])
+        n = n / jnp.linalg.norm(n)
+        assert jnp.allclose(new_cell[:2], cell[:2], atol=1e-6)
+        in_plane = lambda c: c - jnp.dot(c, n) * n  # noqa: E731
+        assert jnp.allclose(
+            in_plane(new_cell[2]), in_plane(cell[2]), atol=1e-6
+        )
+        assert not jnp.isclose(
+            jnp.dot(new_cell[2], n), jnp.dot(cell[2], n), atol=1e-4
+        )
+        new_frac = new_state.positions @ jnp.linalg.inv(new_cell)
+        assert jnp.allclose(new_frac, frac, atol=1e-6)
+
+    def test_non_positive_height_is_a_cell_rejection(self, positions, types):
+        # h = 1 and a step of 100: almost every proposal has h' <= 0.
+        cell = jnp.diag(jnp.array([5.0, 5.0, 1.0]))
+        state = _make_cell_state(
+            positions, types, energy=0.5, cell=cell, step_size=100.0
+        )
+        step = jax.jit(
+            self.build(
+                cell_energy_backend,
+                N_ATOMS,
+                max_vol_per_atom=1e9,
+                min_vol_per_atom=1e-9,
+                min_aspect=1e-9,
+                flat_v_prior=True,
+            )
+        )
+
+        reasons = []
+        for i in range(20):
+            _, info = step(jax.random.key(i), state, likelihood_constraint=1e9)
+            reasons.append(int(info.reject_reason))
+        assert 2 in reasons
+        assert set(reasons) <= {0, 2}
+
+    @pytest.mark.parametrize("flat", [False, True])
+    def test_samples_the_volume_prior(self, flat):
+        """With every energy accepted, h follows h^N (or flat) in bounds."""
+        n_atoms, area = 2, 1.0
+        lo, hi = 1.0, 3.0
+        cell = jnp.diag(jnp.array([1.0, 1.0, 2.0]))
+        positions = jnp.array([[0.1, 0.2, 0.3], [0.5, 0.5, 1.2]])
+        state = _make_cell_state(
+            positions, jnp.array([0, 0]), 0.0, cell, step_size=0.8
+        )
+        step = self.build(
+            lambda *a, **k: BackendResult(energy=jnp.float32(0.0)),
+            n_atoms,
+            max_vol_per_atom=hi * area / n_atoms,
+            min_vol_per_atom=lo * area / n_atoms,
+            min_aspect=1e-6,
+            flat_v_prior=flat,
+        )
+
+        def body(carry, key):
+            carry, _ = step(key, carry, 1.0)
+            return carry, carry.cell[2, 2]
+
+        keys = jax.random.split(jax.random.key(0), 60_000)
+        _, h = jax.jit(lambda s: jax.lax.scan(body, s, keys))(state)
+        h = h[5_000:]
+
+        p = 0 if flat else n_atoms
+        expected = (
+            (p + 1)
+            / (p + 2)
+            * (hi ** (p + 2) - lo ** (p + 2))
+            / (hi ** (p + 1) - lo ** (p + 1))
+        )
+        assert float(jnp.min(h)) >= lo and float(jnp.max(h)) <= hi
+        assert abs(float(jnp.mean(h)) - expected) < 0.03
+
+
 class TestShearMoveStep(_VolumePreservingChecks):
     """Check the shear move on a quadratic-energy backend.
 
@@ -477,6 +587,7 @@ _OVERFLOWING_BACKEND = _OverflowingBackend(count=999)
 
 _MOVE_BUILDERS = {
     "volume": vol_build_kernel,
+    "normal_strain": normal_strain_build_kernel,
     "shear": shear_build_kernel,
     "stretch": stretch_build_kernel,
 }
@@ -491,7 +602,9 @@ class TestCellInvalidOverflowGated:
     never samples.  Signals from cell-valid proposals must still pass.
     """
 
-    @pytest.mark.parametrize("move", ["volume", "shear", "stretch"])
+    @pytest.mark.parametrize(
+        "move", ["volume", "normal_strain", "shear", "stretch"]
+    )
     def test_cell_invalid_does_not_set_overflow_or_count(
         self,
         move,
@@ -521,7 +634,9 @@ class TestCellInvalidOverflowGated:
         assert bool(state.overflow) is False
         assert int(state.max_neighbor_count) == 0
 
-    @pytest.mark.parametrize("move", ["volume", "shear", "stretch"])
+    @pytest.mark.parametrize(
+        "move", ["volume", "normal_strain", "shear", "stretch"]
+    )
     def test_cell_valid_still_propagates_overflow(
         self,
         move,
