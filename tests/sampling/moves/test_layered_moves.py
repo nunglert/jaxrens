@@ -15,7 +15,9 @@ from jaxrens.cli.resolve import _resolve_sheets, resolve
 from jaxrens.cli.schema import RootSpec
 from jaxrens.cli.schema.moves import (
     GalleryHopMoveSpec,
+    GalleryStrainMoveSpec,
     LayerSlideMoveSpec,
+    NormalStrainMoveSpec,
     ShearMoveSpec,
     SingleAtomMoveSpec,
     StackingShiftMoveSpec,
@@ -27,6 +29,7 @@ from jaxrens.sampling.moves import single_atom
 from jaxrens.sampling.moves.layered_moves import (
     SheetInfo,
     build_gallery_hop_kernel,
+    build_gallery_strain_kernel,
     build_layer_slide_kernel,
     build_stacking_shift_kernel,
     check_sheets,
@@ -565,8 +568,8 @@ class TestGalleryHopWiring:
 
 
 class TestLayeredMovesWithLJ:
-    """gallery_hop, layer_slide and stacking_shift in a short NS run on a
-    periodic LJ bilayer."""
+    """gallery_hop, layer_slide, stacking_shift and gallery_strain in a short
+    NS run on a periodic LJ bilayer."""
 
     def test_li_change_gallery_and_sheets_stay_intact(self):
         from jaxrens.sampling.nested_sampling import run_ns
@@ -637,7 +640,26 @@ class TestLayeredMovesWithLJ:
             },
             step_size=0.02,
         )
-        init_fn, step_fn, _ = build_mwg(backend, [hop, local, slide, shift])
+        strain = MoveKernel(
+            name="gallery_strain",
+            build_kernel=build_gallery_strain_kernel,
+            kernel_kwargs=dict(
+                host_codes=(C,),
+                n_sheets=2,
+                in_plane_repeats=(3, 3),
+                n_atoms=len(typ),
+                max_vol_per_atom=1e4,
+                min_vol_per_atom=0.1,
+                min_aspect=0.5,
+                restrict_c_in_plane=True,
+            ),
+            extra_state_fields={
+                "sheet_id": (jnp.ndarray, make_sheet_id_initializer((C,)))
+            },
+            step_size=0.05,
+        )
+        moves = [hop, local, slide, shift, strain]
+        init_fn, step_fn, _ = build_mwg(backend, moves)
         types = jnp.asarray(typ)
         energies = jax.vmap(lambda p, c: backend(p, types, c, 0).energy)(
             jnp.asarray(positions), jnp.asarray(cells)
@@ -653,7 +675,7 @@ class TestLayeredMovesWithLJ:
             rng_key=jax.random.key(0),
             max_iterations=30,
             n_mcmc_steps=10,
-            move_descriptors=[hop, local, slide, shift],
+            move_descriptors=moves,
         )
         assert np.isfinite(float(result["log_evidence"]))
 
@@ -1349,7 +1371,13 @@ class TestStackingShiftSpec:
         assert desc.reject_reasons == {"energy", "cell"}
 
     @pytest.mark.parametrize(
-        "spec_cls", [VolumeMoveSpec, ShearMoveSpec, StretchMoveSpec]
+        "spec_cls",
+        [
+            VolumeMoveSpec,
+            NormalStrainMoveSpec,
+            ShearMoveSpec,
+            StretchMoveSpec,
+        ],
     )
     def test_cell_moves_carry_the_restriction_only_when_set(self, spec_cls):
         off = spec_cls().to_descriptor(n_atoms=39, cell_cfg=self._cell(False))
@@ -1418,6 +1446,202 @@ class TestStackingShiftSpec:
         a = 3 * A1
         with pytest.raises(RuntimeError, match="Wigner-Seitz"):
             resolve(self._root(tmp_path, cpar=(a + 0.5 * A2)[:2]))
+
+
+# ---------------------------------------------------------------------------
+# gallery_strain
+# ---------------------------------------------------------------------------
+
+
+def _strain_setup(
+    spacings=(3.5, 3.2, 3.35),
+    li=(2, 1, 1),
+    tilt=None,
+    sigma=0.2,
+    backend=None,
+    reps=3,
+    **guard,
+):
+    """Kernel and state for gallery_strain on graphite with Li off centre.
+
+    Sheet 0 sits at z = 2.2, so the last gallery straddles the cell
+    boundary.
+    """
+    pos, typ, cell = _graphite(
+        list(spacings), li_per_gallery=li, z0=2.2, reps=reps
+    )
+    li_idx = np.flatnonzero(typ == LI)
+    pos[li_idx, 2] += np.linspace(-0.6, 0.6, li_idx.size)
+    if tilt is not None:
+        cell = cell.copy()
+        cell[2] += tilt
+    kwargs = dict(
+        host_codes=(C,),
+        n_sheets=len(spacings),
+        in_plane_repeats=(3, 3),
+        n_atoms=len(typ),
+        max_vol_per_atom=1e4,
+        min_vol_per_atom=0.1,
+        min_aspect=0.05,
+    )
+    kwargs.update(guard)
+    desc = MoveKernel(
+        name="gallery_strain",
+        build_kernel=build_gallery_strain_kernel,
+        kernel_kwargs=kwargs,
+        extra_state_fields={
+            "sheet_id": (jnp.ndarray, make_sheet_id_initializer((C,)))
+        },
+    )
+    init_fn, _, (step,) = build_mwg(backend or _FlatBackend(), [desc])
+    state = init_fn(jnp.asarray(pos), jnp.asarray(typ), 0.0, jnp.asarray(cell))
+    state = state.set(step_sizes=jnp.full(1, sigma))
+    return step, state
+
+
+def _gallery_layout(pos, sid, cell, n_sheets):
+    """Widths (Angstrom), centres (fractional), and each atom's gallery and
+    relative height ``u`` in it."""
+    pos, cell = jnp.asarray(pos), jnp.asarray(cell)
+    s3 = fractional_heights(pos, cell)
+    lower, width, centre = galleries(sheet_heights(s3, sid, n_sheets))
+    g = gallery_of(s3, lower, width)
+    u = jnp.mod(s3 - lower[g], 1.0) / width[g]
+    h = abs(float(jnp.dot(cell[2], jnp.cross(cell[0], cell[1])))) / float(
+        jnp.linalg.norm(jnp.cross(cell[0], cell[1]))
+    )
+    return (
+        np.asarray(width) * h,
+        np.asarray(centre),
+        np.asarray(g),
+        np.asarray(u),
+        h,
+    )
+
+
+class TestGalleryStrainKernel:
+    @pytest.mark.parametrize("tilt", [None, 0.7 * A1 - 0.4 * A2])
+    def test_only_one_gallery_changes(self, tilt):
+        step, state = _strain_setup(tilt=tilt)
+        sid = state.sheet_id
+        w0, c0, g0, u0, h0 = _gallery_layout(
+            state.positions, sid, state.cell, 3
+        )
+        new, info = _propose(step, state, 100)
+        is_li = np.asarray(state.types) == LI
+        changed = set()
+        n_acc = 0
+        for k in range(100):
+            if not bool(info.accepted[k]):
+                continue
+            n_acc += 1
+            cell = np.asarray(new.cell[k])
+            np.testing.assert_allclose(cell[:2], state.cell[:2], atol=1e-6)
+            dc = cell[2] - np.asarray(state.cell[2])
+            np.testing.assert_allclose(dc[:2], 0.0, atol=1e-6)  # along n
+            w, c, g, u, h = _gallery_layout(new.positions[k], sid, cell, 3)
+            dw = w - w0
+            moved = np.flatnonzero(np.abs(dw) > 1e-4)
+            assert moved.size == 1
+            changed.add(int(moved[0]))
+            assert dw[moved[0]] == pytest.approx(h - h0, abs=1e-4)
+            # The strained gallery keeps its fractional centre.
+            dcen = (c[moved[0]] - c0[moved[0]] + 0.5) % 1.0 - 0.5
+            assert abs(dcen) < 1e-5
+            # Every Li stays in its gallery at the same relative height.
+            np.testing.assert_array_equal(g[is_li], g0[is_li])
+            np.testing.assert_allclose(u[is_li], u0[is_li], atol=1e-5)
+        assert n_acc > 50
+        assert changed == {0, 1, 2}
+
+    def test_collapsing_gallery_is_a_cell_rejection(self):
+        step, state = _strain_setup(sigma=50.0)
+        new, info = _propose(step, state, 100, seed=1)
+        reasons = set(np.asarray(info.reject_reason).tolist())
+        assert 2 in reasons
+        assert reasons <= {0, 2, 3}
+        bad = np.asarray(info.reject_reason) == 2
+        np.testing.assert_array_equal(
+            np.asarray(new.cell)[bad],
+            np.broadcast_to(np.asarray(state.cell), (bad.sum(), 3, 3)),
+        )
+
+    def test_energy_rejection_leaves_the_state(self):
+        step, state = _strain_setup(backend=create_harmonic())
+        new, info = jax.vmap(lambda k: step(state, k, -1.0))(
+            jax.random.split(jax.random.key(2), 20)
+        )
+        assert not bool(jnp.any(info.accepted))
+        assert bool(jnp.all(new.cell == state.cell))
+        assert bool(jnp.all(new.positions == state.positions))
+
+    def test_samples_the_prior(self):
+        """With zero energy the widths follow ``h * prod_g w_g^n_g``.
+
+        The factor ``h`` is the length of the circle on which the crystal
+        can sit along the normal; without the recentring step the chain
+        misses it.
+        """
+        lo, hi = 5.0, 9.0
+        # One primitive cell in plane (2 C per sheet, one hollow site) and
+        # many short chains in parallel keep the test cheap.
+        pos, typ, cell = _graphite([3.5, 3.5], li_per_gallery=(1,), reps=1)
+        area = float(np.linalg.norm(np.cross(cell[0], cell[1])))
+        n = len(typ)
+        step, state = _strain_setup(
+            spacings=(3.5, 3.5),
+            li=(1,),
+            sigma=0.6,
+            reps=1,
+            max_vol_per_atom=hi * area / n,
+            min_vol_per_atom=lo * area / n,
+            min_aspect=1e-3,
+        )
+
+        def body(carry, key):
+            carry, _ = step(carry, key, 1.0)
+            s3 = fractional_heights(carry.positions, carry.cell)
+            _, w, _ = galleries(sheet_heights(s3, carry.sheet_id, 2))
+            return carry, w * carry.cell[2, 2]
+
+        def chain(key):
+            keys = jax.random.split(key, 20_000)
+            return jax.lax.scan(body, state, keys)[1][2_000:]
+
+        chains = jax.random.split(jax.random.key(0), 128)
+        w = np.asarray(jax.jit(jax.vmap(chain))(chains)).reshape(-1, 2)
+
+        grid = np.linspace(1e-3, hi, 1500)
+        w0, w1 = np.meshgrid(grid, grid, indexing="ij")
+        h = w0 + w1
+        dens = ((h >= lo) & (h <= hi)) * h * w0
+        dens /= dens.sum()
+        # Expected E[h] = 7.54, E[w0] = 5.02; without the factor h they would
+        # be 7.37 and 4.91.  The split between w0 and w1 decorrelates
+        # slowly: the standard error of E[w0] is about 0.02.
+        assert w.sum(1).mean() == pytest.approx((dens * h).sum(), abs=0.04)
+        assert w[:, 0].mean() == pytest.approx((dens * w0).sum(), abs=0.08)
+
+
+class TestGalleryStrainSpec:
+    def test_descriptor(self):
+        from jaxrens.cli.schema.cell import CellSpec
+
+        desc = GalleryStrainMoveSpec(step_size=0.05).to_descriptor(
+            n_atoms=39,
+            cell_cfg=CellSpec(min_aspect_ratio=0.5, flat_V_prior=True),
+            symbol_map={0: "C", 1: "Li"},
+            sheets=SheetInfo(2, 18),
+        )
+        assert desc.name == "gallery_strain"
+        assert desc.build_kernel is build_gallery_strain_kernel
+        assert desc.kernel_kwargs["n_sheets"] == 2
+        assert desc.kernel_kwargs["flat_v_prior"] is True
+        assert "restrict_c_in_plane" not in desc.kernel_kwargs
+        assert set(desc.extra_state_fields) == {"sheet_id"}
+        assert desc.mutates == {"positions", "cell"}
+        assert desc.reject_reasons == {"energy", "cell", "prior"}
+        assert desc.adaptive is True
 
 
 class TestSheetIdInReplicaExchange:

@@ -100,8 +100,8 @@ def in_plane_strain_descriptor(
     """Wrap the in-plane strain predicate as a gate constraint.
 
     Depends on the cell only, so the gate checks it after the moves that
-    change the cell (volume, shear, stretch, stacking_shift) and skips the
-    others.  Rejections share bucket 4 with the other configuration
+    change the cell (volume, normal_strain, shear, stretch, stacking_shift,
+    gallery_strain) and skips the others.  Rejections share bucket 4 with the other configuration
     constraints.
     """
     return ConstraintDescriptor(
